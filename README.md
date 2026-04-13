@@ -152,7 +152,7 @@ zulong/
 | 语义漂移检测 & 动态阈值管理 | - | Y |
 | LLM 记忆审查 & 人物画像 | - | Y |
 | 双脑 KV Cache 热切换 | - | Y |
-| L2 智能编排引擎（RAG + 工具调用 + 视觉 + 搜索） | - | Y |
+| L2 智能编排引擎（全链路自动编排） | - | Y |
 | 优先技术支持 & SLA | - | Y |
 
 详见 [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md)。
