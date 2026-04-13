@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenClaw - 祖龙对话</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        
+        .chat-container {
+            width: 90%;
+            max-width: 600px;
+            height: 80vh;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        
+        .chat-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            text-align: center;
+            font-size: 24px;
+            font-weight: bold;
+        }
+        
+        .chat-messages {
+            flex: 1;
+            padding: 20px;
+            overflow-y: auto;
+            background: #f5f5f5;
+        }
+        
+        .message {
+            margin-bottom: 15px;
+            display: flex;
+            align-items: flex-start;
+        }
+        
+        .message.user {
+            justify-content: flex-end;
+        }
+        
+        .message.assistant {
+            justify-content: flex-start;
+        }
+        
+        .message-content {
+            max-width: 70%;
+            padding: 12px 18px;
+            border-radius: 18px;
+            word-wrap: break-word;
+        }
+        
+        .message.user .message-content {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-bottom-right-radius: 4px;
+        }
+        
+        .message.assistant .message-content {
+            background: white;
+            color: #333;
+            border-bottom-left-radius: 4px;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+        }
+        
+        .chat-input-container {
+            padding: 20px;
+            background: white;
+            border-top: 1px solid #e0e0e0;
+            display: flex;
+            gap: 10px;
+        }
+        
+        .chat-input {
+            flex: 1;
+            padding: 12px 20px;
+            border: 2px solid #e0e0e0;
+            border-radius: 25px;
+            font-size: 16px;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+        
+        .chat-input:focus {
+            border-color: #667eea;
+        }
+        
+        .send-button {
+            padding: 12px 30px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 25px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        
+        .send-button:hover {
+            transform: scale(1.05);
+        }
+        
+        .send-button:active {
+            transform: scale(0.95);
+        }
+        
+        .send-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        
+        .status-indicator.connected {
+            background: #4caf50;
+            box-shadow: 0 0 10px #4caf50;
+        }
+        
+        .status-indicator.disconnected {
+            background: #f44336;
+            box-shadow: 0 0 10px #f44336;
+        }
+        
+        .connection-status {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            font-size: 12px;
+            color: white;
+            background: rgba(0, 0, 0, 0.2);
+            padding: 5px 10px;
+            border-radius: 15px;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        .typing-indicator {
+            display: flex;
+            gap: 5px;
+            padding: 12px 18px;
+            background: white;
+            border-radius: 18px;
+            border-bottom-left-radius: 4px;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+            max-width: 70px;
+        }
+        
+        .typing-indicator span {
+            width: 8px;
+            height: 8px;
+            background: #667eea;
+            border-radius: 50%;
+            animation: pulse 1.4s infinite;
+        }
+        
+        .typing-indicator span:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+        
+        .typing-indicator span:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+    </style>
+</head>
+<body>
+    <div class="chat-container">
+        <div class="chat-header">
+            <span class="status-indicator disconnected" id="statusIndicator"></span>
+            OpenClaw × 祖龙
+            <div class="connection-status" id="connectionStatus">连接中...</div>
+        </div>
+        
+        <div class="chat-messages" id="chatMessages">
+            <!-- 消息将动态添加到这里 -->
+        </div>
+        
+        <div class="chat-input-container">
+            <input 
+                type="text" 
+                class="chat-input" 
+                id="chatInput" 
+                placeholder="输入消息..."
+                autocomplete="off"
+            />
+            <button class="send-button" id="sendButton">发送</button>
+        </div>
+    </div>
+    
+    <script>
+        // WebSocket 连接
+        let ws = null;
+        const reconnectDelay = 3000; // 3 秒后重连
+        
+        // DOM 元素
+        const chatMessages = document.getElementById('chatMessages');
+        const chatInput = document.getElementById('chatInput');
+        const sendButton = document.getElementById('sendButton');
+        const statusIndicator = document.getElementById('statusIndicator');
+        const connectionStatus = document.getElementById('connectionStatus');
+        
+        // 连接 WebSocket
+        function connect() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            
+            console.log('[WebSocket] 正在连接到:', wsUrl);
+            
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = () => {
+                console.log('[WebSocket] ✅ 连接成功');
+                updateStatus(true);
+            };
+            
+            ws.onclose = () => {
+                console.log('[WebSocket] ❌ 连接关闭');
+                updateStatus(false);
+                setTimeout(connect, reconnectDelay);
+            };
+            
+            ws.onerror = (error) => {
+                console.error('[WebSocket] 错误:', error);
+            };
+            
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                handleMessage(data);
+            };
+        }
+        
+        // 更新连接状态
+        function updateStatus(connected) {
+            if (connected) {
+                statusIndicator.className = 'status-indicator connected';
+                connectionStatus.textContent = '已连接';
+                sendButton.disabled = false;
+            } else {
+                statusIndicator.className = 'status-indicator disconnected';
+                connectionStatus.textContent = '断开连接';
+                sendButton.disabled = true;
+            }
+        }
+        
+        // 处理收到的消息
+        function handleMessage(data) {
+            console.log('[WebSocket] 📥 收到消息:', data);
+            
+            switch (data.type) {
+                case 'WELCOME':
+                    console.log('[WebSocket] 欢迎消息:', data.message);
+                    break;
+                
+                case 'CHAT_RESPONSE':
+                    removeTypingIndicator();
+                    addMessage(data.text, 'assistant');
+                    // 🔥 [修复] 移除自动语音播报，因为后端已经是 TEXT_ONLY 模式
+                    // speakText(data.text);  // 已禁用
+                    break;
+                
+                case 'STREAMING_RESPONSE':
+                    removeTypingIndicator();
+                    updateStreamingMessage(data.text);
+                    break;
+                
+                default:
+                    console.log('[WebSocket] 未知消息类型:', data.type);
+            }
+        }
+        
+        // 添加消息到聊天窗口
+        function addMessage(text, sender) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${sender}`;
+            
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'message-content';
+            contentDiv.textContent = text;
+            
+            messageDiv.appendChild(contentDiv);
+            chatMessages.appendChild(messageDiv);
+            
+            // 滚动到底部
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+        
+        // 显示打字指示器
+        function showTypingIndicator() {
+            const typingDiv = document.createElement('div');
+            typingDiv.className = 'message assistant';
+            typingDiv.id = 'typingIndicator';
+            
+            const indicatorDiv = document.createElement('div');
+            indicatorDiv.className = 'typing-indicator';
+            
+            for (let i = 0; i < 3; i++) {
+                const span = document.createElement('span');
+                indicatorDiv.appendChild(span);
+            }
+            
+            typingDiv.appendChild(indicatorDiv);
+            chatMessages.appendChild(typingDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+        
+        // 移除打字指示器
+        function removeTypingIndicator() {
+            const typingIndicator = document.getElementById('typingIndicator');
+            if (typingIndicator) {
+                typingIndicator.remove();
+            }
+        }
+        
+        // 更新流式消息
+        function updateStreamingMessage(text) {
+            let streamingMessage = document.getElementById('streamingMessage');
+            
+            if (!streamingMessage) {
+                // 创建流式消息容器
+                streamingMessage = document.createElement('div');
+                streamingMessage.className = 'message assistant';
+                streamingMessage.id = 'streamingMessage';
+                
+                const contentDiv = document.createElement('div');
+                contentDiv.className = 'message-content';
+                contentDiv.textContent = text;
+                
+                streamingMessage.appendChild(contentDiv);
+                chatMessages.appendChild(streamingMessage);
+            } else {
+                // 更新现有流式消息
+                const contentDiv = streamingMessage.querySelector('.message-content');
+                if (contentDiv) {
+                    contentDiv.textContent = text;
+                }
+            }
+            
+            // 滚动到底部
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+        
+        // 发送消息
+        function sendMessage() {
+            const text = chatInput.value.trim();
+            
+            if (!text || !ws || ws.readyState !== WebSocket.OPEN) {
+                return;
+            }
+            
+            // 移除现有的流式消息容器
+            const streamingMessage = document.getElementById('streamingMessage');
+            if (streamingMessage) {
+                streamingMessage.remove();
+            }
+            
+            // 添加到聊天窗口
+            addMessage(text, 'user');
+            
+            // 发送到服务器
+            ws.send(JSON.stringify({
+                type: 'CHAT_MESSAGE',
+                text: text
+            }));
+            
+            // 清空输入框
+            chatInput.value = '';
+            
+            // 显示打字指示器
+            showTypingIndicator();
+        }
+        
+        // 文本转语音
+        function speakText(text) {
+            if ('speechSynthesis' in window) {
+                // 移除打字指示器
+                removeTypingIndicator();
+                
+                const utterance = new SpeechSynthesisUtterance(text);
+                utterance.lang = 'zh-CN';
+                utterance.rate = 1.0;
+                utterance.pitch = 1.0;
+                
+                window.speechSynthesis.speak(utterance);
+            } else {
+                console.warn('[TTS] 浏览器不支持语音合成');
+                removeTypingIndicator();
+            }
+        }
+        
+        // 事件监听
+        sendButton.addEventListener('click', sendMessage);
+        
+        chatInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+        
+        // 初始化
+        connect();
+    </script>
+</body>
+</html>

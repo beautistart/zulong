@@ -1,0 +1,115 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ===== 虚拟环境 =====
+zulong_env/
+venv/
+.venv/
+
+# ===== 模型权重 (体积大，不上传) =====
+models/
+*.safetensors
+*.gguf
+*.pt
+*.pth
+gesture_recognizer.task
+
+# ===== 运行时数据 =====
+data/
+dossiers/
+experience_store/
+checkpoints/
+debug_data/
+diagnostics/
+stability_test_data/
+camera_test_data/
+gesture_test_data/
+test_reports/
+
+# ===== 本地配置 =====
+config.yaml
+docker-compose.yml
+.env
+.env.*
+!.env.example
+
+# ===== 备份/旧版本 =====
+safetensorsvers/
+backup_old_vision_arch/
+backups/
+
+# ===== 内部文档 (含核心架构细节) =====
+资料/
+
+# ===== 闭源核心模块 (企业版，完全不公开) =====
+zulong/memory/knowledge_graph.py
+zulong/memory/person_profile.py
+zulong/memory/llm_memory_reviewer.py
+zulong/memory/summary_store.py
+zulong/memory/memory_evolution.py
+zulong/memory/short_term_memory.py
+zulong/memory/hot_update_engine.py
+zulong/memory/three_libraries.py
+zulong/memory/enhanced_experience_store.py
+zulong/memory/episodic_memory.py
+zulong/memory/semantic_drift_detector.py
+zulong/l1b/hotswap_scheduler.py
+zulong/l1b/scheduler_gatekeeper.py
+zulong/l1b/dynamic_threshold_manager.py
+zulong/l1b/memory_config_initializer.py
+zulong/l3/dual_brain_container.py
+zulong/l2/inference_engine.py
+zulong/l1c/optimized_vision_processor.py
+zulong/replay/
+zulong/review/
+
+# ===== 开发过程文档 (含实现细节) =====
+ARCHITECTURE_*.md
+ASYNC_*.md
+CLEANUP_*.md
+CROSS_SESSION_*.md
+DOWNGRADE_*.md
+FIX_*.md
+GATEKEEPER_*.md
+L2_*.md
+MEMORY_*.md
+PHASE_*.md
+QUICK_REVIEW_*.md
+RAG_*.md
+REVIEW_*.md
+RUNTIME_*.md
+SHARED_POOL_*.md
+SOFTWARE_*.md
+TODO_ENHANCEMENTS.md
+WEB_RESPONSE_*.md
+TESTING_GUIDE.md
+code_review_files.txt
+
+# ===== 根目录临时测试文件 =====
+/test_*.py
+/test_*.txt
+/test_*.json
+/test_*.html
+/test2_output.txt
+/nul
+
+# ===== 启动脚本 (含本地路径) =====
+start_all.bat
+start_console.bat
+start_l2_backup_vllm.bat
+start_web.bat
+启动说明.md
+
+# ===== IDE/系统 =====
+.vscode/
+.idea/
+*.swp
+*.log
+screenshots/

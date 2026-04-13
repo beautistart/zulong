@@ -1,0 +1,42 @@
+# ZULONG Docker Compose Example
+# Copy this file to docker-compose.yml and modify as needed
+
+version: '3.8'
+
+services:
+  zulong:
+    build: .
+    container_name: zulong-main
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+    volumes:
+      - ./models:/app/models:ro
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # Optional: Monitoring with Grafana
+  grafana:
+    image: grafana/grafana:latest
+    container_name: zulong-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-changeme}  # Set via .env file
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+
+volumes:
+  grafana_data:

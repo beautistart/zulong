@@ -1,0 +1,37 @@
+# ZULONG Configuration Example
+# Copy this file to config.yaml and modify as needed
+
+system:
+  name: "ZULONG"
+  version: "beta4"
+  log_level: "INFO"
+
+# Model paths (relative to project root)
+models:
+  base_dir: "./models"
+  l1a_model: "Qwen3.5-0.8B-int4-L1A"
+  l1b_model: "Qwen3.5-0.8B-int4-L1B"
+  l2_model: "Qwen/Qwen3___5-2B"
+  tts_model: "CosyVoice3-0.5B/FunAudioLLM/Fun-CosyVoice3-0___5B-2512"
+
+# Device configuration
+device:
+  gpu_memory_limit: "6GB"  # RTX 3060 6GB
+  tts_device: "cpu"        # TTS runs on CPU
+
+# Memory system
+memory:
+  stm_capacity: 50
+  ltm_backend: "chromadb"
+  embedding_model: "BAAI/bge-small-zh-v1.5"
+
+# TTS configuration
+tts:
+  sample_rate: 22050
+  speaker: "default"
+
+# Server configuration
+server:
+  host: "0.0.0.0"
+  port: 8000
+  websocket_port: 8001
