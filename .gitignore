@@ -54,7 +54,7 @@ zulong/memory/person_profile.py
 zulong/memory/llm_memory_reviewer.py
 zulong/memory/summary_store.py
 zulong/memory/memory_evolution.py
-zulong/memory/short_term_memory.py
+# short_term_memory.py -> 已开放给社区版
 zulong/memory/hot_update_engine.py
 zulong/memory/three_libraries.py
 zulong/memory/enhanced_experience_store.py

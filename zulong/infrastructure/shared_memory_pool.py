@@ -748,10 +748,16 @@ class SharedMemoryPool:
         # 将保存请求加入队列
         await self._save_queue.put(time.time())
         
+        # 🔥 增强日志：详细记录保存流程
+        logger.info(f"💾 [SharedMemoryPool] 保存请求已加入队列 (队列大小：{self._save_queue.qsize()})")
+        
         # 🔥 如果没有正在进行的保存任务，启动一个
         if self._pending_save_task is None or self._pending_save_task.done():
-            logger.debug(f"💾 [SharedMemoryPool] 触发快照保存 (队列大小：{self._save_queue.qsize()})")
+            logger.info(f"💾 [SharedMemoryPool] 触发快照保存任务 (队列大小：{self._save_queue.qsize()})")
             self._pending_save_task = asyncio.create_task(self._process_save_queue())
+            logger.info(f"💾 [SharedMemoryPool] ✅ 保存任务已创建")
+        else:
+            logger.debug(f"💾 [SharedMemoryPool] 保存任务已在运行，跳过创建")
     
     async def _process_save_queue(self):
         """🔥 处理保存队列（合并多次保存请求）

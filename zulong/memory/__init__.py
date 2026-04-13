@@ -9,9 +9,9 @@ Community Edition includes:
 - RAG Manager (RAGManager)
 - Tagging Engine (TaggingEngine)
 - Experience Generator (ExperienceGenerator)
+- Short-term Memory (ShortTermMemory)
 
 Enterprise Edition adds:
-- Short-term Memory (ShortTermMemory)
 - Memory Evolution (MemoryConsolidator)
 - Knowledge Graph (KnowledgeGraph)
 - Person Profile (PersonProfileManager)
@@ -25,6 +25,7 @@ For enterprise licensing, see COMMERCIAL_LICENSE.md
 from .rag_manager import RAGManager, RAGConfig
 from .tagging_engine import TaggingEngine
 from .experience_generator import ExperienceGenerator, ExperienceCandidate
+from .short_term_memory import ShortTermMemory
 
 __all__ = [
     "RAGManager",
@@ -32,13 +33,13 @@ __all__ = [
     "TaggingEngine",
     "ExperienceGenerator",
     "ExperienceCandidate",
+    "ShortTermMemory",
 ]
 
 # --- Enterprise Edition (optional) ---
 try:
-    from .short_term_memory import ShortTermMemory
     from .memory_evolution import MemoryConsolidator, MemoryStrength
-    __all__.extend(["ShortTermMemory", "MemoryConsolidator", "MemoryStrength"])
+    __all__.extend(["MemoryConsolidator", "MemoryStrength"])
 except ImportError:
     pass
 

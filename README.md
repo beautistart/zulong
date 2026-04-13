@@ -118,7 +118,7 @@ zulong/
 ├── l1c/                # L1-C: 安静视觉注意力
 ├── l2/                 # L2: 专家调度、RAG 节点、事件处理
 ├── l3/                 # L3: 专家节点、TTS、模型切换
-├── memory/             # 记忆系统：RAG 管理、向量嵌入、混合搜索
+├── memory/             # 记忆系统：短期记忆、RAG 管理、向量嵌入、混合搜索
 ├── models/             # 模型配置与加载
 ├── modules/l1/core/    # 插件接口 (IL1Module) & 插件管理器
 ├── plugins/            # 内置插件（视觉、语音、电机、气体检测）
@@ -147,10 +147,12 @@ zulong/
 | TTS 语音合成 (CosyVoice) | Y | Y |
 | 插件开发接口 (MIT 许可) | Y | Y |
 | MCP 客户端/服务端 | Y | Y |
+| 短期记忆 & 跨会话记忆持久化 | Y | Y |
 | 记忆进化 & 知识图谱 | - | Y |
+| 语义漂移检测 & 动态阈值管理 | - | Y |
+| LLM 记忆审查 & 人物画像 | - | Y |
 | 双脑 KV Cache 热切换 | - | Y |
 | 推理引擎 | - | Y |
-| 短期记忆 & 人物画像 | - | Y |
 | 优先技术支持 & SLA | - | Y |
 
 详见 [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md)。

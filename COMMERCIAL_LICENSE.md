@@ -53,9 +53,9 @@ You **do NOT need** a commercial license if:
 
 For pricing and licensing inquiries:
 
-- **Email**: q1550567472@qq.com
-- **Website**: https://github.com/beautistart/zulong
-- **GitHub**: https://github.com/beautistart/zulong
+- **Email**: [YOUR_EMAIL]
+- **Website**: [YOUR_WEBSITE]
+- **GitHub**: [YOUR_GITHUB_URL]
 
 ## FAQ
 
