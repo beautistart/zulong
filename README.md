@@ -335,6 +335,8 @@ cp .env.example .env                      # 环境变量
 | **LangChain** | 消息类型与链式调用基础 | [github.com/langchain-ai](https://github.com/langchain-ai/langchain) |
 | **bge-small-zh** | 中文向量嵌入模型，RAG 记忆检索核心 | [huggingface.co/BAAI](https://huggingface.co/BAAI/bge-small-zh-v1.5) |
 | **bitsandbytes** | INT4/INT8 量化，让大模型跑在 6GB 显存上 | [github.com/bitsandbytes-foundation](https://github.com/bitsandbytes-foundation/bitsandbytes) |
+| **SGLang** | 高性能推理后端，Linux 环境推荐方案 | [github.com/sgl-project](https://github.com/sgl-project/sglang) |
+| **vLLM** | 高吞吐推理引擎，支持 OpenAI API 与工具调用 | [github.com/vllm-project](https://github.com/vllm-project/vllm) |
 
 ### 视觉与感知
 
