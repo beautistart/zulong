@@ -357,6 +357,7 @@ cp .env.example .env                      # 环境变量
 | **Qdrant** | 向量数据库，记忆检索后端 | [qdrant.tech](https://qdrant.tech/) |
 | **Prometheus** | 系统监控指标采集 | [prometheus.io](https://prometheus.io/) |
 | **MCP** | Model Context Protocol，技能包生态接入 | [modelcontextprotocol.io](https://modelcontextprotocol.io/) |
+| **OpenClaw** | AI 前端交互平台，Web UI、技能管理与硬件桥接 | [github.com/openclaw](https://github.com/openclaw/openclaw) |
 
 ### 自然语言处理
 
