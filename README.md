@@ -178,12 +178,9 @@ zulong/
 
 | 环境 | 推理后端 | 说明 |
 |------|---------|------|
-| **Linux（推荐）** | SGLang | 原生运行量化模型，6GB 显存即可实现 L2 双实例 |
-| **Windows** | vLLM (WSL) | 需要在 WSL 环境下运行 vLLM 加载 L2；6GB 显存双实例经常加载失败，建议 8GB+ |
-
-- Linux 环境下 SGLang 对量化模型支持最好，是 6GB 显存用户的首选方案
-- Windows 用户建议通过 WSL2 运行 vLLM，原生 Windows 不支持 vLLM
-- 如果显存不足 8GB，建议优先使用 Linux + SGLang 方案以获得稳定的双实例运行
+| **Windows** | Transformers 原生 | 支持 6GB 显存量化加载 L2 双实例 |
+| **Windows** | vLLM (WSL) | 6GB 双实例不稳定，建议 8GB+；支持 OpenAI API，工具调用支持好 |
+| **Linux** | SGLang | 支持 OpenAI API，工具调用支持好 |
 
 ### 安装
 
