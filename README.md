@@ -174,6 +174,17 @@ zulong/
 - L2 双实例：两个大模型实例并行（如 KV Cache 热交换），需要至少 8GB 显存
 - 推荐 AMD AI MAX 395 统一内存架构主机，或 NVLink 多卡主机用于生产环境
 
+### 运行环境建议
+
+| 环境 | 推理后端 | 说明 |
+|------|---------|------|
+| **Linux（推荐）** | SGLang | 原生运行量化模型，6GB 显存即可实现 L2 双实例 |
+| **Windows** | vLLM (WSL) | 需要在 WSL 环境下运行 vLLM 加载 L2；6GB 显存双实例经常加载失败，建议 8GB+ |
+
+- Linux 环境下 SGLang 对量化模型支持最好，是 6GB 显存用户的首选方案
+- Windows 用户建议通过 WSL2 运行 vLLM，原生 Windows 不支持 vLLM
+- 如果显存不足 8GB，建议优先使用 Linux + SGLang 方案以获得稳定的双实例运行
+
 ### 安装
 
 ```bash
