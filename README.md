@@ -309,6 +309,60 @@ cp .env.example .env                      # 环境变量
 
 ---
 
+## 致谢
+
+祖龙站在巨人的肩膀上。感谢以下开源项目和团队：
+
+### AI 框架与模型
+
+| 项目 | 用途 | 链接 |
+|------|------|------|
+| **PyTorch** | 深度学习框架，模型推理与训练基础设施 | [pytorch.org](https://pytorch.org/) |
+| **Hugging Face Transformers** | 模型加载、Tokenizer、量化推理 | [huggingface.co](https://huggingface.co/docs/transformers) |
+| **Qwen (通义千问)** | L1/L2 层语言模型，反射推理与专家推理核心 | [github.com/QwenLM](https://github.com/QwenLM/Qwen) |
+| **CosyVoice** | 语音合成引擎，赋予祖龙说话的能力 | [github.com/FunAudioLLM](https://github.com/FunAudioLLM/CosyVoice) |
+| **LangGraph** | 工作流编排，L1/L2 层状态图驱动 | [github.com/langchain-ai](https://github.com/langchain-ai/langgraph) |
+| **LangChain** | 消息类型与链式调用基础 | [github.com/langchain-ai](https://github.com/langchain-ai/langchain) |
+| **bge-small-zh** | 中文向量嵌入模型，RAG 记忆检索核心 | [huggingface.co/BAAI](https://huggingface.co/BAAI/bge-small-zh-v1.5) |
+| **bitsandbytes** | INT4/INT8 量化，让大模型跑在 6GB 显存上 | [github.com/bitsandbytes-foundation](https://github.com/bitsandbytes-foundation/bitsandbytes) |
+
+### 视觉与感知
+
+| 项目 | 用途 | 链接 |
+|------|------|------|
+| **OpenCV** | 摄像头采集、运动检测、图像处理 | [opencv.org](https://opencv.org/) |
+| **TorchVision** | MobileNetV4 骨干网络、视觉模型基础 | [pytorch.org/vision](https://pytorch.org/vision/) |
+| **MediaPipe** | 手势识别备选方案 | [mediapipe.dev](https://ai.google.dev/edge/mediapipe/solutions/guide) |
+| **NumPy / SciPy** | 数值计算、音频特征提取、向量运算 | [numpy.org](https://numpy.org/) |
+
+### 基础设施
+
+| 项目 | 用途 | 链接 |
+|------|------|------|
+| **FastAPI** | Web API 服务框架 | [fastapi.tiangolo.com](https://fastapi.tiangolo.com/) |
+| **Pydantic** | 数据校验与序列化 | [docs.pydantic.dev](https://docs.pydantic.dev/) |
+| **WebSockets** | 实时双向通信 | [websockets.readthedocs.io](https://websockets.readthedocs.io/) |
+| **Qdrant** | 向量数据库，记忆检索后端 | [qdrant.tech](https://qdrant.tech/) |
+| **Prometheus** | 系统监控指标采集 | [prometheus.io](https://prometheus.io/) |
+| **MCP** | Model Context Protocol，技能包生态接入 | [modelcontextprotocol.io](https://modelcontextprotocol.io/) |
+
+### 自然语言处理
+
+| 项目 | 用途 | 链接 |
+|------|------|------|
+| **jieba** | 中文分词 | [github.com/fxsjy](https://github.com/fxsjy/jieba) |
+| **NLTK** | 自然语言处理工具包 | [nltk.org](https://www.nltk.org/) |
+
+### 开发工具
+
+| 工具 | 角色 |
+|------|------|
+| **通义千问桌面版** | 主力 AI 编程助手，架构设计与代码生成 |
+| **Qoder** | AI 编程助手，代码重构与调试 |
+| **Trae** | AI 编程助手，辅助开发 |
+
+---
+
 ## 贡献
 
 欢迎贡献代码和插件。
