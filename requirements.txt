@@ -1,0 +1,4 @@
+pygame
+numpy
+langgraph>=0.2.0
+# 如果需要3D功能，可以考虑添加pyglet或panda3d

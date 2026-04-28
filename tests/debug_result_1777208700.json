@@ -1,0 +1,135 @@
+{
+  "test_time": "2026-04-26 21:05:00",
+  "complex_task": "帮我制定一份详细的个人健身计划，包括每周训练安排、饮食建议和注意事项。",
+  "resume_command": "继续任务",
+  "phases": [
+    {
+      "phase": "PhaseA_Complex",
+      "total_time_sec": 43.8,
+      "events_count": 6,
+      "thinking_steps_count": 4,
+      "task_graph_events": [
+        {
+          "step_type": "pipeline.pipeline_start",
+          "turn": 0,
+          "tool": "",
+          "node_count": 7,
+          "elapsed": 0.029794692993164062
+        },
+        {
+          "step_type": "pipeline.agent_tool_call",
+          "turn": 1,
+          "tool": "recall_memory",
+          "node_count": 7,
+          "elapsed": 13.143330574035645
+        },
+        {
+          "step_type": "pipeline.agent_tool_call",
+          "turn": 2,
+          "tool": "task_backfill",
+          "node_count": 7,
+          "elapsed": 35.0295672416687
+        },
+        {
+          "step_type": "pipeline.agent_done",
+          "turn": 2,
+          "tool": "",
+          "node_count": 7,
+          "elapsed": 35.298755168914795
+        }
+      ],
+      "final_response": "你好呀！👋 很高兴能帮你制定一份详细的个人健身计划！\n\n不过，为了给你量身定制最合适的方案，我需要先了解一下你的具体情况：\n\n## 📋 需要你提供以下信息：\n\n### 1️⃣ **健身目标**\n- 你想通过健身达到什么目的？（增肌、减脂、提升体能、改善健康等）\n- 你期望在多久内看到明显效果？\n\n### 2️⃣ **身体状况**\n- 你的年龄、性别、身高、体重是多少？\n- 是否有运动基础或经验？\n- 有没有什么伤病或身体限制需要特别注意？\n\n### 3️⃣ **可用资源**\n- 你平时有健身房吗？还是在家锻炼？\n- 每周大概能抽出多少时间锻炼？（几天/每次多久）\n- 有什么运动器材或设备？\n\n### 4️⃣ **饮食偏好**\n- 你对食物有什么特别喜好或忌口吗？\n- 是否有过敏或不耐受的食物？\n\n收到这些信息后，我就能为你制定一份科学、可执行的健身计划啦！💪✨",
+      "final_response_length": 385,
+      "tool_stats": {
+        "total_steps": 4,
+        "tools_called": [
+          "recall_memory",
+          "task_backfill"
+        ],
+        "task_add_node_count": 0,
+        "task_mark_status_count": 0,
+        "task_view_overview_count": 0,
+        "task_list_suspended_count": 0,
+        "other_tool_count": 2,
+        "completed_nodes": [],
+        "in_progress_nodes": []
+      }
+    },
+    {
+      "phase": "PhaseB_Resume",
+      "total_time_sec": 111.0,
+      "events_count": 9,
+      "thinking_steps_count": 7,
+      "task_graph_events": [
+        {
+          "step_type": "pipeline.pipeline_start",
+          "turn": 0,
+          "tool": "",
+          "node_count": 7,
+          "elapsed": 0.045393943786621094
+        },
+        {
+          "step_type": "pipeline.agent_tool_call",
+          "turn": 1,
+          "tool": "task_list_suspended",
+          "node_count": 7,
+          "elapsed": 4.915301084518433
+        },
+        {
+          "step_type": "pipeline.agent_tool_call",
+          "turn": 2,
+          "tool": "task_view_overview",
+          "node_count": 7,
+          "elapsed": 9.620962381362915
+        },
+        {
+          "step_type": "pipeline.agent_tool_call",
+          "turn": 3,
+          "tool": "recall_memory",
+          "node_count": 7,
+          "elapsed": 14.158411741256714
+        },
+        {
+          "step_type": "pipeline.agent_tool_call",
+          "turn": 5,
+          "tool": "task_view_overview",
+          "node_count": 7,
+          "elapsed": 64.60272908210754
+        },
+        {
+          "step_type": "pipeline.agent_tool_call",
+          "turn": 6,
+          "tool": "task_mark_status",
+          "node_count": 7,
+          "elapsed": 66.72084307670593
+        },
+        {
+          "step_type": "pipeline.agent_done",
+          "turn": 7,
+          "tool": "",
+          "node_count": 7,
+          "elapsed": 102.19868159294128
+        }
+      ],
+      "final_response": "## 📍 北京旅游景点推荐\n\n你好！作为祖龙，我很乐意为你规划这份北京旅游攻略！🎉\n\n根据你的需求（5月1日出发、15天行程、自然风光+人文风景、2万元预算），我为你精选了以下必游景点：\n\n### 🏛️ 经典人文景点\n| 景点 | 推荐理由 | 建议游玩时间 |\n|------|----------|--------------|\n| **故宫博物院** | 中国最大古代宫殿建筑群，历史价值极高 | 3-4小时 |\n| **天坛公园** | 明清皇家祭天场所，建筑美学典范 | 2-3小时 |\n| **国家博物馆** | 馆藏丰富，了解中华文明 | 3小时 |\n\n### 🏔️ 自然风光景点\n| 景点 | 推荐理由 | 建议游玩时间 |\n|------|----------|--------------|\n| **颐和园** | 皇家园林，湖光山色，适合散步 | 4-5小时 |\n| **八达岭长城** | 世界文化遗产，经典打卡地 | 3-4小时 |\n| **香山公园** | 秋季红叶，夏季清凉，自然风光好 | 2-3小时 |\n\n### 🎭 特色文化景点\n| 景点 | 推荐理由 | 建议游玩时间 |\n|------|----------|--------------|\n| **长城（慕田峪段）** | 人少景美，适合拍照 | 3小时 |\n| **圆明园** | 历史遗迹，园林艺术 | 2-3小时 |\n\n### 📝 行程建议\n- **第1-3天**：故宫、国家博物馆、天坛（人文核心）\n- **第4-6天**：颐和园、八达岭长城（自然风光）\n- **第7-9天**：圆明园、香山公园（休闲放松）\n- **第10-15天**：可根据兴趣选择其他景点或周边游\n\n### 💰 门票预算参考\n- 故宫：60元/人\n- 颐和园：30元/人\n- 长城：40元/人\n- 国家博物馆：免费（需预约）\n\n---\n\n接下来我会继续为你规划**交通安排**、**住宿建议**等后续内容。需要我继续吗？",
+      "final_response_length": 846,
+      "tool_stats": {
+        "total_steps": 7,
+        "tools_called": [
+          "task_list_suspended",
+          "task_view_overview",
+          "recall_memory",
+          "task_view_overview",
+          "task_mark_status"
+        ],
+        "task_add_node_count": 0,
+        "task_mark_status_count": 1,
+        "task_view_overview_count": 2,
+        "task_list_suspended_count": 1,
+        "other_tool_count": 1,
+        "completed_nodes": [],
+        "in_progress_nodes": []
+      }
+    }
+  ]
+}

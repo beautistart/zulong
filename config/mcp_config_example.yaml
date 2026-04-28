@@ -1,0 +1,26 @@
+# MCP 配置示例
+# 在 config.yaml 中添加以下配置
+
+mcp:
+  client:
+    enabled: true
+    servers:
+      # 文件系统 MCP Server
+      filesystem:
+        command: "npx"
+        args: ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/files"]
+        transport: "stdio"
+        timeout: 30.0
+      
+      # 数据库 MCP Server (示例)
+      database:
+        command: "python"
+        args: ["-m", "mcp_server_database"]
+        env:
+          DATABASE_URL: "sqlite:///data.db"
+        transport: "stdio"
+        timeout: 60.0
+
+  server:
+    enabled: false  # 是否暴露 ZULONG 工具为 MCP Server
+    transport: "stdio"  # stdio 或 sse

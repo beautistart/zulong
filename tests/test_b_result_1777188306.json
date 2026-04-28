@@ -1,0 +1,70 @@
+{
+  "test": "B_resume_task",
+  "time": "2026-04-26 15:25:06",
+  "resume_request": "继续完成上次那个任务",
+  "total_time_sec": 172.5,
+  "events_count": 8,
+  "thinking_steps": 7,
+  "task_graph_events": [
+    {
+      "step_type": "pipeline.pipeline_start",
+      "turn": 0,
+      "tool": "",
+      "node_count": 5
+    },
+    {
+      "step_type": "pipeline.agent_tool_call",
+      "turn": 1,
+      "tool": "task_list_suspended",
+      "node_count": 5
+    },
+    {
+      "step_type": "pipeline.agent_tool_call",
+      "turn": 2,
+      "tool": "task_view_overview",
+      "node_count": 5
+    },
+    {
+      "step_type": "pipeline.agent_tool_call",
+      "turn": 3,
+      "tool": "task_mark_status",
+      "node_count": 5
+    },
+    {
+      "step_type": "pipeline.agent_tool_call",
+      "turn": 4,
+      "tool": "task_view_overview",
+      "node_count": 5
+    },
+    {
+      "step_type": "pipeline.agent_tool_call",
+      "turn": 5,
+      "tool": "task_view_overview",
+      "node_count": 5
+    },
+    {
+      "step_type": "pipeline.agent_tool_call",
+      "turn": 6,
+      "tool": "recall_memory",
+      "node_count": 5
+    }
+  ],
+  "tool_calls": [
+    "task_list_suspended",
+    "task_view_overview",
+    "task_mark_status",
+    "task_view_overview",
+    "task_view_overview",
+    "recall_memory"
+  ],
+  "task_graph_restored": true,
+  "final_response_length": 0,
+  "checks": {
+    "意图分类为 RESUME": true,
+    "TaskGraph 已恢复(nodes>1)": true,
+    "调用了任务管理工具": true,
+    "收到最终回复": false,
+    "未陷入无限循环(耗时<200s)": true
+  },
+  "passed": false
+}

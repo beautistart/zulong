@@ -1,0 +1,776 @@
+# 祖龙 (ZULONG) 系统 - 模型集成与场景扩展方案
+
+**文档版本**: v1.8 (模型集成补充)  
+**创建日期**: 2026-03-21  
+**状态**: 规划中 (Planning)
+
+---
+
+## 📋 目录
+
+1. [模型集成方案](#1-模型集成方案)
+2. [测试模型下载指南](#2-测试模型下载指南)
+3. [显存优化策略](#3-显存优化策略)
+4. [场景扩展测试](#4-场景扩展测试)
+5. [实施步骤](#5-实施步骤)
+
+---
+
+## 1. 模型集成方案
+
+### 1.1 模型选型原则
+
+根据 TSD v1.7 核心规范，系统需同时常驻三个模型，且必须使用 `Q4_K_M` 量化版以适配 RTX 3060 6GB 显存。
+
+#### 推荐模型配置
+
+| 模型 | 推荐型号 | 量化版本 | 显存占用 | 用途 |
+|------|---------|---------|---------|------|
+| **左脑** | Qwen2.5-7B-Instruct | Q4_K_M | ~4.2GB | 快速响应、简单对话 |
+| **右脑** | Llama-3-8B-Instruct | Q4_K_M | ~4.8GB | 深度推理、复杂任务 |
+| **测试模型** | Qwen2.5-0.5B-Instruct | Q4_K_M | ~0.5GB | 开发测试、快速验证 |
+| **Embedding** | bge-m3 | FP16 (CPU) | ~500MB (内存) | 向量嵌入 |
+
+### 1.2 模型下载脚本
+
+创建 `scripts/download_models.py`：
+
+```python
+#!/usr/bin/env python3
+"""
+模型下载脚本
+支持下载测试模型和生产模型
+"""
+
+import os
+import sys
+from huggingface_hub import snapshot_download
+
+# 模型配置
+MODELS = {
+    "test": {
+        "repo_id": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        "local_dir": "models/test_model",
+        "allow_patterns": ["*Q4_K_M.gguf"],
+        "description": "测试模型 (0.5B)"
+    },
+    "left_brain": {
+        "repo_id": "Qwen/Qwen2.5-7B-Instruct-GGUF",
+        "local_dir": "models/left_brain",
+        "allow_patterns": ["*Q4_K_M.gguf"],
+        "description": "左脑模型 (7B)"
+    },
+    "right_brain": {
+        "repo_id": "meta-llama/Llama-3-8b-instruct-GGUF",
+        "local_dir": "models/right_brain",
+        "allow_patterns": ["*Q4_K_M.gguf"],
+        "description": "右脑模型 (8B)"
+    }
+}
+
+def download_model(model_key: str):
+    """下载指定模型"""
+    if model_key not in MODELS:
+        print(f"❌ 错误：未知模型 '{model_key}'")
+        print(f"可用模型：{list(MODELS.keys())}")
+        return False
+    
+    config = MODELS[model_key]
+    
+    print(f"\n📥 开始下载：{config['description']}")
+    print(f"   仓库：{config['repo_id']}")
+    print(f"   目录：{config['local_dir']}")
+    
+    try:
+        # 创建本地目录
+        os.makedirs(config['local_dir'], exist_ok=True)
+        
+        # 下载模型
+        snapshot_download(
+            repo_id=config['repo_id'],
+            local_dir=config['local_dir'],
+            allow_patterns=config['allow_patterns'],
+            local_dir_use_symlinks=False,
+            resume_download=True
+        )
+        
+        print(f"✅ 下载完成：{config['description']}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ 下载失败：{e}")
+        return False
+
+def main():
+    """主函数"""
+    if len(sys.argv) < 2:
+        print("用法：python download_models.py <model_name>")
+        print("\n可用模型:")
+        for key, config in MODELS.items():
+            print(f"  {key}: {config['description']}")
+        print("\n示例:")
+        print("  python download_models.py test          # 下载测试模型")
+        print("  python download_models.py left_brain    # 下载左脑模型")
+        print("  python download_models.py all           # 下载所有模型")
+        sys.exit(1)
+    
+    model_name = sys.argv[1]
+    
+    if model_name == "all":
+        # 下载所有模型
+        success_count = 0
+        for key in MODELS.keys():
+            if download_model(key):
+                success_count += 1
+        print(f"\n📊 下载完成：{success_count}/{len(MODELS)} 个模型")
+    else:
+        # 下载单个模型
+        success = download_model(model_name)
+        sys.exit(0 if success else 1)
+
+if __name__ == "__main__":
+    main()
+```
+
+### 1.3 模型加载器
+
+创建 `zulong/models/model_loader.py`：
+
+```python
+# File: zulong/models/model_loader.py
+# 模型加载器 - 支持 Q4_K_M 量化版
+
+import logging
+from typing import Dict, Any, Optional
+from pathlib import Path
+from llama_cpp import Llama
+
+logger = logging.getLogger(__name__)
+
+
+class ModelConfig:
+    """模型配置"""
+    
+    # 测试模型 (0.5B)
+    TEST_MODEL = {
+        "path": "models/test_model",
+        "pattern": "*Q4_K_M.gguf",
+        "n_ctx": 2048,
+        "n_batch": 512,
+        "n_threads": 4
+    }
+    
+    # 左脑模型 (7B)
+    LEFT_BRAIN = {
+        "path": "models/left_brain",
+        "pattern": "*Q4_K_M.gguf",
+        "n_ctx": 4096,
+        "n_batch": 512,
+        "n_threads": 8
+    }
+    
+    # 右脑模型 (8B)
+    RIGHT_BRAIN = {
+        "path": "models/right_brain",
+        "pattern": "*Q4_K_M.gguf",
+        "n_ctx": 8192,
+        "n_batch": 512,
+        "n_threads": 8
+    }
+
+
+class ModelLoader:
+    """模型加载器（单例模式）"""
+    
+    _instance = None
+    _models: Dict[str, Llama] = {}
+    
+    def __new__(cls):
+        """单例模式"""
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def load_model(
+        self,
+        model_name: str,
+        use_gpu: bool = True,
+        verbose: bool = False
+    ) -> Optional[Llama]:
+        """加载模型
+        
+        Args:
+            model_name: 模型名称 (test/left_brain/right_brain)
+            use_gpu: 是否使用 GPU
+            verbose: 是否显示详细信息
+            
+        Returns:
+            Llama: 模型实例，加载失败返回 None
+        """
+        if model_name in self._models:
+            logger.info(f"[ModelLoader] Model '{model_name}' already loaded")
+            return self._models[model_name]
+        
+        # 获取配置
+        config = getattr(ModelConfig, model_name.upper(), None)
+        if not config:
+            logger.error(f"[ModelLoader] Unknown model: {model_name}")
+            return None
+        
+        # 查找模型文件
+        model_path = self._find_model_file(config["path"], config["pattern"])
+        if not model_path:
+            logger.error(f"[ModelLoader] Model file not found: {config['path']}")
+            return None
+        
+        logger.info(f"[ModelLoader] Loading {model_name} from {model_path}")
+        
+        try:
+            # 加载模型
+            model = Llama(
+                model_path=model_path,
+                n_ctx=config["n_ctx"],
+                n_batch=config["n_batch"],
+                n_threads=config["n_threads"],
+                use_mmap=True,
+                use_mlock=True,
+                verbose=verbose
+            )
+            
+            self._models[model_name] = model
+            
+            logger.info(f"[ModelLoader] Successfully loaded {model_name}")
+            return model
+            
+        except Exception as e:
+            logger.error(f"[ModelLoader] Failed to load {model_name}: {e}")
+            return None
+    
+    def _find_model_file(self, directory: str, pattern: str) -> Optional[str]:
+        """查找模型文件"""
+        dir_path = Path(directory)
+        if not dir_path.exists():
+            return None
+        
+        # 查找匹配的文件
+        for file in dir_path.glob(pattern):
+            return str(file)
+        
+        return None
+    
+    def unload_model(self, model_name: str) -> bool:
+        """卸载模型"""
+        if model_name not in self._models:
+            return False
+        
+        del self._models[model_name]
+        logger.info(f"[ModelLoader] Unloaded {model_name}")
+        return True
+    
+    def get_model(self, model_name: str) -> Optional[Llama]:
+        """获取已加载的模型"""
+        return self._models.get(model_name)
+    
+    def get_loaded_models(self) -> Dict[str, Llama]:
+        """获取所有已加载的模型"""
+        return self._models.copy()
+    
+    def get_memory_usage(self) -> Dict[str, Any]:
+        """获取内存使用情况"""
+        # 这里可以集成 psutil 来获取实际显存占用
+        return {
+            "loaded_models": len(self._models),
+            "model_names": list(self._models.keys())
+        }
+```
+
+---
+
+## 2. 测试模型下载指南
+
+### 2.1 为什么需要测试模型？
+
+1. **开发效率** - 0.5B 模型加载速度快（< 5 秒），适合快速迭代
+2. **显存友好** - 仅占用 ~0.5GB 显存，不会爆显存
+3. **功能验证** - 可以验证架构正确性，无需等待大模型加载
+4. **CI/CD** - 适合自动化测试流程
+
+### 2.2 下载步骤
+
+#### 步骤 1: 安装依赖
+
+```bash
+pip install huggingface_hub llama-cpp-python
+```
+
+#### 步骤 2: 下载测试模型
+
+```bash
+# 下载测试模型
+python scripts/download_models.py test
+```
+
+#### 步骤 3: 验证下载
+
+```bash
+# 检查模型文件
+ls models/test_model/
+# 应看到类似：qwen2.5-0_5b-instruct-q4_k_m.gguf
+```
+
+### 2.3 使用测试模型
+
+创建测试脚本 `tests/test_model_integration.py`：
+
+```python
+#!/usr/bin/env python3
+"""测试模型集成"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from zulong.models.model_loader import ModelLoader
+
+def test_model_loading():
+    """测试模型加载"""
+    print("📥 测试模型加载...")
+    
+    loader = ModelLoader()
+    
+    # 加载测试模型
+    model = loader.load_model("test", verbose=True)
+    
+    if model is None:
+        print("❌ 模型加载失败")
+        return False
+    
+    print("✅ 模型加载成功")
+    
+    # 测试推理
+    print("\n🤖 测试推理...")
+    output = model(
+        "你好，请介绍一下自己。",
+        max_tokens=100,
+        stop=["\n\n", "</s>"]
+    )
+    
+    print(f"响应：{output['choices'][0]['text']}")
+    print("\n✅ 推理测试成功")
+    
+    return True
+
+if __name__ == "__main__":
+    success = test_model_loading()
+    sys.exit(0 if success else 1)
+```
+
+---
+
+## 3. 显存优化策略
+
+### 3.1 显存预算分配（RTX 3060 6GB）
+
+| 组件 | 显存占用 | 优化策略 |
+|------|---------|---------|
+| **左脑** | 4.2GB | Q4_K_M 量化 + 按需加载 |
+| **右脑** | 4.8GB | Q4_K_M 量化 + 冷备模式 |
+| **Embedding** | 0GB | CPU 运行 |
+| **TTS** | 0GB | CPU 运行 |
+| **系统预留** | 0.5GB | 操作系统和驱动 |
+
+**总计**: 9.5GB（通过热切换机制可在 6GB 上运行）
+
+### 3.2 热切换策略
+
+```python
+# 伪代码示例
+class ModelManager:
+    def __init__(self):
+        self.loader = ModelLoader()
+        self.active_model = None
+    
+    def switch_to_left_brain(self):
+        """切换到左脑（快速响应）"""
+        if self.active_model == "right_brain":
+            self.loader.unload_model("right_brain")
+        
+        self.loader.load_model("left_brain")
+        self.active_model = "left_brain"
+    
+    def switch_to_right_brain(self):
+        """切换到右脑（深度推理）"""
+        if self.active_model == "left_brain":
+            self.loader.unload_model("left_brain")
+        
+        self.loader.load_model("right_brain")
+        self.active_model = "right_brain"
+    
+    def switch_to_test_model(self):
+        """切换到测试模型（开发模式）"""
+        if self.active_model in ["left_brain", "right_brain"]:
+            self.loader.unload_model(self.active_model)
+        
+        self.loader.load_model("test")
+        self.active_model = "test"
+```
+
+### 3.3 显存监控
+
+创建监控脚本 `scripts/monitor_vram.py`：
+
+```python
+#!/usr/bin/env python3
+"""显存监控脚本"""
+
+import psutil
+import pynvml
+import time
+
+def init_nvml():
+    """初始化 NVML"""
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    return handle
+
+def get_vram_usage(handle):
+    """获取显存使用"""
+    info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    return {
+        "total": info.total / 1024**2,  # MB
+        "used": info.used / 1024**2,
+        "free": info.free / 1024**2
+    }
+
+def monitor():
+    """实时监控"""
+    handle = init_nvml()
+    
+    print("📊 显存实时监控 (Ctrl+C 退出)")
+    print("=" * 60)
+    
+    try:
+        while True:
+            usage = get_vram_usage(handle)
+            
+            print(f"总显存：{usage['total']:.0f} MB")
+            print(f"已使用：{usage['used']:.0f} MB ({usage['used']/usage['total']*100:.1f}%)")
+            print(f"空闲：{usage['free']:.0f} MB")
+            print("-" * 60)
+            
+            time.sleep(2)
+    
+    except KeyboardInterrupt:
+        print("\n👋 监控结束")
+        pynvml.nvmlShutdown()
+
+if __name__ == "__main__":
+    monitor()
+```
+
+---
+
+## 4. 场景扩展测试
+
+### 4.1 新增场景列表
+
+#### 场景 A: 家庭陪伴
+
+**测试目标**: 验证系统在家庭环境中的长期运行能力
+
+**测试脚本**:
+- 长时间待机（24 小时）
+- 间歇性交互（每小时 1 次）
+- 记忆累积测试（记住用户偏好）
+
+**预期结果**:
+- 显存稳定，无泄漏
+- 记忆正确累积
+- 响应时间无明显下降
+
+#### 场景 B: 办公助理
+
+**测试目标**: 验证多任务处理能力
+
+**测试脚本**:
+- 并发处理多个用户请求
+- 任务切换和上下文保持
+- 工具调用（文件管理、日程安排）
+
+**预期结果**:
+- 任务切换无丢失
+- 上下文正确保持
+- 工具调用成功率 > 95%
+
+#### 场景 C: 教育辅导
+
+**测试目标**: 验证知识检索和推理能力
+
+**测试脚本**:
+- 复杂问题解答（数学、科学）
+- 多轮对话（追问、澄清）
+- RAG 知识库使用
+
+**预期结果**:
+- 答案准确率 > 80%
+- 多轮对话连贯
+- RAG 检索相关性 > 0.7
+
+#### 场景 D: 紧急响应
+
+**测试目标**: 验证紧急事件处理能力
+
+**测试脚本**:
+- 模拟摔倒检测
+- 紧急呼叫（"救命"）
+- 反射触发和中断
+
+**预期结果**:
+- 紧急事件响应 < 100ms
+- 无视安静模式限制
+- 正确触发 L1-A 反射
+
+### 4.2 场景测试框架
+
+创建 `tests/scenario_tests/base.py`：
+
+```python
+# File: tests/scenario_tests/base.py
+# 场景测试基类
+
+import time
+import logging
+from typing import Dict, Any, List
+from abc import ABC, abstractmethod
+
+logger = logging.getLogger(__name__)
+
+
+class ScenarioTest(ABC):
+    """场景测试基类"""
+    
+    def __init__(self, name: str, description: str):
+        """初始化
+        
+        Args:
+            name: 场景名称
+            description: 场景描述
+        """
+        self.name = name
+        self.description = description
+        self.results: List[Dict[str, Any]] = []
+    
+    @abstractmethod
+    def setup(self):
+        """设置测试环境"""
+        pass
+    
+    @abstractmethod
+    def run(self):
+        """运行测试"""
+        pass
+    
+    @abstractmethod
+    def teardown(self):
+        """清理测试环境"""
+        pass
+    
+    def execute(self) -> bool:
+        """执行完整测试流程"""
+        logger.info(f"🎬 开始场景测试：{self.name}")
+        
+        try:
+            # 设置
+            self.setup()
+            
+            # 运行
+            result = self.run()
+            
+            # 清理
+            self.teardown()
+            
+            # 记录结果
+            self.results.append({
+                "scenario": self.name,
+                "success": result,
+                "timestamp": time.time()
+            })
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ 场景测试失败：{e}")
+            self.results.append({
+                "scenario": self.name,
+                "success": False,
+                "error": str(e),
+                "timestamp": time.time()
+            })
+            return False
+    
+    def get_report(self) -> Dict[str, Any]:
+        """获取测试报告"""
+        return {
+            "name": self.name,
+            "description": self.description,
+            "results": self.results
+        }
+```
+
+### 4.3 场景测试示例
+
+创建 `tests/scenario_tests/test_home_companion.py`：
+
+```python
+# File: tests/scenario_tests/test_home_companion.py
+# 场景测试：家庭陪伴
+
+import time
+import logging
+from .base import ScenarioTest
+
+logger = logging.getLogger(__name__)
+
+
+class HomeCompanionTest(ScenarioTest):
+    """家庭陪伴场景测试"""
+    
+    def __init__(self):
+        super().__init__(
+            name="家庭陪伴",
+            description="验证系统在家庭环境中的长期运行能力"
+        )
+    
+    def setup(self):
+        """设置测试环境"""
+        logger.info("📦 设置家庭陪伴测试环境...")
+        # 初始化系统
+        # 清空记忆
+        # 设置用户偏好
+    
+    def run(self):
+        """运行测试"""
+        logger.info("🏃 运行家庭陪伴测试...")
+        
+        # 测试 1: 长时间待机
+        logger.info("测试 1: 长时间待机 (模拟 24 小时)")
+        for hour in range(24):
+            time.sleep(0.1)  # 加速模拟
+            logger.debug(f"  第{hour}小时：待机中...")
+        
+        # 测试 2: 间歇性交互
+        logger.info("测试 2: 间歇性交互")
+        interactions = [
+            "早上好",
+            "今天天气怎么样？",
+            "播放音乐",
+            "提醒我喝水",
+            "晚安"
+        ]
+        
+        for i, text in enumerate(interactions):
+            logger.debug(f"  交互{i+1}: {text}")
+            # 调用系统处理
+            time.sleep(0.05)  # 模拟处理时间
+        
+        # 测试 3: 记忆累积
+        logger.info("测试 3: 记忆累积")
+        memories = [
+            ("用户喜欢早上喝咖啡", "preference"),
+            ("用户养了一只猫", "fact"),
+            ("用户生日是 3 月 15 日", "personal")
+        ]
+        
+        for content, mem_type in memories:
+            logger.debug(f"  添加记忆：{content}")
+            # 添加到记忆库
+            time.sleep(0.02)
+        
+        logger.info("✅ 家庭陪伴测试完成")
+        return True
+    
+    def teardown(self):
+        """清理测试环境"""
+        logger.info("🧹 清理测试环境...")
+        # 清理资源
+        # 保存状态
+```
+
+---
+
+## 5. 实施步骤
+
+### 5.1 第一阶段：模型集成准备（1-2 天）
+
+**任务清单**:
+- [ ] 创建 `zulong/models/` 目录
+- [ ] 实现 `model_loader.py`
+- [ ] 编写 `download_models.py`
+- [ ] 测试模型下载脚本
+
+**验收标准**:
+- 能够成功下载测试模型
+- 模型加载器正常工作
+- 显存监控脚本可用
+
+### 5.2 第二阶段：测试模型验证（1 天）
+
+**任务清单**:
+- [ ] 下载 Qwen2.5-0.5B 测试模型
+- [ ] 运行基础推理测试
+- [ ] 验证显存占用
+- [ ] 性能基准测试
+
+**验收标准**:
+- 测试模型加载时间 < 5 秒
+- 显存占用 < 1GB
+- 推理响应时间 < 1 秒
+
+### 5.3 第三阶段：场景扩展开发（2-3 天）
+
+**任务清单**:
+- [ ] 创建场景测试框架
+- [ ] 实现 4 个场景测试
+- [ ] 运行场景测试
+- [ ] 收集测试结果
+
+**验收标准**:
+- 所有场景测试通过
+- 性能指标符合预期
+- 无显存泄漏
+
+### 5.4 第四阶段：生产模型集成（2-3 天）
+
+**任务清单**:
+- [ ] 下载 Qwen2.5-7B 左脑模型
+- [ ] 下载 Llama-3-8B 右脑模型
+- [ ] 测试热切换机制
+- [ ] 性能调优
+
+**验收标准**:
+- 热切换时间 < 2 秒
+- 显存占用符合预算
+- 系统稳定运行
+
+---
+
+## 📊 总结
+
+### 关键成果
+
+1. **模型集成方案** - 完整的模型下载、加载、管理流程
+2. **测试模型支持** - 0.5B 小模型用于快速开发验证
+3. **显存优化策略** - 热切换机制适配 6GB 显存
+4. **场景扩展测试** - 4 个实际应用场景验证
+
+### 下一步行动
+
+1. 执行模型下载脚本
+2. 运行测试模型验证
+3. 开发场景扩展测试
+4. 集成生产模型
+
+---
+
+**文档结束**

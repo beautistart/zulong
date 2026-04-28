@@ -1,0 +1,135 @@
+{
+  "test_time": "2026-04-26 21:35:26",
+  "complex_task": "帮我制定一份详细的个人健身计划，包括每周训练安排、饮食建议和注意事项。",
+  "resume_command": "继续任务",
+  "phases": [
+    {
+      "phase": "PhaseA_Complex",
+      "total_time_sec": 235.3,
+      "events_count": 13,
+      "thinking_steps_count": 11,
+      "task_graph_events": [
+        {
+          "step_type": "pipeline.pipeline_start",
+          "turn": 0,
+          "tool": "",
+          "node_count": 1,
+          "elapsed": 8.373898267745972
+        },
+        {
+          "step_type": "pipeline.agent_tool_call",
+          "turn": 1,
+          "tool": "recall_memory",
+          "node_count": 1,
+          "elapsed": 14.271507024765015
+        },
+        {
+          "step_type": "pipeline.agent_tool_call",
+          "turn": 1,
+          "tool": "task_view_overview",
+          "node_count": 1,
+          "elapsed": 26.82685089111328
+        },
+        {
+          "step_type": "pipeline.agent_tool_call",
+          "turn": 2,
+          "tool": "task_add_node",
+          "node_count": 2,
+          "elapsed": 41.835792541503906
+        },
+        {
+          "step_type": "pipeline.agent_tool_call",
+          "turn": 2,
+          "tool": "task_add_node",
+          "node_count": 3,
+          "elapsed": 48.23380470275879
+        },
+        {
+          "step_type": "pipeline.agent_tool_call",
+          "turn": 2,
+          "tool": "task_add_node",
+          "node_count": 4,
+          "elapsed": 48.2391471862793
+        },
+        {
+          "step_type": "pipeline.agent_tool_call",
+          "turn": 2,
+          "tool": "task_add_node",
+          "node_count": 5,
+          "elapsed": 48.2455530166626
+        },
+        {
+          "step_type": "pipeline.agent_tool_call",
+          "turn": 3,
+          "tool": "task_view_overview",
+          "node_count": 5,
+          "elapsed": 48.25302696228027
+        },
+        {
+          "step_type": "pipeline.agent_tool_call",
+          "turn": 4,
+          "tool": "task_mark_status",
+          "node_count": 5,
+          "elapsed": 91.29914021492004
+        },
+        {
+          "step_type": "pipeline.agent_tool_call",
+          "turn": 5,
+          "tool": "task_view_overview",
+          "node_count": 5,
+          "elapsed": 113.31448435783386
+        },
+        {
+          "step_type": "pipeline.agent_done",
+          "turn": 6,
+          "tool": "",
+          "node_count": 5,
+          "elapsed": 213.2702398300171
+        }
+      ],
+      "final_response": "你好呀！👋 很高兴能帮你制定一份详细的个人健身计划！\n\n虽然目前我还不太清楚你的具体健身目标和身体状况，但我会先基于一般情况为你制定一份**通用型健身计划**。如果你后续有更多信息（比如想增肌/减脂、是否有运动基础等），可以随时告诉我调整方案哦！\n\n---\n\n## 📋 第一部分：评估用户健身基础和目标\n\n### 🔍 需要确认的信息\n由于你还没有提供详细信息，我基于以下**合理假设**来制定计划：\n- **健身目标**：提升整体体能和健康水平（兼顾增肌与减脂）\n- **训练经验**：初学者到中级阶段\n- **时间安排**：每周可抽出3-4天进行训练\n- **身体状况**：无特殊疾病或运动禁忌\n\n### 💡 建议补充的信息\n为了更精准地调整计划，你可以考虑告诉我：\n1. 你的年龄、性别、身高体重\n2. 是否有运动基础（如是否做过力量训练）\n3. 具体的健身目标（增肌/减脂/提升体能等）\n4. 每周能投入多少时间\n\n---\n\n## 🏋️ 第二部分：设计每周训练安排\n\n### 📅 一周训练计划表（每周3-4练）\n\n| 星期 | 训练类型 | 主要内容 | 时长 |\n|------|----------|----------|------|\n| **周一** | 力量训练（上肢） | 俯卧撑、哑铃推举、划船动作 | 45-60分钟 |\n| **周二** | 有氧运动 | 慢跑/快走/跳绳 | 30-45分钟 |\n| **周三** | 休息日 | 拉伸放松、轻度活动 | - |\n| **周四** | 力量训练（下肢） | 深蹲、弓步蹲、臀桥 | 45-60分钟 |\n| **周五** | 综合训练 | 全身性复合动作 + 核心训练 | 45-60分钟 |\n| **周六** | 有氧运动 | 游泳/骑行/球类运动 | 30-45分钟 |\n| **周日** | 休息日 | 完全休息或轻度散步 | - |\n\n### 🎯 训练强度建议\n- **初学者**：从低重量、高次数开始（12-15次/组）\n- **中级者**：中等重量、8-12次/组\n- **进阶者**：较高重量、6-8次/组\n\n### 💪 核心训练重点\n- 每周至少进行2次核心训练（平板支撑、卷腹等）\n- 注重动作标准性和肌肉控制\n- 每组动作间休息60-90秒\n\n---\n\n## 🥗 第三部分：制定饮食营养建议\n\n### 📊 每日热量需求估算\n| 人群类型 | 基础代谢 (BMR) | 每日总消耗 (TDEE) | 建议摄入 |\n|----------|----------------|-------------------|----------|\n| 轻运动者 | ~1500-1800 kcal | ~2200-2500 kcal | TDEE ± 200 kcal |\n| 中运动者 | ~1600-1900 kcal | ~2400-2800 kcal | TDEE - 300 kcal |\n\n### 🍽️ 宏量营养素比例建议\n| 营养素 | 比例 | 作用 | 食物来源 |\n|--------|------|------|----------|\n| **蛋白质** | 25-30% | 肌肉修复与生长 | 鸡胸肉、鱼、蛋、豆制品 |\n| **碳水化合物** | 45-55% | 主要能量来源 | 全谷物、薯类、部分水果 |\n| **脂肪** | 20-30% | 激素合成、营养吸收 | 坚果、橄榄油、深海鱼 |\n\n### 🕒 进食时间安排建议\n- **早餐**：7:00-8:00（高蛋白+复合碳水）\n- **午餐**：12:00",
+      "final_response_length": 1513,
+      "tool_stats": {
+        "total_steps": 11,
+        "tools_called": [
+          "recall_memory",
+          "task_view_overview",
+          "task_add_node",
+          "task_add_node",
+          "task_add_node",
+          "task_add_node",
+          "task_view_overview",
+          "task_mark_status",
+          "task_view_overview"
+        ],
+        "task_add_node_count": 4,
+        "task_mark_status_count": 1,
+        "task_view_overview_count": 3,
+        "task_list_suspended_count": 0,
+        "other_tool_count": 1,
+        "completed_nodes": [],
+        "in_progress_nodes": []
+      }
+    },
+    {
+      "phase": "PhaseB_Resume",
+      "total_time_sec": 906.0,
+      "events_count": 0,
+      "thinking_steps_count": 0,
+      "task_graph_events": [],
+      "final_response": null,
+      "final_response_length": 0,
+      "tool_stats": {
+        "total_steps": 0,
+        "tools_called": [],
+        "task_add_node_count": 0,
+        "task_mark_status_count": 0,
+        "task_view_overview_count": 0,
+        "task_list_suspended_count": 0,
+        "other_tool_count": 0,
+        "completed_nodes": [],
+        "in_progress_nodes": []
+      }
+    }
+  ]
+}

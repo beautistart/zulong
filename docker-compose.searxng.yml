@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    ports:
+      - "8101:8080"
+    volumes:
+      - ./searxng:/etc/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8101
+    restart: unless-stopped
+    networks:
+      - searxng-network
+
+networks:
+  searxng-network:
+    driver: bridge

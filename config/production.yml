@@ -1,0 +1,125 @@
+# File: config/production.yml
+# 祖龙 (ZULONG) 系统生产环境配置
+
+# 环境配置
+environment:
+  name: production
+  debug: false
+  log_level: INFO
+
+# 服务配置
+server:
+  host: 0.0.0.0
+  port: 8000
+  workers: 4
+  timeout: 300
+  max_body_size: 100MB
+
+# 模型配置
+models:
+  # InternVL 视觉模型
+  internvl:
+    name: "OpenGVLab/InternVL2-1B"
+    use_cpu: false
+    load_in_4bit: true
+    cache_size: 100
+    preload: false
+    model_path: "/models/internvl"
+  
+  # DWA 路径规划
+  dwa:
+    v_min: 0.0
+    v_max: 1.0
+    w_min: -1.0
+    w_max: 1.0
+    n_v_samples: 10
+    n_w_samples: 10
+    enable_parallel: true
+    n_workers: 4
+    adaptive_sampling: true
+    cache_size: 50
+
+# 内存管理
+memory:
+  enable_auto_optimize: true
+  optimization_interval: 300  # 秒
+  pressure_threshold: 0.8
+  gpu_memory_limit: 5.5  # GB
+
+# 日志配置
+logging:
+  level: INFO
+  format: json
+  output:
+    - console
+    - file
+  file:
+    path: "/logs/zulong.log"
+    rotation: "100 MB"
+    retention: "7 days"
+  structured: true
+
+# 监控配置
+monitoring:
+  enabled: true
+  prometheus:
+    enabled: true
+    port: 9090
+    path: "/metrics"
+  metrics:
+    - system.cpu
+    - system.memory
+    - system.gpu
+    - model.inference.latency
+    - model.cache.hit_rate
+    - planner.planning_time
+    - task.success_rate
+
+# 性能配置
+performance:
+  async_inference: true
+  parallel_evaluation: true
+  batch_processing: true
+  batch_size: 4
+  max_concurrent_requests: 10
+
+# 安全配置
+security:
+  api_key_required: false
+  cors_enabled: true
+  allowed_origins: ["*"]
+  rate_limiting:
+    enabled: false
+    requests_per_minute: 60
+
+# 数据持久化
+storage:
+  data_path: "/data"
+  checkpoints_path: "/checkpoints"
+  backup_enabled: true
+  backup_interval: 86400  # 每天
+
+# RAG 配置
+rag:
+  enabled: true
+  vector_db:
+    type: "qdrant"
+    path: "/data/qdrant"
+    embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+  collection_name: "zulong_knowledge"
+
+# 健康检查
+health_check:
+  enabled: true
+  interval: 30
+  endpoints:
+    - /health
+    - /health/models
+    - /health/memory
+
+# 错误处理
+error_handling:
+  retry_enabled: true
+  max_retries: 3
+  fallback_enabled: true
+  error_reporting: true

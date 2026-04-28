@@ -1,0 +1,82 @@
+# File: .dockerignore
+# Docker 构建忽略文件
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# 文档
+*.md
+docs/
+README.md
+
+# 测试
+tests/
+*.test.py
+test_*.py
+pytest.ini
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 开发文件
+.env
+.venv/
+venv/
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 日志
+logs/
+*.log
+
+# 数据（大文件）
+data/
+*.data
+*.csv
+
+# 模型（单独挂载）
+models/
+checkpoints/
+*.pth
+*.pt
+*.bin
+*.onnx
+
+# 配置文件（使用生产配置）
+config/development.yml
+config/staging.yml
+config/*.local.yml
+
+# Docker 文件（避免递归）
+Dockerfile.dev
+docker-compose.override.yml
+.docker/
+
+# 监控数据
+monitoring/prometheus_data/
+monitoring/grafana_data/
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp

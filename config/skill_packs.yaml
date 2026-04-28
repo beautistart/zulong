@@ -1,0 +1,25 @@
+# File: config/skill_packs.yaml
+# 技能包配置
+
+skill_packs:
+  # task_planner 已删除（复杂任务规划由 FC 工具 task_create_plan/task_add_node 等替代）
+
+  - pack_id: "deep_reasoner"
+    enabled: false  # 模块尚未实现，暂时禁用
+    path: "zulong.skill_packs.packs.deep_reasoner"
+    config:
+      reasoning_depth: 3
+      max_hypotheses: 5
+
+  - pack_id: "cline_coder"
+    enabled: false  # 后续实现
+    path: "zulong.skill_packs.packs.cline_coder"
+    config:
+      workspace: "/workspace"
+      allowed_languages: ["python", "javascript"]
+
+# 内化评估参数
+internalization:
+  min_experience_count: 50      # 至少积累50条经验才评估
+  min_success_rate: 0.9         # 成功率>90%才认为学会了
+  evaluation_interval_hours: 24 # 每24小时评估一次

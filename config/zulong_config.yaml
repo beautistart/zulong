@@ -1,0 +1,484 @@
+# ================================================================================
+# 祖龙 (ZULONG) 系统统一配置文件
+# 版本：v2.0
+# 说明：集中管理所有模块的配置，支持多环境切换
+# ================================================================================
+
+# ================================================================================
+# 1. 系统基础配置
+# ================================================================================
+system:
+  name: "ZULONG"
+  version: "2.0.0"
+  environment: "production"  # development / staging / production
+  debug_mode: false
+  log_level: "INFO"  # DEBUG / INFO / WARNING / ERROR
+  data_dir: "./data"
+  models_dir: "./models"
+  cache_dir: "./cache"
+
+# ================================================================================
+# 2. LLM 后端配置 (支持多种推理后端)
+# ================================================================================
+llm:
+  # 后端类型选择：transformer / vllm / sglang / llamaccp / ollama / lmstudio / openai
+  backend: "ollama"
+  
+  # 默认配置 (当 backend 未指定时使用)
+  default:
+    backend: "ollama"
+    base_url: "http://localhost:11434/v1"
+    api_key: "EMPTY"
+    model_id: "gpt-oss:20b-cloud"
+  
+  # Transformer 原生配置
+  transformer:
+    backend: "transformer"
+    # 模型路径 (相对于 models_dir)
+    model_path: "Qwen/Qwen3___5-0.8B-AWQ"
+    # 设备配置
+    device: "cuda"  # cuda / cpu / mps
+    # 量化配置
+    dtype: "float16"  # float16 / bfloat16 / int8 / int4
+    use_flash_attention: true
+    # 内存优化
+    max_memory: 0.8  # GPU 显存使用比例 (0.0-1.0)
+    cpu_offload: false
+    # 推理参数
+    max_length: 4096
+    use_cache: true
+  
+  # vLLM 配置
+  vllm:
+    backend: "vllm"
+    base_url: "http://localhost:8000/v1"
+    api_key: "EMPTY"
+    model_id: "/mnt/d/AI/project/zulong_beta4/models/Qwen/Qwen3___5-0.8B-AWQ"
+    # vLLM 特有参数
+    gpu_memory_utilization: 0.5
+    max_model_len: 4096
+    tensor_parallel_size: 1
+    enable_auto_tool_choice: true
+    tool_call_parser: "qwen3_xml"
+    # 性能优化
+    enforce_eager: false
+    max_num_seqs: 256
+    max_num_batched_tokens: 2048
+  
+  # SGLang 配置
+  sglang:
+    backend: "sglang"
+    base_url: "http://localhost:30000/v1"
+    api_key: "EMPTY"
+    model_id: "/mnt/d/AI/project/zulong_beta4/models/Qwen/Qwen3___5-0.8B-AWQ"
+    # SGLang 特有参数
+    mem_fraction_static: 0.8
+    tp_size: 1
+    schedule_policy: "lpm"
+    schedule_conservativeness: 1.0
+  
+  # llama.cpp 配置
+  llamaccp:
+    backend: "llamaccp"
+    base_url: "http://localhost:8080/v1"
+    api_key: "EMPTY"
+    model_id: "qwen3.5-4b"
+    # llama.cpp 特有参数
+    n_ctx: 4096
+    n_threads: 8
+    n_gpu_layers: -1  # -1 表示全部层卸载到 GPU
+  
+  # Ollama 配置
+  ollama:
+    backend: "ollama"
+    base_url: "http://localhost:11434/v1"
+    api_key: "EMPTY"
+    # 主模型 (L2 CORE)
+    model_id: "gpt-oss:20b-cloud"
+    # 备用模型 (L2 BACKUP)
+    backup_model_id: "qwen3.5:cloud"
+    # Ollama 特有参数（num_ctx 决定 KV 缓存大小，影响 GPU 显存占用）
+    # RTX 3060 6GB: 建议 8192~16384; 更大显存可适当提高
+    num_ctx: 16384
+    num_predict: 1024
+  
+  # LM Studio 配置
+  lmstudio:
+    backend: "lmstudio"
+    base_url: "http://localhost:1234/v1"
+    api_key: "EMPTY"
+    model_id: "qwen3.5-4b"
+  
+  # OpenAI 云端配置
+  openai:
+    backend: "openai"
+    base_url: "https://api.openai.com/v1"
+    api_key: "${OPENAI_API_KEY}"  # 从环境变量读取
+    model_id: "gpt-4o-mini"
+    # 备选模型
+    fallback_models:
+      - "gpt-3.5-turbo"
+      - "gpt-4-turbo"
+
+  # 模型预加载配置
+  preload:
+    enabled: true  # 是否在启动时预加载模型
+    timeout: 300  # 预加载超时时间（秒），复杂任务可能需要更长时间
+    warmup_prompt: "你好"  # 预加载时使用的简单提示
+
+# ================================================================================
+# 3. L2 推理引擎配置
+# ================================================================================
+l2_inference:
+  # 模型配置（直接使用具体模型 ID，不使用跨路径引用）
+  core_model: "qwen3.5:cloud"
+  backup_model: "qwen3.5:cloud"
+  
+  # 生成参数
+  generation:
+    max_tokens: 1024
+    temperature: 0.3
+    top_p: 0.85
+    repetition_penalty: 1.2
+    presence_penalty: 0.0
+    frequency_penalty: 0.0
+  
+  # 超时配置 (秒) - 已大幅放宽以支持复杂任务
+  timeout:
+    core: 600  # 核心模型超时（10分钟，复杂任务需要更长时间）
+    backup: 120  # 备用模型超时（2分钟）
+    fc_loop: 600  # FC 循环单次调用超时（10分钟）
+  
+  # 步数限制配置（替代时间超时机制）
+  step_limits:
+    enabled: true
+    max_fc_turns: 100  # FC 循环最大步数（从 10 提升至 100）
+    soft_limit: 50  # 软限制：超过 50 步后开始警告
+    hard_limit: 100  # 硬限制：绝对上限，强制终止
+    warning_interval: 10  # 每 10 步输出一次进度日志
+  
+  # 重试配置
+  retry:
+    max_attempts: 3
+    delay: 1.0
+    backoff_factor: 2.0
+  
+  # 智能迭代控制（Circuit Breaker）- 替代硬编码 max_tool_iterations=10
+  circuit_breaker:
+    enabled: true
+    safety_hard_cap: 100              # 绝对安全上限（与 hard_limit 一致）
+    
+    # 信号 1: 相同调用重复
+    repetition_window: 3             # 检查最近 N 次调用
+    
+    # 信号 2: 模式循环
+    pattern_window: 6
+    pattern_yellow_count: 5
+    pattern_red_count: 7
+    query_similarity_threshold: 0.7
+    
+    # 信号 3: 信息增益
+    info_gain_window: 3
+    content_overlap_threshold: 0.8
+    
+    # 信号 4: 上下文压力
+    context_window_size: 16384        # 需与 ollama.num_ctx 保持一致
+    context_yellow_ratio: 0.75
+    context_red_ratio: 0.90
+    
+    # 信号 5: 经过时间
+    time_yellow_seconds: 60
+    time_red_seconds: 120
+    
+    # 升级策略
+    max_yellow_before_red: 2         # 连续 N 次 YELLOW 升级为 RED
+  
+  # 任务挂起/恢复
+  task_suspension:
+    enabled: true
+    persistence_path: "./data/suspended_tasks"
+    max_suspended_tasks: 20
+    auto_suspend_on_time_limit: true
+    max_age_hours: 72
+  
+  # 视觉感知关键词（分强/弱两级，代码中使用组合判断）
+  visual_keywords_strong:
+    - "摄像头"
+    - "镜头"
+    - "画面"
+    - "视频"
+    - "图像"
+    - "图片"
+    - "视觉"
+    - "看到"
+    - "看见"
+    - "眼前"
+  visual_keywords_weak:
+    - "周围"
+    - "环境"
+    - "外观"
+    - "样子"
+    - "颜色"
+    - "形状"
+    - "屏幕"
+    - "显示"
+    - "场景"
+    - "物体"
+    - "动作"
+    - "手势"
+
+# ================================================================================
+# 4. 视觉系统配置
+# ================================================================================
+vision:
+  # 设备配置
+  camera:
+    enabled: false
+    device_index: 1  # 摄像头设备索引
+    resolution: [1280, 720]
+    fps: 30
+  
+  # YOLO 模型配置
+  yolo:
+    model_path: "yolov10n.pt"
+    device: "cuda"  # cuda / cpu
+    confidence_threshold: 0.25
+    iou_threshold: 0.45
+  
+  # MediaPipe 配置
+  mediapipe:
+    device: "cpu"
+    hand_tracking: true
+    pose_tracking: true
+    face_tracking: false
+  
+  # 视觉分析配置
+  analysis:
+    keyframes_count: 10
+    min_frames_required: 10
+    short_term_duration: 5  # 秒
+
+# ================================================================================
+# 5. 音频系统配置
+# ================================================================================
+audio:
+  # 麦克风配置
+  microphone:
+    enabled: true
+    device_index: null  # null 表示使用默认设备
+    sample_rate: 16000
+    channels: 1
+    chunk_size: 1024
+  
+  # 扬声器配置
+  speaker:
+    enabled: true
+    device_index: null  # null 表示使用默认设备
+    sample_rate: 44100
+    channels: 2
+  
+  # TTS 配置
+  tts:
+    backend: "cosyvoice"  # cosyvoice / edge / azure
+    model_path: "iic/CosyVoice2-0.5B"
+    device: "cuda"
+    voice: "中文女声"
+
+# ================================================================================
+# 6. 记忆系统配置
+# ================================================================================
+memory:
+  # 短期记忆配置
+  short_term:
+    max_turns: 100
+    ttl: 3600  # 秒
+    persistence_enabled: true
+    persistence_path: "./data/short_term_memory"
+  
+  # 情景记忆配置
+  episodic:
+    max_episodes: 10
+    consolidation_threshold: 0.5
+    review_enabled: true
+  
+  # RAG 记忆配置
+  rag:
+    enabled: true
+    data_dir: "./data/rag"
+    embedding_model: "BAAI/bge-small-zh-v1.5"
+    embedding_dim: 512
+    vector_index_type: "faiss_flat"
+    hybrid_search_enabled: true
+    top_k: 5
+  
+  # 经验数据库配置
+  experience:
+    enabled: true
+    db_path: "./data/experience_db/experiences.db"
+    vector_index_path: "./data/experience_db/vectors.index"
+    max_experiences: 1000
+
+# ================================================================================
+# 7. 工具系统配置
+# ================================================================================
+tools:
+  # 工具引擎配置
+  engine:
+    max_workers: 5
+    timeout: 60  # 秒
+  
+  # 任务图谱 Pipeline 配置
+  pipeline:
+    # Agent 工作目录（任务文件的根目录，每个任务在其下创建子目录）
+    workspace_dir: "./agent_workspace"
+  
+  # OpenClaw 配置
+  openclaw:
+    enabled: true
+    api_url: "http://localhost:3000"
+    websocket_url: "ws://localhost:5555"
+    timeout: 30
+  
+  # 网络搜索配置
+  web_search:
+    enabled: true
+    engine: "searxng"  # searxng / google / bing
+    searxng_url: "http://localhost:8101"
+    max_results: 5
+  
+  # 技能包配置
+  skill_packs:
+    enabled: true
+    packs_dir: "./zulong/skill_packs/packs"
+    enabled_packs: []
+    disabled_packs:
+      - "cline_coder"
+      - "complex_task"       # [已卸载] 旧版复杂任务处理（融合 OpenClaw + AutoGPT）
+
+# ================================================================================
+# 8. 事件总线配置
+# ================================================================================
+event_bus:
+  websocket:
+    host: "localhost"
+    port: 5555
+    queue_size: 1000
+    enable_logging: true
+  
+  # 事件分发配置
+  dispatch:
+    async_mode: true
+    background_thread: true
+    batch_size: 10
+
+# ================================================================================
+# 9. Web 服务配置
+# ================================================================================
+web:
+  # API 服务器配置
+  api:
+    enabled: true
+    host: "localhost"
+    port: 3000
+    cors_enabled: true
+    docs_enabled: true
+  
+  # Web 界面配置
+  ui:
+    enabled: true
+    host: "localhost"
+    port: 8080
+    static_dir: "./web/static"
+    auto_open_browser: true
+
+# ================================================================================
+# 10. 监控与调试配置
+# ================================================================================
+monitoring:
+  # 性能监控
+  performance:
+    enabled: true
+    log_threshold_ms: 100
+    metrics_dir: "./data/metrics"
+  
+  # 调试工具
+  debug:
+    console_enabled: true
+    save_logs: true
+    log_rotation: true
+    max_log_size_mb: 100
+    backup_count: 5
+
+# ================================================================================
+# 11. 安全配置
+# ================================================================================
+security:
+  # API 密钥管理
+  api_keys:
+    # 从环境变量读取，如果未设置则生成随机密钥
+    default: "${ZULONG_API_KEY}"
+  
+  # CORS 配置
+  cors:
+    allowed_origins:
+      - "http://localhost:8080"
+      - "http://localhost:3000"
+    allowed_methods:
+      - "GET"
+      - "POST"
+      - "PUT"
+      - "DELETE"
+      - "OPTIONS"
+  
+  # 速率限制
+  rate_limit:
+    enabled: false
+    requests_per_minute: 60
+
+# ================================================================================
+# 12. 环境特定配置覆盖
+# ================================================================================
+environments:
+  # 开发环境配置
+  development:
+    system:
+      debug_mode: true
+      log_level: "DEBUG"
+    llm:
+      backend: "ollama"
+    vision:
+      camera:
+        enabled: false
+    monitoring:
+      performance:
+        enabled: true
+  
+  # 生产环境配置
+  production:
+    system:
+      debug_mode: false
+      log_level: "INFO"
+    llm:
+      backend: "ollama"
+    vision:
+      camera:
+        enabled: false
+    monitoring:
+      performance:
+        enabled: true
+  
+  # 测试环境配置
+  testing:
+    system:
+      debug_mode: true
+      log_level: "DEBUG"
+    llm:
+      backend: "ollama"
+      ollama:
+        model_id: "tinyllama:latest"  # 使用小模型加速测试
+    vision:
+      camera:
+        enabled: false
+    memory:
+      rag:
+        enabled: false

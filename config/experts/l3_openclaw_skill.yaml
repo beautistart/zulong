@@ -1,0 +1,339 @@
+# File: config/experts/l3_openclaw_skill.yaml
+"""
+OpenClaw L3 专家技能描述文件
+
+对应 TSD v2.2 第 4.4 节（专家技能）
+此文件定义 OpenClaw 机器人的能力接口，供祖龙 L2 调用
+
+架构说明:
+- 此文件为配置文件，无需修改祖龙核心代码
+- L2 通过读取此文件了解 OpenClaw 的能力
+- L1-B 负责将 L2 的调用转换为 TASK_EXECUTE 事件
+"""
+
+# 专家基本信息
+expert_id: "L3_OpenClaw"
+expert_name: "OpenClaw 机器人技能专家"
+version: "1.0.0"
+description: |
+  OpenClaw 机器人专家技能包
+  提供机械臂控制、物体抓取、移动等基础操作能力
+  通过事件驱动与祖龙系统 L1-B 层通信
+
+# 技能函数列表
+functions:
+  # 1. 抓取物体
+  - name: "grasp_object"
+    description: "抓取指定名称的物体"
+    category: "manipulation"
+    parameters:
+      type: "object"
+      required:
+        - object_name
+      properties:
+        object_name:
+          type: "string"
+          description: "要抓取的物体名称（如 '苹果', '杯子'）"
+        force:
+          type: "number"
+          description: "抓取力度（0.0-1.0，默认 0.5）"
+          default: 0.5
+    returns:
+      type: "object"
+      properties:
+        success:
+          type: "boolean"
+          description: "是否成功"
+        message:
+          type: "string"
+          description: "执行结果描述"
+    
+    # 使用示例（供 L2 参考）
+    examples:
+      - input:
+          object_name: "苹果"
+          force: 0.6
+        output:
+          success: true
+          message: "成功抓取苹果"
+    
+    # 执行约束
+    constraints:
+      timeout: 10.0  # 超时时间（秒）
+      retry_count: 2  # 重试次数
+      preconditions:
+        - "物体必须在视野范围内"
+        - "物体必须是可抓取的"
+  
+  # 2. 移动机械臂
+  - name: "move_arm"
+    description: "移动机械臂到指定的 XYZ 坐标"
+    category: "motion"
+    parameters:
+      type: "object"
+      required:
+        - x
+        - y
+        - z
+      properties:
+        x:
+          type: "number"
+          description: "X 轴坐标（米）"
+        y:
+          type: "number"
+          description: "Y 轴坐标（米）"
+        z:
+          type: "number"
+          description: "Z 轴坐标（米）"
+        speed:
+          type: "number"
+          description: "移动速度（0.0-1.0，默认 0.5）"
+          default: 0.5
+    returns:
+      type: "object"
+      properties:
+        success:
+          type: "boolean"
+        position:
+          type: "object"
+          properties:
+            x: {type: "number"}
+            y: {type: "number"}
+            z: {type: "number"}
+    
+    examples:
+      - input:
+          x: 0.5
+          y: 0.3
+          z: 0.8
+          speed: 0.5
+        output:
+          success: true
+          position: {x: 0.5, y: 0.3, z: 0.8}
+    
+    constraints:
+      timeout: 15.0
+      retry_count: 2
+      workspace_limits:
+        x_min: -0.5
+        x_max: 0.8
+        y_min: -0.5
+        y_max: 0.8
+        z_min: 0.0
+        z_max: 1.0
+  
+  # 3. 放置物体
+  - name: "place_object"
+    description: "将当前抓取的物体放置到指定位置"
+    category: "manipulation"
+    parameters:
+      type: "object"
+      required:
+        - x
+        - y
+        - z
+      properties:
+        x:
+          type: "number"
+          description: "放置位置的 X 坐标"
+        y:
+          type: "number"
+          description: "放置位置的 Y 坐标"
+        z:
+          type: "number"
+          description: "放置位置的 Z 坐标"
+        object_name:
+          type: "string"
+          description: "物体名称（可选，用于日志）"
+    returns:
+      type: "object"
+      properties:
+        success:
+          type: "boolean"
+        message:
+          type: "string"
+    
+    examples:
+      - input:
+          x: 0.6
+          y: 0.4
+          z: 0.7
+          object_name: "苹果"
+        output:
+          success: true
+          message: "苹果已放置到目标位置"
+    
+    constraints:
+      timeout: 10.0
+      retry_count: 2
+      preconditions:
+        - "机械臂必须已经抓取物体"
+  
+  # 4. 松开物体
+  - name: "release_object"
+    description: "松开当前抓取的物体"
+    category: "manipulation"
+    parameters:
+      type: "object"
+      properties: {}
+    returns:
+      type: "object"
+      properties:
+        success:
+          type: "boolean"
+        message:
+          type: "string"
+    
+    examples:
+      - input: {}
+        output:
+          success: true
+          message: "物体已松开"
+    
+    constraints:
+      timeout: 5.0
+      retry_count: 1
+  
+  # 5. 归位
+  - name: "home"
+    description: "机械臂归位（回到初始位置）"
+    category: "motion"
+    parameters:
+      type: "object"
+      properties:
+        speed:
+          type: "number"
+          description: "移动速度"
+          default: 0.5
+    returns:
+      type: "object"
+      properties:
+        success:
+          type: "boolean"
+        message:
+          type: "string"
+    
+    examples:
+      - input:
+          speed: 0.5
+        output:
+          success: true
+          message: "机械臂已归位"
+    
+    constraints:
+      timeout: 20.0
+      retry_count: 2
+  
+  # 6. 检测物体
+  - name: "detect_object"
+    description: "检测视野中是否存在指定名称的物体"
+    category: "perception"
+    parameters:
+      type: "object"
+      required:
+        - object_name
+      properties:
+        object_name:
+          type: "string"
+          description: "要检测的物体名称"
+    returns:
+      type: "object"
+      properties:
+        detected:
+          type: "boolean"
+          description: "是否检测到"
+        position:
+          type: "object"
+          description: "物体位置（如果检测到）"
+          properties:
+            x: {type: "number"}
+            y: {type: "number"}
+            z: {type: "number"}
+        confidence:
+          type: "number"
+          description: "检测置信度"
+    
+    examples:
+      - input:
+          object_name: "苹果"
+        output:
+          detected: true
+          position: {x: 0.5, y: 0.2, z: 0.8}
+          confidence: 0.95
+    
+    constraints:
+      timeout: 5.0
+      retry_count: 1
+
+# 事件映射配置
+# 定义函数调用如何转换为事件
+event_mapping:
+  grasp_object:
+    event_type: "TASK_EXECUTE"
+    payload_template:
+      name: "grasp"
+      arguments:
+        object_id: "${object_name}"
+        force: "${force}"
+  
+  move_arm:
+    event_type: "TASK_EXECUTE"
+    payload_template:
+      name: "move_arm"
+      arguments:
+        x: "${x}"
+        y: "${y}"
+        z: "${z}"
+        speed: "${speed}"
+  
+  place_object:
+    event_type: "TASK_EXECUTE"
+    payload_template:
+      name: "place"
+      arguments:
+        object_id: "${object_name}"
+        x: "${x}"
+        y: "${y}"
+        z: "${z}"
+  
+  release_object:
+    event_type: "TASK_EXECUTE"
+    payload_template:
+      name: "release"
+      arguments: {}
+  
+  home:
+    event_type: "TASK_EXECUTE"
+    payload_template:
+      name: "home"
+      arguments:
+        speed: "${speed}"
+  
+  detect_object:
+    event_type: "SENSOR_VISION_QUERY"
+    payload_template:
+      object_name: "${object_name}"
+
+# 状态报告配置
+# 定义 OpenClaw 向祖龙系统报告的状态信息
+status_reporting:
+  enabled: true
+  report_interval: 1.0  # 报告间隔（秒）
+  status_fields:
+    - arm_position  # 机械臂位置
+    - gripper_status  # 夹爪状态
+    - current_object  # 当前抓取的物体
+    - error_code  # 错误代码
+
+# 安全配置
+safety:
+  emergency_stop_keywords:
+    - "停下"
+    - "停止"
+    - "救命"
+    - "紧急"
+    - "危险"
+  
+  max_force: 0.8  # 最大力度限制
+  collision_detection: true  # 碰撞检测
+  auto_stop_on_error: true  # 错误时自动停止

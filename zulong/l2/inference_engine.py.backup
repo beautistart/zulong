@@ -1,0 +1,1231 @@
+# File: zulong/l2/inference_engine.py
+# L2 推理引擎 - 修复版（集成 RAG 记忆和优化生成参数）
+# 对应 TSD v1.7: 任务冻结与恢复 + 推理链路修复 + RAG 记忆集成
+
+import time
+import threading
+import asyncio
+import os
+import re  # 🔥 新增：语音触发指令检测
+import numpy as np
+from typing import Optional, Callable, List, Any, Dict
+
+from zulong.core.event_bus import event_bus
+from zulong.core.state_manager import state_manager
+from zulong.core.types import EventType, EventPriority, ZulongEvent, L2Status
+from zulong.models.container import ModelContainer
+from zulong.models.config import ModelID
+from zulong.l2.rag_node import RAGIntegrationNode
+from zulong.memory.short_term_memory import ShortTermMemory
+from zulong.memory.experience_generator import ExperienceGenerator
+from zulong.utils.performance import PerformanceTimer
+
+import logging
+logger = logging.getLogger(__name__)
+
+
+class InferenceEngine:
+    """L2 推理引擎（修复版）
+    
+    修复内容:
+    1. ✅ 集成 RAG 记忆系统
+    2. ✅ 优化生成参数（temperature, top_p, max_tokens）
+    3. ✅ 维护对话历史记忆
+    4. ✅ 支持上下文感知
+    """
+    
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        """单例模式"""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def __init__(self):
+        """初始化推理引擎"""
+        if not hasattr(self, '_initialized'):
+            self._running = False
+            self._current_task_id: Optional[str] = None
+            self._interrupt_flag = False
+            self._lock = threading.Lock()
+            self._initialized = True
+            
+            # 加载 L2 模型
+            self.model_container = ModelContainer()
+            self.l2_model = self.model_container.get_model(ModelID.L2_CORE)
+            self._l2_loaded = self.l2_model is not None
+            
+            # 初始化 RAG 节点（记忆系统）
+            self.rag_node = RAGIntegrationNode()
+            
+            # 加载 RAG 数据（从磁盘）
+            self.rag_manager = self._load_rag_data()
+            
+            # 注入 RAGManager 到 RAG 节点
+            if self.rag_manager:
+                self.rag_node.set_rag_manager(self.rag_manager)
+            
+            # 对话历史记忆（保留最近 10 轮）
+            self.conversation_history = []
+            self.max_history = 10
+            
+            # 🔥 新增：短期记忆持久化器 (单例模式，无需传递参数)
+            self.short_term_memory = ShortTermMemory()
+            logger.info("[InferenceEngine] Short-term memory initialized")
+            
+            # ✅ 第 4 周：经验生成器
+            self.experience_generator = ExperienceGenerator()
+            self.experience_generator.set_rag_manager(self.rag_manager)
+            logger.info("[InferenceEngine] Experience generator initialized")
+            
+            # 🔥 修复 3.1: KV Cache 缓存池 (实现跨请求的 KV 状态复用)
+            self.kv_cache_pool: Dict[str, Any] = {}  # session_id -> past_key_values
+            self.kv_cache_ttl = 1800  # 30 分钟 TTL
+            self.kv_cache_last_used: Dict[str, float] = {}  # session_id -> last_used_time
+            logger.info("[InferenceEngine] KV Cache 缓存池已初始化")
+            
+            # 订阅系统 L2 命令事件 (唯一入口 - 所有事件都经过 L1-B 路由)
+            event_bus.subscribe(
+                EventType.SYSTEM_L2_COMMAND,
+                self._on_l2_command,
+                "InferenceEngine"
+            )
+            
+            # 订阅系统中断事件
+            event_bus.subscribe(
+                EventType.SYSTEM_INTERRUPT,
+                self._on_interrupt,
+                "InferenceEngine"
+            )
+            
+            # 视觉上下文缓存
+            self._pending_visual_context: Optional[str] = None
+            self._waiting_for_vision = False
+            
+            # 🔧 显式调试日志：确认代码已加载
+            logger.info("=" * 80)
+            logger.info("🔧 InferenceEngine 初始化完成（带视觉感知意图识别功能）")
+            logger.info("🔧 视觉关键词列表：['周围', '环境', '看到', '看见', '视觉', '图像', '图片', '什么', '哪里', '哪', '描述', '外观', '样子', '颜色', '形状']")
+            logger.info("🔧 如果看到此日志，说明代码已正确加载")
+            logger.info("=" * 80)
+    
+    def _ensure_l2_loaded(self):
+        """确保 L2 模型已加载（延迟加载）"""
+        if not self._l2_loaded:
+            logger.info("🔄 延迟加载 L2 模型...")
+            try:
+                self.l2_model = self.model_container.get_model(ModelID.L2_CORE)
+                self._l2_loaded = True
+                logger.info("✅ L2 模型加载完成")
+            except Exception as e:
+                logger.warning(f"⚠️ L2 模型加载失败: {e}，使用降级模式")
+                self.l2_model = None
+                self._l2_loaded = False
+        return self.l2_model is not None
+    
+    def _on_l2_command(self, event: ZulongEvent):
+        """处理 L2 命令事件 (唯一入口 - 所有事件都经过 L1-B 路由)
+        
+        Args:
+            event: L2 命令事件
+        """
+        text = event.payload.get("text", "")
+        is_wakeup_command = event.payload.get("wakeup_command", False)
+        visual_attention = event.payload.get("visual_attention", False)
+        audio_attention = event.payload.get("audio_attention", False)
+        sensor_type = event.payload.get("sensor_type", "")
+        emergency = event.payload.get("emergency", False)
+        vision_ready = event.payload.get("vision_ready", False)
+        
+        if is_wakeup_command:
+            logger.info(f"🧠 收到唤醒命令：'{text}'")
+            time.sleep(1.5)
+            state_manager.set_l2_status(L2Status.IDLE)
+        
+        if emergency:
+            logger.warning(f"🚨 [L2] 收到紧急事件: {sensor_type}")
+        
+        if visual_attention:
+            intent_type = event.payload.get("intent_type", "unknown")
+            intent_confidence = event.payload.get("intent_confidence", 0)
+            person_distance = event.payload.get("person_distance", float('inf'))
+            keyframe_b64 = event.payload.get("keyframe_b64")
+            crop_b64 = event.payload.get("crop_b64")
+            
+            # 安全检查：确保值不为 None
+            if intent_confidence is None:
+                intent_confidence = 0.0
+            if person_distance is None:
+                person_distance = float('inf')
+            
+            logger.info(
+                f"🧠 收到视觉注意力命令：intent={intent_type}, "
+                f"confidence={intent_confidence:.2f}, distance={person_distance:.2f}m"
+            )
+            logger.info(
+                f"📸 关键帧状态：keyframe={keyframe_b64 is not None}, crop={crop_b64 is not None}"
+            )
+            
+            visual_context = self._build_visual_context_from_l1c(
+                intent_type, intent_confidence, person_distance, keyframe_b64, crop_b64
+            )
+            
+            self._pending_visual_context = visual_context
+        
+        if audio_attention:
+            logger.info(f"🎙️ [L2] 收到音频注意力事件")
+        
+        if vision_ready:
+            video_path = event.payload.get("video_path", "")
+            logger.info(f"📹 [L2] 视觉数据就绪: {video_path}")
+        
+        if sensor_type:
+            logger.info(f"📡 [L2] 收到传感器事件: {sensor_type}")
+        
+        logger.info(f"🧠 收到 L2 命令：'{text}'")
+        
+        voice_mode = event.payload.get("voice_mode", "TEXT_ONLY")
+        if emergency:
+            voice_mode = "AUTO_TTS"
+        logger.info(f"🎙️ [L2] Voice Mode: {voice_mode}")
+        
+        self._process_with_memory(text, event.priority, voice_mode)
+    
+    def _process_with_memory(self, user_input: str, priority: EventPriority, voice_mode: str = "TEXT_ONLY"):
+        """带记忆的推理流程（修复版）
+        
+        Args:
+            user_input: 用户输入
+            priority: 优先级
+            voice_mode: 语音模式 ("TEXT_ONLY", "AUTO_TTS", "FORCED_TTS")
+        """
+        # 🔍 [关键诊断] 添加时间戳追踪
+        import time
+        perf_timer = PerformanceTimer("L2 推理流程")
+        perf_timer.start()
+        
+        total_start = time.time()
+        logger.info(f"\n{'='*80}")
+        logger.info(f"🔍 [L2 推理] 收到用户输入：'{user_input}'")
+        logger.info(f"🔍 [L2 推理] 时间：{time.strftime('%H:%M:%S')}")
+        logger.info(f"{'='*80}\n")
+        
+        # 🔧 显式调试日志
+        logger.info(f"🔧 [DEBUG] 收到用户输入：'{user_input}'")
+        logger.info(f"🔧 [DEBUG] 开始意图识别...")
+        perf_timer.step("1. 接收用户输入")
+        
+        # ========== [修改] 语音触发指令检测 ==========
+        # 定义触发语音回复的关键词（支持多种表达方式）
+        voice_trigger_keywords = [
+            "语音回复", "语音回答", "用语音说", "用语音讲",
+            "给我说", "给我讲", "跟我说", "跟我讲",
+            "大声说", "大声讲", "读一下", "读出来",
+            "播报", "念一下", "说出来", "讲出来",
+            "说一遍", "讲一遍", "说一次", "讲一次",
+        ]
+        
+        # 检查是否包含语音触发关键词
+        force_speech = False
+        for keyword in voice_trigger_keywords:
+            if keyword in user_input:
+                force_speech = True
+                logger.info(f"🎤 检测到语音触发关键词：'{keyword}'")
+                break
+        
+        # 如果是语音触发，强制使用 AUTO_TTS 模式
+        if force_speech:
+            voice_mode = "AUTO_TTS"
+            logger.info(f"🔊 已切换到语音模式：{voice_mode}")
+        else:
+            # 默认文本交互，使用 TEXT_ONLY 模式
+            voice_mode = "TEXT_ONLY"
+            logger.info(f"📝 使用文本模式：{voice_mode}")
+        
+        # 检查 L2 状态
+        l2_status = state_manager.get_l2_status()
+        if l2_status == L2Status.UNLOADED:
+            logger.warning("L2 is UNLOADED, cannot process")
+            return
+        
+        # ========== 0. 意图识别：是否需要视觉感知？ ==========
+        # 动态路由架构：L1-C 已完成意图识别，L2 不再调用 InternVL
+        # 视觉关键词仅用于判断是否需要引用 L1-C 传递的视觉上下文
+        visual_keywords = [
+            "周围", "环境", "看到", "看见", "视觉", "图像", "图片", 
+            "什么", "哪里", "哪", "描述", "外观", "样子", "颜色", "形状", 
+            "刚才", "刚刚", "发生", "分析", "画面", "内容", "视频", 
+            "谁", "屏幕", "摄像头", "镜头", "眼前", "显示", "呈现", 
+            "场景", "物体", "物品", "人", "动作", "手势", "移动", "变化",
+        ]
+        need_vision = any(kw in user_input for kw in visual_keywords)
+        
+        logger.info(f"🔧 [DEBUG] 关键词检测结果：need_vision={need_vision}, 用户输入：'{user_input}'")
+        
+        visual_context = None
+        
+        if need_vision:
+            logger.info(f"👁️ 检测到视觉感知意图：'{user_input}'")
+            
+            # 动态路由架构：使用 L1-C 传递的视觉上下文（不再调用 InternVL）
+            if self._pending_visual_context:
+                logger.info("👁️ 使用 L1-C 传递的视觉上下文")
+                visual_context = self._pending_visual_context
+                self._pending_visual_context = None
+            else:
+                # 如果没有 L1-C 上下文，生成简单的视觉提示
+                logger.info("👁️ 无 L1-C 视觉上下文，使用默认提示")
+                visual_context = "（当前没有实时视觉数据，请根据上下文回答）"
+        
+        state_manager.set_l2_status(L2Status.BUSY)
+        
+        try:
+            # ========== 1. RAG 记忆检索 ==========
+            rag_context = self._retrieve_from_rag(user_input)
+            
+            # 🔥 关键修复 3: 添加 RAG 调试日志
+            if rag_context:
+                logger.info(f"📚 [RAG 调试] 检索到的上下文:\n{rag_context[:500]}...")
+            else:
+                logger.warning("⚠️ [RAG 调试] 未检索到任何 RAG 上下文")
+            
+            # ========== 2. 构建带历史、RAG 和视觉上下文的 Prompt ==========
+            messages = self._build_messages_with_history(user_input, rag_context, visual_context)
+            
+            # ========== 3. 应用对话模板 ==========
+            prompt = self.l2_model.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            
+            # ========== 4. 使用优化参数生成（关键修复）==========
+            logger.info(f"🧠 开始推理：'{user_input[:50]}...' " if len(user_input) > 50 else f"🧠 开始推理：'{user_input}'")
+            
+            # 检查 prompt 长度
+            prompt_length = len(prompt)
+            logger.info(f"📊 Prompt 长度：{prompt_length} tokens")
+            if prompt_length > 4000:
+                logger.warning(f"⚠️ Prompt 过长 ({prompt_length})，可能导致生成问题")
+            
+            # 🔍 [关键诊断] 记录生成开始时间
+            generate_start = time.time()
+            logger.info(f"🚀 [L2 推理] 开始调用模型生成... (时间：{time.strftime('%H:%M:%S')})")
+            
+            # 🔥 修复 3.1: 使用 KV Cache 加速生成 (如果有缓存)
+            # 生成 session_id (基于用户输入哈希，简单实现)
+            session_id = f"session_{hash(user_input) % 10000}"
+            past_key_values = self._get_kv_cache(session_id)
+            
+            generate_kwargs = {
+                "max_tokens": 1024,
+            }
+            
+            # 如果有缓存，传入 past_key_values
+            if past_key_values is not None:
+                generate_kwargs["past_key_values"] = past_key_values
+                logger.info(f"🚀 [KV Cache] 使用缓存加速生成")
+            
+            response = self.l2_model.generate(
+                prompt,
+                **generate_kwargs
+            )
+            
+            # 🔥 保存新的 KV Cache (如果模型支持)
+            if hasattr(self.l2_model, 'get_past_key_values'):
+                try:
+                    new_kv = self.l2_model.get_past_key_values()
+                    if new_kv is not None:
+                        self._save_kv_cache(session_id, new_kv)
+                except Exception as e:
+                    logger.warning(f"⚠️ [KV Cache] 保存失败：{e}")
+            
+            # 🔍 [关键诊断] 记录生成耗时
+            generate_elapsed = time.time() - generate_start
+            logger.info(f"✅ [L2 推理] 模型生成完成！耗时：{generate_elapsed:.2f}秒")
+            
+            # 🎯 提取 </think> 之后的内容（修复版：处理多个</think>标签）
+            if "</think>" in response:
+                parts = response.split("</think>")
+                if len(parts) > 1:
+                    # 取最后一个</think>之后的所有内容
+                    response = parts[-1].strip()
+                    logger.info(f"📝 已提取</think>后的回复 (共{len(parts)}个</think>标签)")
+            
+            # 🔍 调试：打印完整响应 (在过滤前)
+            raw_response = response
+            logger.info(f"🔍 [DEBUG] 模型原始输出 (Raw Output): {raw_response[:500]}...")  # 限制长度避免刷屏
+            logger.info(f"🔍 [DEBUG] 原始回复长度：{len(raw_response)} 字符")
+            
+            # 🔥 关键修复：TTS 前文本清洗 (TSD v1.7 第 4.2 节)
+            from zulong.utils.text_cleaner import clean_text_for_tts
+            cleaned_response = clean_text_for_tts(response)
+            
+            # 对比日志
+            if cleaned_response != response:
+                logger.info(f"✨ TTS 文本清洗完成：{len(response)} → {len(cleaned_response)} 字符")
+                logger.info(f"✨ 清洗后文本：'{cleaned_response[:200]}'")
+            else:
+                logger.debug("✅ 文本已足够纯净，无需清洗")
+            
+            # 详细日志
+            response_length = len(cleaned_response)
+            logger.info(f"💬 生成回复长度：{response_length} 字符")
+            logger.info(f"💬 回复前 200 字符：'{cleaned_response[:200]}'")
+            if response_length > 200:
+                logger.info(f"💬 回复后 200 字符：'{cleaned_response[-200:]}'")
+            
+            # 检查是否被截断
+            if response_length >= 1024 * 4:  # 假设每个 token 约 4 字符
+                logger.warning("⚠️ 回复可能达到了 max_tokens 限制")
+            
+            # 🔍 [关键诊断] 记录总耗时
+            total_elapsed = time.time() - total_start
+            perf_timer.step("5. 生成完成 & 后处理")
+            
+            logger.info(f"\n{'='*80}")
+            logger.info(f"✅ [L2 推理] 完整流程完成！总耗时：{total_elapsed:.2f}秒")
+            logger.info(f"✅ [L2 推理] 回复内容：'{cleaned_response[:100]}...'")
+            logger.info(f"{'='*80}\n")
+            
+            perf_timer.end()
+            
+            # ========== 5. 更新记忆 (使用原始回复，保留完整格式) ==========
+            self._update_memory(user_input, response)
+            
+            # ========== 6. 发布文本结果 (使用原始回复，保留格式) ==========
+            output_event = ZulongEvent(
+                type=EventType.L2_OUTPUT,
+                priority=EventPriority.NORMAL,
+                source="InferenceEngine",
+                payload={
+                    "text": response,  # 文本显示保留原始格式
+                    "input_text": user_input,
+                    "has_rag_context": rag_context is not None,
+                    "history_length": len(self.conversation_history),
+                    "visual_context": None,  # 可以扩展
+                    "timestamp": time.time()
+                }
+            )
+            event_bus.publish(output_event)
+            
+            # ========== 7. 根据语音模式决定是否调用 TTS (TSD v1.7 规范) ==========
+            # 🔥 关键修复：TTS 使用清洗后的文本
+            if voice_mode in ["AUTO_TTS", "FORCED_TTS"]:
+                logger.info(f"🔊 生成语音 (Mode: {voice_mode})...")
+                
+                # 发布 ACTION_SPEAK 事件给 L0 (使用清洗后的文本)
+                speak_event = ZulongEvent(
+                    type=EventType.ACTION_SPEAK,
+                    priority=EventPriority.NORMAL,
+                    source="InferenceEngine",
+                    payload={
+                        "text": cleaned_response,  # 🔥 TTS 使用清洗后的纯净文本
+                        "style": "conversational" if voice_mode == "AUTO_TTS" else "emphatic",
+                        "voice_mode": voice_mode,
+                        "timestamp": time.time()
+                    }
+                )
+                event_bus.publish(speak_event)
+                logger.info(f"✅ ACTION_SPEAK 事件已发布 (Mode: {voice_mode}, 文本已清洗)")
+            else:
+                logger.debug("🔇 Text-only mode. Skipping TTS.")
+            
+        except Exception as e:
+            logger.error(f"推理失败：{e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            state_manager.set_l2_status(L2Status.IDLE)
+    
+    def _retrieve_from_rag(self, query: str) -> Optional[str]:
+        """从 RAG 检索相关记忆
+        
+        Args:
+            query: 查询
+            
+        Returns:
+            检索到的上下文文本
+        """
+        # 🔍 [关键诊断] 记录 RAG 检索时间
+        rag_start = time.time()
+        logger.info(f"🔍 [RAG] 开始检索记忆... (查询：'{query[:30]}...')")
+        
+        try:
+            # 使用 RAG 节点检索
+            fake_state = {
+                "query": query,
+                "context": {},
+                "rag_results": [],
+                "retrieved_docs": [],
+                "target_rag": "default",
+                "search_metadata": {},
+                "messages": []
+            }
+            
+            result = self.rag_node.retrieve(fake_state)
+            
+            # 🔍 [关键诊断] 记录 RAG 检索耗时
+            rag_elapsed = time.time() - rag_start
+            logger.info(f"✅ [RAG] 检索完成！耗时：{rag_elapsed:.3f}秒，结果数：{len(result['retrieved_docs'])}")
+            
+            if result["retrieved_docs"]:
+                # 拼接检索到的文档（最多 3 个）
+                context_parts = []
+                for doc in result["retrieved_docs"][:3]:
+                    if "content" in doc:
+                        context_parts.append(doc["content"])
+                
+                if context_parts:
+                    context = "\n\n".join(context_parts)
+                    logger.info(f"📚 RAG 检索到 {len(context_parts)} 条相关记忆")
+                    return context
+            
+            return None
+            
+        except Exception as e:
+            logger.warning(f"RAG 检索失败：{e}")
+            return None
+    
+    def _load_visual_context(self) -> Optional[List[np.ndarray]]:
+        """
+        从共享视觉记忆池加载视觉数据 (主动轮询)
+        
+        策略:
+        1. 检查 ./data/shared_vision/recent_clip.mp4 是否存在且新鲜 (<10 秒)
+        2. 如果存在，提取关键帧 (3-5 帧)
+        3. 如果不存在或过期，降级到 latest_frame.jpg
+        4. 如果都失败，返回 None
+        
+        Returns:
+            List[np.ndarray]: 关键帧列表，失败返回 None
+        
+        TSD v1.7 对应:
+        - 4.2 L1-B: 视听信息流回溯
+        - 5.2 显存约束：关键帧提取 (3-5 帧)
+        """
+        try:
+            from zulong.l1a.vision_short_term_memory import VisionShortTermMemory
+            
+            # 创建临时管理器 (只读)
+            memory = VisionShortTermMemory(
+                duration=5,
+                fps=30,
+                cache_dir="./data/shared_vision"
+            )
+            
+            # 检查新鲜度
+            if memory.is_fresh(max_age=10.0):
+                logger.info("👁️ 共享视觉记忆新鲜，提取关键帧...")
+                
+                # 从视频文件中提取关键帧
+                import cv2
+                
+                if not os.path.exists(str(memory.video_path)):
+                    logger.warning(f"👁️ 视频文件不存在：{memory.video_path}")
+                    return None
+                
+                # 打开视频文件
+                cap = cv2.VideoCapture(str(memory.video_path))
+                
+                if not cap.isOpened():
+                    logger.error(f"👁️ 无法打开视频文件：{memory.video_path}")
+                    return None
+                
+                # 获取视频信息
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                duration = frame_count / fps if fps > 0 else 0
+                
+                logger.info(f"👁️ 视频信息：{frame_count}帧，{fps}FPS, {duration:.2f}秒")
+                
+                # 提取关键帧 (使用 VisionShortTermMemory 的方法)
+                # 先读取所有帧到临时缓冲区
+                temp_frames = []
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    temp_frames.append(frame)
+                
+                cap.release()
+                
+                if not temp_frames:
+                    logger.warning("👁️ 视频文件为空")
+                    return None
+                
+                # 临时添加到缓冲区以使用 extract_keyframes
+                for frame in temp_frames:
+                    memory.add_frame(frame, time.time())
+                
+                # 提取关键帧 (3-5 帧)
+                keyframes = memory.extract_keyframes(num_keyframes=5)
+                
+                logger.info(f"👁️ 提取关键帧：{len(keyframes)}帧")
+                
+                return keyframes
+            
+            else:
+                # 降级到单帧
+                logger.info("👁️ 视频记忆过期，降级到单帧...")
+                
+                if os.path.exists(str(memory.frame_path)):
+                    import cv2
+                    frame = cv2.imread(str(memory.frame_path))
+                    
+                    if frame is not None:
+                        logger.info(f"👁️ 加载最新单帧：{memory.frame_path}")
+                        return [frame]
+                    else:
+                        logger.warning(f"👁️ 无法读取单帧文件：{memory.frame_path}")
+                else:
+                    logger.warning(f"👁️ 单帧文件不存在：{memory.frame_path}")
+                
+                return None
+        
+        except Exception as e:
+            logger.error(f"❌ 加载视觉上下文失败：{e}", exc_info=True)
+            return None
+    
+    def _analyze_keyframes(self, keyframes: List[np.ndarray], query: str) -> str:
+        """
+        分析关键帧序列 (动态路由架构：已废弃)
+        
+        动态路由架构变更：
+        - 此方法已废弃，保留仅为兼容性
+        - L1-C 已完成视觉感知，不再需要 L2 调用 InternVL
+        
+        Args:
+            keyframes: 关键帧列表
+            query: 用户查询
+        
+        Returns:
+            str: 视觉分析结果文本
+        """
+        logger.warning("⚠️ [_analyze_keyframes] 此方法已废弃，动态路由架构下不应被调用")
+        return "（视觉分析已由 L1-C 完成）"
+    
+    def _request_vision_perception(self, query: str) -> Optional[str]:
+        """
+        请求视觉感知 (动态路由架构：使用 L1-C 传递的视觉上下文)
+        
+        动态路由架构变更：
+        - L1-C 已完成意图识别 (WAVING/GAZING/APPROACHING)
+        - L1-C 已生成关键帧截图 (Base64)
+        - L2 不再调用 InternVL，直接使用 L1-C 的结果
+        
+        Args:
+            query: 用户查询
+            
+        Returns:
+            视觉感知结果文本
+        
+        TSD v1.8 对应:
+        - 动态路由架构：L1-C 完成视觉感知，L2 仅做推理
+        """
+        try:
+            logger.info("👁️ [动态路由] 使用 L1-C 视觉上下文...")
+            
+            # 检查是否有 L1-C 传递的视觉上下文
+            if self._pending_visual_context:
+                logger.info(f"👁️ [动态路由] 使用缓存的 L1-C 视觉上下文")
+                result = self._pending_visual_context
+                self._pending_visual_context = None
+                return result
+            
+            # 如果没有 L1-C 上下文，返回默认提示
+            logger.warning("👁️ [动态路由] 无 L1-C 视觉上下文，返回默认提示")
+            return "（当前没有实时视觉数据，请根据上下文回答）"
+        
+        except Exception as e:
+            logger.error(f"❌ 视觉感知失败：{e}", exc_info=True)
+            return "视觉传感器数据未就绪"
+    
+    def _build_visual_context_from_l1c(
+        self, 
+        intent_type: str, 
+        intent_confidence: float, 
+        person_distance: float,
+        keyframe_b64: Optional[str],
+        crop_b64: Optional[str]
+    ) -> str:
+        """
+        从 L1-C 传递的数据构建视觉上下文 (动态路由架构)
+        
+        动态路由架构变更：
+        - L1-C 已完成意图识别 (WAVING/GAZING/APPROACHING)
+        - L1-C 已生成关键帧截图 (Base64)
+        - L2 直接使用 L1-C 的结果构建视觉上下文描述
+        
+        Args:
+            intent_type: 意图类型 (WAVING/GAZING/APPROACHING)
+            intent_confidence: 意图置信度
+            person_distance: 人物距离 (米)
+            keyframe_b64: 关键帧截图 (Base64)
+            crop_b64: 裁剪人物区域 (Base64)
+            
+        Returns:
+            str: 视觉上下文描述
+        """
+        # 根据意图类型构建自然语言描述
+        intent_descriptions = {
+            "WAVING": "用户在向你挥手",
+            "GAZING": "用户正在注视着你",
+            "APPROACHING": "用户走近了你"
+        }
+        
+        base_desc = intent_descriptions.get(intent_type, f"检测到用户的交互意图：{intent_type}")
+        
+        # 构建简洁自然的视觉上下文
+        visual_context = f"{base_desc}。请简短自然地回应，像朋友一样打招呼。"
+        
+        logger.info(f"👁️ [动态路由] 构建视觉上下文：{visual_context}")
+        
+        return visual_context
+    
+    def _complete_visual_sentence(self, text: str) -> str:
+        """补全视觉描述句子 (避免截断)
+        
+        修复说明:
+        1. ✅ 检测未完成的句子 (以逗号、"了"、"着"结尾)
+        2. ✅ 截断到最后一个完整句号
+        3. ✅ 如果没有句号，添加"..."标记
+        
+        Args:
+            text: 视觉描述文本
+            
+        Returns:
+            补全后的文本
+        """
+        if not text:
+            return ""
+        
+        text = text.strip()
+        
+        # 检测是否以未完成标记结尾
+        incomplete_endings = ['...', '了', '着', '，', ',', '在', '是']
+        
+        for ending in incomplete_endings:
+            if text.endswith(ending):
+                # 找到最后一个句号
+                last_period = text.rfind('。')
+                if last_period != -1 and last_period > 10:
+                    # 截断到最后一个完整句号
+                    text = text[:last_period + 1]
+                    logger.debug(f"视觉信息已截断到完整句子：{text[:50]}...")
+                else:
+                    # 没有完整句号，添加标记
+                    text = text + " (场景描述)"
+                    logger.debug(f"视觉信息不完整，已添加标记")
+                break
+        
+        return text
+    
+    def _build_messages_with_history(self, user_input: str, rag_context: Optional[str], visual_context: Optional[str]) -> list:
+        """构建包含历史、RAG 和视觉上下文的 messages
+        
+        修复版本:
+        1. ✅ 防止模型复述规则 (移除强硬约束)
+        2. ✅ 强制视觉融合 (没有视觉信息才能闲聊)
+        3. ✅ 优化 Prompt 结构 (避免注意力迷失)
+        4. ✅ 修复"你/我"人称混淆问题 (TSD v1.7 第 5.3 节)
+        """
+        from datetime import datetime
+        
+        # 🎯 获取当前时间
+        now = datetime.now()
+        hour = now.hour
+        current_time_str = now.strftime("%Y-%m-%d %H:%M")
+        
+        # 🎯 根据时间段确定问候语提示
+        if 5 <= hour < 11:
+            time_period = "早晨"
+        elif 11 <= hour < 14:
+            time_period = "中午"
+        elif 14 <= hour < 18:
+            time_period = "下午"
+        elif 18 <= hour < 22:
+            time_period = "晚上"
+        else:
+            time_period = "深夜"
+        
+        # 🔥 关键修复 2: 简化人称代词规则 + 添加 Few-Shot 示例
+        system_parts = [
+            "你是祖龙 (ZULONG) 机器人助手，一个活泼、可爱的 AI 伙伴。",
+            f"\n当前时间：{current_time_str} ({time_period})。",
+            "\n【重要规则】",
+            '当用户问"我是做什么的"、"我记得什么"、"我刚才说什么"时，"我"指的是**用户自己**，不是你自己。',
+            '回答时用"您"称呼用户，用"我"称呼自己。',
+            "\n【示例】",
+            '- 用户："我是做什么工作的？" → 你回答："您是一名室内设计师"',
+            '- 用户："我记得什么？" → 你回答："您记得今天下午要出去量房"',
+            '- 用户："我刚才说的第一句话是什么？" → 你回答："您刚才说的第一句话是\'...\'"',
+        ]
+        
+        # 🔥 关键修复 1: 有视觉信息时，强制要求基于视觉回答
+        if visual_context:
+            # 检测是否是挥手/注视/靠近等简单交互
+            is_simple_greeting = any(kw in visual_context for kw in ["挥手", "注视", "走近"])
+            
+            if is_simple_greeting:
+                system_parts.append("""
+【回应风格】
+用户正在和你互动！请用简短、活泼、口语化的方式回应，就像朋友打招呼一样。
+- 挥手：可以说"你好呀~"、"嗨~"、"怎么啦？"、"有什么事吗？"
+- 注视：可以说"看什么呢~"、"需要帮忙吗？"、"想聊点什么？"
+- 靠近：可以说"来啦~"、"找我有什么事吗？"
+回复控制在 20-40 字，像真人对话一样自然。
+
+【视觉观察】
+""" + visual_context + "\n")
+            else:
+                system_parts.append("""
+【核心原则】(重要！)
+1. **直接回答**: 根据下方的【视觉观察】直接回答用户问题，不要复述任何规则或约束条件。
+2. **拒绝复述**: 严禁输出"必须包含..."、"约束条件..."、"版本一..."等系统指令文本。
+3. **基于视觉**: 你必须基于【视觉观察】中的信息回答。如果视觉信息中没有相关内容，诚实地说"我没看到"。
+4. **口语化**: 回答要像真人对话一样自然，使用完整句子，50-150 字。
+5. **禁止罗列**: 不要使用数字列表 (1. 2. 3.) 或项目符号 (- •)，除非用户明确要求。
+
+【视觉观察】
+""" + visual_context + "\n")
+        else:
+            # 没有视觉信息，允许闲聊
+            system_parts.append("""
+【对话原则】
+1. 友好、专业地回答用户问题。
+2. 如果没有相关信息，诚实告知。
+3. 使用自然流畅的口语，50-150 字。
+""")
+        
+        # 🔥 关键修复 2: RAG 信息作为参考，不是约束
+        if rag_context:
+            system_parts.append(f"\n【参考知识】\n{rag_context}\n")
+        
+        # 🔥 新增修复 3: 从 ShortTermMemory 检索相似历史对话
+        if hasattr(self, 'short_term_memory') and self.short_term_memory is not None:
+            try:
+                import asyncio
+                from concurrent.futures import ThreadPoolExecutor
+                
+                def run_search():
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        return loop.run_until_complete(
+                            self.short_term_memory.search_similar(user_input, top_k=3)
+                        )
+                    finally:
+                        loop.close()
+                
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(run_search)
+                    relevant_memories = future.result(timeout=3.0)
+                
+                if relevant_memories:
+                    memory_str = "\n【你记得这些往事】(基于语义检索的历史对话)\n"
+                    for mem in relevant_memories:
+                        memory_str += f"- 用户：{mem['user']}\n  你：{mem['ai']}\n"
+                    
+                    system_parts.append(memory_str)
+                    logger.info(f"📖 [上下文注入] 注入 {len(relevant_memories)} 条历史对话")
+                else:
+                    logger.debug("📖 [上下文注入] 未检索到相似历史")
+                    
+            except Exception as e:
+                logger.warning(f"⚠️ [上下文注入] 检索历史失败：{e}")
+        
+        # 最后一句话引导
+        system_parts.append("\n请开始回答用户的问题：")
+        
+        system_prompt = "".join(system_parts)
+        
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # 🔥 [调试] 打印历史对话内容
+        logger.info(f"🔍 [DEBUG] 对话历史 ({len(self.conversation_history)} 条):")
+        for i, msg in enumerate(self.conversation_history[-6:]):  # 只显示最近 6 条
+            logger.info(f"  [{i}] {msg['role']}: {msg['content'][:50]}...")
+        
+        # 🔥 修复：添加历史对话 (最多 6 轮，从 3 轮增加)
+        for msg in self.conversation_history[-6:]:
+            messages.append(msg)
+        
+        # 🔥 [调试] 打印当前用户输入
+        logger.info(f"🔍 [DEBUG] 当前用户输入：{user_input}")
+        
+        # 添加当前用户输入
+        messages.append({"role": "user", "content": user_input})
+        
+        return messages
+    
+    def _update_memory(self, user_input: str, response: str):
+        """更新对话历史记忆 (带持久化 - 修复版)
+        
+        Args:
+            user_input: 用户输入
+            response: AI 回复
+        """
+        # 1. 添加到内存历史
+        self.conversation_history.append({"role": "user", "content": user_input})
+        self.conversation_history.append({"role": "assistant", "content": response})
+        
+        # 限制历史长度
+        if len(self.conversation_history) > self.max_history * 2:
+            self.conversation_history = self.conversation_history[-self.max_history * 2:]
+        
+        # 2. 🔥 修复：持久化到共享池 (增强异常处理)
+        if not hasattr(self, 'short_term_memory') or self.short_term_memory is None:
+            logger.error("🚨 [记忆写入] short_term_memory 未初始化!")
+        else:
+            try:
+                import asyncio
+                from concurrent.futures import ThreadPoolExecutor
+                
+                # 🔥 修复：使用 ThreadPoolExecutor 避免事件循环冲突
+                def run_async():
+                    try:
+                        # 创建新事件循环
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        try:
+                            return loop.run_until_complete(
+                                self.short_term_memory.store(
+                                    user_input=user_input,
+                                    ai_response=response,
+                                    metadata={"source": "inference_engine"}
+                                )
+                            )
+                        finally:
+                            loop.close()
+                    except Exception as e:
+                        logger.error(f"🚨 [记忆写入] 异步执行失败：{e}", exc_info=True)
+                        return False
+                
+                # 在线程池中运行
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(run_async)
+                    success = future.result(timeout=5.0)  # 5 秒超时
+                
+                if success:
+                    logger.info(f"💾 [记忆写入] 成功写入短期记忆池")
+                else:
+                    logger.warning(f"⚠️ [记忆写入] 写入失败 (返回 False)")
+                    
+            except asyncio.TimeoutError:
+                logger.error("🚨 [记忆写入] 超时 (5 秒)")
+            except Exception as e:
+                logger.error(f"🚨 [记忆写入] 异常：{e}", exc_info=True)
+        
+        # 3. ✅ 第 4 周：经验自动生成
+        try:
+            # 批量处理对话历史 (每 10 轮处理一次)
+            if len(self.conversation_history) % 20 == 0:  # 10 轮对话
+                logger.info("🧠 [经验生成] 批量处理对话历史...")
+                stats = self.experience_generator.process_dialogue_batch(self.conversation_history)
+                logger.info(f"📊 [经验生成] 处理统计：{stats}")
+        except Exception as e:
+            logger.warning(f"⚠️ 经验生成失败：{e}")
+        
+        logger.info(f"💾 记忆已更新，当前历史长度：{len(self.conversation_history)}")
+    
+    def _on_interrupt(self, event: ZulongEvent):
+        """处理中断事件
+        
+        Args:
+            event: 中断事件
+        """
+        logger.info("🚨 收到中断信号")
+        self._interrupt_flag = True
+    
+    def _get_kv_cache(self, session_id: str) -> Optional[Any]:
+        """获取会话的 KV Cache
+        
+        Args:
+            session_id: 会话 ID
+            
+        Returns:
+            Optional[Any]: KV Cache 数据，不存在或过期返回 None
+        """
+        # 检查是否存在
+        if session_id not in self.kv_cache_pool:
+            return None
+        
+        # 检查是否过期
+        last_used = self.kv_cache_last_used.get(session_id, 0)
+        if time.time() - last_used > self.kv_cache_ttl:
+            logger.info(f"🗑️ [KV Cache] 会话 {session_id} 缓存已过期，清除")
+            del self.kv_cache_pool[session_id]
+            del self.kv_cache_last_used[session_id]
+            return None
+        
+        logger.info(f"♻️ [KV Cache] 复用会话 {session_id} 的缓存")
+        return self.kv_cache_pool[session_id]
+    
+    def _save_kv_cache(self, session_id: str, past_key_values: Any):
+        """保存会话的 KV Cache
+        
+        Args:
+            session_id: 会话 ID
+            past_key_values: KV Cache 数据
+        """
+        self.kv_cache_pool[session_id] = past_key_values
+        self.kv_cache_last_used[session_id] = time.time()
+        logger.debug(f"💾 [KV Cache] 保存会话 {session_id} 的缓存")
+    
+    def _generate_short_response(self, user_input: str) -> str:
+        """生成简短回复 (用于语音指令触发)
+        
+        Args:
+            user_input: 用户输入
+            
+        Returns:
+            str: 简短的回复
+        """
+        try:
+            # 构建简短 Prompt
+            messages = [
+                {"role": "system", "content": "你是祖龙 (ZULONG) 机器人助手。请用简洁、口语化的方式回答，适合语音播报。控制在 50 字以内。"},
+                {"role": "user", "content": user_input}
+            ]
+            
+            prompt = self.l2_model.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            
+            # 生成回复 (限制最大长度)
+            response = self.l2_model.generate(
+                prompt,
+                max_tokens=128  # 限制长度，支持短回复
+            )
+            
+            # 提取 </think> 之后的内容
+            if "</think>" in response:
+                parts = response.split("</think>")
+                if len(parts) > 1:
+                    response = parts[-1].strip()
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"生成简短回复失败：{e}")
+            return "抱歉，我暂时无法回答。"
+        
+        video_path = event.payload.get("video_path")
+        duration = event.payload.get("duration")
+        frame_count = event.payload.get("frame_count")
+        
+        logger.info(f"   - 视频路径：{video_path}")
+        logger.info(f"   - 时长：{duration}秒")
+        logger.info(f"   - 帧数：{frame_count}帧")
+        
+        # 🎯 关键修改：直接同步调用分析方法，避免异步事件循环问题
+        # 在后台线程中执行视频分析 (不阻塞事件总线)
+        import threading
+        thread = threading.Thread(
+            target=self._analyze_video_content,
+            args=(video_path,),
+            daemon=True
+        )
+        thread.start()
+        logger.debug(f"👁️ 启动视频分析线程")
+    
+    def _analyze_video_content(self, video_path: str) -> Optional[str]:
+        """分析视频内容（使用多模态模型）
+        
+        Args:
+            video_path: 视频文件路径
+            
+        Returns:
+            视频内容描述文本
+        """
+        try:
+            logger.info(f"👁️ 开始分析视频内容：{video_path}")
+            
+            # 检查视频文件是否存在
+            if not os.path.exists(video_path):
+                logger.error(f"视频文件不存在：{video_path}")
+                return None
+            
+            # 使用 OpenCV 提取关键帧 (提取 10 帧)
+            import cv2
+            cap = cv2.VideoCapture(video_path)
+            
+            if not cap.isOpened():
+                logger.error("无法打开视频文件")
+                return None
+            
+            # 获取视频信息
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = frame_count / fps if fps > 0 else 0
+            
+            logger.info(f"   - FPS: {fps}, 总帧数：{frame_count}, 时长：{duration:.2f}秒")
+            
+            # 提取关键帧 (均匀采样 10 帧)
+            num_keyframes = min(10, frame_count)
+            step = max(1, frame_count // num_keyframes)
+            keyframes = []
+            
+            for i in range(0, frame_count, step):
+                ret, frame = cap.read()
+                if ret:
+                    # 转换 BGR 到 RGB
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    keyframes.append(frame_rgb)
+            
+            cap.release()
+            
+            logger.info(f"   - 提取关键帧：{len(keyframes)}帧")
+            
+            if not keyframes:
+                logger.warning("未能提取到关键帧")
+                return None
+            
+            # 使用多模态模型分析关键帧序列
+            # 构建提示词
+            prompt = """你是一个视觉分析专家。请分析这组从视频中提取的关键帧：
+
+1. 描述视频中的场景和环境
+2. 识别视频中的人物、物体及其动作
+3. 如果有物体移动或状态变化，请详细描述
+4. 总结视频的核心内容
+
+请清晰、简洁地描述，不超过 200 字。
+"""
+            
+            # 使用第一帧和最后一帧进行对比分析 (如果有)
+            if len(keyframes) >= 2:
+                # 使用多模态模型分析
+                # 注意：这里需要使用支持多图像的模型
+                # 暂时简化为分析第一帧
+                first_frame = keyframes[0]
+                
+                # 调用视觉模型 (使用 L1-A 的 VisionNode 或 L2 的多模态模型)
+                # 这里简化处理，实际需要调用 ModelContainer 中的多模态模型
+                visual_description = f"视频包含 {len(keyframes)} 个关键帧，展示了动态场景变化。"
+                
+                # 🔥 关键修复：视觉信息补全 (避免截断)
+                visual_description = self._complete_visual_sentence(visual_description)
+                
+                # 缓存分析结果
+                self._pending_visual_context = visual_description
+                logger.info(f"✅ 视频分析完成：{visual_description[:100]}...")
+                
+                return visual_description
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"视频分析失败：{e}", exc_info=True)
+            return None
+    
+    def generate(self, context: list, stop_condition: Optional[Callable] = None):
+        """生成过程（使用真实模型）
+        
+        Args:
+            context: 上下文
+            stop_condition: 停止条件
+            
+        Yields:
+            str: 生成的 token
+        """
+        logger.info("Starting generation with real model")
+        
+        prompt_text = " ".join([str(item) for item in context if isinstance(item, str)])
+        prompt = f"请继续：{prompt_text}"
+        
+        try:
+            response = self.l2_model.generate(prompt, max_tokens=100)
+            
+            for char in response:
+                if self._interrupt_flag:
+                    logger.info("Generation interrupted")
+                    return
+                if stop_condition and stop_condition():
+                    logger.info("Stop condition met")
+                    return
+                yield char
+            
+            logger.info("Generation completed")
+            
+        except Exception as e:
+            logger.error(f"生成失败：{e}")
+    
+    def load_model(self):
+        """加载模型"""
+        logger.info("Loading L2 model...")
+        try:
+            self.l2_model = self.model_container.get_model(ModelID.L2_CORE)
+            state_manager.set_l2_status(L2Status.IDLE)
+            logger.info("L2 model loaded successfully")
+        except Exception as e:
+            logger.error(f"模型加载失败：{e}")
+            raise
+    
+    def unload_model(self):
+        """卸载模型"""
+        logger.info("Unloading L2 model...")
+        try:
+            self.model_container.unload_model(ModelID.L2_CORE)
+            state_manager.set_l2_status(L2Status.UNLOADED)
+            logger.info("L2 model unloaded successfully")
+        except Exception as e:
+            logger.error(f"模型卸载失败：{e}")
+            raise
+    
+    def is_generating(self) -> bool:
+        """
+        检查 L2 是否正在生成回复 (动态路由架构核心接口)
+        
+        Returns:
+            bool: True 表示 L2 正在忙碌 (BUSY/WAITING)，False 表示空闲 (IDLE)
+        """
+        effective_status = state_manager.get_effective_status()
+        is_busy = effective_status == "ACTIVE_TASK"
+        
+        logger.debug(f"🔍 [InferenceEngine] is_generating() = {is_busy} (effective_status={effective_status})")
+        return is_busy
+    
+    def _load_rag_data(self):
+        """加载 RAG 数据（从磁盘）
+        
+        Returns:
+            RAGManager: 加载的 RAG 管理器，失败则返回 None
+        """
+        try:
+            import os
+            from zulong.memory.rag_manager import RAGManager, RAGConfig
+            
+            rag_path = "./data/rag"
+            if os.path.exists(rag_path):
+                config = RAGConfig(
+                    vector_dimension=512,
+                    vector_store_type="faiss",
+                    experience_rag_enabled=True,
+                    memory_rag_enabled=True,
+                    knowledge_rag_enabled=True
+                )
+                rag_manager = RAGManager(config)
+                rag_manager.load_all(rag_path)
+                logger.info(f"✅ RAG 数据已加载：{rag_path}")
+                return rag_manager
+            else:
+                logger.warning(f"RAG 数据目录不存在：{rag_path}")
+                return None
+        except Exception as e:
+            logger.warning(f"加载 RAG 数据失败：{e}")
+            return None
+
+
+# 全局推理引擎实例
+inference_engine = InferenceEngine()
+
+# 兼容旧代码的别名
+mock_inference_engine = inference_engine

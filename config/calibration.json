@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "params": {
+    "l0.speed_compensation": {
+      "key": "l0.speed_compensation",
+      "value": 5.0,
+      "param_type": "float",
+      "min_value": 0.0,
+      "max_value": 50.0,
+      "description": "L0速度补偿百分比",
+      "last_updated": 91677774527.79999,
+      "version": 1
+    }
+  },
+  "updated_at": 91677774543.7
+}

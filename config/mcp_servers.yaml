@@ -1,0 +1,44 @@
+# File: config/mcp_servers.yaml
+# MCP 服务器配置
+# 祖龙作为 MCP Client 接入外部 MCP Server，扩展工具生态
+
+servers:
+  # 文件系统操作
+  filesystem:
+    enabled: false  # 默认禁用，需要时启用
+    command: "npx"
+    args: ["-y", "@anthropic/mcp-server-filesystem", "/workspace"]
+    description: "文件系统操作（读写文件、目录遍历等）"
+    timeout: 30
+
+  # 网络搜索（如已存在 web_search 工具，可不启用）
+  web_search:
+    enabled: false
+    command: "npx"
+    args: ["-y", "@anthropic/mcp-server-fetch"]
+    description: "网页抓取和内容提取"
+    timeout: 30
+
+  # GitHub 代码搜索
+  github:
+    enabled: false
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    description: "GitHub 仓库操作（搜索代码、读取文件等）"
+    env:
+      GITHUB_TOKEN: ""  # 需要配置 GitHub Token
+    timeout: 30
+
+  # 数据库操作
+  database:
+    enabled: false
+    command: "npx"
+    args: ["-y", "@anthropic/mcp-server-sqlite", "--db-path", "./data/mcp_database.db"]
+    description: "SQLite 数据库操作"
+    timeout: 30
+
+# MCP Client 配置
+client:
+  max_servers: 5  # 最大同时连接的服务器数量
+  tool_discovery_interval: 300  # 工具发现间隔（秒），默认 5 分钟
+  auto_retry: true  # 连接断开时自动重试

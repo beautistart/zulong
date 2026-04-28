@@ -1,0 +1,149 @@
+# File: config/l1_plugins.yaml
+"""
+L1 层插件配置文件
+
+TSD v1.7 对应:
+- 2.2.2 L1 层拆分
+- 3.2 智能路由逻辑
+
+使用说明:
+1. enabled: false 可临时禁用插件
+2. priority 决定执行顺序 (CRITICAL > HIGH > NORMAL > LOW)
+3. config 节传递参数给插件
+
+完整插件列表:
+- L1A/Motor: 电机控制 (HIGH)
+- L1C/Vision: 视觉分析 (NORMAL)
+- L1D/Voice: 语音唤醒 (CRITICAL)
+- L1E/Gas: 气体检测 (CRITICAL)
+"""
+
+plugins:
+  # ========== L1-A: 感知与受控反射层 ==========
+  
+  - module_id: "L1A/Motor"
+    class_path: "zulong.plugins.motor.l1a_motor_plugin.L1A_MotorPlugin"
+    enabled: true
+    priority: "HIGH"
+    description: "电机控制与障碍检测反射"
+    config:
+      obstacle_threshold: 0.3  # 米
+      max_speed: 0.8
+      brake_decay: 0.5
+      auto_brake: true
+  
+  - module_id: "L1E/Gas"
+    class_path: "zulong.plugins.gas.l1e_gas_plugin.L1E_GasPlugin"
+    enabled: true
+    priority: "CRITICAL"
+    description: "气体检测与火灾报警"
+    config:
+      threshold: 500  # ppm
+      simulate: true  # 模拟模式 (部署时改为 false)
+      alarm_cooldown: 60.0  # 秒
+  
+  # ========== L1-B: 调度与意图守门层 ==========
+  
+  - module_id: "L1D/Voice"
+    class_path: "zulong.plugins.voice.l1d_voice_plugin.L1D_VoicePlugin"
+    enabled: true
+    priority: "CRITICAL"
+    description: "语音唤醒与命令识别"
+    config:
+      wake_words: ["你好", "救命", "小紫"]
+      silent_commands: ["安静", "睡觉", "去休息"]
+      wakeup_timeout: 30.0  # 秒
+  
+  - module_id: "L1D/Audio"
+    class_path: "zulong.plugins.voice.l1d_audio_plugin.L1D_AudioPlugin"
+    enabled: true
+    priority: "CRITICAL"
+    description: "三层注意力音频处理 (YAMNet分类/Whisper转录/VAD检测)"
+    config:
+      sample_rate: 16000
+      frame_duration_ms: 30
+      vad_mode: 3
+      voice_threshold_energy: 500
+      noise_floor: 100
+      min_speech_duration: 0.5
+      speech_collect_window: 1.5
+      enable_yamnet: true
+      enable_whisper: true
+      yamnet_classify_interval: 1.0
+  
+  # ========== L1-C: 感知预处理层 ==========
+  
+  - module_id: "L1C/Vision"
+    class_path: "zulong.plugins.vision.l1c_vision_plugin.L1C_VisionPlugin"
+    enabled: true
+    priority: "NORMAL"
+    description: "视觉分析与运动检测"
+    config:
+      fps: 30
+      frame_width: 640
+      frame_height: 480
+      motion_threshold: 500  # 像素
+      buffer_duration: 5  # 秒
+  
+  # ========== 可选插件 (示例) ==========
+  
+  # - module_id: "L1F/Radar"
+  #   class_path: "zulong.plugins.radar.l1f_radar_plugin.L1F_RadarPlugin"
+  #   enabled: false
+  #   priority: "HIGH"
+  #   description: "毫米波雷达 (可选)"
+  #   config:
+  #     max_range: 5.0  # 米
+  #     update_rate: 10  # Hz
+  
+  # - module_id: "L1G/IMU"
+  #   class_path: "zulong.plugins.imu.l1g_imu_plugin.L1G_ImuPlugin"
+  #   enabled: false
+  #   priority: "HIGH"
+  #   description: "惯性测量单元 (防摔倒)"
+  #   config:
+  #     fall_threshold: 2.0  # g
+  #     sample_rate: 100  # Hz
+
+# ========== 全局配置 ==========
+
+global:
+  # 插件执行超时 (毫秒)
+  plugin_timeout_ms: 10
+  
+  # 健康检查间隔 (秒)
+  health_check_interval: 10.0
+  
+  # 日志级别
+  log_level: "INFO"
+  
+  # 共享内存配置
+  shared_memory:
+    max_size_mb: 100
+    cleanup_interval: 60.0  # 秒
+
+# ========== 性能调优 ==========
+
+performance:
+  # 目标周期时间 (毫秒)
+  target_cycle_time_ms: 33  # ~30 FPS
+  
+  # 最大插件数量
+  max_plugins: 10
+  
+  # 事件队列大小
+  event_queue_size: 1000
+
+# ========== 安全配置 ==========
+
+safety:
+  # 紧急停止按钮
+  emergency_stop:
+    enabled: true
+    timeout_ms: 10
+  
+  # 看门狗定时器
+  watchdog:
+    enabled: true
+    timeout_seconds: 5.0
+    action: "STOP_ALL"

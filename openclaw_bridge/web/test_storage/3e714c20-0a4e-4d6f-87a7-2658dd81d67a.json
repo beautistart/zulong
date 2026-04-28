@@ -1,0 +1,26 @@
+[
+  {
+    "role": "user",
+    "content": "你好，今天天气不错",
+    "timestamp": 1776244023.5143306,
+    "is_complex_task": false
+  },
+  {
+    "role": "user",
+    "content": "你知道现在几点了吗？",
+    "timestamp": 1776244056.8106465,
+    "is_complex_task": false
+  },
+  {
+    "role": "user",
+    "content": "我想整理房间，但是东西太多了，不知道从哪里开始。请帮我规划一下步骤。",
+    "timestamp": 1776244090.1449373,
+    "is_complex_task": true
+  },
+  {
+    "role": "user",
+    "content": "我想在一个月内学会 Python 编程基础，请帮我制定一个学习计划。",
+    "timestamp": 1776244153.6316562,
+    "is_complex_task": true
+  }
+]

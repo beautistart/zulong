@@ -1,0 +1,68 @@
+{
+  "test": "A_complex_task",
+  "time": "2026-04-26 14:52:43",
+  "task": "请帮我设计一个简单的学生成绩管理方案，需要包含：1) 成绩录入的数据结构 2) 成绩统计的算法思路 3) 排名输出的格式设计。",
+  "total_time_sec": 148.2,
+  "events_count": 8,
+  "thinking_steps": 7,
+  "task_graph_events": [
+    {
+      "step_type": "pipeline.pipeline_start",
+      "turn": 0,
+      "tool": "",
+      "node_count": 1
+    },
+    {
+      "step_type": "pipeline.agent_tool_call",
+      "turn": 1,
+      "tool": "task_add_node",
+      "node_count": 2
+    },
+    {
+      "step_type": "pipeline.agent_tool_call",
+      "turn": 1,
+      "tool": "task_add_node",
+      "node_count": 3
+    },
+    {
+      "step_type": "pipeline.agent_tool_call",
+      "turn": 1,
+      "tool": "task_add_node",
+      "node_count": 4
+    },
+    {
+      "step_type": "pipeline.agent_tool_call",
+      "turn": 2,
+      "tool": "task_view_overview",
+      "node_count": 4
+    },
+    {
+      "step_type": "pipeline.agent_tool_call",
+      "turn": 3,
+      "tool": "task_view_overview",
+      "node_count": 4
+    },
+    {
+      "step_type": "pipeline.agent_tool_call",
+      "turn": 4,
+      "tool": "task_mark_status",
+      "node_count": 4
+    }
+  ],
+  "tool_calls": [
+    "task_add_node",
+    "task_add_node",
+    "task_add_node",
+    "task_view_overview",
+    "task_view_overview",
+    "task_mark_status"
+  ],
+  "final_response_length": 0,
+  "checks": {
+    "意图分类为 COMPLEX": true,
+    "创建了 TaskGraph": true,
+    "有 FC 工具调用": true,
+    "收到最终回复": false
+  },
+  "passed": false
+}

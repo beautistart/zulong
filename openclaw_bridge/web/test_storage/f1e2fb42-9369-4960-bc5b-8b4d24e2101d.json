@@ -1,0 +1,20 @@
+[
+  {
+    "role": "user",
+    "content": "你好，今天天气不错",
+    "timestamp": 1776242275.6738272,
+    "is_complex_task": false
+  },
+  {
+    "role": "user",
+    "content": "你知道现在几点了吗？",
+    "timestamp": 1776242308.882109,
+    "is_complex_task": false
+  },
+  {
+    "role": "user",
+    "content": "我想整理房间，但是东西太多了，不知道从哪里开始。请帮我规划一下步骤。",
+    "timestamp": 1776242342.1814787,
+    "is_complex_task": true
+  }
+]

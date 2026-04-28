@@ -1,0 +1,11 @@
+{
+  "test_time": "2026-04-26 11:12:31",
+  "task": "请帮我分析一下 Python 3.12 和 3.13 版本的主要新特性差异，列出每个版本的 3 个最重要的新功能，并给出升级建议。",
+  "total_time_sec": 129.4,
+  "events_count": 3,
+  "thinking_steps_count": 0,
+  "task_graph_events": [],
+  "final_response": null,
+  "final_response_length": 0,
+  "passed": false
+}
