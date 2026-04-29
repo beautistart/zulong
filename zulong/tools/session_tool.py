@@ -170,12 +170,19 @@ def _search_historical_task(new_title: str):
     if not new_title:
         return None
 
+    logger.info(f"[HistSearch] 开始搜索历史任务: '{new_title[:60]}'")
+
     # ===== 阶段 1：语义检索（优先） =====
     try:
         from zulong.memory.task_search_index import get_task_search_index
         index = get_task_search_index()
         if index.is_available():
             results = index.search(new_title, top_k=3, similarity_threshold=0.55)
+            logger.info(
+                f"[HistSearch] 语义检索返回 {len(results)} 条结果"
+                + (f" (top: sim={results[0][1]:.3f}, '{results[0][0].title[:40]}')"
+                   if results else "")
+            )
             for entry, sim in results:
                 loaded = _load_task_graph_from_entry(entry)
                 if loaded:
@@ -189,6 +196,8 @@ def _search_historical_task(new_title: str):
                 else:
                     # 文件不存在，从索引中移除
                     index.remove_entry(entry.entry_id)
+        else:
+            logger.info("[HistSearch] 语义检索不可用（embedding 模型未就绪），跳到文本匹配")
     except Exception as e:
         logger.debug(f"[HistSearch] 语义检索失败，降级到文本匹配: {e}")
 
@@ -422,7 +431,8 @@ class StartSessionTool(BaseTool):
             _hist_match = _search_historical_task(_hist_title)
             if _hist_match:
                 _hist_tg, _hist_gid, _hist_old_title, _hist_source = _hist_match
-                set_active_task_graph(_hist_tg, _hist_gid)
+                _hist_ws = _hist_tg.metadata.get("workspace_dir", "") if hasattr(_hist_tg, 'metadata') else ""
+                set_active_task_graph(_hist_tg, _hist_gid, workspace_dir=_hist_ws)
                 logger.info(
                     f"[StartSession] 从历史任务恢复: '{_hist_old_title}' "
                     f"(source={_hist_source}, graph_id={_hist_gid})"
@@ -464,7 +474,12 @@ class StartSessionTool(BaseTool):
                 tg.metadata["user_requirement"] = user_input
                 logger.info(f"[StartSession] Rule B: 已存储用户原始需求 ({len(user_input)} 字符)")
 
-            set_active_task_graph(tg, graph_id)
+            # 创建独立工作目录
+            from zulong.tools.task_tools import _create_task_workspace
+            workspace_dir = _create_task_workspace(graph_id)
+            tg.metadata["workspace_dir"] = workspace_dir
+
+            set_active_task_graph(tg, graph_id, workspace_dir=workspace_dir)
 
             # 同步到 MemoryGraph
             try:
@@ -554,7 +569,8 @@ class StartSessionTool(BaseTool):
                 _hist = _search_historical_task(query)
                 if _hist:
                     _hist_tg, _hist_gid, _hist_title, _hist_source = _hist
-                    set_active_task_graph(_hist_tg, _hist_gid)
+                    _hist_ws = _hist_tg.metadata.get("workspace_dir", "") if hasattr(_hist_tg, 'metadata') else ""
+                    set_active_task_graph(_hist_tg, _hist_gid, workspace_dir=_hist_ws)
                     logger.info(
                         f"[StartSession] RESUME: 从历史任务恢复: "
                         f"'{_hist_title}' (source={_hist_source})"
@@ -614,7 +630,8 @@ class StartSessionTool(BaseTool):
 
                 if has_graph:
                     graph_id = match.metadata.get("graph_id", "") if hasattr(match, 'metadata') else ""
-                    set_active_task_graph(match.task_graph, graph_id)
+                    _resume_ws = match.task_graph.metadata.get("workspace_dir", "") if hasattr(match.task_graph, 'metadata') else ""
+                    set_active_task_graph(match.task_graph, graph_id, workspace_dir=_resume_ws)
                     logger.info(f"[StartSession] RESUME: 已恢复任务图 '{description}' (task_id={task_id})")
 
                     # 同步到 TaskStateManager（内存状态 + MemoryGraph）

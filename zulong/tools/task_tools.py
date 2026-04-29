@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 # 当前活跃的 TaskGraph（模块级单例，模型按需创建）
 _active_task_graph = None
 _active_graph_id = None
+_active_workspace_dir = None  # 当前活跃任务的工作目录绝对路径
 _active_graph_lock = threading.RLock()
 
 # 任务图磁盘备份目录
@@ -206,6 +207,7 @@ def _auto_archive_completed(tg):
             total_turns=0,
             completion_status="completed",
             task_graph_snapshot=tg.serialize(),
+            workspace_dir=_active_workspace_dir or "",
             metadata={"graph_id": graph_id},
         )
 
@@ -221,12 +223,19 @@ def get_active_task_graph():
         return _active_task_graph
 
 
-def set_active_task_graph(tg, graph_id):
+def get_active_workspace_dir():
+    """获取当前活跃任务的工作目录路径，无活跃任务时返回 None"""
+    with _active_graph_lock:
+        return _active_workspace_dir
+
+
+def set_active_task_graph(tg, graph_id, workspace_dir=None):
     """设置当前活跃的 TaskGraph，并自动备份到磁盘"""
-    global _active_task_graph, _active_graph_id
+    global _active_task_graph, _active_graph_id, _active_workspace_dir
     with _active_graph_lock:
         _active_task_graph = tg
         _active_graph_id = graph_id
+        _active_workspace_dir = workspace_dir
         # 磁盘备份：每次设置活跃图时保存一份，防止数据丢失
         if tg is not None and graph_id:
             _backup_graph_to_disk(tg, graph_id)
@@ -241,6 +250,22 @@ def set_active_task_graph(tg, graph_id):
                 )
         except Exception as e:
             logger.debug(f"[TaskTools] TaskStateManager 同步跳过: {e}")
+
+
+def _create_task_workspace(graph_id: str) -> str:
+    """为任务创建独立工作目录，返回绝对路径
+
+    目录结构: ./agent_workspace/{YYYYMMDD}_{HHMMSS}_{graph_id}/
+    """
+    from pathlib import Path
+    root = "./agent_workspace"
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    folder_name = f"{timestamp}_{graph_id}"
+    full_path = os.path.join(root, folder_name)
+    os.makedirs(full_path, exist_ok=True)
+    abs_path = str(Path(full_path).resolve())
+    logger.info(f"[Workspace] 创建任务工作目录: {abs_path}")
+    return abs_path
 
 
 def _backup_graph_to_disk(tg, graph_id: str):
@@ -428,7 +453,11 @@ class TaskCreatePlanTool(BaseTool):
                 desc=title,
             )
 
-            set_active_task_graph(tg, graph_id)
+            # 创建独立工作目录
+            workspace_dir = _create_task_workspace(graph_id)
+            tg.metadata["workspace_dir"] = workspace_dir
+
+            set_active_task_graph(tg, graph_id, workspace_dir=workspace_dir)
 
             # 同步到 MemoryGraph
             try:
@@ -458,6 +487,7 @@ class TaskCreatePlanTool(BaseTool):
                     "graph_id": graph_id,
                     "root_node_id": "req",
                     "title": title,
+                    "workspace_dir": workspace_dir,
                     "message": f"任务规划图已创建。根节点: req ({title})。请用 task_add_node 添加子任务。",
                 },
                 execution_time=time.time() - start_time,
@@ -1130,7 +1160,8 @@ class TaskListSuspendedTool(BaseTool):
 
                 if hasattr(match, 'task_id'):
                     if match.task_graph:
-                        set_active_task_graph(match.task_graph, match.metadata.get("graph_id", ""))
+                        _ws = match.task_graph.metadata.get("workspace_dir", "") if hasattr(match.task_graph, 'metadata') else ""
+                        set_active_task_graph(match.task_graph, match.metadata.get("graph_id", ""), workspace_dir=_ws)
                         logger.info(f"[task_list_suspended] 已恢复任务图: {match.task_id}")
 
                     # 确认恢复成功，显式消费（删除）磁盘文件

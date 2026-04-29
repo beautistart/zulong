@@ -149,7 +149,8 @@ class TaskStateManager:
                     # 同步到 task_tools 的活跃 TaskGraph，保持两套状态一致
                     try:
                         from zulong.tools.task_tools import set_active_task_graph
-                        set_active_task_graph(task_graph, task_graph_id)
+                        _ws = task_graph.metadata.get("workspace_dir", "") if hasattr(task_graph, 'metadata') else ""
+                        set_active_task_graph(task_graph, task_graph_id, workspace_dir=_ws)
                         logger.info(
                             f"[TaskStateManager] 已同步 TaskGraph {task_graph_id} 到 task_tools"
                         )

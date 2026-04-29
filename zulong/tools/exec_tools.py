@@ -58,8 +58,10 @@ class ExecWriteFileTool(BaseTool):
             )
 
         try:
-            # 路径安全检查
-            workspace = Path(WORKSPACE_DIR).resolve()
+            # 路径安全检查：优先使用活跃任务的专属工作目录
+            from .task_tools import get_active_workspace_dir
+            active_ws = get_active_workspace_dir()
+            workspace = Path(active_ws).resolve() if active_ws else Path(WORKSPACE_DIR).resolve()
             workspace.mkdir(parents=True, exist_ok=True)
             target = (workspace / file_path).resolve()
 
@@ -174,7 +176,10 @@ class ExecRunCommandTool(BaseTool):
             )
 
         try:
-            workspace = Path(WORKSPACE_DIR).resolve()
+            # 优先使用活跃任务的专属工作目录
+            from .task_tools import get_active_workspace_dir
+            active_ws = get_active_workspace_dir()
+            workspace = Path(active_ws).resolve() if active_ws else Path(WORKSPACE_DIR).resolve()
             workspace.mkdir(parents=True, exist_ok=True)
 
             # 执行命令

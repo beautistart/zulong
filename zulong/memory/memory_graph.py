@@ -2648,6 +2648,7 @@ class MemoryGraph:
                 "edges": edges,
                 "stats": self.stats,
                 "active_node_ids": list(self._active_node_ids),
+                "thought_view": self.get_thought_view_data(),
             }
 
         # ---- 分层模式 ----
@@ -2703,6 +2704,7 @@ class MemoryGraph:
                 "edges": edges,
                 "stats": self.stats,
                 "active_node_ids": list(self._active_node_ids),
+                "thought_view": self.get_thought_view_data(),
             }
 
         # depth > 0: 从根节点沿 HIERARCHY 向下收集 depth 层
@@ -2735,6 +2737,7 @@ class MemoryGraph:
             "edges": edges,
             "stats": self.stats,
             "active_node_ids": list(self._active_node_ids),
+            "thought_view": self.get_thought_view_data(),
         }
 
     def get_node_children_for_frontend(self, node_id: str) -> Dict[str, Any]:
@@ -2798,6 +2801,50 @@ class MemoryGraph:
             "type": "delta",
             "changes": changes,
             "active_node_ids": list(self._active_node_ids),
+            "thought_view": self.get_thought_view_data(),
+        }
+
+    def get_thought_view_data(self) -> Dict[str, Any]:
+        """为思维可视化浮动窗口提供数据：活跃节点 + 1跳邻居 + 连接边"""
+        active_ids = set(self._active_node_ids)
+        if not active_ids:
+            return {"nodes": [], "edges": [], "center_ids": []}
+
+        # 收集 1 跳邻居
+        visible_ids = set(active_ids)
+        for nid in active_ids:
+            for neighbor in self.get_neighbors(nid, max_depth=1):
+                visible_ids.add(neighbor.node_id)
+
+        # 性能保护：上限 50 个节点
+        if len(visible_ids) > 50:
+            neighbor_only = visible_ids - active_ids
+            sorted_neighbors = sorted(
+                neighbor_only,
+                key=lambda nid: self._nodes[nid].activation if nid in self._nodes else 0,
+                reverse=True,
+            )
+            visible_ids = active_ids | set(sorted_neighbors[:50 - len(active_ids)])
+
+        # 序列化节点
+        nodes = []
+        for nid in visible_ids:
+            node = self._nodes.get(nid)
+            if node:
+                d = self._serialize_node(node)
+                d["is_center"] = nid in active_ids
+                nodes.append(d)
+
+        # 序列化边（两端都在 visible_ids 中的边）
+        edges = []
+        for src, dst, data in self._graph.edges(data=True):
+            if src in visible_ids and dst in visible_ids:
+                edges.append(self._serialize_edge(src, dst, data))
+
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "center_ids": list(active_ids),
         }
 
     # ============================================================

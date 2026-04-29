@@ -924,6 +924,128 @@
             --glow-color: #3b82f6;
             animation: mg-active-glow 1.5s ease-in-out infinite;
         }
+
+        /* ===== 思维可视化浮动窗口 ===== */
+        .thought-view-window {
+            position: fixed;
+            z-index: 10000;
+            bottom: 20px;
+            right: 20px;
+            width: 320px;
+            height: 260px;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 12px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            transition: height 0.3s ease, box-shadow 0.3s ease;
+            user-select: none;
+        }
+        .thought-view-window.tv-minimized {
+            height: 34px;
+        }
+        .thought-view-window.tv-hidden {
+            display: none;
+        }
+        .tv-header {
+            height: 34px;
+            min-height: 34px;
+            background: #1e293b;
+            border-bottom: 1px solid #334155;
+            display: flex;
+            align-items: center;
+            padding: 0 10px;
+            gap: 6px;
+            cursor: grab;
+            border-radius: 12px 12px 0 0;
+            flex-shrink: 0;
+        }
+        .tv-header:active { cursor: grabbing; }
+        .tv-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: #e2e8f0;
+        }
+        .tv-node-count {
+            font-size: 11px;
+            color: #64748b;
+        }
+        .tv-btn {
+            margin-left: auto;
+            width: 22px;
+            height: 22px;
+            border: none;
+            background: transparent;
+            color: #94a3b8;
+            cursor: pointer;
+            font-size: 14px;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            line-height: 1;
+        }
+        .tv-btn + .tv-btn { margin-left: 2px; }
+        .tv-btn:hover { background: #334155; color: #f1f5f9; }
+        .tv-body {
+            flex: 1;
+            overflow: hidden;
+            position: relative;
+        }
+        .tv-body svg {
+            width: 100%;
+            height: 100%;
+        }
+        .tv-empty-hint {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #475569;
+            font-size: 12px;
+            pointer-events: none;
+        }
+        .tv-resize-handle {
+            position: absolute;
+            bottom: 0;
+            right: 0;
+            width: 14px;
+            height: 14px;
+            cursor: nwse-resize;
+            background: linear-gradient(135deg, transparent 50%, #475569 50%);
+            border-radius: 0 0 12px 0;
+            opacity: 0.5;
+        }
+        .tv-resize-handle:hover { opacity: 1; }
+        @keyframes tv-pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        .tv-node-center circle {
+            animation: tv-pulse 2s ease-in-out infinite;
+        }
+        .tv-node-label {
+            fill: #cbd5e1;
+            font-size: 9px;
+            pointer-events: none;
+        }
+        .tv-link {
+            stroke-opacity: 0.3;
+        }
+        /* 思维视图重新打开按钮 */
+        .tv-reopen-btn {
+            padding: 3px 8px;
+            font-size: 11px;
+            color: #94a3b8;
+            background: #334155;
+            border: 1px solid #475569;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .tv-reopen-btn:hover { color: #f1f5f9; background: #475569; }
         
         .typing-indicator {
             display: flex;
@@ -1413,6 +1535,7 @@
                 <div class="graph-progress-bar"><div class="graph-progress-fill" id="gp-pfill" style="width:0%"></div></div>
             </div>
             <div class="mg-stats" id="mgStats" style="display:none;">0 节点 | 0 边</div>
+            <button class="tv-reopen-btn" id="tvReopenBtn" onclick="toggleTvVisible(true)" title="打开思维视图">思维</button>
             <button class="graph-close-btn" onclick="toggleTaskGraph()">收起 ✕</button>
         </div>
 
@@ -1499,6 +1622,21 @@
     </div>
 
     </div><!-- app-wrapper end -->
+
+    <!-- ===== 思维可视化浮动窗口 ===== -->
+    <div class="thought-view-window" id="thoughtViewWindow">
+        <div class="tv-header" id="tvHeader">
+            <span class="tv-title">思维视图</span>
+            <span class="tv-node-count" id="tvNodeCount">(0)</span>
+            <button class="tv-btn" onclick="toggleTvMinimize()" title="最小化">&#x2500;</button>
+            <button class="tv-btn" onclick="toggleTvVisible(false)" title="关闭">&#x2715;</button>
+        </div>
+        <div class="tv-body" id="tvBody">
+            <svg id="thoughtViewSvg"></svg>
+            <div class="tv-empty-hint" id="tvEmptyHint">暂无活跃思维节点</div>
+        </div>
+        <div class="tv-resize-handle" id="tvResizeHandle"></div>
+    </div>
     
     <script>
         // WebSocket 连接
@@ -3622,6 +3760,11 @@
             } else if (data.type === 'delta' && data.changes) {
                 mgApplyDelta(data.changes);
             }
+
+            // 更新思维可视化浮动窗口
+            if (data.thought_view) {
+                updateThoughtView(data.thought_view);
+            }
         }
 
         function mgMergeFullUpdate(data) {
@@ -3999,6 +4142,316 @@
                 });
             }
         }
+
+        // ===== 思维可视化浮动窗口 (Thought View) =====
+
+        let tvSimulation = null;
+        let tvInitialized = false;
+        let tvMinimized = false;
+        let tvVisible = true;
+        let tvState = { nodes: new Map(), edges: [], centerIds: new Set() };
+        let tvUpdateTimer = null;
+
+        function initThoughtView() {
+            if (tvInitialized) return;
+            tvInitialized = true;
+
+            var svgEl = document.getElementById('thoughtViewSvg');
+            if (!svgEl) return;
+            var svg = d3.select(svgEl);
+            svg.selectAll('*').remove();
+
+            // defs - arrowhead
+            var defs = svg.append('defs');
+            defs.append('marker')
+                .attr('id', 'tv-arrow')
+                .attr('viewBox', '0 -3 6 6')
+                .attr('refX', 12).attr('refY', 0)
+                .attr('markerWidth', 5).attr('markerHeight', 5)
+                .attr('orient', 'auto')
+                .append('path')
+                .attr('d', 'M0,-3L6,0L0,3')
+                .attr('fill', '#475569');
+
+            var g = svg.append('g').attr('id', 'tvRoot');
+
+            var body = document.getElementById('tvBody');
+            var rect = body.getBoundingClientRect();
+            var w = rect.width || 300;
+            var h = rect.height || 220;
+
+            tvSimulation = d3.forceSimulation()
+                .force('charge', d3.forceManyBody().strength(-60))
+                .force('center', d3.forceCenter(w / 2, h / 2))
+                .force('collision', d3.forceCollide().radius(function(d) {
+                    return d.is_center ? 8 + (d.activation || 0) * 10 : 6;
+                }))
+                .force('link', d3.forceLink().id(function(d) { return d.id; }).distance(50))
+                .on('tick', tvTick)
+                .stop();
+
+            setupTvDrag();
+            setupTvResize();
+        }
+
+        function updateThoughtView(data) {
+            if (!data) return;
+            // 节流 150ms
+            if (tvUpdateTimer) clearTimeout(tvUpdateTimer);
+            tvUpdateTimer = setTimeout(function() {
+                _doUpdateThoughtView(data);
+            }, 150);
+        }
+
+        function _doUpdateThoughtView(data) {
+            if (!tvInitialized) initThoughtView();
+
+            var nodes = data.nodes || [];
+            var edges = data.edges || [];
+            var centerIds = new Set(data.center_ids || []);
+
+            // 更新状态
+            tvState.nodes.clear();
+            nodes.forEach(function(n) {
+                n.is_center = centerIds.has(n.id);
+                tvState.nodes.set(n.id, n);
+            });
+            tvState.edges = edges;
+            tvState.centerIds = centerIds;
+
+            // 更新节点计数
+            var countEl = document.getElementById('tvNodeCount');
+            if (countEl) countEl.textContent = '(' + nodes.length + ')';
+
+            // 空态处理
+            var hint = document.getElementById('tvEmptyHint');
+            var svgEl = document.getElementById('thoughtViewSvg');
+            if (nodes.length === 0) {
+                if (hint) hint.style.display = 'flex';
+                if (svgEl) svgEl.style.display = 'none';
+                return;
+            } else {
+                if (hint) hint.style.display = 'none';
+                if (svgEl) svgEl.style.display = '';
+            }
+
+            renderThoughtView();
+        }
+
+        function renderThoughtView() {
+            var g = d3.select('#tvRoot');
+            if (g.empty()) return;
+
+            var nodes = Array.from(tvState.nodes.values());
+            var edges = tvState.edges.map(function(e) {
+                return {
+                    source: e.source,
+                    target: e.target,
+                    type: e.type,
+                    weight: e.weight || 0.5,
+                };
+            });
+
+            // 边
+            var linkSel = g.selectAll('.tv-link').data(edges, function(d) {
+                var s = typeof d.source === 'object' ? d.source.id : d.source;
+                var t = typeof d.target === 'object' ? d.target.id : d.target;
+                return s + '->' + t;
+            });
+            linkSel.exit().remove();
+            var linkEnter = linkSel.enter().append('line')
+                .attr('class', 'tv-link')
+                .attr('marker-end', 'url(#tv-arrow)');
+            var linkMerge = linkEnter.merge(linkSel);
+            linkMerge.each(function(d) {
+                var style = MG_EDGE_STYLES[d.type] || MG_EDGE_STYLES['reference'] || { stroke: '#475569', width: 1 };
+                d3.select(this)
+                    .attr('stroke', style.stroke)
+                    .attr('stroke-width', Math.max(style.width * 0.7, 0.5));
+            });
+
+            // 节点
+            var nodeSel = g.selectAll('.tv-node').data(nodes, function(d) { return d.id; });
+            nodeSel.exit().remove();
+            var nodeEnter = nodeSel.enter().append('g')
+                .attr('class', function(d) { return 'tv-node' + (d.is_center ? ' tv-node-center' : ''); });
+
+            nodeEnter.append('circle');
+            nodeEnter.append('text').attr('class', 'tv-node-label');
+            // tooltip on hover for neighbor nodes
+            nodeEnter.append('title');
+
+            var nodeMerge = nodeEnter.merge(nodeSel);
+
+            nodeMerge.attr('class', function(d) { return 'tv-node' + (d.is_center ? ' tv-node-center' : ''); });
+
+            nodeMerge.select('circle')
+                .attr('r', function(d) {
+                    return d.is_center ? 6 + (d.activation || 0) * 10 : 4;
+                })
+                .attr('fill', function(d) {
+                    var color = MG_COLORS[d.type] || '#94a3b8';
+                    return color;
+                })
+                .attr('opacity', function(d) { return d.is_center ? 1 : 0.5; })
+                .attr('stroke', function(d) {
+                    if (!d.is_center) return 'none';
+                    return MG_COLORS[d.type] || '#f59e0b';
+                })
+                .attr('stroke-width', function(d) { return d.is_center ? 2 : 0; })
+                .style('filter', function(d) {
+                    if (!d.is_center) return 'none';
+                    var intensity = Math.round((d.activation || 0) * 12);
+                    var color = MG_COLORS[d.type] || '#f59e0b';
+                    return 'drop-shadow(0 0 ' + intensity + 'px ' + color + ')';
+                });
+
+            // 标签：活跃节点始终显示，邻居节点隐藏
+            nodeMerge.select('text.tv-node-label')
+                .attr('dy', function(d) {
+                    var r = d.is_center ? 6 + (d.activation || 0) * 10 : 4;
+                    return -(r + 3);
+                })
+                .attr('text-anchor', 'middle')
+                .attr('display', function(d) { return d.is_center ? null : 'none'; })
+                .text(function(d) { return (d.label || '').substring(0, 8); });
+
+            // tooltip
+            nodeMerge.select('title')
+                .text(function(d) {
+                    var act = d.activation ? ' (act: ' + d.activation.toFixed(2) + ')' : '';
+                    return (d.label || d.id) + act;
+                });
+
+            // 更新 simulation
+            tvSimulation.nodes(nodes);
+            tvSimulation.force('link').links(edges);
+            tvSimulation.alpha(0.6).restart();
+        }
+
+        function tvTick() {
+            var g = d3.select('#tvRoot');
+            g.selectAll('.tv-link')
+                .attr('x1', function(d) { return d.source.x || 0; })
+                .attr('y1', function(d) { return d.source.y || 0; })
+                .attr('x2', function(d) { return d.target.x || 0; })
+                .attr('y2', function(d) { return d.target.y || 0; });
+            g.selectAll('.tv-node')
+                .attr('transform', function(d) { return 'translate(' + (d.x || 0) + ',' + (d.y || 0) + ')'; });
+        }
+
+        // 拖拽移动
+        function setupTvDrag() {
+            var header = document.getElementById('tvHeader');
+            var win = document.getElementById('thoughtViewWindow');
+            if (!header || !win) return;
+
+            var startX, startY, startLeft, startTop;
+
+            header.addEventListener('mousedown', function(e) {
+                if (e.target.closest('.tv-btn')) return;
+                e.preventDefault();
+                var rect = win.getBoundingClientRect();
+                startX = e.clientX;
+                startY = e.clientY;
+                startLeft = rect.left;
+                startTop = rect.top;
+
+                function onMove(ev) {
+                    var dx = ev.clientX - startX;
+                    var dy = ev.clientY - startY;
+                    var newLeft = Math.max(0, Math.min(window.innerWidth - 40, startLeft + dx));
+                    var newTop = Math.max(0, Math.min(window.innerHeight - 40, startTop + dy));
+                    win.style.left = newLeft + 'px';
+                    win.style.top = newTop + 'px';
+                    win.style.right = 'auto';
+                    win.style.bottom = 'auto';
+                }
+                function onUp() {
+                    document.removeEventListener('mousemove', onMove);
+                    document.removeEventListener('mouseup', onUp);
+                }
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+            });
+        }
+
+        // Resize
+        function setupTvResize() {
+            var handle = document.getElementById('tvResizeHandle');
+            var win = document.getElementById('thoughtViewWindow');
+            if (!handle || !win) return;
+
+            handle.addEventListener('mousedown', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                var startX = e.clientX;
+                var startY = e.clientY;
+                var startW = win.offsetWidth;
+                var startH = win.offsetHeight;
+
+                function onMove(ev) {
+                    var newW = Math.max(200, Math.min(600, startW + (ev.clientX - startX)));
+                    var newH = Math.max(160, Math.min(500, startH + (ev.clientY - startY)));
+                    win.style.width = newW + 'px';
+                    win.style.height = newH + 'px';
+                    // 更新 force center
+                    if (tvSimulation) {
+                        var body = document.getElementById('tvBody');
+                        if (body) {
+                            var rect = body.getBoundingClientRect();
+                            tvSimulation.force('center', d3.forceCenter(rect.width / 2, rect.height / 2));
+                            tvSimulation.alpha(0.3).restart();
+                        }
+                    }
+                }
+                function onUp() {
+                    document.removeEventListener('mousemove', onMove);
+                    document.removeEventListener('mouseup', onUp);
+                }
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+            });
+        }
+
+        function toggleTvMinimize() {
+            var win = document.getElementById('thoughtViewWindow');
+            if (!win) return;
+            tvMinimized = !tvMinimized;
+            win.classList.toggle('tv-minimized', tvMinimized);
+            if (!tvMinimized && tvSimulation && tvState.nodes.size > 0) {
+                tvSimulation.alpha(0.3).restart();
+            }
+        }
+
+        function toggleTvVisible(show) {
+            var win = document.getElementById('thoughtViewWindow');
+            if (!win) return;
+            if (typeof show === 'boolean') {
+                tvVisible = show;
+            } else {
+                tvVisible = !tvVisible;
+            }
+            win.classList.toggle('tv-hidden', !tvVisible);
+            if (tvVisible && tvSimulation && tvState.nodes.size > 0) {
+                tvSimulation.alpha(0.3).restart();
+            }
+        }
+
+        // 页面 resize 时检查浮动窗口位置
+        window.addEventListener('resize', function() {
+            var win = document.getElementById('thoughtViewWindow');
+            if (!win || !tvVisible) return;
+            var rect = win.getBoundingClientRect();
+            if (rect.left > window.innerWidth - 40) {
+                win.style.left = (window.innerWidth - 60) + 'px';
+                win.style.right = 'auto';
+            }
+            if (rect.top > window.innerHeight - 40) {
+                win.style.top = (window.innerHeight - 60) + 'px';
+                win.style.bottom = 'auto';
+            }
+        });
 
         // ── 双向导航：记忆图谱 <-> 任务图谱 ──
 
