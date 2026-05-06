@@ -11,9 +11,9 @@ skill_packs:
       reasoning_depth: 3
       max_hypotheses: 5
 
-  - pack_id: "cline_coder"
+  - pack_id: "ide_coder"
     enabled: false  # 后续实现
-    path: "zulong.skill_packs.packs.cline_coder"
+    path: "zulong.skill_packs.packs.ide_coder"
     config:
       workspace: "/workspace"
       allowed_languages: ["python", "javascript"]

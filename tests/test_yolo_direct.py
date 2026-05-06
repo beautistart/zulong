@@ -24,7 +24,7 @@ def test_yolo_human_detection():
     
     # 加载 YOLO 模型
     print("\n 加载 YOLOv8n 模型...")
-    yolo_path = Path(__file__).parent.parent / "yolov8n.pt"
+    yolo_path = Path(__file__).parent.parent / "models" / "yolov8n.pt"
     
     if not yolo_path.exists():
         print(f" 模型文件不存在：{yolo_path}")

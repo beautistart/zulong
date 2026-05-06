@@ -27,7 +27,7 @@ def test_yolo_model():
     print("="*60)
     
     base_dir = Path(__file__).parent.parent
-    yolo_path = base_dir / "yolov10n.pt"
+    yolo_path = base_dir / "models" / "yolov10n.pt"
     
     # 检查文件存在
     assert yolo_path.exists(), f"YOLO 模型文件不存在：{yolo_path}"

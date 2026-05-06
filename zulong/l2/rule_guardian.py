@@ -8,7 +8,7 @@ RuleGuardian — 规则守护者
 
 import re
 import logging
-from typing import Tuple
+from typing import Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,9 @@ class RuleGuardian:
         if not leaf_nodes:
             return False, ""
 
-        uncompleted = [n for n in leaf_nodes if n.status != "completed"]
+        # 排除 CRG 自动注入节点（crg_ 前缀），只看用户任务
+        user_leaves = [n for n in leaf_nodes if not n.id.startswith("crg_")]
+        uncompleted = [n for n in user_leaves if n.status != "completed"]
         if not uncompleted:
             return False, ""  # 确实全部完成了，放行
 
@@ -130,8 +132,9 @@ class RuleGuardian:
             if not leaf_nodes:
                 return False, ""
 
-            # 排除根节点
-            leaf_no_root = [n for n in leaf_nodes if n.id != "req"]
+            # 排除根节点和 CRG 自动注入节点
+            leaf_no_root = [n for n in leaf_nodes
+                           if n.id != "req" and not n.id.startswith("crg_")]
             if not leaf_no_root:
                 return False, ""
 
@@ -214,3 +217,21 @@ class RuleGuardian:
         """重置重试计数器（每次新的 FC 循环开始时调用）"""
         self._retry_count = 0
         self._bypass_redirect_count = 0
+
+    def serialize(self) -> Dict[str, Any]:
+        """导出内部状态（供 FC 暂停时保存）"""
+        return {
+            "retry_count": self._retry_count,
+            "bypass_redirect_count": self._bypass_redirect_count,
+            "enabled": self.enabled,
+            "max_retries": self.max_retries,
+        }
+
+    def deserialize(self, state: Dict[str, Any]) -> None:
+        """恢复内部状态（供 FC 恢复时加载）"""
+        self._retry_count = state.get("retry_count", 0)
+        self._bypass_redirect_count = state.get("bypass_redirect_count", 0)
+        logger.info(
+            f"[RuleGuardian] 状态已恢复: retry_count={self._retry_count}, "
+            f"bypass_redirect_count={self._bypass_redirect_count}"
+        )

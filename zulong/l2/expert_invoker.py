@@ -7,8 +7,7 @@ from dataclasses import dataclass, field
 import time
 
 from ..memory import RAGManager, TaggingEngine
-# MemoryEvolutionEngine 已重命名为 MemoryConsolidator
-from ..memory.memory_evolution import MemoryConsolidator as MemoryEvolutionEngine
+from ..memory.memory_evolution import MemoryEvolutionEngine, set_evolution_engine
 from ..tools import ToolEngine, BaseTool, ToolResult
 from ..l3 import DualBrainContainer
 
@@ -88,6 +87,7 @@ class ExpertInvoker:
         
         # 记忆进化引擎
         self.memory_evolution = MemoryEvolutionEngine(self.rag_manager)
+        set_evolution_engine(self.memory_evolution)
         
         # 上下文管理
         self.context: Dict[str, Any] = {

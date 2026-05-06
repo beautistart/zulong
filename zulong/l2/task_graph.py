@@ -10,6 +10,7 @@ import logging
 import uuid
 import time
 import json
+import threading
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Tuple, Optional, Callable, Any
 
@@ -48,6 +49,12 @@ class TaskNode:
     desc: str                        # 描述文本
     result: Optional[str] = None     # 执行结果（Agent 执行后填充）
     files: List["FileRef"] = field(default_factory=list)  # 关联文件列表
+    # ── 结构化知识存储（Phase 3 新增）──
+    analysis_content: Optional[str] = None     # 分析正文（无长度限制，知识容器）
+    semantic_summary: Optional[str] = None     # 语义摘要（用于 MemoryGraph 检索，≤500字）
+    content_version: int = 0                   # 内容版本号（支持修订追踪）
+    # ── 任务域感知 ──
+    task_domain: str = "general"               # "code"|"research"|"creative"|"data"|"general"
 
     def add_file(self, name: str, path: str):
         """添加关联文件（去重）"""
@@ -69,6 +76,14 @@ class TaskNode:
             d["result"] = self.result
         if self.files:
             d["files"] = [f.to_dict() for f in self.files]
+        if self.analysis_content is not None:
+            d["analysis_content"] = self.analysis_content
+        if self.semantic_summary is not None:
+            d["semantic_summary"] = self.semantic_summary
+        if self.content_version > 0:
+            d["content_version"] = self.content_version
+        if self.task_domain != "general":
+            d["task_domain"] = self.task_domain
         return d
 
     @classmethod
@@ -82,6 +97,10 @@ class TaskNode:
             desc=data.get("desc", ""),
             result=data.get("result"),
             files=files,
+            analysis_content=data.get("analysis_content"),
+            semantic_summary=data.get("semantic_summary"),
+            content_version=data.get("content_version", 0),
+            task_domain=data.get("task_domain", "general"),
         )
 
 
@@ -122,6 +141,7 @@ class TaskGraph:
 
         self._nodes: Dict[str, TaskNode] = {}    # id -> TaskNode
         self._h_edges: List[Tuple[str, str]] = []  # 层级边 (parent, child)
+        self._h_edge_set: set = set()              # 去重索引
         self._d_edges: List[DependencyEdge] = []    # 依赖边
 
         self.parallel_groups: List[List[str]] = []  # Stage2 计算的并行组
@@ -130,32 +150,28 @@ class TaskGraph:
         # 节点变化回调（由 Orchestrator 注入，用于推送前端）
         self.on_change_callback: Optional[Callable] = None
 
+        # 线程锁：保护 _nodes / _h_edges / _d_edges 的并发访问
+        # （CRG 后台线程可能与 FC 主循环同时操作 TaskGraph）
+        self._lock = threading.RLock()
+
+        # 防抖自动保存（与 MemoryGraph 同策略）
+        self._dirty = False
+        self._auto_save_delay = 2          # 防抖延迟（秒）
+        self._auto_save_timer: Optional[threading.Timer] = None
+
     @property
     def address(self) -> str:
         """任务图谱的全局唯一地址"""
         return f"tg:{self.id}"
 
     def get_node_address(self, node_id: str) -> str:
-        """获取节点的完整层级地址
+        """获取节点的全局唯一地址
         
-        从根节点沿 h_edges 追溯到当前节点，拼接为路径。
-        例如: tg:tg_123/req/o1/o1_1
+        直接使用 node_id 作为路径后缀（node_id 本身已经是唯一标识）。
+        避免对 CRG 节点（ID 含路径如 'crg_proj/src/file.py'）产生重复拼接。
+        格式: tg:{graph_id}/{node_id}
         """
-        # 构建 child -> parent 映射
-        child_to_parent = {}
-        for s, t in self._h_edges:
-            child_to_parent[t] = s
-
-        # 从当前节点向上追溯到根
-        path_parts = [node_id]
-        current = node_id
-        visited = set()
-        while current in child_to_parent and current not in visited:
-            visited.add(current)
-            current = child_to_parent[current]
-            path_parts.insert(0, current)
-
-        return f"{self.address}/{'/'.join(path_parts)}"
+        return f"{self.address}/{node_id}"
 
     # ─── 节点操作 ───────────────────────────────────────────
 
@@ -168,14 +184,20 @@ class TaskGraph:
         desc: str = "",
         result: str = None,
         files: List[FileRef] = None,
+        task_domain: str = "general",
     ) -> TaskNode:
-        """添加节点"""
-        node = TaskNode(
-            id=id, label=label, type=type, status=status,
-            desc=desc, result=result, files=files or [],
-        )
-        self._nodes[id] = node
-        logger.debug(f"[TaskGraph] 添加节点: {id} ({label}, type={type}, status={status})")
+        """添加节点（线程安全）"""
+        with self._lock:
+            if id in self._nodes:
+                logger.warning(f"[TaskGraph] 节点 ID 重复: {id}，覆盖旧节点")
+            node = TaskNode(
+                id=id, label=label, type=type, status=status,
+                desc=desc, result=result, files=files or [],
+                task_domain=task_domain,
+            )
+            self._nodes[id] = node
+            logger.debug(f"[TaskGraph] 添加节点: {id} ({label}, type={type}, status={status}, domain={task_domain})")
+            self._mark_dirty()
         return node
 
     def add_file_to_node(self, node_id: str, file_name: str, file_path: str) -> bool:
@@ -194,19 +216,30 @@ class TaskGraph:
                 logger.debug(f"[TaskGraph] 文件回调失败（非致命）: {e}")
         return True
 
+    # 合法状态集合
+    VALID_STATUSES = frozenset({
+        "pending", "in_progress", "completed", "blocked",
+        "skipped", "needs_adjust", "waiting_input",
+    })
+
     def update_node_status(
         self, node_id: str, status: str, result: str = None
     ) -> bool:
-        """更新节点状态，触发变化回调"""
-        node = self._nodes.get(node_id)
-        if not node:
-            logger.warning(f"[TaskGraph] 节点 {node_id} 不存在")
+        """更新节点状态，触发变化回调（线程安全）"""
+        if status not in self.VALID_STATUSES:
+            logger.warning(f"[TaskGraph] 非法状态值: '{status}'，允许: {self.VALID_STATUSES}")
             return False
 
-        old_status = node.status
-        node.status = status
-        if result is not None:
-            node.result = result
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if not node:
+                logger.warning(f"[TaskGraph] 节点 {node_id} 不存在")
+                return False
+
+            old_status = node.status
+            node.status = status
+            if result is not None:
+                node.result = result
 
         logger.info(
             f"[TaskGraph] 节点状态更新: {node_id} {old_status} → {status}"
@@ -229,6 +262,9 @@ class TaskGraph:
         if status in ("completed", "skipped"):
             self._cascade_parent_status(node_id)
 
+        # 防抖自动保存
+        self._mark_dirty()
+
         return True
 
     def _cascade_parent_status(self, node_id: str):
@@ -236,6 +272,9 @@ class TaskGraph:
 
         当某节点的所有兄弟节点均为 completed/skipped 时，
         自动将父节点标记为 completed，并递归向上检查。
+
+        注意: req 节点不参与自动级联（由 FC 循环主动管理），
+        防止 CRG 等后台任务过早将 req 标记为 completed。
         """
         if getattr(self, '_cascading', False):
             return
@@ -243,6 +282,9 @@ class TaskGraph:
         try:
             parent_id = self.get_parent(node_id)
             if not parent_id:
+                return
+            # req 节点不参与自动级联 — 它是 FC 循环的根，由 agent 主动管理
+            if parent_id == "req":
                 return
             children = self.get_children(parent_id)
             if not children:
@@ -303,8 +345,18 @@ class TaskGraph:
                         break
             if mem_node is not None:
                 mem_node.metadata["task_status"] = status
-                if result is not None:
+                # 优先使用 semantic_summary 作为 MemoryGraph 的存储内容
+                # （比截断 result 更有语义价值）
+                task_node = self._nodes.get(node_id)
+                if task_node and task_node.semantic_summary:
+                    mem_node.metadata["task_result"] = task_node.semantic_summary[:500]
+                elif result is not None:
                     mem_node.metadata["task_result"] = result[:500]
+                # 存储分析内容的长度信息（指示是否有详细内容可加载）
+                if task_node and task_node.analysis_content:
+                    mem_node.metadata["has_analysis"] = True
+                    mem_node.metadata["analysis_length"] = len(task_node.analysis_content)
+                    mem_node.metadata["content_version"] = task_node.content_version
                 mem_node.last_accessed = time.time()
                 # 根据任务状态调整 MemoryGraph 激活值
                 _activation_map = {
@@ -343,9 +395,10 @@ class TaskGraph:
         return self.get_nodes_by_type("task")
 
     def get_children(self, parent_id: str) -> List[TaskNode]:
-        """获取某节点的直接子节点（从 h_edges 查找）"""
-        child_ids = [t for s, t in self._h_edges if s == parent_id]
-        return [self._nodes[cid] for cid in child_ids if cid in self._nodes]
+        """获取某节点的直接子节点（从 h_edges 查找），线程安全"""
+        with self._lock:
+            child_ids = [t for s, t in self._h_edges if s == parent_id]
+            return [self._nodes[cid] for cid in child_ids if cid in self._nodes]
 
     def get_leaf_nodes(self) -> List[TaskNode]:
         """获取所有叶子节点（没有子节点的非根节点）
@@ -353,21 +406,28 @@ class TaskGraph:
         叶子节点 = 不在任何 h_edge 的 source 侧 且 不是根节点(req)
         这些节点是实际需要执行的工作项。
         """
-        parent_ids = {s for s, t in self._h_edges}
-        return [
-            n for n in self._nodes.values()
-            if n.id not in parent_ids and n.id != "req"
+        with self._lock:
+            parent_ids = {s for s, t in self._h_edges}
+            return [
+                n for n in self._nodes.values()
+                if n.id not in parent_ids and n.id != "req"
         ]
 
     def get_node_depth(self, node_id: str) -> int:
-        """获取节点在树中的深度（从 req 到该节点的距离）"""
-        child_to_parent = {}
-        for s, t in self._h_edges:
-            child_to_parent[t] = s
+        """获取节点在树中的深度（从 req 到该节点的距离），线程安全"""
+        with self._lock:
+            child_to_parent = {}
+            for s, t in self._h_edges:
+                child_to_parent[t] = s
 
         depth = 0
         current = node_id
+        visited = set()
         while current in child_to_parent:
+            if current in visited:
+                logger.warning(f"[TaskGraph] 循环检测: 节点 {node_id} 的祖先链存在循环")
+                return depth
+            visited.add(current)
             current = child_to_parent[current]
             depth += 1
             if depth > 50:
@@ -384,10 +444,106 @@ class TaskGraph:
         mapping = {0: "requirement", 1: "analysis", 2: "outline", 3: "task"}
         return mapping.get(depth, "subtask")
 
+    def find_duplicate_node(self, label: str, desc: str = "",
+                            threshold: float = 0.8) -> Optional[str]:
+        """语义指纹去重：检测是否已有语义相似的节点
+
+        使用简单的字符集合 Jaccard 相似度，避免引入额外依赖。
+        如果存在相似节点，返回其 ID；否则返回 None。
+
+        Args:
+            label: 待添加节点的标签
+            desc: 待添加节点的描述
+            threshold: 相似度阈值（0-1），默认 0.8
+
+        Returns:
+            相似节点 ID，或 None
+        """
+        new_text = (label + " " + desc).strip().lower()
+        if not new_text:
+            return None
+        new_chars = set(new_text)
+
+        for nid, node in self._nodes.items():
+            if nid == "req":
+                continue
+            existing_text = (node.label + " " + node.desc).strip().lower()
+            if not existing_text:
+                continue
+            existing_chars = set(existing_text)
+            # Jaccard similarity on character sets
+            intersection = len(new_chars & existing_chars)
+            union = len(new_chars | existing_chars)
+            if union > 0 and intersection / union >= threshold:
+                logger.info(
+                    "[TaskGraph] 语义去重命中: '%s' ≈ '%s' (node=%s, sim=%.2f)",
+                    label, node.label, nid, intersection / union,
+                )
+                return nid
+        return None
+
     @property
     def nodes(self) -> List[TaskNode]:
         """所有节点列表"""
         return list(self._nodes.values())
+
+    def update_node_content(
+        self, node_id: str,
+        label: str = None, desc: str = None, result: str = None,
+        analysis_content: str = None, semantic_summary: str = None,
+    ) -> bool:
+        """修改节点的标签、描述或产出内容（仅修改传入的非 None 字段）
+
+        Args:
+            node_id: 节点 ID
+            label: 新标签（None 表示不修改）
+            desc: 新描述（None 表示不修改）
+            result: 新产出内容（None 表示不修改）
+            analysis_content: 分析正文（None 表示不修改）
+            semantic_summary: 语义摘要（None 表示不修改）
+
+        Returns:
+            修改是否成功
+        """
+        node = self._nodes.get(node_id)
+        if not node:
+            logger.warning(f"[TaskGraph] update_node_content: 节点 {node_id} 不存在")
+            return False
+
+        if label is not None:
+            node.label = label
+        if desc is not None:
+            node.desc = desc
+        if result is not None:
+            node.result = result
+        if analysis_content is not None:
+            node.analysis_content = analysis_content
+            node.content_version += 1
+        if semantic_summary is not None:
+            node.semantic_summary = semantic_summary
+
+        # 同步到 MemoryGraph
+        self._sync_node_to_memory_graph(node_id, node.status, result)
+
+        # 触发变化回调（推送到前端）
+        if self.on_change_callback:
+            try:
+                self.on_change_callback(
+                    "node_update",
+                    {
+                        "node_id": node_id,
+                        "label": node.label,
+                        "desc": node.desc,
+                        "result": node.result,
+                        "content_updated": True,
+                    },
+                )
+            except Exception as e:
+                logger.debug(f"[TaskGraph] update_node_content 回调失败（非致命）: {e}")
+
+        self._mark_dirty()
+        logger.info(f"[TaskGraph] 节点内容更新: {node_id}")
+        return True
 
     def remove_node(self, node_id: str) -> List[str]:
         """移除节点及其所有后代，清理相关边
@@ -445,14 +601,27 @@ class TaskGraph:
     # ─── 边操作 ─────────────────────────────────────────────
 
     def add_h_edge(self, source: str, target: str):
-        """添加层级边（父子关系）"""
-        self._h_edges.append((source, target))
+        """添加层级边（父子关系），线程安全，自动去重和自环检测"""
+        if source == target:
+            logger.warning(f"[TaskGraph] 禁止自环: {source} -> {target}")
+            return
+        with self._lock:
+            edge_key = (source, target)
+            if edge_key in self._h_edge_set:
+                return  # 已存在，跳过
+            self._h_edge_set.add(edge_key)
+            self._h_edges.append(edge_key)
+            self._mark_dirty()
 
     def add_d_edge(
         self, source: str, target: str, via: str = "", cross: bool = False
     ):
-        """添加依赖边（数据传递关系）"""
-        self._d_edges.append(DependencyEdge(s=source, t=target, via=via, cross=cross))
+        """添加依赖边（数据传递关系），线程安全"""
+        if source == target:
+            return
+        with self._lock:
+            self._d_edges.append(DependencyEdge(s=source, t=target, via=via, cross=cross))
+            self._mark_dirty()
 
     def get_dependencies(self, node_id: str) -> List[str]:
         """获取某节点的前置依赖节点 ID 列表"""
@@ -473,15 +642,20 @@ class TaskGraph:
     # ─── 导出 ───────────────────────────────────────────────
 
     def to_frontend_dict(self) -> dict:
-        """导出为前端 addTaskGraph() 兼容格式
+        """导出为前端 addTaskGraph() 兼容格式（线程安全快照）
 
         非叶子节点的 status 从子节点状态动态聚合（不修改原始数据）。
         每个节点附带完整层级地址。
         """
-        parent_ids = {s for s, t in self._h_edges}
+        with self._lock:
+            h_edges_snapshot = list(self._h_edges)
+            d_edges_snapshot = list(self._d_edges)
+            nodes_snapshot = list(self._nodes.values())
+
+        parent_ids = {s for s, t in h_edges_snapshot}
         aggregated_nodes = []
 
-        for n in self._nodes.values():
+        for n in nodes_snapshot:
             d = n.to_dict()
             # 非叶子、非模板节点 → 动态聚合 status
             if n.id in parent_ids and n.id not in ("req", "analysis"):
@@ -496,8 +670,9 @@ class TaskGraph:
             "graphAddress": self.address,
             "createdAt": int(self.created_at * 1000),
             "nodes": aggregated_nodes,
-            "hEdges": [list(e) for e in self._h_edges],
-            "dEdges": [e.to_dict() for e in self._d_edges],
+            "hEdges": [list(e) for e in h_edges_snapshot],
+            "dEdges": [e.to_dict() for e in d_edges_snapshot],
+            "code_anchors": self.metadata.get("code_anchors", {}),
         }
 
     def _aggregate_status(self, node_id: str, _nodes_with_children: set = None) -> str:
@@ -585,6 +760,36 @@ class TaskGraph:
                     f"| {child.id} | {prefix}{child.label} | {st} | {result_summary} |"
                 )
 
+    # ─── 防抖自动保存 ──────────────────────────────────────
+
+    def _mark_dirty(self):
+        """标记数据已变更，调度防抖保存
+
+        与 MemoryGraph 同策略：最后一次变更后延迟 _auto_save_delay 秒再落盘。
+        """
+        self._dirty = True
+        if self._auto_save_timer is not None:
+            self._auto_save_timer.cancel()
+        self._auto_save_timer = threading.Timer(
+            self._auto_save_delay, self._do_auto_save,
+        )
+        self._auto_save_timer.daemon = True
+        self._auto_save_timer.start()
+
+    def _do_auto_save(self):
+        """定时器回调：通过 task_tools 的备份机制落盘"""
+        if not self._dirty:
+            return
+        try:
+            import zulong.tools.task_tools as _tt
+            _graph_id = _tt._active_graph_id
+            if _graph_id:
+                _tt._backup_graph_to_disk(self, _graph_id)
+                self._dirty = False
+                logger.debug(f"[TaskGraph] 防抖自动保存完成: {self.title}")
+        except Exception as e:
+            logger.warning(f"[TaskGraph] 防抖自动保存失败: {e}")
+
     # ─── 序列化（挂起/恢复支持） ────────────────────────────
 
     def serialize(self) -> dict:
@@ -630,7 +835,9 @@ class TaskGraph:
         for edge in data.get("h_edges", []):
             src, tgt = edge[0], edge[1]
             if src in valid_node_ids and tgt in valid_node_ids:
-                graph._h_edges.append(tuple(edge))
+                edge_tuple = (src, tgt)
+                graph._h_edges.append(edge_tuple)
+                graph._h_edge_set.add(edge_tuple)
             else:
                 logger.warning(f"[TaskGraph] 层级边 {src}->{tgt} 引用不存在节点，已跳过")
 
@@ -835,3 +1042,130 @@ class TaskGraph:
             f"nodes={len(self._nodes)}, h_edges={len(self._h_edges)}, "
             f"d_edges={len(self._d_edges)})"
         )
+
+
+# ─── TaskScheduler: 依赖感知调度器 ──────────────────────────
+
+
+class TaskScheduler:
+    """基于依赖边（d_edges）的任务调度器
+
+    核心功能：
+    - 拓扑排序：Kahn 算法将叶节点按依赖关系分层（Tier 0 / 1 / 2 ...）
+    - 可执行检测：找出所有前置依赖已满足的 pending 叶节点
+    - 环检测：DFS 验证依赖图是否存在环路
+    """
+
+    def __init__(self, task_graph: TaskGraph):
+        self.tg = task_graph
+
+    def compute_execution_tiers(self) -> List[List[str]]:
+        """Kahn 算法拓扑排序，返回分层执行顺序
+
+        只处理叶节点（实际工作项），忽略中间节点。
+        同一层内的节点可以并行执行。
+
+        Returns:
+            [[tier0_ids], [tier1_ids], ...] — 按依赖层级排列
+        """
+        leaves = self.tg.get_leaf_nodes()
+        leaf_ids = {n.id for n in leaves}
+
+        # 构建叶节点之间的入度表（只关注叶→叶依赖）
+        in_degree: Dict[str, int] = {nid: 0 for nid in leaf_ids}
+        adj: Dict[str, List[str]] = {nid: [] for nid in leaf_ids}
+
+        for edge in self.tg._d_edges:
+            if edge.s in leaf_ids and edge.t in leaf_ids:
+                in_degree[edge.t] = in_degree.get(edge.t, 0) + 1
+                adj[edge.s].append(edge.t)
+
+        # Kahn 算法
+        tiers: List[List[str]] = []
+        queue = [nid for nid, deg in in_degree.items() if deg == 0]
+
+        while queue:
+            tiers.append(sorted(queue))  # 排序保证确定性
+            next_queue = []
+            for nid in queue:
+                for dep in adj.get(nid, []):
+                    in_degree[dep] -= 1
+                    if in_degree[dep] == 0:
+                        next_queue.append(dep)
+            queue = next_queue
+
+        # 没有依赖边的孤立叶节点如果未被分层，放入 Tier 0
+        covered = {nid for tier in tiers for nid in tier}
+        orphans = [nid for nid in leaf_ids if nid not in covered]
+        if orphans:
+            if tiers:
+                tiers[0] = sorted(set(tiers[0]) | set(orphans))
+            else:
+                tiers.append(sorted(orphans))
+
+        return tiers
+
+    def get_next_executable(self) -> List[str]:
+        """获取当前所有前置依赖已满足的可执行叶节点
+
+        Returns:
+            可立即执行的叶节点 ID 列表
+        """
+        leaves = self.tg.get_leaf_nodes()
+        result = []
+
+        for node in leaves:
+            if node.status not in ("pending", "blocked"):
+                continue
+            dep_ids = self.tg.get_dependencies(node.id)
+            # 无依赖或所有依赖已完成/跳过 → 可执行
+            all_met = all(
+                self.tg.get_node(d) is not None
+                and self.tg.get_node(d).status in ("completed", "skipped")
+                for d in dep_ids
+            )
+            if all_met:
+                result.append(node.id)
+
+        return result
+
+    def validate_dependencies(self) -> Tuple[bool, str]:
+        """DFS 检测依赖图是否存在环路
+
+        Returns:
+            (is_valid, message) — True 表示无环，False 表示有环并附带环路描述
+        """
+        leaves = self.tg.get_leaf_nodes()
+        leaf_ids = {n.id for n in leaves}
+
+        # 构建邻接表
+        adj: Dict[str, List[str]] = {nid: [] for nid in leaf_ids}
+        for edge in self.tg._d_edges:
+            if edge.s in leaf_ids and edge.t in leaf_ids:
+                adj[edge.s].append(edge.t)
+
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color = {nid: WHITE for nid in leaf_ids}
+        cycle_path: List[str] = []
+
+        def dfs(node: str) -> bool:
+            color[node] = GRAY
+            for neighbor in adj.get(node, []):
+                if neighbor not in color:
+                    continue
+                if color[neighbor] == GRAY:
+                    cycle_path.append(f"{node} → {neighbor}")
+                    return True  # 找到环
+                if color[neighbor] == WHITE:
+                    if dfs(neighbor):
+                        cycle_path.append(f"{node} → {neighbor}")
+                        return True
+            color[node] = BLACK
+            return False
+
+        for nid in leaf_ids:
+            if color[nid] == WHITE:
+                if dfs(nid):
+                    return (False, f"依赖图存在环路: {' , '.join(reversed(cycle_path))}")
+
+        return (True, "依赖图无环")

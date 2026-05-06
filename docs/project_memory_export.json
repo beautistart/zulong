@@ -1,0 +1,57 @@
+{
+  "export_version": "1.0",
+  "export_date": "2026-05-05",
+  "project": "zulong_beta4",
+  "memories": [
+    {
+      "id": "e1293305-737e-48cc-a360-50c29c709c1c",
+      "category": "project_introduction",
+      "title": "祖龙AI机器人系统概述",
+      "keywords": ["祖龙", "AI机器人", "internvl", "模型推理", "生产就绪"],
+      "content": "**项目定位**: 祖龙（ZULONG）是面向AI机器人的生产级系统，提供模型推理与智能交互能力\n\n**核心功能特征**: \n- 支持 `internvl` 等多模态大模型加载与推理\n- 内置健康检查端点 `/health`\n- 模块化设计：`zulong/`（主代码）、`examples/`（示例）、`scripts/`（运维脚本）、`config/`（配置）\n- 强调生产就绪：日志分级（INFO）、检查点持久化、资源限制（16GB内存/4核CPU）"
+    },
+    {
+      "id": "e20e8571-bd5d-49dd-a7c7-930988f42c65",
+      "category": "project_introduction",
+      "title": "项目功能树",
+      "keywords": ["功能树", "祖龙AI机器人", "记忆图谱", "任务编排", "多模态感知"],
+      "content": "```mermaid\ngraph TD\n    A[祖龙AI机器人系统] --> B[智能体核心能力]\n    A --> C[系统工程能力]\n    A --> D[开发者支持体系]\n    B --> B1[多模态感知]\n    B --> B2[分层认知推理]\n    B --> B3[任务编排执行]\n    B --> B4[记忆图谱管理]\n    B --> B5[复盘学习机制]\n    B1 --> B1a[视觉处理]\n    B1 --> B1b[语音交互]\n    B1 --> B1c[手势识别]\n    B2 --> B2a[三层注意力机制]\n    B2 --> B2b[模型自路由]\n    B3 --> B3a[任务创建]\n    B3 --> B3b[任务挂起/恢复]\n    B3 --> B3c[任务图谱编排]\n    B4 --> B4a[长期记忆]\n    B4 --> B4b[短期记忆]\n    B4 --> B4c[经验存储]\n    B5 --> B5a[实时纠错]\n    B5 --> B5b[经验生成]\n    B5 --> B5c[状态同步复盘]\n    C --> C1[生产就绪部署]\n    C --> C2[全链路监控]\n    C --> C3[深度诊断分析]\n    C --> C4[自动化测试]\n    C1 --> C1a[Docker容器化]\n    C1 --> C1b[WSL2兼容部署]\n    C2 --> C2a[Web实时监控]\n    C2 --> C2b[事件总线追踪]\n    C3 --> C3a[内存泄漏诊断]\n    C3 --> C3b[上下文溢出分析]\n    C4 --> C4a[复杂任务测试]\n    C4 --> C4b[模型性能压测]\n    D --> D1[ZULONG IDE]\n    D --> D2[技能插件生态]\n    D --> D3[代码锚定与CRG]\n    D1 --> D1a[中文本地化]\n    D1 --> D1b[插件开发框架]\n    D2 --> D2a[技能包管理]\n    D2 --> D2b[第三方工具集成]\n    D3 --> D3a[跨文件依赖索引]\n    D3 --> D3b[TASK-代码符号映射]\n```"
+    },
+    {
+      "id": "7512e76e-eeaf-4580-ad9b-9c2d7b65b113",
+      "category": "project_introduction",
+      "title": "index_code_file 工具定位与触发场景",
+      "keywords": ["index_code_file", "代码图谱", "项目理解", "自动索引", "手动索引"],
+      "content": "index_code_file 是 LLM 在理解新项目阶段主动构建代码记忆的核心入口工具，适用于 read_file 后手动索引关键文件；而 write_to_file/replace_in_file 后由系统自动触发索引，无需手动调用。"
+    },
+    {
+      "id": "c385c8a6-bcb3-426b-a717-0f26f32b2dd3",
+      "category": "project_introduction",
+      "title": "祖龙系统CRG与代码锚定现状分析",
+      "keywords": ["祖龙系统", "CRG", "代码锚定", "BFS激活", "TASK", "CODE_SYMBOL"],
+      "content": "祖龙系统代码记忆化实现了约70%的设计：已完成代码解析、单文件依赖、代码锚点、元数据存储、部分BFS激活；部分完成多文件依赖（仅全量）、TASK关联（仅元数据）；缺失跨文件增量索引、图边显式投射。核心缺口包括：1) TASK→CODE_SYMBOL边投射缺失，导致BFS传播不稳定；2) 跨文件import边构建缺失；3) 增量同步中跨文件calls缺失。"
+    },
+    {
+      "id": "00a717d0-0127-4e60-ad41-11defa15bbd4",
+      "category": "project_rule",
+      "title": "Zulong IDE项目上下文说明agents.md",
+      "keywords": ["Zulong IDE", "VS Code插件", "WebSocket", "FastAPI", "React"],
+      "content": "**使用场景**：在Zulong IDE项目中进行开发、调试或理解系统架构时。\n\n**概要**：Zulong IDE是基于Cline v3.82.0的VS Code插件，采用React+Vite前端、TypeScript扩展、Python FastAPI+WebSocket后端，通信地址为ws://127.0.0.1:8090/ide，配置文件为config/zulong_config.yaml。\n\n**获取详情方式**：使用read_file工具，从根目录读取agents.md"
+    },
+    {
+      "id": "722b7fde-b4e9-4c88-8d0a-34f1315d9e38",
+      "category": "project_tech_stack",
+      "title": "祖龙系统技术栈",
+      "keywords": ["Python 3.10", "CUDA 11.7", "CUDNN 8", "多阶段构建", "非root用户"],
+      "content": "**开发语言与核心依赖**: Python 3.10\n\n**AI运行时栈**: NVIDIA CUDA 11.7 + CUDNN 8（Ubuntu 22.04 runtime）\n\n**关键库依赖**: 通过 `requirements.txt` 安装，含深度学习/计算机视觉相关包（由 `internvl` 模型路径及 `libglib2.0-0`/`libsm6` 等GUI兼容库推断）\n\n**基础镜像策略**: 多阶段构建（builder → runtime），安全实践：非root用户 `zulong` 运行"
+    },
+    {
+      "id": "ce23bc5d-5d42-4f10-a38f-7a5a97503843",
+      "category": "project_environment_configuration",
+      "title": "祖龙系统运行环境与监控配置",
+      "keywords": ["ZULONG_MODEL_PATH", "/models", "GPU配置", "Prometheus", "Grafana"],
+      "content": "**核心环境变量**: `ZULONG_MODEL_PATH=/models`, `ZULONG_DATA_PATH=/data`, `ZULONG_LOG_PATH=/logs`, `ZULONG_ENV=production`, `ZULONG_LOG_LEVEL=INFO`\n\n**默认端口**: `8000`（API服务），`9090`（Prometheus），`3000`（Grafana），`3100`（Loki）\n\n**必需卷挂载**: `/models`（ro）、`/data`、`/logs`、`/checkpoints`\n\n**GPU配置**: `NVIDIA_VISIBLE_DEVICES=all`（Dockerfile）+ `count: 1`（docker-compose）\n\n**监控栈**: Prometheus（指标采集）、Grafana（可视化，预置仪表盘）、Loki（日志聚合）\n\n**启动入口**: `/entrypoint.sh` → `python -m zulong.bootstrap`"
+    }
+  ],
+  "import_instructions": "在新账号中，使用 update_memory 工具逐条写入每个记忆条目。示例：update_memory(action='add', category=item.category, title=item.title, content=item.content, keywords=item.keywords)"
+}

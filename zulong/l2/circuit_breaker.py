@@ -47,7 +47,7 @@ class ToolCallCircuitBreaker:
 
     # 搜索类工具名称（用于信号 2 的查询相似度检测）
     SEARCH_TOOL_NAMES = {
-        "web_search", "search", "searxng_search", "openclaw_search",
+        "web_search", "search", "searxng_search",
         "search_web", "google_search", "bing_search"
     }
 
@@ -55,9 +55,12 @@ class ToolCallCircuitBreaker:
     SEARCH_QUERY_KEYS = {"query", "q", "search_query", "keyword", "keywords"}
 
     # 规划构建类工具（规划模式下豁免模式循环检测）
+    # 包含编排层 (plan_*) 和 IDE 层 (task_*) 两套工具名
     PLANNING_TOOL_NAMES = {
         "plan_add_node", "plan_mark_status", "plan_add_dependency",
-        "view_graph_overview", "exec_write_file", "exec_run_command",
+        "task_add_node", "task_mark_status", "task_create_plan",
+        "view_graph_overview", "task_view_overview",
+        "exec_write_file", "exec_run_command",
         "submit_final_answer", "start_task_plan"
     }
 
@@ -75,8 +78,15 @@ class ToolCallCircuitBreaker:
         "navigate_attention",
     }
 
+    # 终结类工具（重复调用豁免 _signal_repetition 检测）
+    # 模型重试这些工具通常是因为安全网拦截后被迫继续，不是死循环
+    TERMINAL_TOOLS = {
+        "submit_final_answer", "attempt_completion",
+    }
+
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}
+        self._config = cfg  # 保存原始配置，供克隆时复用
         self.enabled = cfg.get("enabled", True)
 
         # 安全硬顶：绝对上限
@@ -226,6 +236,7 @@ class ToolCallCircuitBreaker:
             reasons = "; ".join(r for _, r in reds)
             self._consecutive_yellow_count = 0
             logger.warning(f"[CircuitBreaker] RED 触发 (iter={iteration}): {reasons}")
+            self._publish_state_change(CircuitBreakerState.RED, reasons, iteration)
             return CircuitBreakerState.RED, reasons
 
         # 任一 YELLOW → 累计 yellow，连续 N 次 YELLOW 升级为 RED
@@ -237,14 +248,35 @@ class ToolCallCircuitBreaker:
                 upgrade_reason = f"连续 {self._consecutive_yellow_count} 次 YELLOW 警告，升级为 RED: {reasons}"
                 logger.warning(f"[CircuitBreaker] YELLOW→RED 升级 (iter={iteration}): {upgrade_reason}")
                 self._consecutive_yellow_count = 0
+                self._publish_state_change(CircuitBreakerState.RED, upgrade_reason, iteration)
                 return CircuitBreakerState.RED, upgrade_reason
 
             logger.info(f"[CircuitBreaker] YELLOW (iter={iteration}, 连续第{self._consecutive_yellow_count}次): {reasons}")
+            self._publish_state_change(CircuitBreakerState.YELLOW, reasons, iteration)
             return CircuitBreakerState.YELLOW, reasons
 
         # 全部 GREEN
         self._consecutive_yellow_count = 0
         return CircuitBreakerState.GREEN, ""
+
+    def _publish_state_change(self, state: CircuitBreakerState, reason: str, iteration: int):
+        """发布 CB 状态变更事件到 EventBus → WebBridge → 仪表盘"""
+        try:
+            from zulong.core.event_bus import event_bus
+            from zulong.core.types import EventType, ZulongEvent
+            payload = {
+                "component": "CircuitBreaker",
+                "state": state.value,
+                "reason": reason,
+                "iteration": iteration,
+                "call_history_len": len(self._call_history),
+                "planning_mode": self._planning_mode,
+                "timestamp": time.time(),
+            }
+            event = ZulongEvent(type=EventType("SYSTEM_STATUS"), payload=payload)
+            event_bus.publish(event)
+        except Exception:
+            pass
 
     # ==================== 信号评估器 ====================
 
@@ -255,6 +287,10 @@ class ToolCallCircuitBreaker:
 
         window = self._call_history[-self._repetition_window:]
         if len(window) < 2:
+            return CircuitBreakerState.GREEN, ""
+
+        # 终结类工具 + 规划类工具豁免
+        if window[-1].function_name in self.TERMINAL_TOOLS | self.PLANNING_TOOL_NAMES:
             return CircuitBreakerState.GREEN, ""
 
         # 检查最近 N 次是否 function_name + params_hash 完全一致
@@ -279,8 +315,9 @@ class ToolCallCircuitBreaker:
         from collections import Counter
         tool_counts = Counter(r.function_name for r in window)
         for tool_name, count in tool_counts.items():
-            # 规划模式下，规划类工具豁免模式循环检测
-            if self._planning_mode and tool_name in self.PLANNING_TOOL_NAMES:
+            # 规划/行动类工具完全豁免模式循环检测
+            # 超复杂长程任务中，task_add_node 等可能调用上万次
+            if tool_name in self.PLANNING_TOOL_NAMES:
                 continue
 
             if count >= self._pattern_red_count:

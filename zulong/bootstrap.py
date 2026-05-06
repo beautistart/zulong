@@ -282,7 +282,15 @@ class SystemBootstrap:
             # 注册回调：复盘触发时调用 ReplayIntegration
             replay_integration = get_replay_integration()
             self.review_trigger.register_callback(
-                TriggerType.USER_ACTIVE,  # 🔥 v3.0 修复：使用枚举类型
+                TriggerType.USER_ACTIVE,
+                replay_integration.on_replay_triggered
+            )
+            self.review_trigger.register_callback(
+                TriggerType.QUIET_MODE,
+                replay_integration.on_replay_triggered
+            )
+            self.review_trigger.register_callback(
+                TriggerType.NIGHT_SCHEDULE,
                 replay_integration.on_replay_triggered
             )
             
@@ -317,6 +325,27 @@ class SystemBootstrap:
                     logger.info("✅ [BOOTSTRAP] MemoryGraph 修剪循环已启动")
                 except Exception as prune_err:
                     logger.warning(f"⚠️ [BOOTSTRAP] MemoryGraph 修剪循环启动失败: {prune_err}")
+            
+            # 启动 MemoryEvolutionEngine 进化循环（巩固、遗忘、清理）
+            try:
+                from zulong.memory.memory_evolution import (
+                    get_evolution_engine, set_evolution_engine, MemoryEvolutionEngine
+                )
+                evo_engine = get_evolution_engine()
+                if evo_engine is None:
+                    # ExpertInvoker 尚未创建，直接用 inference_engine.rag_manager 初始化
+                    _rag = getattr(inference_engine, 'rag_manager', None)
+                    if _rag is not None:
+                        evo_engine = MemoryEvolutionEngine(_rag)
+                        set_evolution_engine(evo_engine)
+                        logger.info("✅ [BOOTSTRAP] MemoryEvolutionEngine 在 bootstrap 中直接创建")
+                if evo_engine:
+                    asyncio.create_task(evo_engine.start_evolution_loop())
+                    logger.info("✅ [BOOTSTRAP] MemoryEvolutionEngine 进化循环已启动")
+                else:
+                    logger.warning("⚠️ [BOOTSTRAP] MemoryEvolutionEngine 未初始化（RAG 不可用），跳过进化循环")
+            except Exception as evo_err:
+                logger.warning(f"⚠️ [BOOTSTRAP] MemoryEvolutionEngine 启动失败: {evo_err}")
             
             # 检查是否启用摄像头
             if not ENABLE_CAMERA:

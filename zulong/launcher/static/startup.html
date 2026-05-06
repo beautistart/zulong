@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>祖龙 - 统一启动器</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);color:#e2e8f0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.header{text-align:center;margin-bottom:2.5rem}
+.header h1{font-size:2rem;background:linear-gradient(135deg,#667eea,#764ba2);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:.5rem}
+.header p{color:#94a3b8;font-size:.95rem}
+/* Phase 1: Mode Selection */
+#phase-select{display:flex;gap:2rem;flex-wrap:wrap;justify-content:center}
+.mode-card{background:#1e293b;border:2px solid #334155;border-radius:16px;padding:2rem;width:340px;cursor:pointer;transition:all .3s;position:relative;overflow:hidden}
+.mode-card:hover{border-color:#667eea;transform:translateY(-4px);box-shadow:0 12px 40px rgba(102,126,234,.2)}
+.mode-card.selected{border-color:#667eea;box-shadow:0 0 20px rgba(102,126,234,.3)}
+.mode-card h2{font-size:1.3rem;margin-bottom:.5rem;display:flex;align-items:center;gap:.5rem}
+.mode-card .tag{font-size:.7rem;padding:2px 8px;border-radius:10px;background:#334155;color:#94a3b8}
+.mode-card .desc{color:#94a3b8;font-size:.85rem;margin-bottom:1rem;line-height:1.6}
+.mode-card ul{list-style:none;margin-bottom:1.5rem}
+.mode-card li{font-size:.85rem;color:#cbd5e1;padding:4px 0;display:flex;align-items:center;gap:.5rem}
+.mode-card li::before{content:'';display:inline-block;width:6px;height:6px;border-radius:50%;background:#667eea;flex-shrink:0}
+.mode-card li.disabled{color:#64748b}
+.mode-card li.disabled::before{background:#475569}
+.btn-launch{width:100%;padding:.75rem;border:none;border-radius:10px;font-size:1rem;font-weight:600;cursor:pointer;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;transition:opacity .2s}
+.btn-launch:hover{opacity:.9}
+/* Phase 2: Progress */
+#phase-progress{display:none;width:100%;max-width:600px;padding:0 1rem}
+.progress-header{text-align:center;margin-bottom:2rem}
+.progress-header h2{font-size:1.5rem;margin-bottom:.5rem}
+.progress-bar-wrap{background:#334155;border-radius:8px;height:8px;overflow:hidden;margin-bottom:.5rem}
+.progress-bar{height:100%;background:linear-gradient(90deg,#667eea,#764ba2);border-radius:8px;transition:width .5s ease;width:0}
+.progress-percent{text-align:right;font-size:.8rem;color:#94a3b8}
+.module-list{margin-bottom:1.5rem}
+.module-item{display:flex;align-items:center;gap:.75rem;padding:.6rem .75rem;border-radius:8px;margin-bottom:.25rem;background:#0f172a;transition:background .3s}
+.module-item.active{background:#1e293b;box-shadow:inset 0 0 0 1px #667eea}
+.module-item .dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;transition:background .3s}
+.dot.unloaded{background:#475569}
+.dot.starting{background:#f59e0b;animation:pulse 1s infinite}
+.dot.running{background:#22c55e}
+.dot.error{background:#ef4444}
+.module-item .name{flex:1;font-size:.9rem}
+.module-item .status{font-size:.75rem;color:#94a3b8}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.log-area{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:.75rem;max-height:120px;overflow-y:auto;font-family:'Fira Code',monospace;font-size:.75rem;color:#64748b;line-height:1.6}
+/* Phase 3: Complete */
+#phase-complete{display:none;text-align:center}
+#phase-complete h2{font-size:1.5rem;color:#22c55e;margin-bottom:.5rem}
+#phase-complete p{color:#94a3b8}
+.footer{margin-top:2rem;text-align:center;color:#475569;font-size:.75rem}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>ZULONG</h1>
+  <p>祖龙智能系统 - 统一启动器</p>
+</div>
+
+<!-- Phase 1: Mode Selection -->
+<div id="phase-select">
+  <div class="mode-card" onclick="selectMode('full')">
+    <h2>Full 模式 <span class="tag">完整系统</span></h2>
+    <p class="desc">包含完整硬件接入和所有智能层，适合机器人/桌面全功能运行。</p>
+    <ul>
+      <li>L0 硬件层 (摄像头/麦克风)</li>
+      <li>L1 反射/调度/视觉层</li>
+      <li>L2 推理引擎 + 记忆图谱</li>
+      <li>IDE 服务 (FC 循环)</li>
+      <li>复盘系统 + 记忆进化</li>
+      <li>技能包运行时</li>
+    </ul>
+    <button class="btn-launch" onclick="doLaunch('full')">启动 Full 模式</button>
+  </div>
+
+  <div class="mode-card" onclick="selectMode('ide')">
+    <h2>IDE 模式 <span class="tag">轻量级</span></h2>
+    <p class="desc">仅核心推理和 IDE 服务，无硬件依赖，适合纯编程场景。</p>
+    <ul>
+      <li>L2 推理引擎 + 记忆图谱</li>
+      <li>IDE 服务 (FC 循环)</li>
+      <li>事件总线 (EventBus)</li>
+      <li class="disabled">L0 硬件层 (不启动)</li>
+      <li class="disabled">L1 反射/调度层 (不启动)</li>
+      <li class="disabled">复盘/进化 (不启动)</li>
+    </ul>
+    <button class="btn-launch" onclick="doLaunch('ide')">启动 IDE 模式</button>
+  </div>
+</div>
+
+<!-- Phase 2: Progress -->
+<div id="phase-progress">
+  <div class="progress-header">
+    <h2 id="progress-title">正在启动...</h2>
+    <div class="progress-bar-wrap"><div class="progress-bar" id="progress-bar"></div></div>
+    <div class="progress-percent" id="progress-percent">0%</div>
+  </div>
+  <div class="module-list" id="module-list"></div>
+  <div class="log-area" id="log-area"></div>
+</div>
+
+<!-- Phase 3: Complete -->
+<div id="phase-complete">
+  <h2>启动完成</h2>
+  <p>正在跳转到控制面板...</p>
+</div>
+
+<div class="footer">原有启动方式 (bootstrap.py / cline_ide_server.py) 仍可独立使用</div>
+
+<script>
+let ws = null;
+let selectedMode = null;
+let launching = false;
+let pollTimer = null;
+
+function selectMode(mode) {
+  selectedMode = mode;
+  document.querySelectorAll('.mode-card').forEach(c => c.classList.remove('selected'));
+  event.currentTarget.closest('.mode-card').classList.add('selected');
+}
+
+function doLaunch(mode) {
+  event.stopPropagation();
+  if (launching) return;
+  launching = true;
+
+  // Switch to progress phase
+  document.getElementById('phase-select').style.display = 'none';
+  document.getElementById('phase-progress').style.display = 'block';
+  document.getElementById('progress-title').textContent =
+    (mode === 'full' ? 'Full' : 'IDE') + ' 模式启动中...';
+
+  // Connect progress WebSocket
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(protocol + '//' + location.host + '/ws/progress');
+  ws.onmessage = function(ev) {
+    const msg = JSON.parse(ev.data);
+    handleProgressMsg(msg);
+  };
+  ws.onerror = function() { addLog('WebSocket 连接失败'); };
+  ws.onclose = function() {
+    addLog('进度连接已断开，切换到轮询模式...');
+    startStatusPolling();
+  };
+
+  // POST launch
+  fetch('/api/launch', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({mode: mode})
+  }).then(r => r.json()).then(d => {
+    if (d.error) addLog('启动错误: ' + d.error);
+  }).catch(e => addLog('请求失败: ' + e));
+
+  // 同时启动轮询兜底（防止 WebSocket 丢消息）
+  startStatusPolling();
+}
+
+function startStatusPolling() {
+  if (pollTimer) return;
+  pollTimer = setInterval(function() {
+    fetch('/api/status').then(r => r.json()).then(d => {
+      if (d.phase === 'running') {
+        clearInterval(pollTimer);
+        pollTimer = null;
+        doRedirect();
+      }
+    }).catch(function() {});
+  }, 2000);
+}
+
+function doRedirect() {
+  if (ws) { try { ws.close(); } catch(e) {} }
+  document.getElementById('phase-progress').style.display = 'none';
+  document.getElementById('phase-complete').style.display = 'block';
+  // 带时间戳参数避免缓存
+  setTimeout(function() { window.location.href = '/?t=' + Date.now(); }, 1500);
+}
+
+function handleProgressMsg(msg) {
+  if (msg.type === 'STATUS' || msg.type === 'PROGRESS') {
+    const p = msg.payload;
+    if (p.percent !== undefined) {
+      document.getElementById('progress-bar').style.width = p.percent + '%';
+      document.getElementById('progress-percent').textContent = p.percent + '%';
+    }
+    if (p.message) addLog(p.message);
+    if (p.modules) renderModules(p.modules);
+  } else if (msg.type === 'LAUNCH_COMPLETE') {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    doRedirect();
+  } else if (msg.type === 'LAUNCH_ERROR') {
+    addLog('启动失败: ' + (msg.payload.error || '未知错误'));
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    launching = false;
+  }
+}
+
+function renderModules(modules) {
+  const list = document.getElementById('module-list');
+  list.innerHTML = '';
+  for (const [name, info] of Object.entries(modules)) {
+    const state = info.state || 'unloaded';
+    const active = state === 'starting' ? ' active' : '';
+    list.innerHTML += '<div class="module-item' + active + '">' +
+      '<span class="dot ' + state + '"></span>' +
+      '<span class="name">' + (info.display_name || name) + '</span>' +
+      '<span class="status">' + stateLabel(state) + '</span></div>';
+  }
+}
+
+function stateLabel(s) {
+  const map = {unloaded:'等待',starting:'启动中',running:'运行中',stopped:'已停止',error:'错误'};
+  return map[s] || s;
+}
+
+function addLog(text) {
+  const area = document.getElementById('log-area');
+  const time = new Date().toLocaleTimeString();
+  area.innerHTML += '<div>[' + time + '] ' + text + '</div>';
+  area.scrollTop = area.scrollHeight;
+}
+</script>
+
+</body>
+</html>

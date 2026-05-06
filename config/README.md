@@ -164,7 +164,7 @@ vision:
     device_index: 1
   
   yolo:
-    model_path: "yolov10n.pt"
+    model_path: "models/yolov10n.pt"
     device: "cuda"
 ```
 

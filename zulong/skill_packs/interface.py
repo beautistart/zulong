@@ -40,7 +40,7 @@ class SkillPackManifest:
     dependencies: List[str] = field(default_factory=list)  # 依赖的Python包
     resource_requirements: Dict[str, int] = field(default_factory=lambda: {"cpu_mb": 512, "gpu_mb": 0})
     learning_objectives: List[str] = field(default_factory=list)  # 学习目标，用于内化评估
-    source: str = "custom"                          # 来源: "custom" / "cline" 等
+    source: str = "custom"                          # 来源: "custom" / "ide" 等
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""

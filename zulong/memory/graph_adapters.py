@@ -205,6 +205,12 @@ class TaskGraphAdapter(BaseGraphAdapter):
                 metadata={"via": dep_edge.via, "cross": dep_edge.cross},
             )
 
+        # ── 代码锚定: TASK → CODE_SYMBOL 显式图边 ──
+        # 全量同步时，根据 TaskGraph 的 code_anchors 元数据投射边
+        code_anchors_map = getattr(source, 'metadata', {}).get("code_anchors", {})
+        if code_anchors_map:
+            self._project_task_code_edges(graph, source, code_anchors_map, parent_prefix, graph_id)
+
         return count
 
     def incremental_sync(self, graph: MemoryGraph, event_type: str, data: dict):
@@ -252,8 +258,13 @@ class TaskGraphAdapter(BaseGraphAdapter):
             gnode = graph.get_node(mg_id)
             if gnode:
                 gnode.metadata["status"] = data.get("status", gnode.metadata.get("status"))
-                if data.get("result"):
+                # 优先使用 semantic_summary，其次 result 截断
+                if data.get("semantic_summary"):
+                    gnode.metadata["result_preview"] = data["semantic_summary"][:200]
+                elif data.get("result"):
                     gnode.metadata["result_preview"] = data["result"][:100]
+                if data.get("content_updated"):
+                    gnode.metadata["has_analysis"] = True
                 gnode.last_accessed = time.time()
 
         elif event_type == "h_edge_add":
@@ -271,6 +282,235 @@ class TaskGraphAdapter(BaseGraphAdapter):
                 EdgeType.DEPENDENCY, weight=1.0, protected=True,
                 metadata={"via": data.get("via", "")},
             )
+
+    def _project_task_code_edges(
+        self, graph: MemoryGraph, source: Any,
+        code_anchors_map: dict, parent_prefix: str, graph_id: str,
+    ) -> None:
+        """全量同步时投射 TASK → CODE_SYMBOL 显式图边
+
+        code_anchors_map: {task_node_id: [anchor_id, ...]}
+        通过 CodeAnchorStore 查询锚点详情，找到对应 CODE_SYMBOL 节点。
+        """
+        try:
+            from zulong.memory.code_anchor import get_code_anchor_store
+        except ImportError:
+            return
+
+        store = get_code_anchor_store()
+        edge_count = 0
+
+        for task_node_id, anchor_ids in code_anchors_map.items():
+            # 构建 MemoryGraph 中的 TASK 节点 ID
+            if parent_prefix:
+                task_mg_id = f"{parent_prefix}/{task_node_id}"
+            elif graph_id:
+                task_mg_id = f"task:{graph_id}/{task_node_id}"
+            else:
+                task_mg_id = f"task:{task_node_id}"
+
+            if not graph.has_node(task_mg_id):
+                continue
+
+            for anchor_id in anchor_ids:
+                anchor = store.get_anchor(anchor_id) if hasattr(store, 'get_anchor') else None
+                if anchor is None:
+                    # fallback: 遍历查找
+                    for a in store._anchors.values():
+                        if a.id == anchor_id:
+                            anchor = a
+                            break
+                if anchor is None or not anchor.symbol:
+                    continue
+
+                # 在 MemoryGraph 中查找对应 CODE_SYMBOL
+                fp = anchor.file_path.replace("\\", "/")
+                for nid, nd in graph._nodes.items():
+                    if nd.node_type != NodeType.CODE_SYMBOL:
+                        continue
+                    if nd.metadata.get("file_path") == fp and \
+                       nd.label.endswith(anchor.symbol):
+                        graph.add_edge(
+                            task_mg_id, nid,
+                            edge_type=EdgeType.REFERENCE,
+                            weight=0.9,
+                            metadata={
+                                "relation": "anchored_to",
+                                "anchor_type": anchor.anchor_type,
+                                "anchor_id": anchor.id,
+                            },
+                        )
+                        edge_count += 1
+                        break
+
+        if edge_count:
+            logger.info(
+                f"[TaskGraphAdapter] 锚定投射: {edge_count} 条 TASK→CODE_SYMBOL 边"
+            )
+
+
+# ============================================================
+# TaskGraph 从 MemoryGraph 重建（轻量级恢复路径）
+# ============================================================
+
+def rebuild_task_graph_from_memory(mg: MemoryGraph, graph_id: str):
+    """从 MemoryGraph 中重建 TaskGraph 运行时对象（无需磁盘 I/O）
+
+    通过遍历 MemoryGraph 中 graph_id 对应的 TASK 节点及 HIERARCHY/DEPENDENCY
+    边来还原完整的 TaskGraph 结构。这是轻量级恢复路径——当 LLM 通过节点地址
+    引用一个历史任务时，无需从 JSON 文件反序列化即可恢复执行。
+
+    Args:
+        mg: MemoryGraph 实例
+        graph_id: 任务图谱 ID（如 "tg_1234567890"）
+
+    Returns:
+        TaskGraph 实例，如果重建失败返回 None
+    """
+    from zulong.l2.task_graph import TaskGraph, TaskNode, DependencyEdge
+
+    # 1. 收集属于该 graph_id 的所有 TASK 节点
+    task_nodes = []
+    for node in mg._nodes.values():
+        if (node.node_type == NodeType.TASK
+                and node.metadata.get("graph_id") == graph_id):
+            task_nodes.append(node)
+
+    if len(task_nodes) < 1:
+        # MemoryGraph 中无足够数据，降级到磁盘备份
+        return _fallback_load_from_disk(graph_id)
+
+    # 2. 识别根节点并收集节点 mg_id -> local_id 映射
+    mg_id_to_local: Dict[str, str] = {}
+    root_local_id = None
+    root_label = ""
+
+    for gnode in task_nodes:
+        # 从 graph_address 提取本地 node_id
+        # 格式: "tg:{graph_id}/task:{node_id}" 或 "tg:{graph_id}/{node_id}"
+        local_id = _extract_local_id(gnode, graph_id)
+        if not local_id:
+            continue
+        mg_id_to_local[gnode.node_id] = local_id
+
+        # 根节点判定
+        if (gnode.metadata.get("sub_type") == "task_root"
+                or local_id == "req"):
+            root_local_id = local_id
+            root_label = gnode.label
+
+    if not root_local_id:
+        # 无法确定根节点，降级
+        return _fallback_load_from_disk(graph_id)
+
+    # 3. 构建 TaskGraph
+    tg = TaskGraph(title=root_label, graph_id=graph_id)
+
+    # 从 GraphNode metadata 还原 TaskNode
+    for gnode in task_nodes:
+        local_id = mg_id_to_local.get(gnode.node_id)
+        if not local_id:
+            continue
+        meta = gnode.metadata
+        task_node = TaskNode(
+            id=local_id,
+            label=gnode.label,
+            type=meta.get("type", "task"),
+            status=meta.get("status", "pending"),
+            desc=meta.get("desc", ""),
+            result=meta.get("task_result") or meta.get("result_preview"),
+            semantic_summary=meta.get("semantic_summary"),
+            analysis_content=meta.get("analysis_content"),
+            content_version=meta.get("content_version", 0),
+            task_domain=meta.get("task_domain", "general"),
+        )
+        tg._nodes[local_id] = task_node
+
+    # 4. 从 HIERARCHY 边重建 h_edges
+    local_ids_set = set(mg_id_to_local.keys())
+    for mg_id in local_ids_set:
+        try:
+            for _, neighbor, data in mg._graph.out_edges(mg_id, data=True):
+                if (data.get("edge_type") == EdgeType.HIERARCHY.value
+                        and neighbor in local_ids_set):
+                    parent_local = mg_id_to_local[mg_id]
+                    child_local = mg_id_to_local[neighbor]
+                    edge_tuple = (parent_local, child_local)
+                    if edge_tuple not in tg._h_edge_set:
+                        tg._h_edges.append(edge_tuple)
+                        tg._h_edge_set.add(edge_tuple)
+        except Exception:
+            pass
+
+    # 5. 从 DEPENDENCY 边重建 d_edges
+    for mg_id in local_ids_set:
+        try:
+            for _, neighbor, data in mg._graph.out_edges(mg_id, data=True):
+                if (data.get("edge_type") == EdgeType.DEPENDENCY.value
+                        and neighbor in local_ids_set):
+                    s_local = mg_id_to_local[mg_id]
+                    t_local = mg_id_to_local[neighbor]
+                    dep_meta = data.get("metadata", {}) if isinstance(data.get("metadata"), dict) else {}
+                    dep = DependencyEdge(
+                        s=s_local, t=t_local,
+                        via=dep_meta.get("via", ""),
+                        cross=dep_meta.get("cross", False),
+                    )
+                    tg._d_edges.append(dep)
+        except Exception:
+            pass
+
+    # 6. 验证：至少有根节点
+    if root_local_id not in tg._nodes:
+        return _fallback_load_from_disk(graph_id)
+
+    logger.info(
+        f"[GraphAdapters] 从 MemoryGraph 重建 TaskGraph: "
+        f"graph_id={graph_id}, nodes={len(tg._nodes)}, "
+        f"h_edges={len(tg._h_edges)}, d_edges={len(tg._d_edges)}")
+    return tg
+
+
+def _extract_local_id(gnode: GraphNode, graph_id: str) -> str:
+    """从 GraphNode 的地址信息中提取 TaskGraph 本地 node_id"""
+    # 优先从 graph_address 提取: "tg:{graph_id}/task:{node_id}"
+    addr = gnode.metadata.get("graph_address", "")
+    if addr:
+        parts = addr.split("/")
+        for part in parts:
+            if part.startswith("task:"):
+                return part[5:]  # 去掉 "task:" 前缀
+        # 如果格式是 "tg:xxx/node_id"（无 task: 前缀）
+        if len(parts) >= 2:
+            return parts[-1]
+
+    # 从 full_path 末尾提取
+    full_path = gnode.metadata.get("full_path", "")
+    if full_path:
+        last_part = full_path.rsplit("/", 1)[-1]
+        if last_part and last_part != f"task:{graph_id}":
+            return last_part
+
+    # 从 node_id 末尾提取
+    nid = gnode.node_id
+    if "/" in nid:
+        return nid.rsplit("/", 1)[-1]
+
+    return ""
+
+
+def _fallback_load_from_disk(graph_id: str):
+    """降级：从磁盘备份加载 TaskGraph"""
+    try:
+        from zulong.tools.task_tools import load_graph_from_backup
+        tg = load_graph_from_backup(graph_id)
+        if tg:
+            logger.info(
+                f"[GraphAdapters] MemoryGraph 数据不足，降级从磁盘加载: {graph_id}")
+        return tg
+    except Exception as e:
+        logger.warning(f"[GraphAdapters] 磁盘加载也失败: {graph_id}, {e}")
+        return None
 
 
 # ============================================================
@@ -1300,6 +1540,593 @@ class ExperienceAdapter(BaseGraphAdapter):
 
 
 # ============================================================
+# CodeGraph 适配器
+# ============================================================
+
+class CodeGraphAdapter(BaseGraphAdapter):
+    """将 Tree-sitter 代码图谱投射到 MemoryGraph
+
+    - CodeSymbol(function/method/class) → GraphNode(CODE_SYMBOL)
+    - contains 边 → HIERARCHY 边 (class→method, protected)
+    - calls 边 → REFERENCE 边
+    - inherits 边 → HIERARCHY 边 (protected)
+    """
+
+    # 代码边类型 → MemoryGraph EdgeType + 是否 protected
+    _EDGE_MAP = {
+        "contains": (EdgeType.HIERARCHY, True),
+        "calls": (EdgeType.REFERENCE, False),
+        "inherits": (EdgeType.HIERARCHY, True),
+        "imports": (EdgeType.DEPENDENCY, True),
+    }
+
+    @property
+    def name(self) -> str:
+        return "code_graph"
+
+    def sync(self, graph: MemoryGraph, source: Any, on_batch=None) -> int:
+        """全量同步 CodeGraph
+
+        Args:
+            source: CodeGraph 实例 (来自 CodeGraphBuilder.build())
+            on_batch: 可选回调 on_batch(changes: list[dict]) — 每处理一批节点后调用，
+                      传递 delta changes 列表用于流式推送前端
+        """
+        if source is None:
+            return 0
+
+        count = 0
+        # 提取项目根路径，用于多项目隔离
+        project_root = getattr(source, "root_dir", "")
+
+        # 收集初始 delta（目录/模块节点）
+        _batch_changes = []
+
+        # ── 构建 PROJECT → MODULE → FILE 层次链 ──
+        project_name = getattr(source, "project_name", "") or "project"
+        project_node_id = f"module:/{project_name}"
+        if not graph.has_node(project_node_id):
+            project_node = GraphNode(
+                node_id=project_node_id,
+                node_type=NodeType.MODULE,
+                label=project_name,
+                backend_ref=f"project:{project_name}",
+                metadata={"kind": "project", "path": "", "project_root": project_root},
+            )
+            graph.add_node(project_node, touch=False)
+            _batch_changes.append({
+                "action": "add_node",
+                "data": {
+                    "id": project_node_id,
+                    "type": "module",
+                    "label": project_name,
+                    "metadata": project_node.metadata,
+                    "children_count": 0,
+                },
+            })
+
+        directories = getattr(source, "directories", {})
+        # 创建 MODULE 节点并建立 MODULE→MODULE HIERARCHY 边
+        for dir_path in sorted(directories.keys()):
+            if not dir_path:
+                # 根目录直属文件挂到 project 节点
+                continue
+            mod_node_id = f"module:{dir_path}"
+            if not graph.has_node(mod_node_id):
+                dir_label = dir_path.split("/")[-1]
+                mod_node = GraphNode(
+                    node_id=mod_node_id,
+                    node_type=NodeType.MODULE,
+                    label=dir_label,
+                    backend_ref=f"module:{dir_path}",
+                    metadata={
+                        "kind": "directory",
+                        "path": dir_path,
+                        "project_root": project_root,
+                        "is_package": any(
+                            f.endswith("__init__.py")
+                            for f in directories.get(dir_path, [])
+                        ),
+                    },
+                )
+                graph.add_node(mod_node, touch=False)
+                _batch_changes.append({
+                    "action": "add_node",
+                    "data": {
+                        "id": mod_node_id,
+                        "type": "module",
+                        "label": dir_label,
+                        "metadata": mod_node.metadata,
+                        "children_count": 0,
+                    },
+                })
+
+            # 父级关系：找直接父目录
+            parent_parts = dir_path.rsplit("/", 1)
+            if len(parent_parts) == 2 and parent_parts[0]:
+                parent_id = f"module:{parent_parts[0]}"
+            else:
+                parent_id = project_node_id
+
+            if graph.has_node(parent_id):
+                graph.add_edge(
+                    parent_id, mod_node_id,
+                    edge_type=EdgeType.HIERARCHY,
+                    weight=0.9,
+                    protected=True,
+                    metadata={"relation": "contains_dir"},
+                )
+                _batch_changes.append({
+                    "action": "add_edge",
+                    "data": {
+                        "source": parent_id,
+                        "target": mod_node_id,
+                        "type": "hierarchy",
+                        "label": "contains_dir",
+                    },
+                })
+
+        # 发送目录/模块层 batch
+        if on_batch and _batch_changes:
+            on_batch(_batch_changes)
+            _batch_changes = []
+
+        # 投射符号节点 — 按文件分批
+        current_file = None
+        for node_id, sym in source.symbols.items():
+            # 文件切换时发送上一批
+            if sym.file_path != current_file:
+                if on_batch and _batch_changes:
+                    on_batch(_batch_changes)
+                    _batch_changes = []
+                current_file = sym.file_path
+
+            if graph.has_node(node_id):
+                existing = graph.get_node(node_id)
+                if existing:
+                    existing.metadata["start_line"] = sym.start_line
+                    existing.metadata["end_line"] = sym.end_line
+                count += 1
+                continue
+
+            gnode = GraphNode(
+                node_id=node_id,
+                node_type=NodeType.CODE_SYMBOL,
+                label=sym.qualified_name,
+                backend_ref=f"code:{sym.file_path}:{sym.start_line}",
+                metadata={
+                    "kind": sym.kind,
+                    "file_path": sym.file_path,
+                    "start_line": sym.start_line,
+                    "end_line": sym.end_line,
+                    "parameters": sym.parameters,
+                    "bases": sym.bases,
+                    "docstring": sym.docstring or "",
+                    "parent_class": sym.parent_class or "",
+                    "project_root": project_root,
+                },
+            )
+            graph.add_node(gnode, touch=False)
+            count += 1
+
+            # 关联 FILE 节点
+            file_node_id = f"file:{sym.file_path}"
+            if not graph.has_node(file_node_id):
+                # 获取文件的 content_hash 用于增量更新判断
+                file_result = source.file_results.get(sym.file_path)
+                content_hash = file_result.content_hash if file_result else ""
+                file_node = GraphNode(
+                    node_id=file_node_id,
+                    node_type=NodeType.FILE,
+                    label=sym.file_path.split("/")[-1],
+                    backend_ref=f"file:{sym.file_path}",
+                    metadata={
+                        "path": sym.file_path,
+                        "content_hash": content_hash,
+                        "project_root": project_root,
+                    },
+                )
+                graph.add_node(file_node, touch=False)
+
+                # 将 FILE 挂到对应的 MODULE 节点下
+                file_dir = "/".join(sym.file_path.split("/")[:-1])
+                parent_mod_id = f"module:{file_dir}" if file_dir else project_node_id
+                if graph.has_node(parent_mod_id):
+                    graph.add_edge(
+                        parent_mod_id, file_node_id,
+                        edge_type=EdgeType.HIERARCHY,
+                        weight=0.8,
+                        protected=True,
+                        metadata={"relation": "contains_file"},
+                    )
+                    _batch_changes.append({
+                        "action": "add_edge",
+                        "data": {
+                            "source": parent_mod_id,
+                            "target": file_node_id,
+                            "type": "hierarchy",
+                            "label": "contains_file",
+                        },
+                    })
+
+                _batch_changes.append({
+                    "action": "add_node",
+                    "data": {
+                        "id": file_node_id,
+                        "type": "file",
+                        "label": file_node.label,
+                        "metadata": file_node.metadata,
+                        "children_count": 0,
+                    },
+                })
+
+            graph.add_edge(
+                file_node_id, node_id,
+                edge_type=EdgeType.HIERARCHY,
+                weight=0.8,
+                protected=True,
+                metadata={"relation": "defines"},
+            )
+            _batch_changes.append({
+                "action": "add_node",
+                "data": {
+                    "id": node_id,
+                    "type": "code_symbol",
+                    "label": sym.qualified_name,
+                    "metadata": {"kind": sym.kind, "file_path": sym.file_path},
+                },
+            })
+            _batch_changes.append({
+                "action": "add_edge",
+                "data": {
+                    "source": file_node_id,
+                    "target": node_id,
+                    "type": "hierarchy",
+                    "label": "defines",
+                },
+            })
+
+        # 发送最后一个文件的 batch
+        if on_batch and _batch_changes:
+            on_batch(_batch_changes)
+            _batch_changes = []
+
+        # 投射关系边
+        for edge in source.edges:
+            # import 边的源/目标可能是 file:{path} 格式（不在 symbols 中）
+            # 需要确保对应的 MemoryGraph 节点已存在
+            if edge.edge_type == "imports":
+                # imports 边：source/target 可以是 file:xxx 或符号 node_id
+                src_exists = graph.has_node(edge.source_id) or edge.source_id in source.symbols
+                tgt_exists = graph.has_node(edge.target_id) or edge.target_id in source.symbols
+                if not src_exists or not tgt_exists:
+                    continue
+            else:
+                if edge.source_id not in source.symbols:
+                    continue
+                if edge.target_id not in source.symbols:
+                    continue
+
+            mg_edge_type, protected = self._EDGE_MAP.get(
+                edge.edge_type, (EdgeType.REFERENCE, False)
+            )
+            graph.add_edge(
+                edge.source_id, edge.target_id,
+                edge_type=mg_edge_type,
+                weight=0.7 if edge.edge_type == "calls" else 0.9,
+                protected=protected,
+                metadata={
+                    "code_relation": edge.edge_type,
+                    **edge.metadata,
+                },
+            )
+
+        logger.info(
+            f"[CodeGraphAdapter] 同步完成: "
+            f"{count} 个符号, {len(source.edges)} 条边, "
+            f"{len(directories)} 个目录/模块"
+        )
+        return count
+
+    def incremental_sync(self, graph: MemoryGraph, event_type: str, data: dict):
+        """代码图谱增量同步 -- 文件粒度（事件驱动懒索引）
+
+        event_type:
+          "file_updated" - 文件被读取/编辑后重新解析
+          "file_removed" - 文件被删除
+
+        data:
+          file_path: str - 相对路径 (已归一化为 /)
+          symbols: List[CodeSymbol] - 该文件的符号列表 (file_updated)
+          edges: List[CodeEdge] - 该文件内部的关系边 (file_updated)
+        """
+        file_path = data.get("file_path", "")
+        if not file_path:
+            return
+
+        if event_type in ("file_updated", "file_removed"):
+            # 清除该文件的旧 CODE_SYMBOL 节点
+            self.remove_file_nodes(graph, file_path)
+
+        if event_type == "file_updated":
+            symbols = data.get("symbols", [])
+            edges = data.get("edges", [])
+            project_root = data.get("project_root", "")
+
+            # 创建/更新 FILE 节点
+            file_node_id = f"file:{file_path}"
+            content_hash = data.get("content_hash", "")
+            if not graph.has_node(file_node_id):
+                file_node = GraphNode(
+                    node_id=file_node_id,
+                    node_type=NodeType.FILE,
+                    label=file_path.split("/")[-1],
+                    backend_ref=f"file:{file_path}",
+                    metadata={
+                        "path": file_path,
+                        "content_hash": content_hash,
+                        "project_root": project_root,
+                    },
+                )
+                graph.add_node(file_node, touch=False)
+            elif content_hash:
+                # 文件已存在但内容变化，更新 hash
+                existing_file = graph.get_node(file_node_id)
+                if existing_file:
+                    existing_file.metadata["content_hash"] = content_hash
+
+            # 创建 CODE_SYMBOL 节点 + FILE→SYMBOL HIERARCHY 边
+            sym_ids = set()
+            for sym in symbols:
+                node_id = sym.node_id
+                sym_ids.add(node_id)
+                gnode = GraphNode(
+                    node_id=node_id,
+                    node_type=NodeType.CODE_SYMBOL,
+                    label=sym.qualified_name,
+                    backend_ref=f"code:{sym.file_path}:{sym.start_line}",
+                    metadata={
+                        "kind": sym.kind,
+                        "file_path": sym.file_path,
+                        "start_line": sym.start_line,
+                        "end_line": sym.end_line,
+                        "parameters": sym.parameters,
+                        "bases": sym.bases,
+                        "docstring": sym.docstring or "",
+                        "parent_class": sym.parent_class or "",
+                        "project_root": project_root,
+                    },
+                )
+                graph.add_node(gnode)  # touch=True → 自动 embedding + 语义邻居
+                graph.add_edge(
+                    file_node_id, node_id,
+                    edge_type=EdgeType.HIERARCHY,
+                    weight=0.8, protected=True,
+                    metadata={"relation": "defines"},
+                )
+
+            # 创建关系边 (calls, contains, inherits)
+            for edge in edges:
+                src_exists = edge.source_id in sym_ids or graph.has_node(edge.source_id)
+                tgt_exists = edge.target_id in sym_ids or graph.has_node(edge.target_id)
+                if src_exists and tgt_exists:
+                    mg_edge_type, protected = self._EDGE_MAP.get(
+                        edge.edge_type, (EdgeType.REFERENCE, False))
+                    graph.add_edge(
+                        edge.source_id, edge.target_id,
+                        edge_type=mg_edge_type,
+                        weight=0.7 if edge.edge_type == "calls" else 0.9,
+                        protected=protected,
+                        metadata={"code_relation": edge.edge_type},
+                    )
+
+            logger.info(
+                f"[CodeGraphAdapter] 增量同步: {file_path} → "
+                f"{len(symbols)} 符号, {len(edges)} 边"
+            )
+
+            # ── 代码锚定 → TASK→CODE_SYMBOL 显式图边 ──
+            # 查询该文件的 CodeAnchor，建立 TASK→CODE_SYMBOL REFERENCE 边
+            self._project_anchor_edges(graph, file_path, sym_ids)
+
+    def remove_file_nodes(self, graph: MemoryGraph, file_path: str) -> int:
+        """清除指定文件的所有 CODE_SYMBOL 节点"""
+        stale_ids = [
+            nid for nid, n in graph._nodes.items()
+            if n.node_type == NodeType.CODE_SYMBOL
+            and n.metadata.get("file_path") == file_path
+        ]
+        for nid in stale_ids:
+            graph.remove_node(nid)
+        if stale_ids:
+            logger.debug(
+                f"[CodeGraphAdapter] 清除 {file_path} 的 {len(stale_ids)} 个旧符号"
+            )
+        return len(stale_ids)
+
+    def _project_anchor_edges(
+        self, graph: MemoryGraph, file_path: str, sym_ids: set
+    ) -> None:
+        """根据 CodeAnchor 建立 TASK → CODE_SYMBOL 的显式 REFERENCE 边
+
+        当某个文件被增量同步后，查询该文件关联的 CodeAnchor，
+        将锚点的 owner（TASK 节点）与锚点指向的 CODE_SYMBOL 连接起来。
+        """
+        try:
+            from zulong.memory.code_anchor import get_code_anchor_store
+        except ImportError:
+            return
+
+        store = get_code_anchor_store()
+        anchors = store.get_anchors_by_file(file_path)
+        if not anchors:
+            return
+
+        anchor_count = 0
+        for anchor in anchors:
+            owner_ref = anchor.owner_ref
+            if not owner_ref:
+                continue
+
+            # 解析 owner_ref → MemoryGraph TASK 节点 ID
+            # owner_ref 格式: "tg:{graph_id}/{task_node_id}" 或 "mg:{node_id}"
+            task_mg_id = None
+            if owner_ref.startswith("tg:"):
+                # tg:graph_001/subtask_002 → task:graph_001/subtask_002
+                task_mg_id = "task:" + owner_ref[3:]
+            elif owner_ref.startswith("mg:"):
+                task_mg_id = owner_ref[3:]
+
+            if not task_mg_id or not graph.has_node(task_mg_id):
+                # 尝试在图中查找含该 ID 后缀的 TASK 节点
+                parts = owner_ref[3:] if ":" in owner_ref else owner_ref
+                for nid, nd in graph._nodes.items():
+                    if nd.node_type == NodeType.TASK and nid.endswith(parts):
+                        task_mg_id = nid
+                        break
+                if not task_mg_id or not graph.has_node(task_mg_id):
+                    continue
+
+            # 通过 anchor.symbol + file_path 找到对应的 CODE_SYMBOL 节点
+            if anchor.symbol:
+                target_code_id = None
+                for sid in sym_ids:
+                    if sid.endswith(f":{anchor.symbol}") or \
+                       sid.endswith(f":{file_path}:{anchor.symbol}"):
+                        target_code_id = sid
+                        break
+
+                if target_code_id and graph.has_node(target_code_id):
+                    graph.add_edge(
+                        task_mg_id, target_code_id,
+                        edge_type=EdgeType.REFERENCE,
+                        weight=0.9,
+                        metadata={
+                            "relation": "anchored_to",
+                            "anchor_type": anchor.anchor_type,
+                            "anchor_id": anchor.id,
+                        },
+                    )
+                    anchor_count += 1
+
+        if anchor_count:
+            logger.info(
+                f"[CodeGraphAdapter] 锚定投射: {file_path} → "
+                f"{anchor_count} 条 TASK→CODE_SYMBOL 边"
+            )
+
+    def verify_and_refresh(
+        self, graph: MemoryGraph, project_root: str = ""
+    ) -> Dict[str, Any]:
+        """验证已索引文件的新鲜度，刷新陈旧条目
+
+        在系统恢复（崩溃/暂停后重启）时调用。
+        遍历 MemoryGraph 中的 FILE 节点，对比 content_hash 检测变更。
+
+        Args:
+            graph: MemoryGraph 实例
+            project_root: 限定验证范围（空字符串=验证所有已索引文件）
+
+        Returns:
+            {"checked": int, "stale": int, "refreshed": int, "missing": int}
+        """
+        import hashlib
+        from pathlib import Path
+
+        file_nodes = graph.get_nodes_by_type(NodeType.FILE)
+        checked = 0
+        stale = 0
+        refreshed = 0
+        missing = 0
+
+        for file_node in file_nodes:
+            # 筛选项目范围
+            node_project = file_node.metadata.get("project_root", "")
+            if project_root and node_project != project_root:
+                continue
+
+            rel_path = file_node.metadata.get("path", "")
+            stored_hash = file_node.metadata.get("content_hash", "")
+            if not rel_path or not stored_hash:
+                continue
+
+            # 解析绝对路径
+            if node_project:
+                abs_path = Path(node_project) / rel_path
+            else:
+                abs_path = Path(rel_path)
+
+            checked += 1
+
+            if not abs_path.exists():
+                missing += 1
+                continue
+
+            # 计算当前 hash
+            try:
+                current_hash = hashlib.md5(abs_path.read_bytes()).hexdigest()
+            except Exception:
+                continue
+
+            if current_hash == stored_hash:
+                continue
+
+            # 文件已变更，需要重新索引
+            stale += 1
+            try:
+                from zulong.code.ast_parser import ASTParser
+                from zulong.code.graph_builder import CodeGraphBuilder, ext_to_lang
+                import os
+
+                ext = os.path.splitext(rel_path)[1]
+                lang = ext_to_lang(ext)
+                if not lang:
+                    continue
+
+                parser = ASTParser(lang)
+                if not parser.available:
+                    continue
+
+                result = parser.parse_file(str(abs_path))
+                if result.parse_error:
+                    continue
+
+                # 更新 file_path 为相对路径
+                for sym in result.symbols:
+                    sym.file_path = rel_path
+
+                edges = CodeGraphBuilder._build_edges_for_file(result)
+
+                # 增量同步
+                self.incremental_sync(graph, "file_updated", {
+                    "file_path": rel_path,
+                    "symbols": result.symbols,
+                    "edges": edges,
+                    "content_hash": current_hash,
+                    "project_root": node_project,
+                })
+                refreshed += 1
+
+            except Exception as e:
+                logger.debug(
+                    f"[CodeGraphAdapter] verify_and_refresh 刷新失败 "
+                    f"{rel_path}: {e}"
+                )
+
+        logger.info(
+            f"[CodeGraphAdapter] verify_and_refresh: "
+            f"checked={checked}, stale={stale}, "
+            f"refreshed={refreshed}, missing={missing}"
+        )
+        return {
+            "checked": checked,
+            "stale": stale,
+            "refreshed": refreshed,
+            "missing": missing,
+        }
+
+
+# ============================================================
 # 注册所有适配器
 # ============================================================
 
@@ -1312,6 +2139,7 @@ def register_all_adapters(graph: MemoryGraph):
         EpisodeAdapter(),
         PersonProfileAdapter(),
         ExperienceAdapter(),
+        CodeGraphAdapter(),
     ]
     for adapter in adapters:
         graph.register_adapter(adapter.name, adapter)

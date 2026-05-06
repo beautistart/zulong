@@ -314,6 +314,34 @@ class OpenClawWebAdapter:
                 "file": str(export_file)
             })
         
+        # ========== 聊天会话持久化 API ==========
+        # 会话数据存储在服务端 JSON 文件，跨端口/浏览器持久化
+        
+        self._chat_sessions_path = Path(self.config.static_path).parent / "chat_sessions.json"
+        
+        @self.app.get("/api/chat/sessions")
+        async def get_chat_sessions():
+            """读取服务端持久化的聊天会话数据"""
+            try:
+                if self._chat_sessions_path.exists():
+                    with open(self._chat_sessions_path, 'r', encoding='utf-8') as f:
+                        return JSONResponse(json.load(f))
+            except Exception as e:
+                logger.error(f"[WebAdapter] 读取聊天会话失败: {e}")
+            return JSONResponse({"activeSessionId": None, "sessions": []})
+        
+        @self.app.post("/api/chat/sessions")
+        async def save_chat_sessions(data: dict):
+            """保存聊天会话数据到服务端"""
+            try:
+                self._chat_sessions_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self._chat_sessions_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                return JSONResponse({"status": "ok"})
+            except Exception as e:
+                logger.error(f"[WebAdapter] 保存聊天会话失败: {e}")
+                return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+        
         # ========== 文件服务 API ==========
         
         @self.app.get("/api/files/serve")
@@ -770,7 +798,9 @@ class OpenClawWebAdapter:
             app=self.app,
             host=self.config.host,
             port=self.config.port,
-            log_level="info"
+            log_level="info",
+            ws_ping_interval=None,
+            ws_ping_timeout=None,
         )
         server = uvicorn.Server(config)
         

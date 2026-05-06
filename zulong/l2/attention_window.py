@@ -76,7 +76,7 @@ class MessageEnvelope:
 # 这些工具触发 GLOBAL → FOCUS
 _FOCUS_TRIGGERS: Set[str] = {
     "recall_memory", "read_memory_node", "discover_related",
-    "search_experience",
+    "search_experience", "task_get_detail",
 }
 
 # 这些工具触发 FOCUS → SINGLE_CHAIN
@@ -225,6 +225,10 @@ class AttentionWindowManager:
                 f"[AttentionWindow] 模式切换: {old_mode.value} → {new_mode.value} "
                 f"(触发: {tool_name}, node={self._current_node_id})"
             )
+            self._publish_mode_change(old_mode, new_mode, f"tool:{tool_name}")
+            # 聚焦切换时，自动注入目标节点的已有知识
+            if new_mode in (AttentionMode.FOCUS, AttentionMode.SINGLE_CHAIN):
+                self._inject_node_knowledge(self._current_node_id)
             return new_mode
 
         return None
@@ -277,6 +281,73 @@ class AttentionWindowManager:
                 f"{old_mode.value} → {self.mode.value} "
                 f"(direction={direction}, target={target_node_id})"
             )
+            self._publish_mode_change(old_mode, self.mode, f"navigate:{direction}")
+            # 聚焦切换时，自动注入目标节点的已有知识
+            if self.mode in (AttentionMode.FOCUS, AttentionMode.SINGLE_CHAIN):
+                self._inject_node_knowledge(self._current_node_id)
+
+    def auto_navigate_on_status_change(self, node_id: str, new_status: str):
+        """task_mark_status 后自动导航注意力窗口
+
+        - completed/skipped: 寻找下一个待处理的兄弟节点并跳转；若无，则回退到父级
+        - in_progress: 深入聚焦当前节点
+        """
+        if not self.task_graph or not node_id:
+            return
+
+        if new_status in ("completed", "skipped"):
+            # 找父节点 → 找下一个 pending 兄弟
+            parent_id = self.task_graph.get_parent(node_id)
+            if parent_id:
+                siblings = self.task_graph.get_children(parent_id)
+                next_pending = None
+                for sib in siblings:
+                    if sib.id != node_id and sib.status in ("pending", "blocked"):
+                        next_pending = sib
+                        break
+                if next_pending:
+                    logger.info(
+                        f"[AttentionWindow] 自动导航: 节点 {node_id} 完成 → "
+                        f"跳转到兄弟 {next_pending.id}"
+                    )
+                    self.on_navigate_attention("jump", target_node_id=next_pending.id)
+                else:
+                    # 同级全部完成，回退到父级视角
+                    logger.info(
+                        f"[AttentionWindow] 自动导航: 节点 {node_id} 完成, "
+                        f"同级已全部完成 → 回退到父级 {parent_id}"
+                    )
+                    self.on_navigate_attention("broader")
+
+        elif new_status == "in_progress":
+            # 深入聚焦当前节点
+            depth = self.task_graph.get_node_depth(node_id)
+            if depth is not None and depth >= 2:
+                logger.info(
+                    f"[AttentionWindow] 自动导航: 节点 {node_id} 开始执行 (depth={depth}) → deeper"
+                )
+                self.on_navigate_attention("jump", target_node_id=node_id)
+
+    def _publish_mode_change(self, old_mode: AttentionMode, new_mode: AttentionMode, trigger: str):
+        """发布注意力模式变更事件到 EventBus → WebBridge → 仪表盘"""
+        try:
+            from zulong.core.event_bus import event_bus
+            from zulong.core.types import EventType, ZulongEvent
+            import time as _time
+            payload = {
+                "component": "AttentionWindow",
+                "old_mode": old_mode.value,
+                "new_mode": new_mode.value,
+                "trigger": trigger,
+                "current_node_id": self._current_node_id,
+                "usage_ratio": self.usage_ratio,
+                "total_messages": len(self.envelopes),
+                "timestamp": _time.time(),
+            }
+            event = ZulongEvent(type=EventType("SYSTEM_STATUS"), payload=payload)
+            event_bus.publish(event)
+        except Exception:
+            pass
 
     def _compute_transition(
         self,
@@ -287,6 +358,16 @@ class AttentionWindowManager:
         # navigate_attention 由 on_navigate_attention 单独处理
         if tool_name == "navigate_attention":
             return None
+
+        # P2-1: adjust_attention_mode 直接指定目标模式
+        if tool_name == "adjust_attention_mode":
+            mode_str = tool_args.get("mode", "")
+            _mode_map = {
+                "global": AttentionMode.GLOBAL,
+                "focus": AttentionMode.FOCUS,
+                "single_chain": AttentionMode.SINGLE_CHAIN,
+            }
+            return _mode_map.get(mode_str)
 
         # 强制回全局
         if tool_name in _GLOBAL_FORCE_TRIGGERS:
@@ -412,9 +493,13 @@ class AttentionWindowManager:
                     "content": summary_text,
                 }
 
-            logger.debug(
+            # 将淘汰内容的语义摘要写回 MemoryGraph（闭合淘汰-恢复环路）
+            self._persist_evicted_to_memory(evicted_envs)
+
+            logger.info(
                 f"[AttentionWindow] 淘汰 {len(evicted_envs)} 条消息, "
-                f"保留 {len(kept_envs)} 条, 模式={self.mode.value}"
+                f"保留 {len(kept_envs)} 条, 模式={self.mode.value}, "
+                f"预算={self.budget}, 已用={used_tokens}"
             )
 
         # 7. 按原始时间顺序排列
@@ -552,13 +637,19 @@ class AttentionWindowManager:
     # ── 淘汰摘要 ──
 
     def _build_summary(self, evicted: List[MessageEnvelope]) -> str:
-        """为被淘汰的消息生成简短摘要"""
+        """为被淘汰的消息生成语义级摘要
+
+        与旧版仅记录元数据（工具名×次数）不同，新版提取每组工具结果的
+        关键内容片段，保留结论性信息而非仅记录操作记录。
+        """
         if not evicted:
             return ""
 
         # 收集被淘汰的工具调用和节点
         tool_counts: Dict[str, int] = {}
         node_ids: Set[str] = set()
+        # 收集工具结果中的关键内容片段
+        content_snippets: List[str] = []
 
         for env in evicted:
             if env.tool_name:
@@ -567,21 +658,32 @@ class AttentionWindowManager:
                 )
             if env.node_id:
                 node_ids.add(env.node_id)
+            # 从 tool result 消息中提取内容摘要
+            if env.msg.get("role") == "tool" and env.msg.get("content"):
+                snippet = self._extract_content_snippet(
+                    str(env.msg["content"]), env.tool_name)
+                if snippet:
+                    content_snippets.append(snippet)
 
-        parts = [f"[上下文窗口管理] 已淘汰 {len(evicted)} 条历史消息以控制上下文长度。"]
+        parts = [f"[上下文窗口管理] 已淘汰 {len(evicted)} 条历史消息。"]
 
         if tool_counts:
             tool_summary = ", ".join(
                 f"{name}×{count}" for name, count in
                 sorted(tool_counts.items(), key=lambda x: -x[1])[:5]
             )
-            parts.append(f"涉及工具调用: {tool_summary}")
+            parts.append(f"涉及工具: {tool_summary}")
 
         if node_ids:
             nodes_str = ", ".join(sorted(node_ids)[:8])
             if len(node_ids) > 8:
                 nodes_str += f" 等共 {len(node_ids)} 个节点"
             parts.append(f"涉及节点: {nodes_str}")
+
+        # 插入内容摘要（关键改进：保留语义信息）
+        if content_snippets:
+            merged = " | ".join(content_snippets[:5])
+            parts.append(f"关键发现: {merged}")
 
         parts.append("如需回顾已淘汰的内容，请使用 recall_memory 或 read_memory_node 工具重新查询。")
 
@@ -595,6 +697,195 @@ class AttentionWindowManager:
             summary = summary[:int(len(summary) * ratio)] + "..."
 
         return summary
+
+    @staticmethod
+    def _extract_content_snippet(content: str, tool_name: Optional[str],
+                                 max_len: int = 200) -> str:
+        """从工具结果中提取关键内容片段
+
+        规则：
+        - read_file 类结果：提取文件路径和结构性关键词
+        - JSON 格式结果：提取 message/result/data 字段
+        - 其他：取首段非空文本
+        """
+        if not content or len(content) < 10:
+            return ""
+
+        # JSON 格式结果 — 提取 message/data 字段
+        stripped = content.strip()
+        if stripped.startswith("{"):
+            try:
+                import json
+                obj = json.loads(stripped)
+                for key in ("message", "result", "data", "summary"):
+                    val = obj.get(key)
+                    if val and isinstance(val, str) and len(val) > 10:
+                        return val[:max_len]
+                    if val and isinstance(val, dict):
+                        # data 是字典时，取其 message 字段
+                        msg = val.get("message", "")
+                        if msg:
+                            return str(msg)[:max_len]
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # 纯文本 — 取首段有意义内容（跳过空行和分隔线）
+        lines = content.split("\n")
+        meaningful = []
+        total = 0
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("---") or line.startswith("==="):
+                continue
+            meaningful.append(line)
+            total += len(line)
+            if total >= max_len:
+                break
+
+        return " ".join(meaningful)[:max_len] if meaningful else ""
+
+    def _persist_evicted_to_memory(self, evicted: List[MessageEnvelope]) -> None:
+        """将淘汰消息的语义摘要持久化到 MemoryGraph 和 TaskGraph
+
+        按 node_id 分组收集淘汰的工具结果内容，生成每个节点的语义摘要，
+        写入 MemoryGraph 的 eviction_summary metadata 字段，使后续
+        recall_memory 检索能找回关键信息。
+        同时将摘要追加到 TaskNode 的 analysis_content，形成知识积累。
+        """
+        if not self.memory_graph and not self.task_graph:
+            return
+
+        # 按 node_id 分组收集内容片段
+        node_snippets: Dict[str, List[str]] = {}
+        for env in evicted:
+            nid = env.node_id
+            if not nid:
+                continue
+            if env.msg.get("role") == "tool" and env.msg.get("content"):
+                snippet = self._extract_content_snippet(
+                    str(env.msg["content"]), env.tool_name, max_len=300)
+                if snippet:
+                    if nid not in node_snippets:
+                        node_snippets[nid] = []
+                    node_snippets[nid].append(snippet)
+
+        if not node_snippets:
+            return
+
+        for nid, snippets in node_snippets.items():
+            new_summary = " | ".join(snippets[:3])
+
+            # 写入 MemoryGraph
+            if self.memory_graph:
+                try:
+                    mg_node = self.memory_graph.get_node(nid)
+                    if mg_node is not None:
+                        existing = mg_node.metadata.get("eviction_summary", "")
+                        if existing:
+                            combined = f"{existing} | {new_summary}"
+                            if len(combined) > 1500:
+                                combined = combined[-1500:]
+                            mg_node.metadata["eviction_summary"] = combined
+                        else:
+                            mg_node.metadata["eviction_summary"] = new_summary[:1500]
+                        mg_node.metadata["eviction_turn"] = self._current_turn
+                except Exception as e:
+                    logger.info(
+                        f"[AttentionWindow] 淘汰内容持久化到 MG 失败 (node={nid}): {e}")
+
+            # 写入 TaskGraph（追加到 analysis_content，形成知识积累）
+            if self.task_graph:
+                try:
+                    task_node = self.task_graph.get_node(nid)
+                    if task_node is not None:
+                        eviction_note = f"\n[淘汰恢复 turn={self._current_turn}] {new_summary}"
+                        if task_node.analysis_content:
+                            task_node.analysis_content += eviction_note
+                        else:
+                            task_node.analysis_content = eviction_note.strip()
+                        task_node.content_version += 1
+                except Exception as e:
+                    logger.info(
+                        f"[AttentionWindow] 淘汰内容持久化到 TG 失败 (node={nid}): {e}")
+
+    def _inject_node_knowledge(self, node_id: Optional[str]) -> None:
+        """聚焦切换时，从 TaskNode 加载已有分析内容注入上下文
+
+        当 AttentionWindow 切换到 FOCUS/SINGLE_CHAIN 模式聚焦某节点时，
+        自动将该节点的 semantic_summary 注入为 system 消息，帮助模型
+        快速恢复对该节点的知识上下文。
+        """
+        if not node_id or not self.task_graph:
+            return
+
+        try:
+            node = self.task_graph.get_node(node_id)
+            if node is None:
+                return
+
+            # 优先使用 semantic_summary（简洁，适合上下文注入）
+            knowledge = node.semantic_summary
+            if not knowledge and node.analysis_content:
+                # 没有摘要时，取 analysis_content 的前 500 字符
+                knowledge = node.analysis_content[:500]
+            if not knowledge:
+                return
+
+            # 构造知识回顾消息
+            recall_msg = {
+                "role": "system",
+                "content": (
+                    f"[节点知识回顾] {node.label} (v{node.content_version}):\n"
+                    f"{knowledge}"
+                ),
+            }
+            self.register_message(
+                recall_msg,
+                turn=self._current_turn,
+                node_id=node_id,
+                pinned=False,
+            )
+            logger.info(
+                f"[AttentionWindow] 注入节点知识: {node_id} "
+                f"({len(knowledge)} chars, v{node.content_version})"
+            )
+        except Exception as e:
+            logger.info(f"[AttentionWindow] 节点知识注入失败: {e}")
+
+    # ── 编排器阶段感知 ──
+
+    def set_phase(self, phase: str, subtask_id: str = None):
+        """编排器阶段切换时调整注意力模式
+
+        不新增额外乘数系统，只利用已有的三种 AttentionMode：
+        - plan   → GLOBAL（全局视角，关注大纲和整体结构）
+        - execute → FOCUS（聚焦当前子任务，依赖产出权重提升）
+        - reflect → GLOBAL（回到全局视野评估质量）
+        - synthesize → GLOBAL（汇总需要全局概览）
+
+        Args:
+            phase: 编排器阶段名 ("plan" / "execute" / "reflect" / "synthesize")
+            subtask_id: 当前子任务节点 ID（execute 阶段必传）
+        """
+        old_mode = self.mode
+
+        if phase == "plan":
+            self.mode = AttentionMode.GLOBAL
+        elif phase == "execute":
+            self.mode = AttentionMode.FOCUS
+            if subtask_id:
+                self._current_node_id = subtask_id
+        elif phase in ("reflect", "synthesize"):
+            self.mode = AttentionMode.GLOBAL
+        else:
+            logger.warning(f"[AttentionWindow] 未知阶段: {phase}，保持当前模式")
+            return
+
+        if self.mode != old_mode:
+            logger.info(
+                f"[AttentionWindow] 阶段切换: {old_mode.value} → {self.mode.value} "
+                f"(phase={phase}, subtask={subtask_id})"
+            )
 
     # ── 容量查询 ──
 
@@ -628,3 +919,72 @@ class AttentionWindowManager:
             "current_node_id": self._current_node_id,
             "context_window_size": self.context_window_size,
         }
+
+    # ── 序列化/反序列化（IDE 跨请求 Session 持久化）──
+
+    def serialize(self) -> Dict[str, Any]:
+        """序列化当前状态，用于 AgentSession 跨请求持久化"""
+        return {
+            "mode": self.mode.value,
+            "current_node_id": self._current_node_id,
+            "seq_counter": self._seq_counter,
+            "group_counter": self._group_counter,
+            "current_turn": self._current_turn,
+            "budget": self.budget,
+            "context_window_size": self.context_window_size,
+            "reserved_tokens": self.reserved_tokens,
+            "envelopes": [
+                {
+                    "seq": e.seq,
+                    "turn": e.turn,
+                    "tool_name": e.tool_name,
+                    "node_id": e.node_id,
+                    "tokens": e.tokens,
+                    "is_pinned": e.is_pinned,
+                    "weight": e.weight,
+                    "group_id": e.group_id,
+                    "msg": e.msg,
+                }
+                for e in self.envelopes
+            ],
+        }
+
+    @classmethod
+    def from_serialized(
+        cls,
+        data: Dict[str, Any],
+        task_graph=None,
+        memory_graph=None,
+    ) -> "AttentionWindowManager":
+        """从序列化数据恢复 AttentionWindowManager 实例"""
+        instance = cls(
+            context_window_size=data["context_window_size"],
+            task_graph=task_graph,
+            memory_graph=memory_graph,
+            reserved_tokens=data["reserved_tokens"],
+        )
+        instance.mode = AttentionMode(data["mode"])
+        instance.budget = data.get("budget", instance.budget)
+        instance._current_node_id = data.get("current_node_id")
+        instance._seq_counter = data.get("seq_counter", 0)
+        instance._group_counter = data.get("group_counter", 0)
+        instance._current_turn = data.get("current_turn", 0)
+        for e_data in data.get("envelopes", []):
+            env = MessageEnvelope(
+                msg=e_data["msg"],
+                seq=e_data["seq"],
+                turn=e_data["turn"],
+                tool_name=e_data.get("tool_name"),
+                node_id=e_data.get("node_id"),
+                tokens=e_data.get("tokens", 0),
+                is_pinned=e_data.get("is_pinned", False),
+                weight=e_data.get("weight", 1.0),
+                group_id=e_data.get("group_id"),
+            )
+            instance.envelopes.append(env)
+        logger.info(
+            f"[AttentionWindow] 从序列化恢复: mode={instance.mode.value}, "
+            f"envelopes={len(instance.envelopes)}, "
+            f"seq={instance._seq_counter}"
+        )
+        return instance

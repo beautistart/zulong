@@ -21,6 +21,7 @@
 """
 
 import asyncio
+import os
 from typing import Dict, List, Optional, Any
 import time
 import logging
@@ -1204,7 +1205,7 @@ class ShortTermMemory:
             logger.error(f"[记忆巩固] 巩固对话失败：{e}", exc_info=True)
     
     def _save_index(self):
-        """保存索引到磁盘"""
+        """保存索引到磁盘（原子写入：temp file + fsync + replace）"""
         if not self.persistence_enabled:
             return
         
@@ -1217,13 +1218,24 @@ class ShortTermMemory:
             }
             
             path = self.persistence_path / "index.json"
-            with open(path, 'w', encoding='utf-8') as f:
+            tmp_path = self.persistence_path / "index.json.tmp"
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(index_data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            # 原子替换：防止崩溃时 JSON 损坏
+            tmp_path.replace(path)
             
-            logger.debug(f"✅ [持久化] 短期记忆索引已保存")
+            logger.debug(f"[持久化] 短期记忆索引已保存")
             
         except Exception as e:
             logger.error(f"[持久化] 保存索引失败：{e}")
+            try:
+                tmp_path = self.persistence_path / "index.json.tmp"
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
     
     def _load_index(self):
         """从磁盘加载索引"""

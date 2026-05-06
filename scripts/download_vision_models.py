@@ -86,7 +86,7 @@ def main():
     ]
     
     # 检查 YOLOv10-Nano
-    yolo_path = base_dir / "yolov10n.pt"
+    yolo_path = base_dir / "models" / "yolov10n.pt"
     if yolo_path.exists():
         print(f"\n✅ YOLOv10-Nano 已存在：{yolo_path}")
         print(f"   Layer 1: 人体检测 (已就绪)")

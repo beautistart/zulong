@@ -9,7 +9,7 @@
 - manifest.yaml (可选，替代代码中的 manifest)
 
 已实现的技能包：
-- cline_coder: Cline编程
+- ide_coder: IDE编程
 
 已卸载的技能包：
 - complex_task: [已移除] 旧版复杂任务处理（融合 OpenClaw + AutoGPT 逻辑）

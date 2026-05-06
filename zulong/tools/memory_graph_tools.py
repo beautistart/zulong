@@ -1,11 +1,14 @@
 # File: zulong/tools/memory_graph_tools.py
 # MemoryGraph FC 工具集 — 让模型通过 Function Calling 自主访问图记忆系统
 #
-# 4 个工具:
+# 7 个工具:
 # - recall_memory: 检索记忆（语义搜索 + 热数据遍历）
 # - read_memory_node: 读取特定节点详情及邻域
 # - save_memory_note: 保存笔记/观察到记忆图
 # - discover_related: 从种子节点发现关联节点
+# - activate_memory_network: BFS 扩散激活记忆网络（P1-2）
+# - list_memory: 按类型/温度/重要性浏览记忆节点（P1-3）
+# - set_importance: 设置节点重要性级别（P2-2）
 
 import logging
 import time
@@ -90,13 +93,19 @@ class RecallMemoryTool(BaseTool):
             # 格式化返回
             memories = []
             for item in results[:top_k]:
-                memories.append({
+                entry = {
                     "node_id": item.get("node_id", ""),
                     "type": str(item.get("node_type", item.get("type", ""))),
                     "label": item.get("label", ""),
                     "content": item.get("content", item.get("metadata", {}).get("content", "")),
                     "score": round(item.get("score", 0), 3),
-                })
+                }
+                # 附带代码锚点摘要（如有）
+                meta = item.get("metadata", {})
+                code_ref = meta.get("code_ref_summary", "")
+                if code_ref:
+                    entry["code_ref"] = code_ref
+                memories.append(entry)
 
             logger.info(f"[recall_memory] 查询 '{query}' 返回 {len(memories)} 条结果")
 
@@ -231,6 +240,22 @@ class ReadMemoryNodeTool(BaseTool):
             if backend_content:
                 result_data["content"] = backend_content[:2000]
 
+            # 加载完整代码锚点数据（如有）
+            anchor_ids = node.metadata.get("code_anchors", [])
+            if anchor_ids:
+                try:
+                    from zulong.memory.code_anchor import get_code_anchor_store
+                    store = get_code_anchor_store()
+                    anchors_data = []
+                    for aid in anchor_ids:
+                        anchor = store.get_anchor(aid)
+                        if anchor:
+                            anchors_data.append(anchor.to_dict())
+                    if anchors_data:
+                        result_data["code_anchors"] = anchors_data
+                except Exception:
+                    pass
+
             logger.info(f"[read_memory_node] 读取节点 {node_id}")
 
             return self._create_result(
@@ -272,9 +297,10 @@ class SaveMemoryNoteTool(BaseTool):
     def __init__(self):
         super().__init__(name="save_memory_note", category=ToolCategory.CUSTOM)
         self.description = (
-            "保存笔记到记忆。当你发现需要长期记住的信息时调用，"
-            "如用户偏好、重要事实、任务中的关键发现等。"
-            "信息会持久化到图记忆系统中，后续可通过 recall_memory 检索。"
+            "保存笔记到记忆。当用户明确要求'记住'、'保存'、'记录'信息时调用。"
+            "关键词：记住、保存、记录、存储、备忘、笔记、重要信息。"
+            "适用场景：用户偏好、重要事实、关键发现、待办事项等需要长期存储的信息。"
+            "注意：如果用户要求'规划'或'制定计划'，请使用task_create_plan工具。"
         )
 
     def initialize(self) -> bool:
@@ -361,12 +387,24 @@ class SaveMemoryNoteTool(BaseTool):
 
             logger.info(f"[save_memory_note] 保存节点 {node_id}: {label}")
 
+            # P2-7: 自动语义关联 — 发现与新笔记语义相似的已有节点并建边
+            # 类比：人记下新知识时，大脑自动将其与已有相关记忆建立关联
+            _semantic_count = 0
+            try:
+                sem_neighbors = mg.discover_semantic_neighbors(
+                    node_id, top_k=3, threshold=0.75,
+                )
+                _semantic_count = len(sem_neighbors)
+            except Exception as _sem_err:
+                logger.debug(f"[save_memory_note] 语义关联跳过: {_sem_err}")
+
             return self._create_result(
                 success=True,
                 data={
                     "node_id": node_id,
                     "label": label,
                     "importance": imp_level.value,
+                    "semantic_links": _semantic_count,
                     "message": "笔记已保存到记忆图",
                 },
                 execution_time=time.time() - start_time,
@@ -537,4 +575,437 @@ class DiscoverRelatedTool(BaseTool):
                 },
             },
             "required": ["node_id"],
+        }
+
+
+# ============================================================
+# P1-2: BFS 扩散激活工具
+# ============================================================
+
+class ActivateMemoryNetworkTool(BaseTool):
+    """activate_memory_network — BFS 扩散激活
+
+    从种子节点出发，通过加权 BFS 沿边传播激活值。
+    边权越高传播越多，每跳按 decay 衰减。
+    这是记忆图谱的核心能力：从任意节点追溯全局关联。
+    """
+
+    def __init__(self):
+        super().__init__(name="activate_memory_network", category=ToolCategory.CUSTOM)
+        self.description = (
+            "从种子节点出发，通过 BFS 扩散激活记忆网络。"
+            "当你需要了解某个主题的全局关联、发现隐含联系、"
+            "或预热与当前任务相关的记忆网络时调用。"
+            "激活值沿边权衰减传播，揭示整个关联图谱。"
+        )
+
+    def initialize(self) -> bool:
+        return True
+
+    def cleanup(self) -> None:
+        pass
+
+    def execute(self, request: ToolRequest) -> ToolResult:
+        start_time = time.time()
+        seed_node_ids = request.parameters.get("seed_node_ids", [])
+        max_depth = request.parameters.get("max_depth", 3)
+        min_activation = request.parameters.get("min_activation", 0.01)
+
+        if not seed_node_ids:
+            return self._create_result(
+                success=False,
+                error="seed_node_ids 不能为空",
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
+            )
+
+        try:
+            from zulong.memory.memory_graph import get_memory_graph
+            mg = get_memory_graph()
+            if mg is None:
+                return self._create_result(
+                    success=False,
+                    error="MemoryGraph 未初始化",
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
+
+            # 验证种子节点存在
+            valid_seeds = [s for s in seed_node_ids if mg.has_node(s)]
+            if not valid_seeds:
+                return self._create_result(
+                    success=False,
+                    error=f"所有种子节点均不存在: {seed_node_ids}",
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
+
+            # 调用 BFS 扩散激活
+            activations = mg.compute_activations(
+                seed_node_ids=valid_seeds,
+                max_depth=min(max_depth, 5),
+                min_activation=max(min_activation, 0.001),
+            )
+
+            # 格式化返回，按激活值降序
+            activated = []
+            for node_id, score in sorted(activations.items(), key=lambda x: -x[1]):
+                node = mg.get_node(node_id)
+                if node:
+                    activated.append({
+                        "node_id": node_id,
+                        "type": node.node_type.value,
+                        "label": node.label,
+                        "activation": round(score, 4),
+                    })
+
+            logger.info(
+                f"[activate_memory_network] 种子 {valid_seeds} → "
+                f"激活 {len(activated)} 个节点"
+            )
+
+            return self._create_result(
+                success=True,
+                data={
+                    "seed_node_ids": valid_seeds,
+                    "total_activated": len(activated),
+                    "activated_nodes": activated[:30],
+                },
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
+            )
+
+        except Exception as e:
+            logger.error(f"[activate_memory_network] 激活失败: {e}", exc_info=True)
+            return self._create_result(
+                success=False,
+                error=f"网络激活失败: {e}",
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
+            )
+
+    def _get_parameters_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "seed_node_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "种子节点 ID 列表，BFS 将从这些节点开始扩散",
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "最大扩散深度（默认 3，最大 5）",
+                },
+                "min_activation": {
+                    "type": "number",
+                    "description": "最小激活阈值，低于此值的节点不返回（默认 0.01）",
+                },
+            },
+            "required": ["seed_node_ids"],
+        }
+
+
+# ============================================================
+# P1-3: 记忆浏览工具
+# ============================================================
+
+class ListMemoryTool(BaseTool):
+    """list_memory — 浏览记忆节点列表
+
+    按类型/温度/重要性筛选并列出记忆图中的节点。
+    """
+
+    def __init__(self):
+        super().__init__(name="list_memory", category=ToolCategory.CUSTOM)
+        self.description = (
+            "浏览记忆图中的节点列表。"
+            "当你需要了解记忆中有哪些信息、按类型/重要性筛选记忆、"
+            "或获取记忆图的总体概况时调用。"
+            "支持按节点类型、温度、重要性过滤。"
+        )
+
+    def initialize(self) -> bool:
+        return True
+
+    def cleanup(self) -> None:
+        pass
+
+    def execute(self, request: ToolRequest) -> ToolResult:
+        start_time = time.time()
+        node_type = request.parameters.get("node_type", None)
+        importance = request.parameters.get("importance", None)
+        temperature = request.parameters.get("temperature", None)
+        limit = min(request.parameters.get("limit", 20), 50)
+
+        try:
+            from zulong.memory.memory_graph import (
+                get_memory_graph, NodeType, Importance, Temperature,
+            )
+            mg = get_memory_graph()
+            if mg is None:
+                return self._create_result(
+                    success=False,
+                    error="MemoryGraph 未初始化",
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
+
+            # 获取所有节点或按类型过滤
+            if node_type:
+                type_map = {t.value: t for t in NodeType}
+                nt = type_map.get(node_type)
+                if nt is None:
+                    return self._create_result(
+                        success=False,
+                        error=f"无效的 node_type: {node_type}，"
+                              f"可选值: {list(type_map.keys())}",
+                        execution_time=time.time() - start_time,
+                        request_id=request.request_id,
+                    )
+                nodes = mg.get_nodes_by_type(nt)
+            else:
+                nodes = list(mg._nodes.values())
+
+            # 按重要性过滤
+            if importance:
+                imp_map = {i.value: i for i in Importance}
+                target_imp = imp_map.get(importance)
+                if target_imp:
+                    nodes = [
+                        n for n in nodes
+                        if n.metadata.get("importance", "normal") == target_imp.value
+                    ]
+
+            # 按温度过滤
+            if temperature:
+                temp_map = {t.value: t for t in Temperature}
+                target_temp = temp_map.get(temperature)
+                if target_temp:
+                    nodes = [
+                        n for n in nodes
+                        if mg.get_temperature(n.node_id) == target_temp
+                    ]
+
+            total_filtered = len(nodes)
+
+            # 按 last_accessed 降序排序
+            nodes.sort(key=lambda n: n.last_accessed, reverse=True)
+
+            # 格式化
+            result_nodes = []
+            for node in nodes[:limit]:
+                temp = mg.get_temperature(node.node_id)
+                imp = mg.get_importance(node.node_id)
+                result_nodes.append({
+                    "node_id": node.node_id,
+                    "type": node.node_type.value,
+                    "label": node.label,
+                    "activation": round(node.activation, 3),
+                    "temperature": temp.value if temp else "unknown",
+                    "importance": imp.value if imp else "normal",
+                })
+
+            # 统计
+            type_stats = {}
+            for t in NodeType:
+                count = len(mg.get_nodes_by_type(t))
+                if count > 0:
+                    type_stats[t.value] = count
+
+            logger.info(f"[list_memory] 返回 {len(result_nodes)}/{total_filtered} 个节点")
+
+            return self._create_result(
+                success=True,
+                data={
+                    "total_in_graph": len(mg._nodes),
+                    "filtered_count": total_filtered,
+                    "returned_count": len(result_nodes),
+                    "type_stats": type_stats,
+                    "nodes": result_nodes,
+                },
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
+            )
+
+        except Exception as e:
+            logger.error(f"[list_memory] 查询失败: {e}", exc_info=True)
+            return self._create_result(
+                success=False,
+                error=f"记忆列表查询失败: {e}",
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
+            )
+
+    def _get_parameters_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "node_type": {
+                    "type": "string",
+                    "enum": [
+                        "task", "dialogue", "knowledge", "experience",
+                        "episode", "file", "concept", "person", "document",
+                    ],
+                    "description": "按节点类型过滤（不填则返回全部类型）",
+                },
+                "importance": {
+                    "type": "string",
+                    "enum": [
+                        "trivial", "normal", "identity",
+                        "fact", "important", "must_remember",
+                    ],
+                    "description": "按重要性过滤",
+                },
+                "temperature": {
+                    "type": "string",
+                    "enum": ["hot", "warm", "cold"],
+                    "description": "按温度过滤（hot=最近访问, warm=中等, cold=长期未访问）",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "返回数量上限（默认 20，最大 50）",
+                },
+            },
+            "required": [],
+        }
+
+
+# ============================================================
+# P2-2: 重要性设置工具
+# ============================================================
+
+class SetImportanceTool(BaseTool):
+    """set_importance — 设置记忆节点重要性
+
+    调整指定节点的重要性标签，影响其衰减半衰期和检索优先级。
+    重要性越高的记忆衰减越慢、检索时权重越高。
+    """
+
+    def __init__(self):
+        super().__init__(name="set_importance", category=ToolCategory.CUSTOM)
+        self.description = (
+            "设置记忆节点的重要性级别。当用户明确要求记住某条信息、"
+            "标记某条记忆为重要/不重要、或调整信息优先级时调用。"
+            "重要性影响记忆的衰减速度和检索排名。"
+        )
+
+    def initialize(self) -> bool:
+        return True
+
+    def cleanup(self) -> None:
+        pass
+
+    def execute(self, request: ToolRequest) -> ToolResult:
+        start_time = time.time()
+        node_id = request.parameters.get("node_id", "")
+        importance = request.parameters.get("importance", "")
+        reason = request.parameters.get("reason", "")
+
+        if not node_id or not importance:
+            return self._create_result(
+                success=False,
+                error="node_id 和 importance 参数不能为空",
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
+            )
+
+        try:
+            from zulong.memory.memory_graph import get_memory_graph, Importance
+            mg = get_memory_graph()
+            if mg is None:
+                return self._create_result(
+                    success=False,
+                    error="MemoryGraph 未初始化",
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
+
+            # 映射重要性
+            imp_map = {i.value: i for i in Importance}
+            target_imp = imp_map.get(importance)
+            if target_imp is None:
+                return self._create_result(
+                    success=False,
+                    error=f"无效的 importance: {importance}，"
+                          f"可选值: {list(imp_map.keys())}",
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
+
+            # 检查节点存在
+            node = mg.get_node(node_id)
+            if node is None:
+                return self._create_result(
+                    success=False,
+                    error=f"节点 '{node_id}' 不存在",
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
+
+            # 读取旧值
+            old_imp = mg.get_importance(node_id)
+            old_value = old_imp.value if old_imp else "unknown"
+
+            # 设置新值
+            ok = mg.set_importance(node_id, target_imp)
+
+            if not ok:
+                return self._create_result(
+                    success=False,
+                    error="设置重要性失败",
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
+
+            logger.info(
+                f"[set_importance] {node_id}: {old_value} → {target_imp.value}"
+                f"{f' (原因: {reason})' if reason else ''}"
+            )
+
+            return self._create_result(
+                success=True,
+                data={
+                    "node_id": node_id,
+                    "label": node.label,
+                    "old_importance": old_value,
+                    "new_importance": target_imp.value,
+                    "reason": reason,
+                    "message": f"重要性已从 {old_value} 调整为 {target_imp.value}",
+                },
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
+            )
+
+        except Exception as e:
+            logger.error(f"[set_importance] 设置失败: {e}", exc_info=True)
+            return self._create_result(
+                success=False,
+                error=f"重要性设置失败: {e}",
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
+            )
+
+    def _get_parameters_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "node_id": {
+                    "type": "string",
+                    "description": "要设置重要性的节点 ID",
+                },
+                "importance": {
+                    "type": "string",
+                    "enum": [
+                        "trivial", "normal", "identity",
+                        "fact", "important", "must_remember",
+                    ],
+                    "description": "目标重要性级别",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "调整原因（可选，用于日志记录）",
+                },
+            },
+            "required": ["node_id", "importance"],
         }

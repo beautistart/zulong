@@ -426,7 +426,9 @@ skill('fetch-webpage', {{ url: '{url}' }})
             app=self.app,
             host=self.host,
             port=self.port,
-            log_level="info"
+            log_level="info",
+            ws_ping_interval=None,
+            ws_ping_timeout=None,
         )
         server = uvicorn.Server(config)
         

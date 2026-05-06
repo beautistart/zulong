@@ -369,6 +369,25 @@ class WebSocketServer:
         
         logger.info(f"[WebSocketServer] 收到事件：{event_type} from {source}")
         
+        # ✅ 特殊处理 L2_COMMAND：如果启用 streaming，使用流式输出
+        if event_type == "L2_COMMAND":
+            enable_streaming = payload.get("enable_streaming", True)
+            
+            # 检查配置是否启用 streaming
+            try:
+                from zulong.config.config_manager import get_l2_inference_config
+                config = get_l2_inference_config()
+                orch_config = config.get("orchestrator", {})
+                streaming_enabled = orch_config.get("enable_streaming", False)
+            except Exception as e:
+                logger.warning(f"[WebSocketServer] 读取 streaming 配置失败: {e}，默认禁用")
+                streaming_enabled = False
+            
+            if streaming_enabled and enable_streaming:
+                logger.info("[WebSocketServer] ✅ 使用流式模式处理 L2_COMMAND")
+                await self._handle_l2_command_streaming(payload, websocket)
+                return
+        
         # 映射事件类型
         try:
             zulong_event_type = EventType(event_type)
@@ -399,6 +418,98 @@ class WebSocketServer:
             "timestamp": datetime.now().isoformat(),
             "message": "Event published successfully"
         }))
+    
+    async def _handle_l2_command_streaming(
+        self, 
+        payload: dict, 
+        websocket: websockets.WebSocketServerProtocol
+    ):
+        """处理 L2_COMMAND 流式输出
+        
+        Args:
+            payload: 命令载荷
+            websocket: WebSocket 连接
+        """
+        try:
+            # 提取命令参数
+            text = payload.get("text", "")
+            vllm_model_id = payload.get("vllm_model_id", "qwen3.5:4b")
+            
+            logger.info(f"[WebSocketServer] 开始流式处理 L2 命令: '{text[:50]}...'")
+            
+            # 发送开始事件
+            await websocket.send(json.dumps({
+                "type": "L2_STREAM_START",
+                "timestamp": datetime.now().isoformat(),
+                "message": "Streaming started"
+            }))
+            
+            # 获取 InferenceEngine 实例
+            from zulong.l2.inference_engine import InferenceEngine
+            engine = InferenceEngine()
+            
+            # 检查是否启用 LangGraph Orchestrator
+            from zulong.config.config_manager import get_l2_inference_config
+            config = get_l2_inference_config()
+            orch_config = config.get("orchestrator", {})
+            use_langgraph = orch_config.get("use_langgraph", False)
+            
+            if not use_langgraph:
+                logger.warning("[WebSocketServer] LangGraph 未启用，降级为非流式模式")
+                await websocket.send(json.dumps({
+                    "type": "L2_STREAM_ERROR",
+                    "error": "LangGraph not enabled",
+                    "message": "Streaming requires LangGraph to be enabled"
+                }))
+                return
+            
+            # 创建或复用编排器实例
+            if not hasattr(engine, '_orchestrator_langgraph'):
+                from zulong.l2.orchestrator_graph import OrchestratorWithLangGraph
+                engine._orchestrator_langgraph = OrchestratorWithLangGraph(engine)
+            
+            orchestrator = engine._orchestrator_langgraph
+            
+            # 准备消息和工具定义
+            messages = [
+                {"role": "user", "content": text}
+            ]
+            tool_definitions = []  # TODO: 从引擎获取实际的工具定义
+            
+            # ✅ 使用 stream_run 方法进行流式执行
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                async for event in orchestrator.stream_run(
+                    user_input=text,
+                    messages=messages,
+                    tool_definitions=tool_definitions,
+                    vllm_model_id=vllm_model_id,
+                ):
+                    # 转发每个流式事件到 WebSocket 客户端
+                    await websocket.send(json.dumps(event))
+                    
+            finally:
+                loop.close()
+            
+            # 发送结束事件
+            await websocket.send(json.dumps({
+                "type": "L2_STREAM_END",
+                "timestamp": datetime.now().isoformat(),
+                "message": "Streaming completed"
+            }))
+            
+            logger.info("[WebSocketServer] L2 命令流式处理完成")
+            
+        except Exception as e:
+            logger.error(f"[WebSocketServer] 流式处理失败: {e}", exc_info=True)
+            await websocket.send(json.dumps({
+                "type": "L2_STREAM_ERROR",
+                "error": str(e),
+                "timestamp": datetime.now().isoformat()
+            }))
     
     async def stop(self):
         """停止 WebSocket 服务器"""

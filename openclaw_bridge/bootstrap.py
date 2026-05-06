@@ -410,10 +410,10 @@ async def main():
         executor_mock_mode=True,
         speak_mock_mode=True,
         
-        # 启用 Web 功能
+        # 启用 Web 功能（端口 8081，避免与 Cline API Server 的 8080 冲突）
         web_enabled=True,
-        web_host="localhost",
-        web_port=8080,
+        web_host="0.0.0.0",
+        web_port=8081,
         
         # 启用所有模块
         enable_mic=True,

@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # 默认热工具白名单（始终在 prompt 中）
 DEFAULT_HOT_TOOLS: Set[str] = {
-    "openclaw_search",     # 核心搜索
+    "web_search",          # 核心搜索
     "read_memory_detail",  # 记忆检索
     "search_tools",        # 元工具（发现冷工具的入口）
 }
@@ -183,6 +183,48 @@ class CoreToolManager:
             "max_hot_tools": self._max_hot_tools,
         }
     
+    # ==================== 域感知工具路由 ====================
+
+    # 每个 task_domain 对应的推荐工具名
+    DOMAIN_TOOL_MAP: Dict[str, Set[str]] = {
+        "code": {
+            "exec_write_file", "exec_run_command", "search_code",
+            "read_file", "write_file", "edit_code",
+            "search_code_symbols", "get_symbol_context",
+        },
+        "research": {
+            "web_search", "recall_memory", "read_memory_detail",
+            "discover_related", "search_experience",
+        },
+        "creative": {
+            "web_search", "recall_memory", "save_memory_note",
+        },
+        "data": {
+            "exec_run_command", "exec_write_file", "web_search",
+        },
+        "general": set(),  # 不额外提升，仅用默认热工具
+    }
+
+    def get_domain_tools(self, domain: str) -> Set[str]:
+        """根据任务域返回推荐的额外工具名集合
+
+        调用方可将返回的工具名传给 promote_tools() 临时提升为热工具。
+
+        Args:
+            domain: task_domain 值，如 "code"/"research" 等
+
+        Returns:
+            推荐工具名集合（只包含已在 schema_cache 中注册的工具）
+        """
+        candidates = self.DOMAIN_TOOL_MAP.get(domain, set())
+        available = {t for t in candidates if t in self._schema_cache}
+        if available:
+            logger.debug(
+                "[CoreToolManager] domain=%s → promoting %s",
+                domain, available,
+            )
+        return available
+
     # ==================== 内部方法 ====================
     
     def _register_cold_tool(self, tool_name: str, schema: Dict[str, Any], source: str):

@@ -25,7 +25,7 @@ set ZULONG_L2_TOP_P=0.85
 
 REM 视觉系统配置
 set ZULONG_CAMERA_ENABLED=false
-set ZULONG_YOLO_MODEL_PATH=yolov10n.pt
+set ZULONG_YOLO_MODEL_PATH=models\yolov10n.pt
 
 REM 音频系统配置
 set ZULONG_MICROPHONE_ENABLED=true

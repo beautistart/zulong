@@ -15,7 +15,7 @@ from .base import (
     ToolStatus, ToolCategory
 )
 from .openclaw_tool import OpenClawToolAdapter
-from .openclaw_search import OpenClawSearchTool
+from .web_search import WebSearchTool
 from .openclaw_plugin import OpenClawPluginAdapter
 
 logger = logging.getLogger(__name__)
@@ -490,12 +490,12 @@ class ToolEngine:
             else:
                 logger.debug("[ToolEngine] OpenClaw 工具适配器已存在，跳过注册")
             
-            # 注册 OpenClaw 搜索工具
-            openclaw_search_tool = OpenClawSearchTool()
-            if self.register_tool(openclaw_search_tool):
-                logger.info("[ToolEngine] 已注册 OpenClaw 搜索工具")
+            # 注册 Web 搜索工具（SearXNG 直连）
+            web_search_tool = WebSearchTool()
+            if self.register_tool(web_search_tool):
+                logger.info("[ToolEngine] 已注册 Web 搜索工具 (SearXNG)")
             else:
-                logger.debug("[ToolEngine] OpenClaw 搜索工具已存在，跳过注册")
+                logger.debug("[ToolEngine] Web 搜索工具已存在，跳过注册")
             
             # 注册 OpenClaw 插件适配器
             openclaw_plugin_tool = OpenClawPluginAdapter()
@@ -528,12 +528,18 @@ class ToolEngine:
             
             # 注册 navigate_attention 工具（思维深度索引 — 注意力导航）
             try:
-                from zulong.tools.attention_tool import NavigateAttentionTool
+                from zulong.tools.attention_tool import NavigateAttentionTool, AdjustAttentionModeTool
                 attention_tool = NavigateAttentionTool()
                 if self.register_tool(attention_tool):
                     logger.info("[ToolEngine] 已注册 navigate_attention 工具")
                 else:
                     logger.debug("[ToolEngine] navigate_attention 工具已存在，跳过注册")
+                # P2-1: 注册直接模式切换工具
+                attn_mode_tool = AdjustAttentionModeTool()
+                if self.register_tool(attn_mode_tool):
+                    logger.info("[ToolEngine] 已注册 adjust_attention_mode 工具")
+                else:
+                    logger.debug("[ToolEngine] adjust_attention_mode 工具已存在，跳过注册")
             except ImportError:
                 logger.debug("[ToolEngine] attention_tool 模块未找到，跳过注册")
             
@@ -542,9 +548,13 @@ class ToolEngine:
                 from zulong.tools.memory_graph_tools import (
                     RecallMemoryTool, ReadMemoryNodeTool,
                     SaveMemoryNoteTool, DiscoverRelatedTool,
+                    ActivateMemoryNetworkTool, ListMemoryTool,
+                    SetImportanceTool,
                 )
                 for tool_cls in [RecallMemoryTool, ReadMemoryNodeTool,
-                                 SaveMemoryNoteTool, DiscoverRelatedTool]:
+                                 SaveMemoryNoteTool, DiscoverRelatedTool,
+                                 ActivateMemoryNetworkTool, ListMemoryTool,
+                                 SetImportanceTool]:
                     tool_inst = tool_cls()
                     if self.register_tool(tool_inst):
                         logger.info(f"[ToolEngine] 已注册 {tool_inst.name} 工具")
@@ -553,6 +563,20 @@ class ToolEngine:
             except ImportError:
                 logger.debug("[ToolEngine] memory_graph_tools 模块未找到，跳过注册")
             
+            # 注册 CodeAnchor FC 工具集
+            try:
+                from zulong.tools.code_anchor_tools import (
+                    MemoryWriteWithCodeTool, CodeQueryTool, TaskLinkCodeTool,
+                )
+                for tool_cls in [MemoryWriteWithCodeTool, CodeQueryTool, TaskLinkCodeTool]:
+                    tool_inst = tool_cls()
+                    if self.register_tool(tool_inst):
+                        logger.info(f"[ToolEngine] 已注册 {tool_inst.name} 工具")
+                    else:
+                        logger.debug(f"[ToolEngine] {tool_inst.name} 工具已存在，跳过注册")
+            except ImportError:
+                logger.debug("[ToolEngine] code_anchor_tools 模块未找到，跳过注册")
+            
             # 注册任务管理 FC 工具集
             try:
                 from zulong.tools.task_tools import (
@@ -560,11 +584,21 @@ class ToolEngine:
                     TaskMarkStatusTool,
                     TaskViewOverviewTool,
                     TaskSuspendTool, TaskListSuspendedTool,
+                    TaskAddDependencyTool, TaskGetDetailTool,
+                    TaskUpdateNodeTool, TaskRemoveNodeTool,
+                    TaskUpdateContentTool, TaskAttachFileTool,
+                    SubmitFinalAnswerTool,
+                    TaskResumeByAddressTool, TaskReviseNodeTool,
                 )
                 for tool_cls in [TaskCreatePlanTool, TaskAddNodeTool,
                                  TaskMarkStatusTool,
                                  TaskViewOverviewTool,
-                                 TaskSuspendTool, TaskListSuspendedTool]:
+                                 TaskSuspendTool, TaskListSuspendedTool,
+                                 TaskAddDependencyTool, TaskGetDetailTool,
+                                 TaskUpdateNodeTool, TaskRemoveNodeTool,
+                                 TaskUpdateContentTool, TaskAttachFileTool,
+                                 SubmitFinalAnswerTool,
+                                 TaskResumeByAddressTool, TaskReviseNodeTool]:
                     tool_inst = tool_cls()
                     if self.register_tool(tool_inst):
                         logger.info(f"[ToolEngine] 已注册 {tool_inst.name} 工具")
@@ -586,6 +620,35 @@ class ToolEngine:
                         logger.debug(f"[ToolEngine] {tool_inst.name} 工具已存在，跳过注册")
             except ImportError:
                 logger.debug("[ToolEngine] exec_tools 模块未找到，跳过注册")
+            
+            # 注册会话交互工具
+            try:
+                from zulong.tools.session_tools import AskUserTool
+                ask_user_tool = AskUserTool()
+                if self.register_tool(ask_user_tool):
+                    logger.info("[ToolEngine] 已注册 ask_user 工具")
+                else:
+                    logger.debug("[ToolEngine] ask_user 工具已存在，跳过注册")
+            except ImportError:
+                logger.debug("[ToolEngine] session_tools 模块未找到，跳过注册")
+
+            # 注册代码智能工具
+            try:
+                from zulong.tools.code_tools import (
+                    SearchCodeSymbolsTool, GetSymbolContextTool,
+                    GetImpactAnalysisTool, IndexCodeFileTool,
+                    IndexProjectTool, AnalyzeModuleTool,
+                )
+                for code_tool_cls in (
+                    SearchCodeSymbolsTool, GetSymbolContextTool,
+                    GetImpactAnalysisTool, IndexCodeFileTool,
+                    IndexProjectTool, AnalyzeModuleTool,
+                ):
+                    code_tool = code_tool_cls()
+                    if self.register_tool(code_tool):
+                        logger.info(f"[ToolEngine] 已注册 {code_tool.name} 工具")
+            except ImportError:
+                logger.debug("[ToolEngine] code_tools 模块未找到，跳过注册")
         except Exception as e:
             logger.error(f"[ToolEngine] 注册内置工具失败：{e}")
     

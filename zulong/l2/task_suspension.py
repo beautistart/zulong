@@ -37,12 +37,21 @@ class SuspendableTaskState:
     memory_snapshot: Optional[Dict] = None  # MemoryGraph 激活快照（焦点/激活值）
 
     def to_dict(self) -> Dict:
-        """序列化为字典"""
-        result = asdict(self)
-        # 移除不可序列化的 task_graph 对象，只保留序列化数据
-        if 'task_graph' in result:
-            del result['task_graph']
-        return result
+        """序列化为字典（避免 asdict 的深拷贝触发不可序列化对象）"""
+        return {
+            "task_id": self.task_id,
+            "description": self.description,
+            "messages": self.messages,
+            "accumulated_links": self.accumulated_links,
+            "circuit_breaker_state": self.circuit_breaker_state,
+            "iteration_count": self.iteration_count,
+            "task_graph_serialized": self.task_graph_serialized,
+            "created_at": self.created_at,
+            "suspended_at": self.suspended_at,
+            "suspended_reason": self.suspended_reason,
+            "metadata": self.metadata,
+            "memory_snapshot": self.memory_snapshot,
+        }
 
     @classmethod
     def from_dict(cls, data: Dict) -> 'SuspendableTaskState':
@@ -154,15 +163,26 @@ class TaskSuspensionManager:
         except Exception as e:
             logger.info(f"[TaskSuspension] MemoryGraph 快照跳过: {e}")
 
-        # 写入磁盘
+        # 原子写入磁盘：temp file → fsync → os.replace
+        # 防止写入过程中崩溃导致 JSON 损坏，任务永久丢失
         file_path = os.path.join(self._persistence_path, f"{state.task_id}.json")
+        tmp_path = file_path + ".tmp"
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(state.to_dict(), f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, file_path)
             logger.info(f"[TaskSuspension] 任务已挂起: {state.task_id} (reason={state.suspended_reason}, iters={state.iteration_count})")
             return state.task_id
         except Exception as e:
             logger.error(f"[TaskSuspension] 挂起失败: {e}")
+            # 清理可能残留的临时文件
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
             return ""
 
     async def resume_task(self, task_id: str, consume: bool = True) -> Optional[SuspendableTaskState]:
@@ -237,6 +257,9 @@ class TaskSuspensionManager:
                 continue
             file_path = os.path.join(self._persistence_path, filename)
             try:
+                if os.path.getsize(file_path) == 0:
+                    logger.warning(f"[TaskSuspension] 跳过零字节文件: {filename}")
+                    continue
                 with open(file_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 tasks.append({

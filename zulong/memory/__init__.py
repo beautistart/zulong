@@ -20,7 +20,7 @@ ZULONG 记忆系统模块
 """
 
 from .short_term_memory import ShortTermMemory
-from .memory_evolution import MemoryConsolidator, MemoryStrength
+from .memory_evolution import MemoryConsolidator, MemoryStrength, MemoryEvolutionEngine
 from .experience_generator import ExperienceGenerator, ExperienceCandidate
 from .rag_manager import RAGManager, RAGConfig
 from .tagging_engine import TaggingEngine
@@ -35,6 +35,7 @@ __all__ = [
     "ShortTermMemory",
     "MemoryConsolidator",
     "MemoryStrength",
+    "MemoryEvolutionEngine",
     "ExperienceGenerator",
     "ExperienceCandidate",
     "RAGManager",

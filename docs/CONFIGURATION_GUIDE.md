@@ -185,7 +185,7 @@ vision:
     resolution: [1280, 720]
   
   yolo:
-    model_path: "yolov10n.pt"
+    model_path: "models/yolov10n.pt"
     device: "cuda"
     confidence_threshold: 0.25
 ```
@@ -278,7 +278,7 @@ ZULONG_L2_CORE_TIMEOUT=30
 ### 视觉系统
 ```bash
 ZULONG_CAMERA_ENABLED=false
-ZULONG_YOLO_MODEL_PATH=yolov10n.pt
+ZULONG_YOLO_MODEL_PATH=models/yolov10n.pt
 ```
 
 ### 音频系统

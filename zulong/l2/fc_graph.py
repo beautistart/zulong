@@ -1,19 +1,30 @@
 """
-FC Loop 的 LangGraph StateGraph 实现
+FC Loop 的 LangGraph StateGraph 实现 [已废弃]
 
-将 inference_engine.py 中的 while FC 循环替换为 4 节点有向图：
-  check → call_model → exec_tools / eval_response → (循环回 check 或 END)
+已被 unified_fc_runner.py 替代。本文件中的节点工厂函数
+(_make_check_node, _make_call_model_node, _make_exec_tools_node,
+ _make_eval_response_node) 仍被 UnifiedFCRunner 复用，
+但 LangGraph StateGraph 构建和 run_fc_loop() 入口已废弃。
 
-步数作为主要收敛控制，时间信号降级为 Circuit Breaker 的辅助信号。
+新代码请使用:
+    from zulong.l2.unified_fc_runner import run_fc_loop
 """
 
 import concurrent.futures
 import json as _json
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple, TypedDict, TYPE_CHECKING
 
-from langgraph.graph import StateGraph, END
+try:
+    from langgraph.graph import StateGraph, END
+    from langgraph.checkpoint.sqlite import SqliteSaver
+    LANGGRAPH_AVAILABLE = True
+except ImportError:
+    LANGGRAPH_AVAILABLE = False
+    from langgraph.graph import StateGraph, END
+    SqliteSaver = None
 
 if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
@@ -53,6 +64,7 @@ class FCLoopState(TypedDict, total=False):
     resume_automark_count: int
     null_response_count: int  # 连续 response=None 的拦截次数
     api_timeout_count: int  # API 连续超时次数
+    intent_max_tokens: int  # 由 intent_type 决定的 max_tokens（COMPLEX/RESUME=4096, CHAT=1024）
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +135,7 @@ def _make_call_model_node(engine: "InferenceEngine"):
         api_kwargs: Dict[str, Any] = {
             "model": vllm_model_id,
             "messages": windowed_messages,
-            "max_tokens": 1024,
+            "max_tokens": state.get("intent_max_tokens", 1024),
             "temperature": 0.3,
             "top_p": 0.85,
             "stream": False,
@@ -145,6 +157,11 @@ def _make_call_model_node(engine: "InferenceEngine"):
                 api_kwargs["tool_choice"] = "auto"
 
         # API 调用（含超时）
+        # FC 请求间隔：防止 API 被打满（跳过第一轮）
+        _req_interval = getattr(engine, "_fc_request_interval", 1.0)
+        if fc_turn > 1 and _req_interval > 0:
+            time.sleep(_req_interval)
+
         def _call(kwargs=api_kwargs):
             return engine.vllm_client.chat.completions.create(**kwargs)
 
@@ -178,7 +195,7 @@ def _make_call_model_node(engine: "InferenceEngine"):
                         backup_resp = engine.backup_client.chat.completions.create(
                             model=LLM_MODEL_ID_BACKUP,
                             messages=messages,
-                            max_tokens=1024,
+                            max_tokens=state.get("intent_max_tokens", 1024),
                             temperature=0.3,
                             stream=False,
                             **engine._get_llm_extra_kwargs(),
@@ -439,8 +456,18 @@ def _make_exec_tools_node(engine: "InferenceEngine"):
                 _in_progress = _tg.get_nodes_by_status("in_progress")
                 if _in_progress:
                     _seed_ids = [f"task:{_tg.id}/{n.id}" for n in _in_progress]
-                    # 过滤掉 MemoryGraph 中不存在的种子 ID
-                    _valid_seeds = [s for s in _seed_ids if _mg.has_node(s)]
+                    # P1-3: 将最近 retrieve_context 命中的 top-3 节点也加入种子
+                    # 类比：人回忆起一件事后，该记忆自动触发关联联想
+                    _retrieved_seeds = getattr(_mg, '_last_retrieved_node_ids', [])
+                    if _retrieved_seeds:
+                        _seed_ids.extend(_retrieved_seeds)
+                    # 过滤掉 MemoryGraph 中不存在的种子 ID（去重）
+                    _seen_seeds = set()
+                    _valid_seeds = []
+                    for s in _seed_ids:
+                        if s not in _seen_seeds and _mg.has_node(s):
+                            _valid_seeds.append(s)
+                            _seen_seeds.add(s)
                     logger.info(
                         f"[FC][Graph] BFS 种子: seed_ids={_seed_ids}, "
                         f"valid={len(_valid_seeds)}/{len(_seed_ids)}"
@@ -1217,7 +1244,30 @@ def build_fc_graph(engine: "InferenceEngine") -> "CompiledStateGraph":
         {"end": END, "check": "check"},
     )
 
-    compiled = graph.compile()
+    # ✅ 配置 Checkpointer（如果启用）
+    try:
+        from zulong.config.config_manager import get_l2_inference_config
+        config = get_l2_inference_config()
+        fc_config = config.get("fc_loop", {})
+        use_checkpointer = fc_config.get("use_langgraph_checkpointer", False)
+        
+        if use_checkpointer and LANGGRAPH_AVAILABLE and SqliteSaver is not None:
+            db_path = fc_config.get("checkpointer_db_path", "./data/fc_loop_checkpoints.db")
+            os.makedirs(os.path.dirname(db_path), exist_ok=True)
+            
+            checkpointer = SqliteSaver.from_conn_string(db_path)
+            compiled = graph.compile(checkpointer=checkpointer)
+            logger.info(f"[FC][Graph] ✅ FC Loop Checkpointer 已启用: {db_path}")
+        else:
+            compiled = graph.compile()
+            if use_checkpointer:
+                logger.warning("[FC][Graph] ⚠️ Checkpointer 配置为启用但 LangGraph 不可用，使用内存模式")
+            else:
+                logger.info("[FC][Graph] ⚠️ FC Loop Checkpointer 未启用，使用内存模式")
+    except Exception as e:
+        logger.error(f"[FC][Graph] Checkpointer 配置失败: {e}，使用内存模式")
+        compiled = graph.compile()
+    
     logger.info("[FC][Graph] LangGraph FC Loop 图已编译")
     return compiled
 
@@ -1230,8 +1280,12 @@ def run_fc_loop(
     force_first_tool: bool = False,
     user_input: str = "",
     is_resume: bool = None,
+    intent_max_tokens: int = 1024,
 ) -> Tuple[Optional[str], int]:
     """执行 LangGraph FC Loop，返回 (response, fc_turn)。
+
+    .. deprecated::
+        请使用 ``from zulong.l2.unified_fc_runner import run_fc_loop``。
 
     Args:
         engine: InferenceEngine 实例
@@ -1270,6 +1324,7 @@ def run_fc_loop(
         "resume_automark_count": 0,
         "null_response_count": 0,
         "api_timeout_count": 0,
+        "intent_max_tokens": intent_max_tokens,
     }
 
     # 执行图（recursion_limit 作为安全网）
@@ -1301,3 +1356,144 @@ def run_fc_loop(
 
     logger.info(f"[FC][Graph] 图执行完成，共 {fc_turn} 轮，response={'有' if response else '无'}")
     return response, fc_turn
+
+
+# ═══════════════════════════════════════════════════════════════
+# FC Loop Checkpointer 管理器
+# ═══════════════════════════════════════════════════════════════
+
+class FCLoopCheckpointManager:
+    """FC Loop 检查点管理器
+    
+    提供列出、恢复检查点的功能
+    """
+    
+    @staticmethod
+    def list_checkpoints() -> List[Dict[str, Any]]:
+        """列出所有可用的 FC Loop 检查点
+        
+        Returns:
+            检查点列表
+        """
+        if not LANGGRAPH_AVAILABLE:
+            logger.warning("[FC][Checkpoint] LangGraph 未启用，无法列出检查点")
+            return []
+        
+        try:
+            from zulong.config.config_manager import get_l2_inference_config
+            config = get_l2_inference_config()
+            fc_config = config.get("fc_loop", {})
+            db_path = fc_config.get("checkpointer_db_path", "./data/fc_loop_checkpoints.db")
+            
+            if not os.path.exists(db_path):
+                logger.info(f"[FC][Checkpoint] 检查点数据库不存在: {db_path}")
+                return []
+            
+            import sqlite3
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # 查询所有不同的 thread_id
+            cursor.execute("SELECT DISTINCT thread_id FROM checkpoints")
+            rows = cursor.fetchall()
+            
+            checkpoints = []
+            for (thread_id,) in rows:
+                # 获取每个线程的最新检查点
+                cursor.execute(
+                    "SELECT checkpoint_id, parent_checkpoint_id, type, checkpoint "
+                    "FROM checkpoints "
+                    "WHERE thread_id = ? "
+                    "ORDER BY checkpoint_id DESC "
+                    "LIMIT 1",
+                    (thread_id,)
+                )
+                checkpoint_row = cursor.fetchone()
+                
+                if checkpoint_row:
+                    checkpoint_id, parent_id, checkpoint_type, checkpoint_data = checkpoint_row
+                    
+                    try:
+                        checkpoint_info = {
+                            "thread_id": thread_id,
+                            "checkpoint_id": checkpoint_id,
+                            "parent_checkpoint_id": parent_id,
+                            "type": checkpoint_type,
+                        }
+                        
+                        # 尝试从 checkpoint_data 中提取信息
+                        if checkpoint_data:
+                            import pickle
+                            try:
+                                state = pickle.loads(checkpoint_data)
+                                if isinstance(state, dict):
+                                    channel_values = state.get('channel_values', {})
+                                    checkpoint_info['fc_turn'] = channel_values.get('fc_turn', 0)
+                                    checkpoint_info['should_terminate'] = channel_values.get('should_terminate', '')
+                            except Exception as e:
+                                logger.debug(f"[FC][Checkpoint] 解析检查点数据失败: {e}")
+                        
+                        checkpoints.append(checkpoint_info)
+                    except Exception as e:
+                        logger.error(f"[FC][Checkpoint] 处理检查点失败: {e}")
+            
+            conn.close()
+            
+            logger.info(f"[FC][Checkpoint] 找到 {len(checkpoints)} 个检查点")
+            return checkpoints
+            
+        except Exception as e:
+            logger.error(f"[FC][Checkpoint] 列出检查点失败: {e}", exc_info=True)
+            return []
+    
+    @staticmethod
+    async def restore(
+        engine: "InferenceEngine",
+        thread_id: str,
+        checkpoint_id: Optional[str] = None,
+    ) -> Tuple[Optional[str], int]:
+        """恢复到指定的 FC Loop 检查点并继续执行
+        
+        Args:
+            engine: InferenceEngine 实例
+            thread_id: 线程ID
+            checkpoint_id: 检查点ID（可选）
+            
+        Returns:
+            (response, fc_turn)
+        """
+        if not LANGGRAPH_AVAILABLE:
+            logger.error("[FC][Checkpoint] LangGraph 未启用，无法恢复")
+            return None, 0
+        
+        compiled_graph = build_fc_graph(engine)
+        
+        config = {"configurable": {"thread_id": thread_id}}
+        if checkpoint_id:
+            config["configurable"]["checkpoint_id"] = checkpoint_id
+        
+        logger.info(
+            f"[FC][Checkpoint] 恢复执行: thread_id={thread_id}, "
+            f"checkpoint_id={checkpoint_id or 'latest'}"
+        )
+        
+        try:
+            # 从检查点恢复，传入 None 表示从上次状态继续
+            final_state = compiled_graph.invoke(None, config=config)
+            
+            response = final_state.get("response")
+            fc_turn = final_state.get("fc_turn", 0)
+            
+            logger.info(
+                f"[FC][Checkpoint] 恢复完成: thread_id={thread_id}, "
+                f"fc_turn={fc_turn}"
+            )
+            
+            return response, fc_turn
+            
+        except Exception as e:
+            logger.error(
+                f"[FC][Checkpoint] 恢复失败: thread_id={thread_id}, error={e}",
+                exc_info=True
+            )
+            return None, 0

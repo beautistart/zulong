@@ -77,7 +77,7 @@ def _lazy_load_yolo():
             from ultralytics import YOLO
             
             # 查找模型文件
-            yolo_path = os.path.join(os.path.dirname(__file__), '..', '..', 'yolov10n.pt')
+            yolo_path = os.path.join(os.path.dirname(__file__), '..', '..', 'models', 'yolov10n.pt')
             yolo_path = os.path.normpath(yolo_path)
             
             if not os.path.exists(yolo_path):

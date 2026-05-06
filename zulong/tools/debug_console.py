@@ -66,6 +66,8 @@ class DebugConsole:
             self._running = False
             self._input_thread: Optional[threading.Thread] = None
             self._stream_prefix_printed = False  # 流式输出前缀标志
+            self._output_queue: list = []         # 输出消息队列
+            self._queue_lock = threading.Lock()   # 队列专用锁（与单例锁分离）
             self._initialized = True
             
             # 🎯 初始化扬声器设备 (自动启动)
@@ -226,7 +228,7 @@ class DebugConsole:
         """输出循环 - 格式化打印系统事件"""
         while self._running:
             try:
-                with self._lock:
+                with self._queue_lock:
                     if self._output_queue:
                         message = self._output_queue.pop(0)
                         print(message)
@@ -237,7 +239,7 @@ class DebugConsole:
     
     def _enqueue_output(self, message: str):
         """将消息加入输出队列"""
-        with self._lock:
+        with self._queue_lock:
             timestamp = datetime.now().strftime("%H:%M:%S")
             self._output_queue.append(f"[{timestamp}] {message}")
     

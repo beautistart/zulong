@@ -336,10 +336,13 @@ def get_l2_inference_config() -> Dict[str, Any]:
         'generation': config_manager.get_dict('l2_inference.generation'),
         'timeout': config_manager.get_dict('l2_inference.timeout'),
         'retry': config_manager.get_dict('l2_inference.retry'),
+        'request_interval': config_manager.get('l2_inference.request_interval', 1.0),
         'visual_keywords': (
             config_manager.get_list('l2_inference.visual_keywords_strong')
             + config_manager.get_list('l2_inference.visual_keywords_weak')
         ),
+        'orchestrator': config_manager.get_dict('l2_inference.orchestrator'),
+        'fc_loop': config_manager.get_dict('l2_inference.fc_loop'),
     }
 
 

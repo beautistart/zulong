@@ -81,16 +81,17 @@ def build_round1_system_prompt() -> str:
         "你的任务：分析用户输入的意图，然后调用 start_session 工具进行分类。\n"
         "\n"
         "意图分类定义：\n"
-        "- chat: 简短闲聊、单一问题、打招呼。例：\"你好\"、\"今天天气怎么样\"、\"Python是什么\"\n"
+        "- chat: 闲聊、单一问题、打招呼、记住/记录/保存信息。例：\"你好\"、\"请记住小王的信息\"、\"帮我记一下明天开会\"\n"
         "- complex: 需要多个步骤或产出多个部分的任务。包括但不限于：\n"
         "  * 开发/编码/设计/写报告/做游戏等创作任务\n"
         "  * 分析对比、列出多项内容、归纳总结等结构化输出\n"
-        "  * 包含\"并\"、\"同时\"、\"另外\"等连接词的多部分请求\n"
-        "  * 包含\"分析\"、\"对比\"、\"列出\"、\"设计\"、\"帮我做\"等动词的任务\n"
+        "  * 包含\"同时\"、\"另外\"、\"此外\"等连接词的多部分请求\n"
+        "  * 包含\"帮我做\"、\"帮我写\"、\"帮我设计\"等明确任务动词的请求\n"
         "  * 用户为正在进行的任务补充信息（如回答出发日期、预算等问题）\n"
         "- resume: 用户想要继续/恢复/接着做之前暂停或挂起的任务\n"
         "\n"
         "分类要点：\n"
+        "- 用户请求\"记住\"、\"记录\"、\"记下\"、\"保存\"某些信息时 → chat（不需要创建任务）\n"
         "- 包含\"继续\"、\"接着做\"、\"恢复\"、\"上次那个\"等恢复意图时 → resume\n"
         "- 用户请求中包含2个或以上子任务/子要求时 → complex\n"
         "- 用户请求需要结构化输出（列表、对比表、多段分析）时 → complex\n"
@@ -145,13 +146,15 @@ def get_round1_tools() -> List[Dict[str, Any]]:
 _CHAT_TOOLS = {
     "recall_memory", "read_memory_node", "save_memory_note",
     "discover_related", "navigate_attention", "search_experience",
-    "openclaw_search", "search_tools",
+    "web_search", "search_tools",
 }
 
 _RESUME_TOOLS = {
     # 任务管理
     "task_view_overview", "task_mark_status", "task_suspend",
     "task_list_suspended",
+    # CRUD 补全（让 RESUME 也能查看/修改节点）
+    "task_get_detail", "task_update_node",
     # 执行类（RESUME 必须能实际执行任务内容）
     "exec_write_file", "exec_run_command",
     # 记忆/检索
@@ -455,8 +458,8 @@ def _build_complex_prompt(user_input: str, rag_context: Optional[str],
         "2. 用 task_view_overview 查看一次任务概览确认结构（只需查看一次）\n"
         "3. 按顺序逐个执行每个子任务：\n"
         "   a) 调用 task_mark_status(node_id='节点ID', status='in_progress')\n"
-        "   b) 生成该子任务的完整内容/结果\n"
-        "   c) 调用 task_mark_status(node_id='节点ID', status='completed', result='结果摘要')\n"
+        "   b) 用 exec_write_file 把该子任务的完整内容写入文件（代码/文档/方案等），或者对于纯分析/决策类子任务直接在 result 中写详细结论\n"
+        "   c) 调用 task_mark_status(node_id='节点ID', status='completed', result='详细结果，不少于50字，包含关键结论或产出文件路径')\n"
         "   d) 立即开始下一个子任务\n"
         "\n"
         "重要规则：\n"
@@ -467,6 +470,7 @@ def _build_complex_prompt(user_input: str, rag_context: Optional[str],
         "- ⚠️ 在还有未完成的子任务时，绝对不能声称任务已全部完成\n"
         "- ⚠️ 绝对不要向用户反问或要求补充信息，直接基于合理假设开始执行\n"
         "- ⚠️ 工具调用中的 label、desc、result 等字段必须使用与用户相同的语言\n"
+        "- 内容型子任务（代码/文档/方案）必须调用 exec_write_file 写入工作目录\n"
     )
 
     # 信息缺口感知
@@ -505,6 +509,18 @@ def _build_complex_prompt(user_input: str, rag_context: Optional[str],
             f"- 用 task_add_node 添加新的子任务节点\n"
             f"- 用 task_mark_status 完成未完成的任务\n"
             f"- 不需要重新创建任务图\n"
+        )
+    elif scaffold_data.get("old_graph_cleared"):
+        # 🔥 [Fix-8] 旧图谱已清除，需要创建全新图谱
+        cleared_title = scaffold_data.get("cleared_graph_title", "未知任务")
+        system_parts.append(
+            f"\n【重要：需要创建全新任务图】\n"
+            f"之前的任务图「{cleared_title}」已全部完成并已归档。\n"
+            f"这是一个全新的任务请求，请首先调用 task_create_plan 创建新图谱：\n"
+            f"1. 调用 task_create_plan(title='新任务标题') 创建新图谱和根节点\n"
+            f"2. 然后用 task_add_node 添加子任务节点（parent_id='req'）\n"
+            f"3. 用 task_add_dependency 建立依赖关系\n"
+            f"4. 然后按顺序执行每个子任务\n"
         )
     elif graph_id:
         system_parts.append(

@@ -98,8 +98,13 @@ class CompletedTaskArchiveManager:
 
         file_path = os.path.join(self._persistence_path, f"{state.task_id}.json")
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
+            # 原子写入：先写临时文件，再 rename，防止中途崩溃产生零字节/截断文件
+            tmp_path = file_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(state.to_dict(), f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, file_path)
             logger.info(
                 f"[TaskArchive] 任务已归档: {state.task_id} "
                 f"(status={state.completion_status}, turns={state.total_turns}, "
@@ -126,6 +131,35 @@ class CompletedTaskArchiveManager:
         except Exception as e:
             logger.error(f"[TaskArchive] 归档失败: {e}")
             return ""
+
+    def patch_archive(self, task_id: str, **updates) -> bool:
+        """补丁更新已归档任务的字段（原子读-改-写）。
+
+        用于 FC 循环结束后回填 final_answer / duration / total_turns 等
+        在归档时不可用的元数据。
+        """
+        if not self.enabled or not updates:
+            return False
+        file_path = os.path.join(self._persistence_path, f"{task_id}.json")
+        if not os.path.exists(file_path):
+            return False
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            data.update(updates)
+            tmp_path = file_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, file_path)
+            logger.info(
+                f"[TaskArchive] 补丁更新: {task_id}, fields={list(updates.keys())}"
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"[TaskArchive] 补丁更新失败（非致命）: {e}")
+            return False
 
     async def get_task(self, task_id: str) -> Optional[CompletedTaskArchive]:
         """按 ID 获取完整归档（不删除文件）"""
@@ -157,6 +191,9 @@ class CompletedTaskArchiveManager:
                 continue
             file_path = os.path.join(self._persistence_path, filename)
             try:
+                if os.path.getsize(file_path) == 0:
+                    logger.warning(f"[TaskArchive] 跳过零字节文件: {filename}")
+                    continue
                 with open(file_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 tasks.append({
