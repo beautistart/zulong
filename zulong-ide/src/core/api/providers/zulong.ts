@@ -181,11 +181,18 @@ export class ZulongHandler implements ApiHandler {
 			pushChunk({ type: "error", error: err.message })
 		})
 
+		this.transport.on("disconnected", (code: number, reason: string) => {
+			Logger.warn(`[ZulongHandler] \u2190 disconnected: code=${code} reason=${reason}`)
+			// WS 意外断开时，通知 generator 退出，避免永久 hang
+			pushChunk({ type: "done" })
+		})
+
 		// Detect resume: if there are prior assistant messages, this is a resumed session
 		const hasHistory = messages.some((m) => m.role === "assistant")
 		if (hasHistory) {
-			Logger.info(`[ZulongHandler] \u2192 session_resume (detected prior history), cwd=${cwd}`)
-			this.transport.sendSessionResume(taskText, cwd, systemPrompt)
+			const graphId = this.extractGraphId(messages)
+			Logger.info(`[ZulongHandler] \u2192 session_resume (detected prior history), cwd=${cwd}, graph_id=${graphId || "none"}`)
+			this.transport.sendSessionResume(taskText, cwd, systemPrompt, graphId)
 		} else {
 			Logger.info(`[ZulongHandler] \u2192 session_start, cwd=${cwd}`)
 			this.transport.sendSessionStart(taskText, cwd, systemPrompt)
@@ -259,6 +266,31 @@ export class ZulongHandler implements ApiHandler {
 		} else {
 			Logger.error(`[ZulongHandler] Cannot send tool result - transport not connected! call_id=${callId}, tool=${toolName}`)
 		}
+	}
+
+	/**
+	 * 从历史消息中提取最近的 graph_id (格式: tg_NNNNNNNNNN)
+	 */
+	private extractGraphId(messages: ZulongStorageMessage[]): string | undefined {
+		const pattern = /\btg_\d{10,13}\b/
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const msg = messages[i]
+			if (msg.role !== "assistant") continue
+			const content = msg.content
+			if (typeof content === "string") {
+				const match = content.match(pattern)
+				if (match) return match[0]
+			} else if (Array.isArray(content)) {
+				for (const block of content) {
+					if (typeof block === "object" && block !== null) {
+						const text = (block as any).text || JSON.stringify(block)
+						const match = text.match(pattern)
+						if (match) return match[0]
+					}
+				}
+			}
+		}
+		return undefined
 	}
 
 	abort(): void {

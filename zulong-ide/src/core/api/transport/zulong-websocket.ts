@@ -155,12 +155,16 @@ export class ZulongWebSocket extends EventEmitter {
 	/**
 	 * Send session_resume to continue a previous task.
 	 */
-	sendSessionResume(task: string, cwd: string, zulongSystemPrompt?: string): void {
-		this.send("session_resume", {
+	sendSessionResume(task: string, cwd: string, zulongSystemPrompt?: string, graphId?: string): void {
+		const payload: Record<string, string> = {
 			task,
 			cwd,
 			ide_system_prompt: zulongSystemPrompt || "",
-		})
+		}
+		if (graphId) {
+			payload.graph_id = graphId
+		}
+		this.send("session_resume", payload)
 	}
 
 	/**

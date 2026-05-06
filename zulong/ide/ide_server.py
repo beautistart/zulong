@@ -182,6 +182,47 @@ async def _handle_user_cancel(session: IDESession, _payload: Dict) -> None:
     session.cancel_event.set()
 
 
+def _load_graph_deterministic(graph_id: str) -> bool:
+    """确定性三级加载 TaskGraph: 内存 → 磁盘 → MemoryGraph
+
+    Returns: True 表示加载成功并已设置为活跃图
+    """
+    from zulong.tools.task_tools import (
+        get_active_task_graph, set_active_task_graph, load_graph_from_backup,
+    )
+
+    # Level 1: 内存匹配
+    tg = get_active_task_graph()
+    if tg and getattr(tg, 'id', '') == graph_id:
+        logger.info(f"[ZulongIDE] 确定性恢复 Level 1 (内存): {graph_id}")
+        return True
+
+    # Level 2: 磁盘备份
+    tg = load_graph_from_backup(graph_id)
+    if tg:
+        set_active_task_graph(tg, graph_id)
+        logger.info(f"[ZulongIDE] 确定性恢复 Level 2 (磁盘): {graph_id}")
+        return True
+
+    # Level 3: MemoryGraph 重建
+    try:
+        from zulong.memory.memory_graph import get_memory_graph
+        from zulong.memory.graph_adapters import rebuild_task_graph_from_memory
+        mg = get_memory_graph()
+        if mg:
+            tg = rebuild_task_graph_from_memory(mg, graph_id)
+            if tg:
+                set_active_task_graph(tg, graph_id)
+                logger.info(
+                    f"[ZulongIDE] 确定性恢复 Level 3 (MemoryGraph): {graph_id}")
+                return True
+    except Exception as e:
+        logger.debug(f"[ZulongIDE] Level 3 MemoryGraph 重建失败: {e}")
+
+    logger.warning(f"[ZulongIDE] 确定性恢复失败: 三级加载均未找到 {graph_id}")
+    return False
+
+
 async def _handle_session_resume(session: IDESession, payload: Dict) -> None:
     """处理会话恢复（插件重连后继续未完成的任务）"""
     task_text = payload.get("task", "")
@@ -204,25 +245,33 @@ async def _handle_session_resume(session: IDESession, payload: Dict) -> None:
 
     session.cancel_event.clear()
 
-    # 恢复活跃 TaskGraph：如果内存中没有，从磁盘备份加载最近的图谱
-    try:
-        from zulong.tools.task_tools import (
-            get_active_task_graph, load_latest_backup,
-            set_active_task_graph,
-        )
-        if get_active_task_graph() is None:
-            backup_tg, backup_gid = load_latest_backup()
-            if backup_tg and backup_gid:
-                set_active_task_graph(backup_tg, backup_gid)
-                logger.info(
-                    f"[ZulongIDE] session_resume: 从备份恢复活跃图 {backup_gid}")
-    except Exception as e:
-        logger.debug(f"[ZulongIDE] session_resume: 备份恢复尝试失败: {e}")
+    # 恢复活跃 TaskGraph
+    graph_id = payload.get("graph_id", "")
+
+    if graph_id:
+        # 确定性恢复路径
+        _load_graph_deterministic(graph_id)
+    else:
+        # 兼容旧逻辑: 从磁盘备份加载最近的图谱
+        try:
+            from zulong.tools.task_tools import (
+                get_active_task_graph, load_latest_backup,
+                set_active_task_graph,
+            )
+            if get_active_task_graph() is None:
+                backup_tg, backup_gid = load_latest_backup()
+                if backup_tg and backup_gid:
+                    set_active_task_graph(backup_tg, backup_gid)
+                    logger.info(
+                        f"[ZulongIDE] session_resume: 从备份恢复活跃图 {backup_gid}")
+        except Exception as e:
+            logger.debug(f"[ZulongIDE] session_resume: 备份恢复尝试失败: {e}")
 
     # 恢复模式：使用 "继续" 前缀触发 RESUME 意图检测
     resume_text = f"继续之前的任务：{task_text}"
     session.fc_task = asyncio.create_task(
-        _run_fc_loop(session, resume_text, cwd, ide_system_prompt))
+        _run_fc_loop(session, resume_text, cwd, ide_system_prompt,
+                     force_graph_id=graph_id))
 
 
 # 消息路由表
@@ -347,6 +396,7 @@ def _inject_code_anchor_monitor_hook() -> None:
 async def _run_fc_loop(
     session: IDESession, task_text: str, cwd: str,
     ide_system_prompt: str = "",
+    force_graph_id: str = "",
 ) -> None:
     """在后台运行祖龙 FC 循环
 
@@ -377,6 +427,7 @@ async def _run_fc_loop(
         from zulong.ide.ide_fc_runner import IDEFCRunner
         runner = IDEFCRunner(engine, ide_session, tool_registry)
         runner.cwd = cwd  # 保存工作目录，供 CRG 自动锚定读取文件
+        runner.force_graph_id = force_graph_id  # 确定性恢复锚点
         session.runner = runner
 
         # 注入 TaskGraph Web 广播回调
@@ -402,11 +453,17 @@ async def _run_fc_loop(
             cancel_event=session.cancel_event,
         )
 
-        # FC 循环完成
+        # FC 循环完成（task_complete 已在 FC Runner 内部发送，此处仅做兜底）
         if result and result.text_response:
-            await session.send_msg("task_complete", {"result": result.text_response})
+            try:
+                await session.send_msg("task_complete", {"result": result.text_response})
+            except Exception:
+                pass  # WS 可能已断开，FC Runner 已提前发送过
         else:
-            await session.send_msg("task_complete", {"result": "(任务完成，无输出)"})
+            try:
+                await session.send_msg("task_complete", {"result": "(任务完成，无输出)"})
+            except Exception:
+                pass
 
         # Web 监控: IDE 会话结束
         await broadcast_monitor_event("IDE_SESSION_END", {

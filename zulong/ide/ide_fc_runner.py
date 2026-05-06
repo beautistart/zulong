@@ -343,13 +343,9 @@ class IDEFCRunner:
 
                 if verdict == "done":
                     state.phase = "done"
-                    await loop.run_in_executor(
-                        None, self._auto_complete_task, state)
-                    self._finalize_dialogue_round(state, status="completed")
-                    await loop.run_in_executor(
-                        None, self._auto_save_session_memory, state)
-                    self._save_runner_state()
-                    self.session.fc_state = state
+                    # 立即通知前端任务完成（在后处理之前，防止 WS 断开导致丢失）
+                    _done_text = state.last_response_content or ""
+                    await send_callback("task_complete", {"result": _done_text})
                     # Web 监控: FC 循环完成（保护性包裹）
                     try:
                         await broadcast_monitor_event("FC_DONE", {
@@ -359,6 +355,14 @@ class IDEFCRunner:
                         })
                     except Exception:
                         pass
+                    # 后处理（耗时操作，客户端已收到完成通知）
+                    await loop.run_in_executor(
+                        None, self._auto_complete_task, state)
+                    self._finalize_dialogue_round(state, status="completed")
+                    await loop.run_in_executor(
+                        None, self._auto_save_session_memory, state)
+                    self._save_runner_state()
+                    self.session.fc_state = state
                     return IDEFCResult(
                         phase="done",
                         text_response=state.last_response_content)
@@ -773,11 +777,28 @@ class IDEFCRunner:
                     )
                 break
 
-        # ── Layer 1: 意图检测启发式 ──────────────────────────
-        intent, has_active_tg = self._detect_ide_intent(user_input)
+        # ── Layer 1: 意图检测 ──────────────────────────────────
+        _force_gid = getattr(self, 'force_graph_id', '') or ''
+        if _force_gid:
+            # 确定性恢复: graph_id 已由 ide_server 加载，跳过启发式
+            from zulong.tools.task_tools import get_active_task_graph
+            _tg = get_active_task_graph()
+            if _tg and getattr(_tg, 'id', '') == _force_gid:
+                intent = "resume"
+                has_active_tg = True
+                self.session.active_task_graph_id = _force_gid
+                logger.info(
+                    f"[IDEFCRunner] 确定性恢复模式: graph_id={_force_gid}")
+            else:
+                # 活跃图加载失败(不应发生), 降级到启发式
+                logger.warning(
+                    f"[IDEFCRunner] 确定性恢复降级: 活跃图不匹配 {_force_gid}")
+                intent, has_active_tg = self._detect_ide_intent(user_input)
+        else:
+            intent, has_active_tg = self._detect_ide_intent(user_input)
 
-        # 恢复模式：将全局活跃图 ID 关联到当前 session（跨连接保持关联）
-        if intent == "resume" and has_active_tg:
+        # 非确定性路径下，恢复模式关联活跃图到 session
+        if not _force_gid and intent == "resume" and has_active_tg:
             from zulong.tools.task_tools import get_active_task_graph
             _tg = get_active_task_graph()
             if _tg and hasattr(_tg, 'id') and not self.session.active_task_graph_id:

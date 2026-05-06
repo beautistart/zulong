@@ -47,6 +47,7 @@ class IDEFCState:
     # 意图感知扩展（融合原生 3 层编排）
     ide_intent: str = "complex"  # "complex" | "resume"（IDE 模式无 CHAT）
     force_first_tool: bool = False  # RESUME 首轮强制 task_view_overview
+    force_graph_id: str = ""  # 确定性恢复: 前端传入的 graph_id，非空时跳过启发式
 
     # 错误恢复计数器
     loop_error_count: int = 0  # 连续循环体异常次数，>=3 时终止
