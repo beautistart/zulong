@@ -191,6 +191,30 @@ class L2BackupScheduler:
             
             logger.info(f"[L2BackupScheduler] 任务完成：{task.task_id}, 耗时：{processing_time:.2f}秒")
             
+            # 🔥 修复：任务完成后立即回写审查结果
+            if task.conversation_turns:
+                meta = task.conversation_turns[0].get("_meta", {}) if task.conversation_turns else {}
+                review_task_id = meta.get("review_task_id")
+                if review_task_id and task.result:
+                    try:
+                        from zulong.memory.llm_memory_reviewer import get_llm_memory_reviewer
+                        reviewer = get_llm_memory_reviewer()
+                        if reviewer:
+                            original_memories = meta.get("original_memories", [])
+                            context = meta.get("context", {})
+                            import asyncio as _aio
+                            # 🔥 增强日志
+                            logger.info(f"[L2BackupScheduler] 开始回写审查结果: {review_task_id}, 原始记忆数={len(original_memories)}, context={context}")
+                            await reviewer.process_review_result(
+                                task_id=review_task_id,
+                                llm_response=task.result,
+                                original_memories=original_memories,
+                                context=context,
+                            )
+                            logger.info(f"[L2BackupScheduler] ✅ 审查结果已回写: {review_task_id}")
+                    except Exception as re:
+                        logger.warning(f"[L2BackupScheduler] 审查结果回写失败: {re}", exc_info=True)
+            
             # 回调
             if self._on_summarization_complete:
                 await self._on_summarization_complete(task)
@@ -199,7 +223,7 @@ class L2BackupScheduler:
             task.status = "failed"
             task.error = str(e)
             self._stats["total_tasks_failed"] += 1
-            logger.error(f"[L2BackupScheduler] 任务失败：{task.task_id}, 错误：{e}")
+            logger.error(f"[L2BackupScheduler] 任务失败：{task.task_id}, 错误：{e}", exc_info=True)
         
         finally:
             # 从运行中移除
@@ -212,6 +236,10 @@ class L2BackupScheduler:
             # 限制已完成列表大小
             if len(self._completed_tasks) > 100:
                 self._completed_tasks.pop(0)
+            
+            # 🔥 修复：任务完成后重置L2-BACKUP状态为IDLE
+            self.update_l2_backup_status(L2Status.IDLE)
+            logger.info(f"[L2BackupScheduler] L2-BACKUP状态重置为IDLE，可处理下一个任务")
     
     async def _call_l2_backup(self, conversation_turns: List[Dict[str, str]]) -> Dict[str, Any]:
         """
@@ -289,8 +317,9 @@ class L2BackupScheduler:
         while self._running:
             try:
                 # 1. 检查 L2-PRIME 状态
-                if self.l2_prime_status == L2Status.IDLE:
-                    # 2. L2-PRIME 空闲，可以触发复盘
+                # 🔥 修复：如果状态未知或忙碌超过5分钟，强制设为IDLE允许后台任务执行
+                if self.l2_prime_status in (L2Status.IDLE, L2Status.ERROR):
+                    # 2. L2-PRIME 空闲或错误，可以触发复盘
                     if not self._task_queue.empty():
                         # 3. 获取最高优先级任务
                         task = self._task_queue.get()
@@ -303,9 +332,10 @@ class L2BackupScheduler:
                             # 异步处理任务
                             asyncio.create_task(self._process_task(task))
                             
-                            # 重置 BACKUP 状态
-                            await asyncio.sleep(0.5)
-                            self.update_l2_backup_status(L2Status.IDLE)
+                            # 重置 BACKUP 状态（等待任务完成）
+                            # 🔥 修复：不要立即重置，让_process_task完成后再重置
+                            # await asyncio.sleep(0.5)
+                            # self.update_l2_backup_status(L2Status.IDLE)
                         else:
                             # BACKUP 忙碌，稍后重试
                             self._task_queue.put(task)

@@ -540,6 +540,7 @@ class MemoryGraph:
         self._auto_save_timer = None       # threading.Timer 实例
         self._last_save_time = 0.0         # 上次保存时间戳
         self._save_lock = threading.Lock() # 保存操作锁（防并发写）
+        self._data_lock = threading.RLock()  # 内存数据结构读写锁（_nodes/_graph/_embeddings/_coactivation_counter）
 
         # 活跃节点追踪（前端高亮用，不持久化）
         self._active_node_ids: Set[str] = set()
@@ -575,6 +576,9 @@ class MemoryGraph:
         # P2-3: atexit 安全网 — 进程退出时强制刷盘防抖窗口内未保存的变更
         atexit.register(self._atexit_flush)
 
+        # P1-5: 启动异步修剪循环（尝试在现有事件循环中调度）
+        self._try_start_prune_loop()
+
         logger.info(
             f"[MemoryGraph] 初始化完成: "
             f"{self._stats['total_nodes']} 节点, "
@@ -608,47 +612,42 @@ class MemoryGraph:
         Returns:
             str: node_id
         """
-        if node.node_id in self._nodes:
-            existing = self._nodes[node.node_id]
-            existing.label = node.label
-            existing.metadata.update(node.metadata)
-            if touch:
-                existing.last_accessed = time.time()
-            existing.backend_ref = node.backend_ref or existing.backend_ref
-            # P1-4: 更新地址反向索引
-            self._index_node_address(node.node_id, existing.metadata)
-            # 更新图节点属性
-            self._graph.nodes[node.node_id].update(node.to_dict())
+        with self._data_lock:
+            if node.node_id in self._nodes:
+                existing = self._nodes[node.node_id]
+                existing.label = node.label
+                existing.metadata.update(node.metadata)
+                if touch:
+                    existing.last_accessed = time.time()
+                existing.backend_ref = node.backend_ref or existing.backend_ref
+                self._index_node_address(node.node_id, existing.metadata)
+                self._graph.nodes[node.node_id].update(node.to_dict())
+                self._pending_changes.append({
+                    "action": "update_node",
+                    "data": {"id": node.node_id, "type": node.node_type.value, "label": node.label},
+                })
+                self._mark_dirty()
+                return node.node_id
+
+            node.metadata.setdefault("temperature", Temperature.HOT.value)
+            node.metadata.setdefault("importance", Importance.NORMAL.value)
+            node.metadata.setdefault("memory_strength", {
+                "base_strength": 1.0,
+                "current_strength": 1.0,
+                "rehearsal_count": 0,
+                "last_rehearsal": node.created_at,
+            })
+
+            self._nodes[node.node_id] = node
+            self._graph.add_node(node.node_id, **node.to_dict())
+            self._stats["total_nodes"] += 1
+            self._index_node_address(node.node_id, node.metadata)
             self._pending_changes.append({
-                "action": "update_node",
+                "action": "add_node",
                 "data": {"id": node.node_id, "type": node.node_type.value, "label": node.label},
             })
             self._mark_dirty()
-            return node.node_id
 
-        # 新节点设置默认多维标签
-        node.metadata.setdefault("temperature", Temperature.HOT.value)
-        node.metadata.setdefault("importance", Importance.NORMAL.value)
-        # memory_strength: 复用 MemoryStrength 衰减追踪结构
-        node.metadata.setdefault("memory_strength", {
-            "base_strength": 1.0,
-            "current_strength": 1.0,
-            "rehearsal_count": 0,
-            "last_rehearsal": node.created_at,
-        })
-
-        self._nodes[node.node_id] = node
-        self._graph.add_node(node.node_id, **node.to_dict())
-        self._stats["total_nodes"] += 1
-        # P1-4: 新节点建立地址反向索引
-        self._index_node_address(node.node_id, node.metadata)
-        self._pending_changes.append({
-            "action": "add_node",
-            "data": {"id": node.node_id, "type": node.node_type.value, "label": node.label},
-        })
-        self._mark_dirty()
-
-        # 新节点自动生成 embedding + 语义边发现
         self._auto_embed_node(node)
 
         return node.node_id
@@ -659,24 +658,23 @@ class MemoryGraph:
 
     def remove_node(self, node_id: str) -> bool:
         """移除节点及其所有关联边"""
-        if node_id not in self._nodes:
-            return False
-        # P1-4: 清理地址反向索引
-        self._unindex_node_address(node_id)
-        del self._nodes[node_id]
-        self._embeddings.pop(node_id, None)
-        self._summary_index.remove(node_id)  # 同步移除 FAISS 摘要索引
-        self._graph.remove_node(node_id)
-        # 清理共激活计数器中引用该节点的条目（防止内存泄漏）
-        stale_keys = [k for k in self._coactivation_counter if node_id in k]
-        for k in stale_keys:
-            del self._coactivation_counter[k]
-        self._active_node_ids.discard(node_id)
-        self._stats["total_nodes"] = len(self._nodes)
-        self._stats["total_edges"] = self._graph.number_of_edges()
-        self._pending_changes.append({"action": "remove_node", "data": {"id": node_id}})
-        self._mark_dirty()
-        return True
+        with self._data_lock:
+            if node_id not in self._nodes:
+                return False
+            self._unindex_node_address(node_id)
+            del self._nodes[node_id]
+            self._embeddings.pop(node_id, None)
+            self._summary_index.remove(node_id)
+            self._graph.remove_node(node_id)
+            stale_keys = [k for k in self._coactivation_counter if node_id in k]
+            for k in stale_keys:
+                del self._coactivation_counter[k]
+            self._active_node_ids.discard(node_id)
+            self._stats["total_nodes"] = len(self._nodes)
+            self._stats["total_edges"] = self._graph.number_of_edges()
+            self._pending_changes.append({"action": "remove_node", "data": {"id": node_id}})
+            self._mark_dirty()
+            return True
 
     def update_node_activation(self, node_id: str, activation: float):
         """更新节点激活水平"""
@@ -838,10 +836,10 @@ class MemoryGraph:
 
         规则:
         - access_count >= 3 且 importance == NORMAL → 自动提升为 IMPORTANT
-        - access_count >= 5 且 importance == IMPORTANT → 标记为 LLM 审查候选
+        - access_count >= 5 且 importance == IMPORTANT → 提交给 LLMMemoryReviewer 审查
 
         Returns:
-            {"auto_promoted": int, "llm_candidates": List[str]}
+            {"auto_promoted": int, "llm_candidates": List[str], "submitted_count": int}
         """
         auto_promoted = 0
         llm_candidates = []
@@ -855,15 +853,66 @@ class MemoryGraph:
                     auto_promoted += 1
 
             elif count >= 5 and imp == Importance.IMPORTANT:
-                # 不直接调用 LLM，仅标记候选
                 llm_candidates.append(node_id)
 
         if auto_promoted > 0:
             logger.info(f"[MemoryGraph] 自动提升了 {auto_promoted} 个节点的重要度")
-        if llm_candidates:
-            logger.info(f"[MemoryGraph] {len(llm_candidates)} 个节点待 LLM 审查确认提升")
 
-        return {"auto_promoted": auto_promoted, "llm_candidates": llm_candidates}
+        submitted_count = 0
+        if llm_candidates:
+            if not hasattr(self, '_pending_llm_candidates'):
+                self._pending_llm_candidates = []
+            self._pending_llm_candidates = list(set(self._pending_llm_candidates + llm_candidates))
+            batch = self._pending_llm_candidates[:50]
+            try:
+                import asyncio
+                from zulong.memory.llm_memory_reviewer import get_llm_memory_reviewer
+                reviewer = get_llm_memory_reviewer()
+                if reviewer:
+                    candidate_memories = []
+                    for cid in batch:
+                        node = self._nodes.get(cid)
+                        if node:
+                            imp = self.get_importance(cid)
+                            candidate_memories.append({
+                                "id": cid, 
+                                "label": getattr(node, 'label', ''), 
+                                "content": getattr(node, 'content', ''), 
+                                "importance": str(imp.value if imp else "NORMAL"), 
+                                "access_count": node.access_count
+                            })
+                    if candidate_memories:
+                        try:
+                            loop = asyncio.get_event_loop()
+                            if loop.is_running():
+                                asyncio.ensure_future(reviewer.review_importance_candidates(candidate_memories))
+                            else:
+                                loop.run_until_complete(reviewer.review_importance_candidates(candidate_memories))
+                            # 🔥 修复：提交成功后立即从候选列表中移除
+                            submitted_count = len(candidate_memories)
+                            self._pending_llm_candidates = self._pending_llm_candidates[submitted_count:]
+                            logger.info(f"[MemoryGraph] ✅ 成功提交 {submitted_count} 个节点给LLM审查，剩余候选={len(self._pending_llm_candidates)}")
+                        except RuntimeError:
+                            try:
+                                asyncio.run(reviewer.review_importance_candidates(candidate_memories))
+                                # 🔥 修复：提交成功后立即从候选列表中移除
+                                submitted_count = len(candidate_memories)
+                                self._pending_llm_candidates = self._pending_llm_candidates[submitted_count:]
+                                logger.info(f"[MemoryGraph] ✅ 成功提交 {submitted_count} 个节点给LLM审查，剩余候选={len(self._pending_llm_candidates)}")
+                            except Exception as e:
+                                logger.warning(f"[MemoryGraph] 重要性审查提交失败: {e}")
+                                submitted_count = 0  # 失败时不计数
+                    else:
+                        logger.warning(f"[MemoryGraph] 候选节点信息为空，跳过提交")
+                else:
+                    logger.warning(f"[MemoryGraph] LLMMemoryReviewer未初始化，无法提交审查")
+            except Exception as e:
+                logger.warning(f"[MemoryGraph] 重要性审查提交异常: {e}", exc_info=True)
+                submitted_count = 0  # 异常时不计数
+
+            logger.info(f"[MemoryGraph] {len(llm_candidates)} 个节点待 LLM 审查确认提升，已提交 {submitted_count} 个，剩余待提交={len(self._pending_llm_candidates)}")
+
+        return {"auto_promoted": auto_promoted, "llm_candidates": llm_candidates, "submitted_count": submitted_count}
 
     # ============================================================
     # 边 CRUD
@@ -885,24 +934,24 @@ class MemoryGraph:
         if source_id not in self._nodes or target_id not in self._nodes:
             return False
 
-        if self._graph.has_edge(source_id, target_id):
-            # 更新已有边
-            data = self._graph.edges[source_id, target_id]
-            data["weight"] = max(data["weight"], weight)
-            data["last_activated"] = time.time()
-            data["activation_count"] = data.get("activation_count", 0) + 1
+        with self._data_lock:
+            if self._graph.has_edge(source_id, target_id):
+                data = self._graph.edges[source_id, target_id]
+                data["weight"] = max(data["weight"], weight)
+                data["last_activated"] = time.time()
+                data["activation_count"] = data.get("activation_count", 0) + 1
+                self._mark_dirty()
+                return True
+
+            edge_data = _make_edge_data(edge_type, weight, protected, metadata)
+            self._graph.add_edge(source_id, target_id, **edge_data)
+            self._stats["total_edges"] = self._graph.number_of_edges()
+            self._pending_changes.append({
+                "action": "add_edge",
+                "data": {"source": source_id, "target": target_id, "type": edge_type.value, "weight": weight},
+            })
             self._mark_dirty()
             return True
-
-        edge_data = _make_edge_data(edge_type, weight, protected, metadata)
-        self._graph.add_edge(source_id, target_id, **edge_data)
-        self._stats["total_edges"] = self._graph.number_of_edges()
-        self._pending_changes.append({
-            "action": "add_edge",
-            "data": {"source": source_id, "target": target_id, "type": edge_type.value, "weight": weight},
-        })
-        self._mark_dirty()
-        return True
 
     def get_edge(self, source_id: str, target_id: str) -> Optional[Dict]:
         """获取边属性"""
@@ -916,14 +965,15 @@ class MemoryGraph:
 
     def remove_edge(self, source_id: str, target_id: str) -> bool:
         """移除边"""
-        if self._graph.has_edge(source_id, target_id):
-            self._graph.remove_edge(source_id, target_id)
-            self._stats["total_edges"] = self._graph.number_of_edges()
-            self._pending_changes.append({
-                "action": "remove_edge", "data": {"source": source_id, "target": target_id},
-            })
-            self._mark_dirty()
-            return True
+        with self._data_lock:
+            if self._graph.has_edge(source_id, target_id):
+                self._graph.remove_edge(source_id, target_id)
+                self._stats["total_edges"] = self._graph.number_of_edges()
+                self._pending_changes.append({
+                    "action": "remove_edge", "data": {"source": source_id, "target": target_id},
+                })
+                self._mark_dirty()
+                return True
         return False
 
     # ============================================================
@@ -1298,6 +1348,97 @@ class MemoryGraph:
 
         return activations
 
+    def compute_activations_dynamic(
+        self,
+        seed_node_ids: List[str],
+        context_window_size: int = 131072,
+        usage_ratio: float = 0.0,
+        node_type_filter: Optional[set] = None,
+    ) -> Dict[str, float]:
+        """上下文感知的加权 BFS 扩散激活
+
+        根据 context_window_size 和 usage_ratio 动态计算 BFS 扩散参数:
+        - 大窗口(>64K) + 低占用(<0.5): 扩散更深层(max_depth=5)，检索更广
+        - 小窗口(<32K) 或 高占用(>0.8): 收窄扩散(max_depth=2)，减少噪声
+        - 中间状态: 按比例线性插值
+
+        Args:
+            seed_node_ids: 种子节点 ID 列表
+            context_window_size: 模型上下文窗口大小（tokens）
+            usage_ratio: 当前上下文使用率 (0.0~1.0)
+            node_type_filter: 允许传播的节点类型集合
+
+        Returns:
+            Dict[node_id, activation_score]
+        """
+        remaining_ratio = max(0.0, 1.0 - usage_ratio)
+
+        window_tier = 0.0
+        if context_window_size >= 200000:
+            window_tier = 2.0
+        elif context_window_size >= 128000:
+            window_tier = 1.5
+        elif context_window_size >= 64000:
+            window_tier = 1.0
+        else:
+            window_tier = 0.5
+
+        capacity_factor = remaining_ratio * (0.5 + 0.5 * min(window_tier / 2.0, 1.0))
+
+        max_depth = max(2, min(6, int(2 + 4 * capacity_factor)))
+        decay = 0.3 + 0.4 * (1.0 - capacity_factor)
+        min_activation = 0.01 + 0.09 * (1.0 - capacity_factor)
+
+        logger.info(
+            f"[MemoryGraph] 动态BFS参数: context_window={context_window_size}, "
+            f"usage_ratio={usage_ratio:.2f}, capacity_factor={capacity_factor:.2f} → "
+            f"max_depth={max_depth}, decay={decay:.2f}, min_activation={min_activation:.3f}"
+        )
+
+        return self.compute_activations(
+            seed_node_ids,
+            max_depth=max_depth,
+            decay=decay,
+            min_activation=min_activation,
+            node_type_filter=node_type_filter,
+        )
+
+    def retrieve_context_dynamic(
+        self,
+        query_text: str,
+        context_window_size: int = 131072,
+        usage_ratio: float = 0.0,
+        session_id: str = "",
+    ) -> "asyncio.coroutine":
+        """上下文感知的记忆检索
+
+        根据 context_window_size 和 usage_ratio 动态调整:
+        - top_k: 按剩余容量比例计算，而非固定值
+        - hot_window_minutes: 高占用时缩窄热窗口，低占用时扩大
+        - 结果注入时按token预算裁剪
+        """
+        remaining_ratio = max(0.0, 1.0 - usage_ratio)
+
+        window_factor = min(context_window_size / 128000, 2.0)
+
+        base_top_k = 10
+        top_k = max(3, min(20, int(base_top_k * remaining_ratio * window_factor)))
+
+        hot_window_minutes = max(5, min(60, int(30 * remaining_ratio + 10)))
+
+        logger.info(
+            f"[MemoryGraph] 动态检索参数: remaining={remaining_ratio:.2f}, "
+            f"window_factor={window_factor:.2f} → "
+            f"top_k={top_k}, hot_window={hot_window_minutes}min"
+        )
+
+        return self.retrieve_context(
+            query_text,
+            top_k=top_k,
+            hot_window_minutes=hot_window_minutes,
+            session_id=session_id,
+        )
+
     # ============================================================
     # 赫布学习
     # ============================================================
@@ -1605,6 +1746,29 @@ class MemoryGraph:
         self._prune_task = asyncio.create_task(_loop())
         logger.info(f"[MemoryGraph] 修剪循环已启动 (间隔 {interval_seconds}s)")
 
+    def _try_start_prune_loop(self, interval_seconds: int = 1800):
+        """尝试在现有事件循环中启动修剪循环（__init__中调用）"""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._start_prune_coro(interval_seconds))
+            logger.info("[MemoryGraph] 修剪循环已在运行事件循环中调度")
+        except RuntimeError:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self._start_prune_coro(interval_seconds))
+                    logger.info("[MemoryGraph] 修剪循环已在事件循环中调度")
+                else:
+                    logger.info("[MemoryGraph] 无运行中事件循环，修剪循环将在首次retrieve时启动")
+            except Exception:
+                logger.info("[MemoryGraph] 无法获取事件循环，修剪循环延迟启动")
+
+    async def _start_prune_coro(self, interval_seconds: int):
+        """修剪循环的coroutine入口，等待首次调用后自动运行"""
+        await asyncio.sleep(60)
+        if not self._running:
+            await self.start_prune_loop(interval_seconds)
+
     def stop_prune_loop(self):
         """停止异步修剪循环"""
         self._running = False
@@ -1628,10 +1792,16 @@ class MemoryGraph:
             meta = data.get("metadata", {})
             if not meta.get("pending_review"):
                 continue
-            # 超过 2 个修剪周期（默认 1 小时）未返回审查结果 → 按 DISCARD 处理
+            # 超过 2 小时未返回审查结果 → 按 DISCARD 处理
             requested_at = meta.get("review_requested_at", now)
-            if (now - requested_at) > 3600:
+            elapsed = now - requested_at
+            if elapsed > 7200:
                 pending_edges.append((src, tgt, "timeout"))
+            elif elapsed > 1800 and not meta.get("review_retried", False):
+                # 超过30分钟未响应且未重试过 → 标记重试
+                meta["review_retried"] = True
+                meta["review_requested_at"] = now
+                pending_edges.append((src, tgt, "pending"))
             else:
                 pending_edges.append((src, tgt, "pending"))
 
@@ -1961,15 +2131,16 @@ class MemoryGraph:
         overlap = len(q_bigrams & t_bigrams) / len(q_bigrams)
         return overlap * 0.6 if overlap >= 0.2 else 0.0
 
-    def _compute_semantic_similarity(self, query_text: str, node: GraphNode) -> float:
+    def _compute_semantic_similarity(self, query_text: str, node: GraphNode, query_embedding=None) -> float:
         """计算查询文本与节点的语义相似度
 
-        使用节点的 embedding 和查询文本的词汇重叠来估算语义相似度。
-        这是一个简化的实现，避免依赖外部 embedding 服务。
+        优先使用 query_embedding 与节点 embedding 的余弦相似度，
+        退化时回退到词汇重叠 + embedding丰富度代理。
 
         Args:
             query_text: 查询文本
             node: 目标节点
+            query_embedding: 查询文本的向量表示（可选，优先使用）
 
         Returns:
             0.0 ~ 1.0 的语义相似度分数
@@ -1978,40 +2149,38 @@ class MemoryGraph:
             return 0.0
         
         try:
-            # 获取节点的 embedding
             node_embedding = self._embeddings[node.node_id]
             
-            # 构建节点文本（标签 + 关键元数据）
-            node_text_parts = [node.label]
+            if query_embedding is not None:
+                query_vec = np.asarray(query_embedding, dtype=np.float32)
+                node_vec = np.asarray(node_embedding, dtype=np.float32)
+                q_norm = np.linalg.norm(query_vec)
+                n_norm = np.linalg.norm(node_vec)
+                if q_norm > 1e-8 and n_norm > 1e-8:
+                    cosine_sim = float(np.dot(query_vec, node_vec) / (q_norm * n_norm))
+                    return max(0.0, (cosine_sim + 1.0) / 2.0)
             
-            # 添加关键元数据字段
+            node_text_parts = [node.label]
             for field in ["content", "desc", "goal"]:
                 field_value = node.metadata.get(field, "")
                 if field_value and isinstance(field_value, str):
                     node_text_parts.append(field_value)
-            
             node_text = " ".join(node_text_parts)
             
-            # 简化的语义相似度：基于词汇重叠和 embedding 归一化
-            # 这里使用一个简化的方法，实际应用中应该使用真正的查询 embedding
             query_words = set(query_text.lower().split())
             node_words = set(node_text.lower().split())
             
-            # 词汇重叠度
             if not query_words or not node_words:
                 word_overlap = 0.0
             else:
                 overlap = len(query_words & node_words)
                 word_overlap = overlap / len(query_words)
             
-            # 使用 embedding 的模长作为语义丰富度的代理
             embedding_norm = np.linalg.norm(node_embedding)
-            semantic_richness = min(embedding_norm / 10.0, 1.0)  # 归一化到 0-1
+            semantic_richness = min(embedding_norm / 10.0, 1.0)
             
-            # 组合得分：词汇重叠 + 语义丰富度
             semantic_score = 0.7 * word_overlap + 0.3 * semantic_richness
             
-            # 只有当有一定的词汇重叠时才认为有语义相关性
             return semantic_score if word_overlap > 0.1 else 0.0
             
         except Exception as e:
@@ -2094,12 +2263,9 @@ class MemoryGraph:
         query_embedding = None
         if np is not None and len(query_text) >= 3:
             try:
-                from zulong.memory.memory_graph import get_memory_graph
-                mg = get_memory_graph()
-                if mg and hasattr(mg, '_embeddings') and mg._embeddings:
-                    # 使用第一个可用的 embedding model 来编码查询
-                    # 这里简化处理，实际应该使用统一的 embedding 服务
-                    pass  # 暂时跳过查询编码，使用节点间相似度
+                emb_mgr = self._summary_index._get_embedding_manager()
+                if emb_mgr is not None:
+                    query_embedding = emb_mgr.encode_document(query_text[:512])
             except Exception:
                 pass
         
@@ -2126,7 +2292,7 @@ class MemoryGraph:
             # 语义相似度得分（仅对有关键词匹配或 embedding 的节点）
             semantic_score = 0.0
             if (keyword_score > 0 or query_embedding is not None) and node_id in self._embeddings:
-                semantic_score = self._compute_semantic_similarity(query_text, node)
+                semantic_score = self._compute_semantic_similarity(query_text, node, query_embedding=query_embedding)
             
             # 合并得分：60% 关键词 + 40% 语义
             if keyword_score > 0 or semantic_score > 0:
@@ -2500,7 +2666,7 @@ class MemoryGraph:
                 backup_filepath = filepath + ".bak"
 
                 data = {
-                    "version": "1.0",
+                    "version": self._SCHEMA_VERSION,
                     "nodes": {
                         nid: node.to_dict() for nid, node in self._nodes.items()
                     },
@@ -2558,6 +2724,8 @@ class MemoryGraph:
                 logger.error(f"[MemoryGraph] 保存失败: {e}")
                 return False
 
+    _SCHEMA_VERSION = "1.0"
+
     def _load(self) -> bool:
         """从磁盘加载记忆图谱（支持 .bak 崩溃恢复）"""
         filepath = os.path.join(self.persist_path, "memory_graph.json")
@@ -2570,6 +2738,14 @@ class MemoryGraph:
             try:
                 with open(candidate, 'r', encoding='utf-8') as f:
                     data = json.load(f)
+
+                # 版本号校验
+                file_version = data.get("version", "unknown")
+                if file_version != self._SCHEMA_VERSION:
+                    logger.warning(
+                        f"[MemoryGraph] {label}版本不匹配: 文件={file_version}, "
+                        f"当前={self._SCHEMA_VERSION}，将尝试兼容加载"
+                    )
 
                 # 恢复节点
                 for nid, ndata in data.get("nodes", {}).items():
@@ -3269,6 +3445,18 @@ class MemoryGraph:
 # 便捷访问函数
 # ============================================================
 
-def get_memory_graph(persist_path: str = "./data/memory_graph") -> MemoryGraph:
-    """获取 MemoryGraph 单例"""
+def get_memory_graph(persist_path: str = None) -> MemoryGraph:
+    """获取 MemoryGraph 单例（P3-23: 优先从配置读取路径）"""
+    if persist_path is None:
+        try:
+            import yaml
+            import os
+            cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "..", "..", "config", "zulong_config.yaml")
+            if os.path.exists(cfg_path):
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                persist_path = (cfg.get("memory") or {}).get("persist_path") or "./data/memory_graph"
+        except Exception:
+            persist_path = "./data/memory_graph"
     return MemoryGraph(persist_path=persist_path)
