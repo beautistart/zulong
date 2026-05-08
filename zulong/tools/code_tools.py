@@ -853,10 +853,34 @@ class IndexProjectTool(BaseTool):
             """后台执行 AST 解析 + MemoryGraph 同步 + 注入任务图"""
             try:
                 from zulong.code.graph_builder import CodeGraphBuilder
+                from zulong.code.ast_parser import ASTParser
+                
+                # 🔥 修复：检查语言包可用性，过滤掉不支持的语言
+                available_languages = []
+                for lang in languages:
+                    parser = ASTParser(lang)
+                    if parser.available:
+                        available_languages.append(lang)
+                    else:
+                        logger.warning(
+                            f"[IndexProjectTool] 跳过语言 {lang}：tree-sitter 语言包未安装"
+                        )
+                
+                if not available_languages:
+                    logger.error("[IndexProjectTool] 没有可用的语言包，索引终止")
+                    return
+                
+                if len(available_languages) < len(languages):
+                    logger.info(
+                        f"[IndexProjectTool] 语言包检查："
+                        f"请求{len(languages)}种语言，可用{len(available_languages)}种 "
+                        f"({', '.join(available_languages)})"
+                    )
+                
                 bg_builder = CodeGraphBuilder()
                 code_graph = bg_builder.build(
                     resolved_root,
-                    languages=languages,
+                    languages=available_languages,  # 🔥 使用过滤后的语言列表
                     max_files=max_files,
                 )
 
@@ -1121,6 +1145,26 @@ class IndexProjectTool(BaseTool):
                 )
             except Exception as bg_err:
                 logger.error(f"[IndexProjectTool] 后台索引异常: {bg_err}")
+                # 🔥 修复：广播失败事件到前端
+                try:
+                    from zulong.ide.ide_server import _broadcast_sync
+                    _broadcast_sync("CRG_INDEX_FAILED", {
+                        "error": str(bg_err),
+                        "project_name": root_path.name,
+                    })
+                except Exception:
+                    pass
+                try:
+                    from zulong.launcher.web_chat_router import _schedule_broadcast
+                    _schedule_broadcast({
+                        "type": "CRG_INDEX_FAILED",
+                        "payload": {
+                            "error": str(bg_err),
+                            "project_name": root_path.name,
+                        },
+                    })
+                except Exception:
+                    pass
 
         # 启动后台线程
         t = threading.Thread(target=_background_index, daemon=True, name="CRG-IndexProject")
