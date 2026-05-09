@@ -15,18 +15,10 @@ import logging
 import asyncio
 import time
 from typing import Dict, List, Optional, Any, Tuple
-from enum import Enum
+from zulong.core.types import L2Status
 import queue
 
 logger = logging.getLogger(__name__)
-
-
-class L2Status(Enum):
-    """L2 实例状态"""
-    IDLE = "idle"  # 空闲
-    BUSY = "busy"  # 忙碌
-    PROCESSING = "processing"  # 处理中
-    ERROR = "error"  # 错误
 
 
 class SummarizationTask:
@@ -96,6 +88,10 @@ class L2BackupScheduler:
         self._running = False
         self._scheduler_task: Optional[asyncio.Task] = None
         
+        # 🔥 新增：任务中断控制
+        self._current_task: Optional[asyncio.Task] = None  # 当前正在执行的异步任务
+        self._interrupt_flag = False  # 中断标志
+        
         # 回调函数
         self._on_summarization_complete = None
         
@@ -104,6 +100,7 @@ class L2BackupScheduler:
             "total_tasks_received": 0,
             "total_tasks_completed": 0,
             "total_tasks_failed": 0,
+            "total_tasks_interrupted": 0,  # 🔥 新增：被中断的任务数
             "avg_processing_time": 0.0,
             "current_queue_size": 0
         }
@@ -173,9 +170,15 @@ class L2BackupScheduler:
             
             logger.info(f"[L2BackupScheduler] 开始处理任务：{task.task_id}")
             
-            # 🔥 调用 L2-BACKUP 进行复盘
-            # 这里需要根据实际项目架构调整
-            summary = await self._call_l2_backup(task.conversation_turns)
+            # 🔥 调用 L2-BACKUP 进行复盘（支持中断检查）
+            summary = await self._call_l2_backup_with_interrupt_check(task.conversation_turns)
+            
+            # 🔥 检查是否被中断
+            if self._interrupt_flag:
+                logger.info(f"[L2BackupScheduler] 任务被中断：{task.task_id}")
+                task.status = "interrupted"
+                self._stats["total_tasks_interrupted"] += 1
+                return
             
             # 更新任务状态
             task.status = "completed"
@@ -219,6 +222,10 @@ class L2BackupScheduler:
             if self._on_summarization_complete:
                 await self._on_summarization_complete(task)
                 
+        except asyncio.CancelledError:
+            task.status = "interrupted"
+            self._stats["total_tasks_interrupted"] += 1
+            logger.info(f"[L2BackupScheduler] 任务被取消：{task.task_id}")
         except Exception as e:
             task.status = "failed"
             task.error = str(e)
@@ -278,9 +285,38 @@ class L2BackupScheduler:
                 "timestamp": time.time()
             }
             
+        except asyncio.CancelledError:
+            logger.info("[L2BackupScheduler] L2-BACKUP 调用被取消")
+            raise
         except Exception as e:
             logger.error(f"[L2BackupScheduler] 调用 L2-BACKUP 失败：{e}")
             raise
+    
+    async def _call_l2_backup_with_interrupt_check(self, conversation_turns: List[Dict[str, str]]) -> Dict[str, Any]:
+        """🔥 调用 L2-BACKUP（支持中断检查）
+        
+        在执行过程中检查中断标志，如果被中断则抛出CancelledError
+        """
+        # 创建异步任务执行实际的调用
+        task = asyncio.create_task(self._call_l2_backup(conversation_turns))
+        
+        # 等待完成，但期间检查中断标志
+        while not task.done():
+            # 检查中断
+            if self._interrupt_flag:
+                logger.info("[L2BackupScheduler] 检测到中断标志，取消L2-BACKUP调用")
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                raise asyncio.CancelledError("任务被中断")
+            
+            # 短暂等待后继续检查
+            await asyncio.sleep(0.1)
+        
+        # 返回结果
+        return await task
     
     def _build_summarization_prompt(self, conversation_turns: List[Dict[str, str]]) -> str:
         """
@@ -330,7 +366,7 @@ class L2BackupScheduler:
                             self.update_l2_backup_status(L2Status.PROCESSING)
                             
                             # 异步处理任务
-                            asyncio.create_task(self._process_task(task))
+                            self._current_task = asyncio.create_task(self._process_task(task))
                             
                             # 重置 BACKUP 状态（等待任务完成）
                             # 🔥 修复：不要立即重置，让_process_task完成后再重置
@@ -367,6 +403,24 @@ class L2BackupScheduler:
             self._scheduler_task.cancel()
             logger.info("[L2BackupScheduler] 调度器已停止")
     
+    def interrupt_current_task(self):
+        """🔥 中断当前正在执行的任务
+        
+        当有新任务或用户输入时调用，中断正在执行的审查任务
+        """
+        if self._current_task and not self._current_task.done():
+            logger.info("[L2BackupScheduler] 🔥 中断当前正在执行的任务")
+            self._interrupt_flag = True
+            self._current_task.cancel()
+            self._current_task = None
+    
+    def clear_interrupt_flag(self):
+        """🔥 清除中断标志
+        
+        在开始新任务前调用
+        """
+        self._interrupt_flag = False
+    
     def register_completion_callback(self, callback):
         """注册完成回调"""
         self._on_summarization_complete = callback
@@ -379,7 +433,8 @@ class L2BackupScheduler:
             "l2_prime_status": self.l2_prime_status.value,
             "l2_backup_status": self.l2_backup_status.value,
             "running_tasks": len(self._running_tasks),
-            "queue_size": self._task_queue.qsize()
+            "queue_size": self._task_queue.qsize(),
+            "interrupt_flag": self._interrupt_flag  # 🔥 新增：中断标志状态
         }
     
     async def map_reduce_summarization(self, 
