@@ -19,6 +19,10 @@ export class SkeletonRenderer {
 		const viewport = this._viewport
 		ctx.lineWidth = 1
 
+		// 🔥 性能优化：根据缩放级别简化边渲染
+		const zoom = viewport.zoom
+		const useSimpleLine = zoom < 0.3  // 小缩放时使用简单直线
+
 		for (const edge of edges) {
 			const sourcePos = nodePositions.get(edge.source)
 			const targetPos = nodePositions.get(edge.target)
@@ -28,6 +32,13 @@ export class SkeletonRenderer {
 			const sy = sourcePos.y * viewport.zoom + viewport.offsetY
 			const tx = targetPos.x * viewport.zoom + viewport.offsetX
 			const ty = targetPos.y * viewport.zoom + viewport.offsetY
+
+			// 🔥 视口裁剪：跳过屏幕外的边
+			const margin = 100
+			if (sx < -margin && tx < -margin) continue
+			if (sx > viewport.width + margin && tx > viewport.width + margin) continue
+			if (sy < -margin && ty < -margin) continue
+			if (sy > viewport.height + margin && ty > viewport.height + margin) continue
 
 			ctx.strokeStyle = EDGE_TYPE_COLORS[edge.type] || "#888888"
 			ctx.beginPath()

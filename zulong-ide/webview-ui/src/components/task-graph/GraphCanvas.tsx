@@ -175,6 +175,11 @@ export default function GraphCanvas({ width = 800, height = 600 }: GraphCanvasPr
 			visibleEdges = edgeArray.filter(
 				(e) => visibleSet.has(e.source) && visibleSet.has(e.target)
 			)
+			
+			// 🔥 降级模式额外优化：限制最大边数
+			if (renderMode === "degraded" && visibleEdges.length > 500) {
+				visibleEdges = visibleEdges.slice(0, 500)
+			}
 		}
 
 		renderer.renderEdges(visibleEdges, positions)
@@ -184,6 +189,11 @@ export default function GraphCanvas({ width = 800, height = 600 }: GraphCanvasPr
 			const visibleIds = viewportManagerRef.current.getVisibleNodeIds(currentViewport)
 			const visibleSet = new Set(visibleIds)
 			visibleNodes = nodeArray.filter((n) => visibleSet.has(n.id))
+			
+			// 🔥 降级模式额外优化：限制最大节点数
+			if (renderMode === "degraded" && visibleNodes.length > 200) {
+				visibleNodes = visibleNodes.slice(0, 200)
+			}
 		} else {
 			visibleNodes = nodeArray
 		}
