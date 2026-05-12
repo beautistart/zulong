@@ -106,16 +106,32 @@ class WebSearchTool(BaseTool):
             query, len(results), len(raw_results),
         )
 
+        # 格式化为 Markdown 文本，方便 LLM 直接引用链接
+        formatted = self._format_results_markdown(query, results)
+
         return self._create_result(
             success=True,
-            data={
-                "query": query,
-                "total": len(raw_results),
-                "results": results,
-            },
+            data=formatted,
             execution_time=time.time() - start,
             request_id=request.request_id,
         )
+
+    def _format_results_markdown(self, query: str, results: List[Dict[str, Any]]) -> str:
+        """将搜索结果格式化为 Markdown 文本，便于 LLM 引用来源链接"""
+        if not results:
+            return f"搜索 \"{query}\" 未找到结果。"
+
+        lines = [f"搜索 \"{query}\" 找到 {len(results)} 条结果：\n"]
+        for i, r in enumerate(results, 1):
+            title = r.get("title", "无标题")
+            url = r.get("url", "")
+            snippet = r.get("snippet", "")
+            lines.append(f"{i}. [{title}]({url})")
+            if snippet:
+                lines.append(f"   {snippet}")
+            lines.append("")
+        lines.append("请在回复中引用相关来源链接。")
+        return "\n".join(lines)
 
     # ── Schema ──
 

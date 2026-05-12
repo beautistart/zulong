@@ -541,6 +541,8 @@ class MemoryGraph:
         self._last_save_time = 0.0         # 上次保存时间戳
         self._save_lock = threading.Lock() # 保存操作锁（防并发写）
         self._data_lock = threading.RLock()  # 内存数据结构读写锁（_nodes/_graph/_embeddings/_coactivation_counter）
+        self._candidates_lock = threading.Lock()  # _pending_llm_candidates 读写锁
+        self._pending_llm_candidates: List[str] = []
 
         # 活跃节点追踪（前端高亮用，不持久化）
         self._active_node_ids: Set[str] = set()
@@ -831,15 +833,30 @@ class MemoryGraph:
         )
         return True
 
+    def _auto_promote_importance(self) -> int:
+        """仅自动提升 NORMAL→IMPORTANT，不提交LLM审查（修剪循环调用）"""
+        auto_promoted = 0
+        for node_id, node in self._nodes.items():
+            imp = self.get_importance(node_id) or Importance.NORMAL
+            count = node.access_count
+            if count >= 3 and imp == Importance.NORMAL:
+                if self.promote_importance(node_id, Importance.IMPORTANT):
+                    auto_promoted += 1
+        if auto_promoted > 0:
+            logger.info(f"[MemoryGraph] 自动提升了 {auto_promoted} 个节点的重要度")
+        return auto_promoted
+
     def run_importance_review(self) -> Dict[str, Any]:
-        """扫描所有节点，根据访问模式自动提升重要度
+        """扫描所有节点，自动提升重要度并将候选入列（不提交LLM审查）
+
+        LLM审查提交由 _idle_review_loop 在系统空闲5分钟时统一处理。
 
         规则:
         - access_count >= 3 且 importance == NORMAL → 自动提升为 IMPORTANT
-        - access_count >= 5 且 importance == IMPORTANT → 提交给 LLMMemoryReviewer 审查
+        - access_count >= 5 且 importance == IMPORTANT → 入列 _pending_llm_candidates 等待空闲审查
 
         Returns:
-            {"auto_promoted": int, "llm_candidates": List[str], "submitted_count": int}
+            {"auto_promoted": int, "llm_candidates": List[str], "submitted_count": 0}
         """
         auto_promoted = 0
         llm_candidates = []
@@ -858,61 +875,13 @@ class MemoryGraph:
         if auto_promoted > 0:
             logger.info(f"[MemoryGraph] 自动提升了 {auto_promoted} 个节点的重要度")
 
-        submitted_count = 0
         if llm_candidates:
-            if not hasattr(self, '_pending_llm_candidates'):
-                self._pending_llm_candidates = []
-            self._pending_llm_candidates = list(set(self._pending_llm_candidates + llm_candidates))
-            batch = self._pending_llm_candidates[:50]
-            try:
-                import asyncio
-                from zulong.memory.llm_memory_reviewer import get_llm_memory_reviewer
-                reviewer = get_llm_memory_reviewer()
-                if reviewer:
-                    candidate_memories = []
-                    for cid in batch:
-                        node = self._nodes.get(cid)
-                        if node:
-                            imp = self.get_importance(cid)
-                            candidate_memories.append({
-                                "id": cid, 
-                                "label": getattr(node, 'label', ''), 
-                                "content": getattr(node, 'content', ''), 
-                                "importance": str(imp.value if imp else "NORMAL"), 
-                                "access_count": node.access_count
-                            })
-                    if candidate_memories:
-                        try:
-                            loop = asyncio.get_event_loop()
-                            if loop.is_running():
-                                asyncio.ensure_future(reviewer.review_importance_candidates(candidate_memories))
-                            else:
-                                loop.run_until_complete(reviewer.review_importance_candidates(candidate_memories))
-                            # 🔥 修复：提交成功后立即从候选列表中移除
-                            submitted_count = len(candidate_memories)
-                            self._pending_llm_candidates = self._pending_llm_candidates[submitted_count:]
-                            logger.info(f"[MemoryGraph] ✅ 成功提交 {submitted_count} 个节点给LLM审查，剩余候选={len(self._pending_llm_candidates)}")
-                        except RuntimeError:
-                            try:
-                                asyncio.run(reviewer.review_importance_candidates(candidate_memories))
-                                # 🔥 修复：提交成功后立即从候选列表中移除
-                                submitted_count = len(candidate_memories)
-                                self._pending_llm_candidates = self._pending_llm_candidates[submitted_count:]
-                                logger.info(f"[MemoryGraph] ✅ 成功提交 {submitted_count} 个节点给LLM审查，剩余候选={len(self._pending_llm_candidates)}")
-                            except Exception as e:
-                                logger.warning(f"[MemoryGraph] 重要性审查提交失败: {e}")
-                                submitted_count = 0  # 失败时不计数
-                    else:
-                        logger.warning(f"[MemoryGraph] 候选节点信息为空，跳过提交")
-                else:
-                    logger.warning(f"[MemoryGraph] LLMMemoryReviewer未初始化，无法提交审查")
-            except Exception as e:
-                logger.warning(f"[MemoryGraph] 重要性审查提交异常: {e}", exc_info=True)
-                submitted_count = 0  # 异常时不计数
+            with self._candidates_lock:
+                self._pending_llm_candidates = list(set(self._pending_llm_candidates + llm_candidates))
+                pending_len = len(self._pending_llm_candidates)
+            logger.info(f"[MemoryGraph] {len(llm_candidates)} 个节点入列待审查（积压={pending_len}），等待空闲时提交")
 
-            logger.info(f"[MemoryGraph] {len(llm_candidates)} 个节点待 LLM 审查确认提升，已提交 {submitted_count} 个，剩余待提交={len(self._pending_llm_candidates)}")
-
-        return {"auto_promoted": auto_promoted, "llm_candidates": llm_candidates, "submitted_count": submitted_count}
+        return {"auto_promoted": auto_promoted, "llm_candidates": llm_candidates, "submitted_count": 0}
 
     # ============================================================
     # 边 CRUD
@@ -1716,8 +1685,113 @@ class MemoryGraph:
                 f"[MemoryGraph] 清理了 {len(nodes_to_remove)} 个语义孤立/极短内容节点"
             )
 
+    async def _idle_review_loop(self):
+        """空闲时自动批量审批待审批节点
+
+        当系统空闲5分钟且有待审批节点时，启动节点审查流程。
+        审查一旦启动，不会被新任务打断，直到所有待审查节点处理完毕。
+        """
+        _IDLE_THRESHOLD = 300.0  # 5分钟空闲阈值
+        _IDLE_CHECK_INTERVAL = 60.0  # 每60秒检查一次空闲状态
+        _IDLE_BATCH_SIZE = 10  # 每批审批10个节点
+        _IDLE_BATCH_INTERVAL = 3.0  # 批次间间隔3秒，避免LLM过载
+
+        while self._running:
+            await asyncio.sleep(_IDLE_CHECK_INTERVAL)
+
+            try:
+                from zulong.core.state_manager import state_manager
+                is_idle = state_manager.is_system_idle(_IDLE_THRESHOLD)
+            except Exception:
+                is_idle = False
+
+            if not is_idle:
+                continue
+
+            # 检查 L2-PRIME 是否空闲，避免审查任务与用户请求竞争 LLM 资源
+            try:
+                from zulong.core.types import L2Status
+                if state_manager._l2_status not in (L2Status.IDLE, L2Status.WAITING):
+                    continue
+            except Exception:
+                pass
+
+            with self._candidates_lock:
+                pending = list(self._pending_llm_candidates)
+            if not pending:
+                continue
+
+            logger.info(f"[MemoryGraph] 🔔 系统空闲5分钟，启动节点审查流程，共 {len(pending)} 个待审查节点（每批{_IDLE_BATCH_SIZE}个）")
+
+            try:
+                from zulong.memory.llm_memory_reviewer import get_llm_memory_reviewer
+                reviewer = get_llm_memory_reviewer()
+            except Exception:
+                continue
+
+            if not reviewer:
+                continue
+
+            total_reviewed = 0
+            while self._running:
+                with self._candidates_lock:
+                    if not self._pending_llm_candidates:
+                        break
+                # 每批前检查：用户有活动则立即中断审查
+                try:
+                    is_idle = state_manager.is_system_idle(_IDLE_THRESHOLD)
+                except Exception:
+                    is_idle = False
+
+                if not is_idle:
+                    with self._candidates_lock:
+                        remaining = len(self._pending_llm_candidates)
+                    logger.info(f"[MemoryGraph] 用户活动，中断审查（已审查 {total_reviewed} 个，剩余 {remaining} 个）")
+                    break
+
+                with self._candidates_lock:
+                    batch = list(self._pending_llm_candidates[:_IDLE_BATCH_SIZE])
+                batch_ids = set(batch)
+                candidate_memories = []
+                for cid in batch:
+                    node = self._nodes.get(cid)
+                    if node:
+                        imp = self.get_importance(cid)
+                        candidate_memories.append({
+                            "id": cid,
+                            "label": getattr(node, 'label', ''),
+                            "content": getattr(node, 'content', ''),
+                            "importance": str(imp.value if imp else "NORMAL"),
+                            "access_count": node.access_count
+                        })
+
+                if not candidate_memories:
+                    with self._candidates_lock:
+                        self._pending_llm_candidates = [c for c in self._pending_llm_candidates if c not in batch_ids]
+                    continue
+
+                try:
+                    await reviewer.review_importance_candidates(candidate_memories)
+                    reviewed_ids = set(m["id"] for m in candidate_memories)
+                    with self._candidates_lock:
+                        self._pending_llm_candidates = [c for c in self._pending_llm_candidates if c not in reviewed_ids]
+                        remaining = len(self._pending_llm_candidates)
+                    total_reviewed += len(reviewed_ids)
+                    logger.debug(f"[MemoryGraph] 空闲审批: 提交 {len(reviewed_ids)} 个，累计 {total_reviewed}，剩余 {remaining}")
+                except Exception as e:
+                    logger.warning(f"[MemoryGraph] 空闲审批提交失败: {e}")
+                    break
+
+                await asyncio.sleep(_IDLE_BATCH_INTERVAL)
+
+            if total_reviewed > 0:
+                with self._candidates_lock:
+                    final_remaining = len(self._pending_llm_candidates)
+                logger.info(f"[MemoryGraph] 空闲审批完成: 共审批 {total_reviewed} 个节点，剩余待审批 {final_remaining} 个")
+                self.save()
+
     async def start_prune_loop(self, interval_seconds: int = 1800):
-        """启动异步修剪循环 (每30分钟)"""
+        """启动异步修剪循环 (每30分钟，积压时自动加速)"""
         if self._running:
             return
         self._running = True
@@ -1725,15 +1799,22 @@ class MemoryGraph:
         async def _loop():
             cycle_count = 0
             while self._running:
-                await asyncio.sleep(interval_seconds)
+                # 自适应间隔：积压时缩短等待时间
+                with self._candidates_lock:
+                    pending = len(self._pending_llm_candidates)
+                if pending > 500:
+                    actual_interval = min(interval_seconds, 300)
+                elif pending > 200:
+                    actual_interval = min(interval_seconds, 600)
+                else:
+                    actual_interval = interval_seconds
+                await asyncio.sleep(actual_interval)
                 try:
                     cycle_count += 1
                     self.decay_and_prune()
                     self.run_importance_review()
-                    # 每 3 轮执行一次语义孤立 / 极短内容清理
                     if cycle_count % 3 == 0:
                         self.cleanup_orphan_nodes()
-                    # 每 2 个周期提交 pending_review 边给 LLM 审查
                     if cycle_count % 2 == 0:
                         try:
                             await self.submit_prune_review()
@@ -1744,6 +1825,8 @@ class MemoryGraph:
                     logger.error(f"[MemoryGraph] 修剪循环异常: {e}")
 
         self._prune_task = asyncio.create_task(_loop())
+        # 启动空闲时自动审批循环
+        self._idle_review_task = asyncio.create_task(self._idle_review_loop())
         logger.info(f"[MemoryGraph] 修剪循环已启动 (间隔 {interval_seconds}s)")
 
     def _try_start_prune_loop(self, interval_seconds: int = 1800):
@@ -1774,6 +1857,8 @@ class MemoryGraph:
         self._running = False
         if self._prune_task and not self._prune_task.done():
             self._prune_task.cancel()
+        if hasattr(self, '_idle_review_task') and self._idle_review_task and not self._idle_review_task.done():
+            self._idle_review_task.cancel()
         logger.info("[MemoryGraph] 修剪循环已停止")
 
     # ============================================================
@@ -1825,7 +1910,7 @@ class MemoryGraph:
 
         # 构建记忆列表供 LLM 审查
         memories = []
-        for src, tgt in review_edges[:10]:  # 批量限制 10 条
+        for src, tgt in review_edges[:50]:  # 批量限制 50 条（从10提升）
             src_node = self.get_node(src)
             tgt_node = self.get_node(tgt)
             if src_node and tgt_node:

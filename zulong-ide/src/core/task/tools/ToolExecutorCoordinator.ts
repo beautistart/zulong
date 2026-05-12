@@ -26,6 +26,7 @@ import { UseSkillToolHandler } from "./handlers/UseSkillToolHandler"
 import { WebFetchToolHandler } from "./handlers/WebFetchToolHandler"
 import { WebSearchToolHandler } from "./handlers/WebSearchToolHandler"
 import { WriteToFileToolHandler } from "./handlers/WriteToFileToolHandler"
+import { DeleteFileToolHandler } from "./handlers/DeleteFileToolHandler"
 import { AgentConfigLoader } from "./subagent/AgentConfigLoader"
 import { ToolValidator } from "./ToolValidator"
 import type { TaskConfig } from "./types/TaskConfig"
@@ -84,6 +85,7 @@ export class ToolExecutorCoordinator {
 			new SharedToolHandler(ZulongDefaultTool.FILE_EDIT, new WriteToFileToolHandler(v)),
 		[ZulongDefaultTool.FILE_READ]: (v: ToolValidator) => new ReadFileToolHandler(v),
 		[ZulongDefaultTool.FILE_NEW]: (v: ToolValidator) => new WriteToFileToolHandler(v),
+		[ZulongDefaultTool.FILE_DELETE]: (v: ToolValidator) => new DeleteFileToolHandler(v),
 		[ZulongDefaultTool.SEARCH]: (v: ToolValidator) => new SearchFilesToolHandler(v),
 		[ZulongDefaultTool.LIST_FILES]: (v: ToolValidator) => new ListFilesToolHandler(v),
 		[ZulongDefaultTool.LIST_CODE_DEF]: (v: ToolValidator) => new ListCodeDefinitionNamesToolHandler(v),

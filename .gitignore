@@ -70,6 +70,24 @@ tests/test_storage_hybrid.py
 logs/
 *.log
 
+# ===== 工作空间 =====
+agent_workspace/
+rw/
+rz/
+zulong/workspace/
+
+# ===== 子模块和外部项目 =====
+openclaw/
+TSD/
+
+# ===== 测试和临时文件 =====
+tests/
+nul
+temp_check.js
+test_*.py
+AI_Agent_Technology_Trends_2024.md
+VOICE_INTEGRATION_SUMMARY.md
+
 # ===== 其他 =====
 .arts/
 .codeartsdoer/

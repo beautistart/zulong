@@ -849,6 +849,68 @@ class IndexProjectTool(BaseTool):
         # 避免阻塞 FC 循环（大型项目可能耗时 60~90 秒）
         resolved_root = str(root_path.resolve())
 
+        def _inject_symbols_to_tg(tg, code_graph, proj_name, file_rel_path, file_node_id):
+            """将文件中的类/函数/方法符号注入到TaskGraph中"""
+            _MAX_CLASSES_PER_FILE = 20
+            _MAX_METHODS_PER_CLASS = 15
+            _MAX_TOP_FUNCTIONS = 20
+
+            file_syms = [
+                sym for sym in code_graph.symbols.values()
+                if sym.file_path == file_rel_path
+            ]
+
+            # 按类型分组
+            classes = [s for s in file_syms if s.kind == "class"]
+            top_funcs = [s for s in file_syms if s.kind == "function"]
+
+            # 注入顶层函数
+            for sym in top_funcs[:_MAX_TOP_FUNCTIONS]:
+                sym_node_id = f"crg_{proj_name}/sym:{sym.node_id}"
+                if tg.get_node(sym_node_id):
+                    continue
+                param_str = f"({', '.join(sym.parameters)})" if sym.parameters else "()"
+                tg.add_node(
+                    id=sym_node_id,
+                    label=f"F {sym.name}{param_str}",
+                    type="subtask",
+                    status="completed",
+                    desc=f"函数 {sym.qualified_name}{param_str}\n行 {sym.start_line}-{sym.end_line}",
+                )
+                tg.add_h_edge(file_node_id, sym_node_id)
+
+            # 注入类及其方法
+            for cls_sym in classes[:_MAX_CLASSES_PER_FILE]:
+                cls_node_id = f"crg_{proj_name}/sym:{cls_sym.node_id}"
+                if tg.get_node(cls_node_id):
+                    continue
+                bases_str = f" extends {', '.join(cls_sym.bases)}" if cls_sym.bases else ""
+                tg.add_node(
+                    id=cls_node_id,
+                    label=f"C {cls_sym.name}{bases_str}",
+                    type="subtask",
+                    status="completed",
+                    desc=f"类 {cls_sym.name}{bases_str}\n行 {cls_sym.start_line}-{cls_sym.end_line}",
+                )
+                tg.add_h_edge(file_node_id, cls_node_id)
+
+                # 注入类方法
+                methods = [s for s in file_syms
+                           if s.kind == "method" and s.parent_class == cls_sym.name]
+                for meth_sym in methods[:_MAX_METHODS_PER_CLASS]:
+                    meth_node_id = f"crg_{proj_name}/sym:{meth_sym.node_id}"
+                    if tg.get_node(meth_node_id):
+                        continue
+                    param_str = f"({', '.join(meth_sym.parameters)})" if meth_sym.parameters else "()"
+                    tg.add_node(
+                        id=meth_node_id,
+                        label=f"M {meth_sym.name}{param_str}",
+                        type="subtask",
+                        status="completed",
+                        desc=f"方法 {meth_sym.qualified_name}{param_str}\n行 {meth_sym.start_line}-{meth_sym.end_line}",
+                    )
+                    tg.add_h_edge(cls_node_id, meth_node_id)
+
         def _background_index():
             """后台执行 AST 解析 + MemoryGraph 同步 + 注入任务图"""
             try:
@@ -1004,13 +1066,11 @@ class IndexProjectTool(BaseTool):
                                     base_name = file_rel_path.split("/")[-1]
                                     file_node_id = f"crg_{proj_name}/{file_rel_path}"
                                     if not tg.get_node(file_node_id):
-                                        # 收集该文件的符号摘要
                                         file_syms = [
                                             sym for sym in code_graph.symbols.values()
                                             if sym.file_path == file_rel_path
                                         ]
                                         file_sym_count = len(file_syms)
-                                        # 构建丰富描述（符号列表）
                                         sym_lines = []
                                         for sym in file_syms[:10]:
                                             kind_icon = {"class": "C", "function": "F", "method": "M"}.get(sym.kind, "?")
@@ -1024,8 +1084,9 @@ class IndexProjectTool(BaseTool):
                                             desc=desc,
                                         )
                                         tg.add_h_edge(sub_dir_id, file_node_id)
-                                        # 关联文件引用（使前端显示"关联文件"）
                                         tg.add_file_to_node(file_node_id, base_name, file_rel_path)
+                                    # 3b-sym) 文件下的类/函数符号节点
+                                    _inject_symbols_to_tg(tg, code_graph, proj_name, file_rel_path, file_node_id)
 
                             # 3c) 顶层目录下直接的文件（不在子目录中的）
                             for file_rel_path in dir_files[:5]:
@@ -1051,6 +1112,8 @@ class IndexProjectTool(BaseTool):
                                     )
                                     tg.add_h_edge(dir_node_id, file_node_id)
                                     tg.add_file_to_node(file_node_id, base_name, file_rel_path)
+                                # 3c-sym) 文件下的类/函数符号节点
+                                _inject_symbols_to_tg(tg, code_graph, proj_name, file_rel_path, file_node_id)
 
                         # 4) 注入跨文件依赖边（calls/inherits/imports → d_edge）
                         dep_count = 0
@@ -1086,25 +1149,35 @@ class IndexProjectTool(BaseTool):
                                     tg.add_d_edge(src_file_node, tgt_file_node, via=f"imports {via_label}", cross=True)
                                     dep_count += 1
                             else:
-                                # calls/inherits 边：source_id/target_id 是符号 node_id
+                                # calls/inherits 边：优先在符号节点间建立依赖边
                                 src_sym = code_graph.symbols.get(edge.source_id)
                                 tgt_sym = code_graph.symbols.get(edge.target_id)
                                 if not src_sym or not tgt_sym:
                                     continue
                                 if src_sym.file_path == tgt_sym.file_path:
                                     continue
+                                # 尝试符号级依赖边
+                                src_sym_node = f"crg_{proj_name}/sym:{edge.source_id}"
+                                tgt_sym_node = f"crg_{proj_name}/sym:{edge.target_id}"
+                                if tg.get_node(src_sym_node) and tg.get_node(tgt_sym_node):
+                                    sym_pair = (src_sym_node, tgt_sym_node)
+                                    if sym_pair not in seen_dep_pairs:
+                                        seen_dep_pairs.add(sym_pair)
+                                        via_label = f"{src_sym.name}→{tgt_sym.name} ({edge.edge_type})"
+                                        tg.add_d_edge(src_sym_node, tgt_sym_node, via=via_label, cross=True)
+                                        dep_count += 1
+                                # 同时在文件级也建立依赖边（兜底）
                                 src_file_node = f"crg_{proj_name}/{src_sym.file_path}"
                                 tgt_file_node = f"crg_{proj_name}/{tgt_sym.file_path}"
                                 pair_key = (src_file_node, tgt_file_node)
-                                if pair_key in seen_dep_pairs:
-                                    continue
-                                if tg.get_node(src_file_node) and tg.get_node(tgt_file_node):
-                                    seen_dep_pairs.add(pair_key)
-                                    via_label = f"{src_sym.name}→{tgt_sym.name} ({edge.edge_type})"
-                                    tg.add_d_edge(src_file_node, tgt_file_node, via=via_label, cross=True)
-                                    dep_count += 1
+                                if pair_key not in seen_dep_pairs:
+                                    if tg.get_node(src_file_node) and tg.get_node(tgt_file_node):
+                                        seen_dep_pairs.add(pair_key)
+                                        via_label = f"{src_sym.name}→{tgt_sym.name} ({edge.edge_type})"
+                                        tg.add_d_edge(src_file_node, tgt_file_node, via=via_label, cross=True)
+                                        dep_count += 1
 
-                        logger.info(f"[IndexProjectTool] 已注入任务图: {created_dirs} 模块, {len(code_graph.file_results)} 文件, {dep_count} 依赖边")
+                        logger.info(f"[IndexProjectTool] 已注入任务图: {created_dirs} 模块, {len(code_graph.file_results)} 文件, {len(code_graph.symbols)} 符号, {dep_count} 依赖边")
 
                         # 推送完整任务图更新到前端
                         if tg.on_change_callback:

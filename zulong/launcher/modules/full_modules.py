@@ -378,6 +378,58 @@ class MicrophoneModule(Module):
         self.state = ModuleState.STOPPED
 
 
+# ── 10b. SpeakerModule ──────────────────────────────
+
+class SpeakerModule(Module):
+    name = "speaker"
+    display_name = "扬声器设备"
+    dependencies = ["config"]
+    mode_tags: Set[str] = {"full"}
+
+    def __init__(self):
+        super().__init__()
+        self._speaker = None
+        self._thread = None
+
+    async def start(self) -> None:
+        self.progress_message = "正在初始化扬声器..."
+        from zulong.l0.devices.speaker_device import SpeakerDevice
+        
+        try:
+            # 创建 SpeakerDevice 实例（不再自动启动）
+            self._speaker = SpeakerDevice()
+            
+            # 在独立线程中启动扬声器，避免事件循环冲突
+            def _run_speaker():
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(self._speaker.start())
+                    loop.run_forever()
+                except Exception as e:
+                    logger.error(f"[SpeakerModule] 线程异常: {e}", exc_info=True)
+            
+            self._thread = threading.Thread(target=_run_speaker, daemon=True, name="SpeakerDevice")
+            self._thread.start()
+            
+            # 等待扬声器启动
+            await asyncio.sleep(1.0)
+            
+            self.state = ModuleState.RUNNING
+            logger.info("[SpeakerModule] 扬声器已启动")
+        except Exception as e:
+            logger.error(f"[SpeakerModule] 启动失败: {e}", exc_info=True)
+            self.state = ModuleState.RUNNING  # 标记为运行但记录错误
+
+    async def stop(self) -> None:
+        if self._speaker and hasattr(self._speaker, "stop"):
+            try:
+                await self._speaker.stop()
+            except Exception as e:
+                logger.warning(f"[SpeakerModule] 停止异常: {e}")
+        self.state = ModuleState.STOPPED
+
+
 # ── 11. RecoveryNotifierModule ──────────────────────
 
 class RecoveryNotifierModule(Module):
@@ -411,5 +463,6 @@ def get_full_modules() -> List[Module]:
         MemoryEvolutionModule(),
         CameraModule(),
         MicrophoneModule(),
+        SpeakerModule(),  # 🔊 新增：扬声器设备模块
         RecoveryNotifierModule(),
     ]

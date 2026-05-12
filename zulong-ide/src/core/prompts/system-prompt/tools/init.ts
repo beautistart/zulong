@@ -23,6 +23,7 @@ import { use_skill_variants } from "./use_skill"
 import { web_fetch_variants } from "./web_fetch"
 import { web_search_variants } from "./web_search"
 import { write_to_file_variants } from "./write_to_file"
+import { delete_file_variants } from "./delete_file"
 
 /**
  * Registers all tool variants with the ZulongToolSet provider.
@@ -54,6 +55,7 @@ export function registerZulongToolSets(): void {
 		...web_fetch_variants,
 		...web_search_variants,
 		...write_to_file_variants,
+		...delete_file_variants,
 		...apply_patch_variants,
 	]
 

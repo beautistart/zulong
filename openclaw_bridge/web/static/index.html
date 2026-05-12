@@ -3,8 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OpenClaw - 祖龙对话</title>
-    <script src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
+    <title>祖龙对话</title>
+    <!-- dagre布局算法核心库 -->
+    <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
+    <!-- Cytoscape.js 核心（使用3.26.0稳定版） -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
+    <!-- Cytoscape dagre布局扩展 -->
+    <script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+    <!-- 保留d3用于其他功能 -->
     <script src="https://d3js.org/d3.v7.min.js"></script>
     <style>
         * {
@@ -424,19 +430,19 @@
         .graph-progress-bar { width: 140px; height: 6px; background: #e2e8f0; border-radius: 3px; overflow: hidden; }
         .graph-progress-fill { height: 100%; background: linear-gradient(90deg,#22c55e,#16a34a); border-radius: 3px; transition: width .4s; }
         .graph-body { flex: 1; display: flex; overflow: hidden; }
-        .graph-svg-area { flex: 1; overflow: hidden; background: #f8fafc; position: relative; cursor: grab; }
+        .graph-svg-area { flex: 1; overflow: hidden; background: #f8fafc; position: relative; cursor: grab; min-height: 200px; }
         .graph-svg-area.panning { cursor: grabbing; }
-        .graph-svg-area svg { display: block; transform-origin: 0 0; }
+        .graph-svg-area svg { display: block; transform-origin: 0 0; will-change: transform; }
 
         /* 图谱节点 */
         .graph-panel .gnode { cursor: pointer; }
         .graph-panel .gnode .card { fill: #fff; stroke: #e2e8f0; stroke-width: 1.5; }
-        .graph-panel .gnode:hover .card { stroke: #3b82f6; filter: drop-shadow(0 2px 8px rgba(59,130,246,.18)); }
-        .graph-panel .gnode.selected .card { stroke: #3b82f6; stroke-width: 2.5; filter: drop-shadow(0 3px 12px rgba(59,130,246,.25)); }
+        .graph-panel .gnode:hover .card { stroke: #3b82f6; stroke-width: 2.5; }
+        .graph-panel .gnode.selected .card { stroke: #3b82f6; stroke-width: 3; }
         .graph-panel .gnode .title { font-size: 11.5px; font-weight: 600; fill: #1e293b; }
         .graph-panel .gnode .subtitle { font-size: 10px; fill: #64748b; }
-        .graph-panel .gnode.dimmed { opacity: .18; transition: opacity .3s; }
-        .graph-panel .gnode { transition: opacity .3s; }
+        .graph-panel .gnode.dimmed { opacity: .18; }
+        .graph-panel .dep-group { }
 
         /* 图谱边 */
         .graph-panel .edge-hier { fill: none; stroke: #cbd5e1; stroke-width: 1.4; }
@@ -449,10 +455,10 @@
         .graph-panel .dep-group.satisfied .dep-label { fill: #16a34a; }
         .graph-panel .dep-group.unsatisfied .dep-label { fill: #dc2626; }
         .graph-panel .dep-group.dimmed { opacity: .08; }
-        .graph-panel .dep-group.highlighted .dep-line { stroke-width: 3; filter: drop-shadow(0 0 4px rgba(239,68,68,.4)); }
-        .graph-panel .dep-group.highlighted.satisfied .dep-line { filter: drop-shadow(0 0 4px rgba(34,197,94,.4)); }
+        .graph-panel .dep-group.highlighted .dep-line { stroke-width: 3; }
+        .graph-panel .dep-group.highlighted.satisfied .dep-line { stroke-width: 3; }
         @keyframes dash { to { stroke-dashoffset: -22; } }
-        .graph-panel .dep-group .dep-line { animation: dash .8s linear infinite; }
+        .graph-panel .dep-group:hover .dep-line { animation: dash .8s linear infinite; }
 
         /* 图谱右侧详情面板 */
         .graph-detail-panel {
@@ -853,6 +859,38 @@
             display: flex;
             gap: 10px;
             flex-wrap: wrap;
+        }
+
+        .voice-input-btn {
+            width: 40px;
+            height: 40px;
+            background: #f3f4f6;
+            border: 2px solid #e5e7eb;
+            border-radius: 50%;
+            font-size: 18px;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+
+        .voice-input-btn:hover {
+            background: #e5e7eb;
+            border-color: #667eea;
+            transform: scale(1.1);
+        }
+
+        .voice-input-btn.recording {
+            background: #fef2f2;
+            border-color: #ef4444;
+            animation: voice-pulse 1.5s ease-in-out infinite;
+        }
+
+        @keyframes voice-pulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+            50% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
         }
         
         .test-controls {
@@ -2065,6 +2103,7 @@
         </div>
         
         <div class="chat-input-container">
+            <button class="voice-input-btn" id="voiceInputBtn" title="语音输入">🎤</button>
             <input 
                 type="text" 
                 class="chat-input" 
@@ -2241,8 +2280,46 @@
         const chatMessages = document.getElementById('chatMessages');
         const chatInput = document.getElementById('chatInput');
         const sendButton = document.getElementById('sendButton');
+        const voiceInputBtn = document.getElementById('voiceInputBtn');
         const statusIndicator = document.getElementById('statusIndicator');
         const connectionStatus = document.getElementById('connectionStatus');
+
+        // ===== 语音录音功能 =====
+        let isRecording = false;
+
+        voiceInputBtn.addEventListener('click', async function() {
+            if (isRecording) {
+                // 停止录音
+                isRecording = false;
+                voiceInputBtn.classList.remove('recording');
+                voiceInputBtn.textContent = '🎤';
+                console.log('[Voice] 停止录音');
+
+                // 发送 audio_end
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: 'audio_end',
+                        session_id: currentSessionId
+                    }));
+                }
+            } else {
+                // 发送 audio_start
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: 'audio_start',
+                        session_id: currentSessionId
+                    }));
+                    
+                    isRecording = true;
+                    voiceInputBtn.classList.add('recording');
+                    voiceInputBtn.textContent = '⏹';
+                    console.log('[Voice] 开始录音（后端采集）');
+                } else {
+                    console.error('[Voice] WebSocket 未连接');
+                    alert('WebSocket 未连接，无法录音');
+                }
+            }
+        });
         
         // ===== 多会话管理 =====
         const STORAGE_KEY = 'zulong_sessions';
@@ -2325,7 +2402,28 @@
             
             // 恢复该会话的消息
             const session = store.sessions.find(s => s.id === sessionId);
-            if (session && session.messages) {
+            if (session && session.source === 'memory_graph') {
+                // 后端会话：通过 WebSocket 从 MemoryGraph 加载消息
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    // 显示加载提示
+                    const loadingDiv = document.createElement('div');
+                    loadingDiv.className = 'message system';
+                    loadingDiv.id = 'session-loading';
+                    loadingDiv.innerHTML = '<div class="message-content"><em>正在加载对话记录...</em></div>';
+                    chatMessages.appendChild(loadingDiv);
+                    
+                    ws.send(JSON.stringify({
+                        type: "GET_SESSION_MESSAGES",
+                        session_id: sessionId
+                    }));
+                } else {
+                    const offDiv = document.createElement('div');
+                    offDiv.className = 'message system';
+                    offDiv.innerHTML = '<div class="message-content"><em>WebSocket 未连接，无法加载对话记录</em></div>';
+                    chatMessages.appendChild(offDiv);
+                }
+            } else if (session && session.messages) {
+                // 本地会话：从 localStorage 恢复
                 session.messages.forEach(msg => {
                     addMessage(msg.text, msg.sender, false, null, msg.id);
                 });
@@ -2343,33 +2441,49 @@
         function deleteSession(sessionId, ev) {
             if (ev) ev.stopPropagation();
 
-            // 调用后端级联删除 API
-            fetch('/api/chat/sessions/' + sessionId + '?cascade=true', {
-                method: 'DELETE',
-            }).then(function(r) { return r.json(); }).then(function(result) {
-                if (result.mg_nodes_deleted > 0) {
-                    console.log('[Session] 级联删除了', result.mg_nodes_deleted, '个图谱节点');
-                }
-            }).catch(function(e) {
-                console.warn('[Session] 级联删除请求失败:', e);
-            });
-
-            // 前端立即删除（不等后端响应）
+            // 判断是否为后端 MemoryGraph 会话
             const store = loadSessionStore();
-            store.sessions = store.sessions.filter(s => s.id !== sessionId);
+            const session = store.sessions.find(s => s.id === sessionId);
             
-            if (currentSessionId === sessionId) {
-                if (store.sessions.length > 0) {
-                    store.activeSessionId = store.sessions[0].id;
-                    saveSessionStore(store);
-                    switchToSession(store.sessions[0].id);
+            if (session && session.source === 'memory_graph') {
+                // 后端会话：通过 WebSocket 删除 MemoryGraph 节点
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: "DELETE_DIALOGUE_SESSION",
+                        session_id: sessionId
+                    }));
+                    // handleSessionDeleted 回调会处理前端列表更新
                 } else {
-                    saveSessionStore(store);
-                    createNewSession();
+                    console.warn('[Session] WebSocket 未连接，无法删除后端会话');
                 }
             } else {
-                saveSessionStore(store);
-                renderSessionList();
+                // 本地会话：调用 REST API 级联删除
+                fetch('/api/chat/sessions/' + sessionId + '?cascade=true', {
+                    method: 'DELETE',
+                }).then(function(r) { return r.json(); }).then(function(result) {
+                    if (result.mg_nodes_deleted > 0) {
+                        console.log('[Session] 级联删除了', result.mg_nodes_deleted, '个图谱节点');
+                    }
+                }).catch(function(e) {
+                    console.warn('[Session] 级联删除请求失败:', e);
+                });
+
+                // 前端立即删除（不等后端响应）
+                store.sessions = store.sessions.filter(s => s.id !== sessionId);
+                
+                if (currentSessionId === sessionId) {
+                    if (store.sessions.length > 0) {
+                        store.activeSessionId = store.sessions[0].id;
+                        saveSessionStore(store);
+                        switchToSession(store.sessions[0].id);
+                    } else {
+                        saveSessionStore(store);
+                        createNewSession();
+                    }
+                } else {
+                    saveSessionStore(store);
+                    renderSessionList();
+                }
             }
             console.log('[Session] 已删除会话:', sessionId);
         }
@@ -2426,7 +2540,7 @@
                 
                 const title = document.createElement('span');
                 title.className = 'session-title';
-                title.textContent = s.title + (s.source === 'ide' ? ' [IDE]' : '');
+                title.textContent = s.title + (s.source === 'ide' ? ' [IDE]' : '') + (s.source === 'memory_graph' ? ' [记忆]' : '');
                 title.ondblclick = function(e) { startRenameSession(s.id, e); };
                 
                 const del = document.createElement('button');
@@ -2529,6 +2643,135 @@
             }
         }
         
+        // ===== 后端 MemoryGraph 对话会话整合 =====
+        
+        // 合并后端对话会话到本地会话列表
+        function mergeBackendSessions(backendSessions) {
+            if (!backendSessions || backendSessions.length === 0) return;
+            
+            const store = loadSessionStore();
+            const existingDialogueIds = new Set(
+                store.sessions
+                    .filter(s => s.dialogue_session_id)
+                    .map(s => s.dialogue_session_id)
+            );
+            
+            let added = 0;
+            for (const bs of backendSessions) {
+                // 跳过已经通过 dialogue_session_id 关联的
+                if (existingDialogueIds.has(bs.id)) continue;
+                // 跳过已经以 source=memory_graph 存在的
+                if (store.sessions.find(s => s.id === bs.id)) continue;
+                
+                store.sessions.push({
+                    id: bs.id,
+                    title: bs.title || '对话记录',
+                    messages: [],  // 消息按需从后端加载
+                    createdAt: (bs.created_at || 0) * 1000,
+                    source: 'memory_graph',
+                    dialogue_session_id: bs.id,
+                    round_count: bs.round_count || 0,
+                    preview: bs.preview || '',
+                    last_active_at: bs.last_active_at || bs.created_at || 0,
+                    bound_task_id: bs.bound_task_id || '',
+                });
+                added++;
+            }
+            
+            if (added > 0) {
+                // 重新排序：按 last_active_at 降序
+                store.sessions.sort((a, b) => {
+                    const ta = a.last_active_at || (a.createdAt / 1000) || 0;
+                    const tb = b.last_active_at || (b.createdAt / 1000) || 0;
+                    return tb - ta;
+                });
+                saveSessionStore(store);
+                renderSessionList();
+                console.log('[Session] 合并了', added, '个后端对话会话');
+            }
+        }
+        
+        // 渲染后端会话的完整消息列表
+        function renderSessionMessages(sessionId, messages) {
+            // 只在当前会话匹配时渲染
+            if (sessionId !== currentSessionId) return;
+            
+            chatMessages.innerHTML = '';
+            
+            if (messages.length === 0) {
+                const emptyDiv = document.createElement('div');
+                emptyDiv.className = 'message system';
+                emptyDiv.innerHTML = '<div class="message-content"><em>该会话暂无消息记录</em></div>';
+                chatMessages.appendChild(emptyDiv);
+                return;
+            }
+            
+            for (const msg of messages) {
+                if (msg.role === 'user') {
+                    addMessage(msg.content, 'user', false, null, msg.node_id);
+                } else if (msg.role === 'assistant') {
+                    addMessage(msg.content, 'assistant', false, null, msg.node_id);
+                } else if (msg.role === 'tool') {
+                    // 工具消息以折叠卡片形式
+                    addToolMessage(msg.content, msg.node_id);
+                } else {
+                    addMessage(msg.content, 'assistant', false, null, msg.node_id);
+                }
+            }
+            
+            // 滚动到底部
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+        
+        // 添加工具消息（折叠卡片形式）
+        function addToolMessage(content, nodeId) {
+            const div = document.createElement('div');
+            div.className = 'message assistant';
+            if (nodeId) div.setAttribute('data-node-id', nodeId);
+            
+            // 提取工具名
+            const toolMatch = content.match(/^\[([^\]]+)\]\s*/);
+            const toolName = toolMatch ? toolMatch[1] : '工具调用';
+            const toolContent = toolMatch ? content.slice(toolMatch[0].length) : content;
+            
+            div.innerHTML = `
+                <div class="message-content tool-card" style="font-size:12px; opacity:0.8; border-left:3px solid #6366f1; padding-left:8px;">
+                    <details>
+                        <summary style="cursor:pointer; font-weight:500; color:#6366f1;">🔧 ${toolName}</summary>
+                        <pre style="margin-top:4px; white-space:pre-wrap; font-size:11px; max-height:200px; overflow-y:auto;">${escapeHtml(toolContent.slice(0, 500))}</pre>
+                    </details>
+                </div>`;
+            chatMessages.appendChild(div);
+        }
+        
+        // 处理会话删除确认
+        function handleSessionDeleted(sessionId, nodesDeleted) {
+            console.log('[Session] 后端会话已删除:', sessionId, '节点数:', nodesDeleted);
+            // 从本地列表移除
+            const store = loadSessionStore();
+            store.sessions = store.sessions.filter(s => s.id !== sessionId);
+            if (currentSessionId === sessionId) {
+                if (store.sessions.length > 0) {
+                    store.activeSessionId = store.sessions[0].id;
+                    saveSessionStore(store);
+                    switchToSession(store.sessions[0].id);
+                } else {
+                    saveSessionStore(store);
+                    createNewSession();
+                }
+            } else {
+                saveSessionStore(store);
+                renderSessionList();
+            }
+        }
+        
+        // HTML 转义
+        function escapeHtml(text) {
+            const el = document.createElement('div');
+            el.textContent = text;
+            return el.innerHTML;
+        }
+        
         // 连接 WebSocket
         function connect() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -2541,6 +2784,8 @@
             ws.onopen = () => {
                 console.log('[WebSocket] ✅ 连接成功');
                 updateStatus(true);
+                // 重连后自动同步后端状态（图谱+会话）
+                syncBackendState();
             };
             
             ws.onclose = () => {
@@ -2577,8 +2822,33 @@
             console.log('[WebSocket] 收到消息:', data.type);
             
             switch (data.type) {
+                case 'audio_transcript':
+                    // 语音转录结果
+                    if (data.payload && data.payload.text) {
+                        chatInput.value += data.payload.text;
+                        console.log('[Voice] 转录结果:', data.payload.text);
+                    }
+                    break;
+
                 case 'WELCOME':
                     console.log('[WebSocket] 欢迎消息:', data.message);
+                    // 预填充已有活跃 IDE 会话映射
+                    if (data.payload && data.payload.active_sessions) {
+                        data.payload.active_sessions.forEach(function(s) {
+                            if (s.session_id && !_ideSessionMap[s.session_id]) {
+                                _ideSessionMap[s.session_id] = s.session_id;
+                            }
+                        });
+                    }
+                    // 自动重建：恢复后端已有的任务图谱
+                    if (data.payload && data.payload.task_graph) {
+                        addTaskGraph(data.payload.task_graph);
+                        console.log('[WebSocket] 已从WELCOME恢复任务图谱');
+                    }
+                    // 连接建立后请求后端对话会话列表
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({type: "LIST_DIALOGUE_SESSIONS"}));
+                    }
                     break;
                 
                 case 'THINKING_STEP':
@@ -2636,6 +2906,12 @@
                     // 轻量事件，仅日志
                     console.log('[IDE]', data.type, data.payload);
                     break;
+                case 'DISPLAY_TEXT':
+                    handleDisplayText(data);
+                    break;
+                case 'TASK_COMPLETE':
+                    handleTaskComplete(data);
+                    break;
                 case 'FC_DONE':
                     handleFCDone(data);
                     break;
@@ -2644,6 +2920,12 @@
                     break;
                 case 'IDE_SESSION_END':
                     handleIdeSessionEnd(data);
+                    break;
+                case 'IDE_SESSION_CANCEL':
+                    handleIdeSessionCancel(data);
+                    break;
+                case 'IDE_SESSION_LINKED':
+                    handleIdeSessionLinked(data);
                     break;
                 case 'TASK_GRAPH_UPDATE':
                     if (data.payload && data.payload.graph) {
@@ -2667,6 +2949,17 @@
 
                 case 'STOP_ACK':
                     addIdeSystemMessage('[系统] 停止指令已确认，任务正在终止...');
+                    break;
+
+                // ── 对话会话管理（后端 MemoryGraph 重建） ──
+                case 'SESSION_LIST':
+                    mergeBackendSessions(data.sessions || []);
+                    break;
+                case 'SESSION_MESSAGES':
+                    renderSessionMessages(data.session_id, data.messages || []);
+                    break;
+                case 'SESSION_DELETED':
+                    handleSessionDeleted(data.session_id, data.nodes_deleted || 0);
                     break;
 
                 default:
@@ -2728,6 +3021,29 @@
             addIdeSystemMessage(text);
         }
 
+        // DISPLAY_TEXT: 任务最终文本结果
+        function handleDisplayText(data) {
+            var p = data.payload || {};
+            removeTypingIndicator();
+            if (p.text) {
+                finalizeStreamingMessage(p.text, null);
+            }
+        }
+
+        // TASK_COMPLETE: 任务完成（含最终结果）
+        function handleTaskComplete(data) {
+            var p = data.payload || {};
+            removeTypingIndicator();
+            switchToSendMode();
+            var turns = p.total_turns || '?';
+            var resultPreview = (p.result || '').substring(0, 200);
+            addIdeSystemMessage('✅ 任务完成 (共 ' + turns + ' 轮)' + (resultPreview ? ' — ' + resultPreview : ''));
+            // 如果有结果文本，渲染到聊天窗口
+            if (p.result) {
+                finalizeStreamingMessage(p.result, null);
+            }
+        }
+
         // FC_DONE: FC 循环结束
         function handleFCDone(data) {
             var p = data.payload || {};
@@ -2739,9 +3055,31 @@
         var _ideSessionMap = {};
         function handleIdeSessionStart(data) {
             var p = data.payload || {};
-            // 1. 在 Web 端创建/绑定会话
             var ideSessionId = p.session_id;
             var taskTitle = p.task_title || (p.task_preview || '').substring(0, 40) || '新任务';
+            var isResume = p.is_resume === true;
+            var taskGraphId = p.task_graph_id || null;
+
+            // 恢复模式：优先查找已有的同 task_graph_id 会话，在其上继续
+            if (isResume && taskGraphId) {
+                var store = loadSessionStore();
+                var existingSession = store.sessions.find(function(s) {
+                    return s.task_graph_id === taskGraphId;
+                });
+                if (existingSession) {
+                    // 复用已有会话，更新 ide_session_id 映射
+                    _ideSessionMap[ideSessionId] = existingSession.id;
+                    existingSession.ide_session_id = ideSessionId;
+                    store.activeSessionId = existingSession.id;
+                    saveSessionStore(store);
+                    currentSessionId = existingSession.id;
+                    renderSessionList();
+                    addIdeSystemMessage('任务恢复: ' + cleanDisplayText((p.task_preview || '').substring(0, 100)));
+                    return;
+                }
+            }
+
+            // 新会话：在 Web 端创建/绑定
             if (ideSessionId && !_ideSessionMap[ideSessionId]) {
                 var store = loadSessionStore();
                 var newId = _generateIdForSession();
@@ -2753,6 +3091,9 @@
                     source: 'ide',
                     ide_session_id: ideSessionId,
                     dialogue_session_id: p.dialogue_session_id || null,
+                    project_id: p.project_id || null,
+                    task_graph_id: taskGraphId,
+                    cwd: p.cwd || null,
                 };
                 store.sessions.unshift(newSession);
                 store.activeSessionId = newId;
@@ -2762,7 +3103,7 @@
                 document.getElementById('chatMessages').innerHTML = '';
                 renderSessionList();
             }
-            // 2. 显示系统消息
+            // 显示系统消息
             addIdeSystemMessage('IDE 会话启动: ' + cleanDisplayText((p.task_preview || '').substring(0, 100)));
         }
 
@@ -2771,6 +3112,32 @@
             var p = data.payload || {};
             var statusMap = {completed: '已完成', cancelled: '已取消', error: '异常'};
             addIdeSystemMessage('IDE 会话结束 (' + (statusMap[p.status] || p.status) + ')');
+            switchToSendMode();
+        }
+
+        // IDE_SESSION_CANCEL: IDE端取消，同步Web端状态
+        function handleIdeSessionCancel(data) {
+            var p = data.payload || {};
+            addIdeSystemMessage('IDE 会话已取消');
+            removeTypingIndicator();
+            switchToSendMode();
+        }
+
+        // IDE_SESSION_LINKED: 会话关联到任务图谱
+        function handleIdeSessionLinked(data) {
+            var p = data.payload || {};
+            var ideSessionId = p.session_id;
+            var localId = _ideSessionMap[ideSessionId];
+            if (localId) {
+                var store = loadSessionStore();
+                var sess = store.sessions.find(function(s) { return s.id === localId; });
+                if (sess) {
+                    sess.task_graph_id = p.task_graph_id;
+                    sess.project_id = p.project_id || sess.project_id;
+                    saveSessionStore(store);
+                }
+            }
+            addIdeSystemMessage('任务图谱已关联: ' + (p.task_graph_id || ''));
         }
 
         // 辅助: 添加 IDE 系统消息（不保存到会话历史）
@@ -3029,16 +3396,17 @@
 
         function stopGeneration() {
             if (ws && ws.readyState === WebSocket.OPEN) {
-                // 发送 STOP_GENERATION（兼容 web_chat_router）
+                // 发送 STOP_GENERATION（附带 session_id 实现精准停止）
                 if (currentRequestId) {
                     ws.send(JSON.stringify({
                         type: 'STOP_GENERATION',
-                        request_id: currentRequestId
+                        request_id: currentRequestId,
+                        session_id: currentSessionId || undefined
                     }));
                 }
                 // 同时发送 STOP_TASK（兼容 monitor WebSocket）
-                ws.send(JSON.stringify({ type: 'STOP_TASK' }));
-                console.log('[WebSocket] 发送停止请求:', currentRequestId);
+                ws.send(JSON.stringify({ type: 'STOP_TASK', session_id: currentSessionId || undefined }));
+                console.log('[WebSocket] 发送停止请求:', currentRequestId, 'session:', currentSessionId);
             }
             removeTypingIndicator();
             switchToSendMode();
@@ -4110,10 +4478,12 @@
 
         // 添加新图谱（由后端推送或演示时调用）
         // 返回 { id, isNew } — isNew 为 true 表示首次创建
+        // 图谱渲染防抖：同一backendId的更新合并，200ms内只重绘一次
+        var _graphUpdateTimers = {};
+        var _graphPendingData = {};
+
         function addTaskGraph(graphData) {
             const graphs = getSessionGraphs();
-            // 去重：仅用后端图谱 ID (backendId) 精确匹配
-            // 不同任务即使同名也各自独立，同一任务多次推送事件只保留一条
             var backendId = graphData.id || '';
             var backendTitle = cleanDisplayText(graphData.title || '');
             var graphAddress = graphData.graphAddress || '';
@@ -4127,15 +4497,40 @@
                 }
             }
             if (existingIdx >= 0) {
-                // 同一后端图谱 → 更新数据，不新建条目
                 graphs[existingIdx].nodes = graphData.nodes || graphs[existingIdx].nodes;
                 graphs[existingIdx].hEdges = graphData.hEdges || graphs[existingIdx].hEdges;
                 graphs[existingIdx].dEdges = graphData.dEdges || graphs[existingIdx].dEdges;
                 graphs[existingIdx].title = backendTitle || graphs[existingIdx].title;
                 if (graphAddress) graphs[existingIdx].graphAddress = graphAddress;
                 if (graphData.code_anchors) graphs[existingIdx].code_anchors = graphData.code_anchors;
-                saveSessionGraphs(graphs);
                 activeGraphId = graphs[existingIdx].id;
+
+                // 增量更新：如果当前显示的图谱就是这个，尝试只更新变化的节点
+                if (activeGraphId === graphs[existingIdx].id && _tryIncrementalUpdate(graphData)) {
+                    // 增量更新成功，延迟写localStorage
+                    _graphPendingData[backendId] = graphs;
+                    if (!_graphUpdateTimers[backendId]) {
+                        _graphUpdateTimers[backendId] = setTimeout(function() {
+                            delete _graphUpdateTimers[backendId];
+                            var pending = _graphPendingData[backendId];
+                            delete _graphPendingData[backendId];
+                            if (pending) saveSessionGraphs(pending);
+                        }, 500);
+                    }
+                    renderGraphList();
+                    return { id: graphs[existingIdx].id, isNew: false };
+                }
+
+                // 增量更新失败（首次渲染或结构变化），立即全量重绘 + 延迟写localStorage
+                _graphPendingData[backendId] = graphs;
+                if (!_graphUpdateTimers[backendId]) {
+                    _graphUpdateTimers[backendId] = setTimeout(function() {
+                        delete _graphUpdateTimers[backendId];
+                        var pending = _graphPendingData[backendId];
+                        delete _graphPendingData[backendId];
+                        if (pending) saveSessionGraphs(pending);
+                    }, 300);
+                }
                 renderGraphList();
                 renderGraphById(activeGraphId);
                 return { id: graphs[existingIdx].id, isNew: false };
@@ -4157,6 +4552,87 @@
             renderGraphList();
             renderGraphById(newGraph.id);
             return { id: newGraph.id, isNew: true };
+        }
+
+        // 增量DOM更新：仅更新节点状态（status/class），不重建SVG
+        // 返回true表示增量成功，false表示需要全量重绘
+        function _tryIncrementalUpdate(graphData) {
+            var gsvg = document.getElementById('graphSvg');
+            if (!gsvg || !gsvg.children.length) return false;
+            var newNodes = graphData.nodes;
+            if (!newNodes || !newNodes.length) return false;
+
+            var existingNodes = gsvg.querySelectorAll('.gnode');
+            if (existingNodes.length !== newNodes.length) return false;
+
+            var changed = false;
+            for (var i = 0; i < newNodes.length; i++) {
+                var n = newNodes[i];
+                var el = gsvg.querySelector('.gnode[data-id="' + n.id + '"]');
+                if (!el) return false;  // 节点ID不匹配，需全量重绘
+
+                var oldClass = el.getAttribute('class');
+                var newClass = 'gnode status-' + (n.status || 'pending');
+                if (oldClass !== newClass) {
+                    el.setAttribute('class', newClass);
+                    changed = true;
+
+                    // 更新状态标签文字
+                    var tagTexts = el.querySelectorAll('text');
+                    var statusLabel = SZH[n.status] || n.status || '';
+                    for (var j = tagTexts.length - 1; j >= 0; j--) {
+                        var t = tagTexts[j];
+                        if (t.textContent && t.textContent.startsWith('[')) {
+                            t.textContent = '[' + statusLabel + ']';
+                            break;
+                        }
+                    }
+                    // 更新状态图标
+                    var icoTexts = el.querySelectorAll('text[font-size="11"]');
+                    if (icoTexts.length && SICO[n.status]) {
+                        icoTexts[0].textContent = SICO[n.status];
+                    }
+                    // 更新状态标签背景色
+                    var tagRects = el.querySelectorAll('rect');
+                    for (var j = tagRects.length - 1; j >= 0; j--) {
+                        var r = tagRects[j];
+                        if (r.getAttribute('rx') === '4' && r.getAttribute('height') === '16') {
+                            r.setAttribute('fill', STBG[n.status] || '#f1f5f9');
+                            break;
+                        }
+                    }
+                    // 更新左侧状态条颜色
+                    var allRects = el.querySelectorAll('rect');
+                    for (var k = 0; k < allRects.length; k++) {
+                        var rr = allRects[k];
+                        if (rr.getAttribute('width') === '4' && rr.getAttribute('rx') === '2') {
+                            rr.setAttribute('fill', SCOLOR[n.status] || '#cbd5e1');
+                            break;
+                        }
+                    }
+                    // 更新标签前景色
+                    var tagFgTexts = el.querySelectorAll('text[font-weight="700"]');
+                    for (var j = tagFgTexts.length - 1; j >= 0; j--) {
+                        var t = tagFgTexts[j];
+                        if (t.textContent && t.textContent.startsWith('[')) {
+                            t.setAttribute('fill', STFG[n.status] || '#64748b');
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (changed) {
+                // 更新进度条
+                var gTot = newNodes.length;
+                var gDone = newNodes.filter(function(n){return n.status==='completed'||n.status==='skipped';}).length;
+                var gpPtext = document.getElementById('gp-ptext');
+                var gpPfill = document.getElementById('gp-pfill');
+                if (gpPtext) gpPtext.textContent = gDone+'/'+gTot+' 已完成';
+                if (gpPfill) gpPfill.style.width = (gDone/gTot*100).toFixed(0)+'%';
+            }
+
+            return true;
         }
 
         // 切换到指定图谱
@@ -4281,8 +4757,9 @@
 
         // 清空图谱SVG
         function clearGraphSvg() {
-            const gsvg = document.getElementById('graphSvg');
-            if (gsvg) { gsvg.innerHTML = ''; gsvg.removeAttribute('width'); gsvg.removeAttribute('height'); }
+            if (_cyInstance) {
+                _cyInstance.elements().remove();
+            }
             document.getElementById('gp-ptext').textContent = '0/0';
             document.getElementById('gp-pfill').style.width = '0%';
             if (document.getElementById('gp-detail')) {
@@ -4452,206 +4929,499 @@
         const STBG   = { completed:'#dcfce7', in_progress:'#dbeafe', pending:'#f1f5f9', blocked:'#fee2e2', skipped:'#ede9fe', needs_adjust:'#fef3c7' };
         const STFG   = { completed:'#15803d', in_progress:'#1d4ed8', pending:'#64748b', blocked:'#dc2626', skipped:'#7c3aed', needs_adjust:'#d97706' };
 
+// Cytoscape.js 实例管理
+        var _cyInstance = null;  // 当前图谱实例
+        var _cyFoldState = new Map();  // 折叠状态
+        
+        // 获取或初始化Cytoscape实例
+        function getCytoscapeInstance() {
+            if (!_cyInstance) {
+                const container = document.getElementById('graphSvgArea');
+                if (!container) {
+                    console.error('[Cytoscape] Container #graphSvgArea not found');
+                    return null;
+                }
+                
+                // 清空容器内的SVG元素（Cytoscape需要干净容器）
+                container.innerHTML = '';
+                
+                // 检查容器尺寸
+                const rect = container.getBoundingClientRect();
+                console.log('[Cytoscape] Container size:', rect.width, 'x', rect.height);
+                
+                _cyInstance = cytoscape({
+                    container: container,
+                    
+                    // 交互配置
+                    minZoom: 0.25,
+                    maxZoom: 3,
+                    
+                    // 元素样式
+                    style: getCytoscapeStyles(),
+                    
+                    // 交互模式
+                    userZoomingEnabled: true,
+                    userPanningEnabled: true,
+                    boxSelectionEnabled: true,
+                    autoungrabify: true,
+                    autounselectify: false
+                });
+                
+                // 绑定事件
+                setupCytoscapeEvents(_cyInstance);
+            }
+            return _cyInstance;
+        }
+        
+        // Cytoscape样式配置
+        function getCytoscapeStyles() {
+            return [
+                // 节点基础样式
+                {
+                    selector: 'node',
+                    style: {
+                        'shape': 'roundrectangle',
+                        'width': 160,
+                        'height': 70,
+                        'background-color': '#1e293b',
+                        'border-width': 2,
+                        'border-color': '#334155',
+                        'border-opacity': 0.8,
+                        'label': 'data(label)',
+                        'text-valign': 'center',
+                        'text-halign': 'center',
+                        'font-size': '13px',
+                        'font-weight': '600',
+                        'color': '#f8fafc',
+                        'text-wrap': 'wrap',
+                        'text-max-width': 150,
+                        'text-margin-y': 0
+                    }
+                },
+                
+                // 类型条（顶部彩色条）
+                {
+                    selector: 'node[type="requirement"]',
+                    style: { 'border-color': '#8b5cf6', 'border-width': 3 }
+                },
+                {
+                    selector: 'node[type="analysis"]',
+                    style: { 'border-color': '#6366f1', 'border-width': 3 }
+                },
+                {
+                    selector: 'node[type="outline"]',
+                    style: { 'border-color': '#3b82f6', 'border-width': 3 }
+                },
+                {
+                    selector: 'node[type="task"]',
+                    style: { 'border-color': '#06b6d4', 'border-width': 3 }
+                },
+                {
+                    selector: 'node[type="subtask"]',
+                    style: { 'border-color': '#10b981', 'border-width': 3 }
+                },
+                
+                // 状态样式
+                {
+                    selector: 'node[status="completed"]',
+                    style: { 
+                        'background-color': '#1e293b',
+                        'border-opacity': 0.6
+                    }
+                },
+                {
+                    selector: 'node[status="in_progress"]',
+                    style: { 
+                        'background-color': '#1e3a5f',
+                        'border-width': 3,
+                        'border-color': '#3b82f6'
+                    }
+                },
+                {
+                    selector: 'node[status="pending"]',
+                    style: { 'background-color': '#334155' }
+                },
+                {
+                    selector: 'node[status="blocked"]',
+                    style: { 
+                        'background-color': '#450a0a',
+                        'border-color': '#ef4444'
+                    }
+                },
+                {
+                    selector: 'node[status="skipped"]',
+                    style: { 'background-color': '#2d1f3d' }
+                },
+                {
+                    selector: 'node[status="needs_adjust"]',
+                    style: { 
+                        'background-color': '#422006',
+                        'border-color': '#f59e0b'
+                    }
+                },
+                
+                // 选中状态
+                {
+                    selector: 'node:selected',
+                    style: {
+                        'border-width': 4,
+                        'border-color': '#3b82f6',
+                        'overlay-color': '#3b82f6',
+                        'overlay-padding': 8
+                    }
+                },
+                
+                // 边样式（层级边）
+                {
+                    selector: 'edge[edgeType="hierarchy"]',
+                    style: {
+                        'width': 2,
+                        'line-color': '#94a3b8',
+                        'target-arrow-color': '#94a3b8',
+                        'target-arrow-shape': 'triangle',
+                        'curve-style': 'bezier',
+                        'arrow-scale': 1.5
+                    }
+                },
+                
+                // 边样式（依赖边）
+                {
+                    selector: 'edge[edgeType="dependency"]',
+                    style: {
+                        'width': 2,
+                        'line-color': '#f87171',
+                        'line-style': 'dashed',
+                        'target-arrow-color': '#f87171',
+                        'target-arrow-shape': 'triangle',
+                        'curve-style': 'bezier',
+                        'arrow-scale': 1.2,
+                        'label': 'data(via)',
+                        'font-size': '11px',
+                        'color': '#fca5a5',
+                        'text-rotation': 'autorotate',
+                        'text-margin-y': -6
+                    }
+                },
+                
+                // 已满足的依赖边
+                {
+                    selector: 'edge[edgeType="dependency"][satisfied="true"]',
+                    style: {
+                        'line-color': '#4ade80',
+                        'target-arrow-color': '#4ade80',
+                        'width': 2.5
+                    }
+                },
+                
+                // 折叠节点样式
+                {
+                    selector: 'node[id="__folded__"]',
+                    style: {
+                        'background-color': '#475569',
+                        'border-color': '#64748b',
+                        'border-style': 'dashed',
+                        'label': 'data(label)',
+                        'font-size': '11px'
+                    }
+                }
+            ];
+        }
+        
+        // 绑定Cytoscape事件
+        function setupCytoscapeEvents(cy) {
+            // 节点点击
+            cy.on('tap', 'node', function(evt) {
+                const node = evt.target;
+                const nodeId = node.id();
+                
+                // 排除折叠占位节点
+                if (nodeId === '__folded__') return;
+                
+                // 触发选中回调
+                const nodeData = node.data();
+                console.log('[Cytoscape] Node selected:', nodeId, nodeData);
+                
+                // 更新详情面板（如果有）
+                updateNodeDetailPanel(nodeId, nodeData);
+            });
+            
+            // 节点右键
+            cy.on('cxttap', 'node', function(evt) {
+                const node = evt.target;
+                const nodeId = node.id();
+                const nodeData = node.data();
+                
+                // 显示右键菜单
+                evt.originalEvent.preventDefault();
+                showGraphContextMenu(
+                    evt.originalEvent.clientX,
+                    evt.originalEvent.clientY,
+                    nodeId,
+                    nodeData.label,
+                    nodeData.address
+                );
+            });
+            
+            // 边点击
+            cy.on('tap', 'edge', function(evt) {
+                const edge = evt.target;
+                console.log('[Cytoscape] Edge selected:', edge.id());
+            });
+        }
+        
+        // 更新节点详情面板
+        function updateNodeDetailPanel(nodeId, nodeData) {
+            // 触发原有的选中逻辑
+            if (typeof onGraphSelect === 'function') {
+                // 构造兼容的数据结构
+                const gnodeMap = {};
+                const cy = getCytoscapeInstance();
+                cy.nodes().forEach(n => {
+                    gnodeMap[n.id()] = n.data();
+                });
+                
+                // 获取依赖边
+                const G_D_EDGES = [];
+                cy.edges('[edgeType="dependency"]').forEach(e => {
+                    G_D_EDGES.push({
+                        s: e.source().id(),
+                        t: e.target().id(),
+                        via: e.data('via')
+                    });
+                });
+                
+                onGraphSelect(nodeId, gnodeMap, G_D_EDGES);
+            }
+        }
+        
+
+
         function gEsc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
         // 缓存 window 级事件处理器引用，切换图谱时清理旧的
         var _graphWindowHandlers = { mousemove: null, mouseup: null, wheelHandler: null };
 
         // 通用图谱渲染函数
-        function renderGraphData(G_NODES, G_H_EDGES, G_D_EDGES) {
-            const gnodeMap = {}; G_NODES.forEach(function(n) { gnodeMap[n.id] = n; });
+        // 大图谱保护：超过此阈值启用折叠渲染
+        var _GRAPH_FULL_RENDER_LIMIT = 300;
 
-            /* ---- Dagre 布局 ---- */
-            const NW = 140, NH = 66;
-            const gd = new dagre.graphlib.Graph();
-            gd.setGraph({ rankdir:'TB', nodesep:36, ranksep:56, marginx:40, marginy:40 });
-            gd.setDefaultEdgeLabel(function() { return {}; });
-            G_NODES.forEach(function(n) { gd.setNode(n.id, { width:NW, height:NH }); });
-            G_H_EDGES.forEach(function(e) { gd.setEdge(e[0], e[1]); });
-            dagre.layout(gd);
-            const gi = gd.graph();
-
-            /* ---- SVG 渲染 ---- */
-            const gsvg = document.getElementById('graphSvg');
-            gsvg.innerHTML = '';
-            const GW = gi.width + 80, GH = gi.height + 80;
-            gsvg.setAttribute('width', GW); gsvg.setAttribute('height', GH);
-            gsvg.setAttribute('viewBox', '0 0 ' + GW + ' ' + GH);
-
-            function sE(tag, a) {
-                a = a || {};
-                const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
-                for (const k in a) e.setAttribute(k, a[k]); return e;
-            }
-
-            // Defs (markers)
-            const defs = sE('defs');
-            [['gah','#cbd5e1'],['gad-r','#ef4444'],['gad-g','#22c55e']].forEach(function(arr) {
-                const id = arr[0], c = arr[1];
-                const m = sE('marker',{id:id, markerWidth:7, markerHeight:7, refX:6, refY:3.5, orient:'auto'});
-                m.appendChild(sE('path',{d:'M0 0L7 3.5L0 7Z',fill:c})); defs.appendChild(m);
-            });
-            gsvg.appendChild(defs);
-
-            const layerHier = sE('g'), layerDep = sE('g'), layerNode = sE('g');
-            gsvg.appendChild(layerHier); gsvg.appendChild(layerDep); gsvg.appendChild(layerNode);
-
-            function nP(id){ const n=gd.node(id); return {x:n.x, y:n.y}; }
-
-            // Hierarchy edges
-            G_H_EDGES.forEach(function(e) {
-                var s = e[0], t = e[1];
-                const sp=nP(s), tp=nP(t), sy=sp.y+NH/2, ty=tp.y-NH/2, my=(sy+ty)/2;
-                const d='M'+sp.x+' '+sy+' C'+sp.x+' '+my+' '+tp.x+' '+my+' '+tp.x+' '+ty;
-                layerHier.appendChild(sE('path',{d:d, class:'edge-hier','marker-end':'url(#gah)','data-s':s,'data-t':t}));
-            });
-
-            // Dependency edges
-            G_D_EDGES.forEach(function(e) {
-                const sp=nP(e.s), tp=nP(e.t);
-                const sx=sp.x, sy=sp.y+NH/2, tx=tp.x, ty=tp.y-NH/2;
-                const dy=ty-sy, dx=tx-sx;
-                const off=e.cross?Math.min(Math.abs(dx)*0.35,60)*(dx>=0?1:-1):0;
-                const d='M'+sx+' '+sy+' C'+(sx+off)+' '+(sy+dy*.45)+' '+(tx-off)+' '+(ty-dy*.45)+' '+tx+' '+ty;
-                const src=gnodeMap[e.s], sat=src&&(src.status==='completed'||src.status==='skipped');
-                const grp=sE('g',{class:'dep-group '+(sat?'satisfied':'unsatisfied'),'data-s':e.s,'data-t':e.t});
-                grp.appendChild(sE('path',{d:d, class:'dep-line','marker-end':sat?'url(#gad-g)':'url(#gad-r)'}));
-                const mx=(sx+tx)/2+off*0.4, my2=(sy+ty)/2;
-                const lb=sE('text',{x:mx, y:my2-7, class:'dep-label','text-anchor':'middle'});
-                lb.textContent=e.via; grp.appendChild(lb);
-                layerDep.appendChild(grp);
-            });
-
-            // Nodes
-            G_NODES.forEach(function(n) {
-                const p=nP(n.id), x=p.x-NW/2, y=p.y-NH/2;
-                const g=sE('g',{class:'gnode status-'+n.status,'data-id':n.id,transform:'translate('+x+','+y+')'});
-                g.appendChild(sE('rect',{class:'card',width:NW,height:NH,rx:8}));
-                g.appendChild(sE('rect',{width:NW,height:3,rx:2,fill:TCOLOR[n.type]||'#94a3b8'}));
-                g.appendChild(sE('rect',{width:4,height:NH,rx:2,fill:SCOLOR[n.status]||'#cbd5e1'}));
-                const ico=sE('text',{x:NW-16,y:16,'font-size':'11'}); ico.textContent=SICO[n.status]||''; g.appendChild(ico);
-                const lines=n.label.split(/[\uff1a:]/);
-                if(lines.length>1){
-                    const t1=sE('text',{class:'subtitle',x:NW/2,y:18,'text-anchor':'middle'}); t1.textContent=lines[0]; g.appendChild(t1);
-                    const t2=sE('text',{class:'title',x:NW/2,y:33,'text-anchor':'middle'}); t2.textContent=lines[1]; g.appendChild(t2);
-                } else {
-                    const t=sE('text',{class:'title',x:NW/2,y:26,'text-anchor':'middle'}); t.textContent=n.label; g.appendChild(t);
+        // 节点折叠状态管理（全局）
+        if (!window._nodeFoldState) {
+            window._nodeFoldState = {
+                expanded: new Map(),
+                init: function(nodes, hEdges) {
+                    const self = this;
+                    nodes.forEach(function(n) {
+                        if (!self.expanded.has(n.id)) {
+                            self.expanded.set(n.id, true);
+                        }
+                    });
+                },
+                toggle: function(nodeId) {
+                    const current = this.expanded.get(nodeId);
+                    this.expanded.set(nodeId, !current);
+                    return !current;
+                },
+                isExpanded: function(nodeId) {
+                    return this.expanded.get(nodeId) !== false;
                 }
-                const tagLabel=SZH[n.status]||n.status, tagStr='['+tagLabel+']';
-                const tagW=tagStr.length*10.5+10, tagX=(NW-tagW)/2, tagY=NH-19;
-                g.appendChild(sE('rect',{x:tagX,y:tagY,width:tagW,height:16,rx:4,fill:STBG[n.status]||'#f1f5f9'}));
-                const tt=sE('text',{x:NW/2,y:tagY+12,'text-anchor':'middle','font-size':'10','font-weight':'700',fill:STFG[n.status]||'#64748b'});
-                tt.textContent=tagStr; g.appendChild(tt);
-
-                // 文件指示器：有关联文件时在节点右下角显示图标
-                if(n.files && n.files.length > 0){
-                    const fi=sE('text',{x:NW-12,y:NH-6,'font-size':'10','text-anchor':'middle',fill:'#3b82f6',opacity:'0.85'});
-                    fi.textContent='\ud83d\udcc4'+n.files.length; g.appendChild(fi);
-                }
-
-                g.addEventListener('click', function(ev){ ev.stopPropagation(); onGraphSelect(n.id, gnodeMap, G_D_EDGES); });
-                g.addEventListener('contextmenu', function(ev) {
-                    ev.preventDefault();
-                    ev.stopPropagation();
-                    showGraphContextMenu(ev.clientX, ev.clientY, n.id, n.label, n.address);
+            };
+        }
+        
+        // 获取所有子节点（递归）
+        function getAllDescendants(nodeId, hEdges, maxDepth) {
+            const descendants = [];
+            const visited = new Set();
+            const queue = [{id: nodeId, depth: 0}];
+            
+            while (queue.length > 0) {
+                const current = queue.shift();
+                if (current.depth >= (maxDepth || 100)) continue;
+                
+                hEdges.forEach(function(e) {
+                    if (e[0] === current.id && !visited.has(e[1])) {
+                        visited.add(e[1]);
+                        descendants.push(e[1]);
+                        queue.push({id: e[1], depth: current.depth + 1});
+                    }
                 });
-                layerNode.appendChild(g);
-            });
-
-            /* ---- 交互：选中 / 缩放 / 平移 ---- */
-            const area = document.getElementById('graphSvgArea');
-
-            area.onclick = function(ev){ if(ev.target===gsvg||ev.target===area) graphDeselect(); };
-            gsvg.onclick = function(ev){ if(ev.target===gsvg) graphDeselect(); };
-
-            // Zoom & Pan
-            let gScale=1, gPanX=0, gPanY=0;
-            let gIsPanning=false, gStartX=0, gStartY=0, gStartPX=0, gStartPY=0;
-            const MIN_S=0.25, MAX_S=3;
-
-            function applyGT(){ gsvg.style.transform='translate('+gPanX+'px,'+gPanY+'px) scale('+gScale+')'; }
-
-            // 清理旧的 window 级事件处理器（防止切换图谱时泄漏）
-            if (_graphWindowHandlers.mousemove) {
-                window.removeEventListener('mousemove', _graphWindowHandlers.mousemove);
             }
-            if (_graphWindowHandlers.mouseup) {
-                window.removeEventListener('mouseup', _graphWindowHandlers.mouseup);
+            
+            return descendants;
+        }
+        
+        // 切换节点折叠状态
+        function toggleNodeFold(nodeId) {
+            const graphs = getSessionGraphs();
+            const graph = graphs.find(function(g) { return g.id === activeGraphId; });
+            if (!graph) return;
+            
+            // 切换折叠状态
+            const currentState = _cyFoldState.get(nodeId) !== false;
+            _cyFoldState.set(nodeId, !currentState);
+            
+            console.log('[Fold] Node', nodeId, '->', !currentState ? 'expanded' : 'collapsed');
+            
+            // 重新渲染（保持缩放）
+            renderGraphData(graph.nodes, graph.hEdges, graph.dEdges, true);
+        }
+        
+        function renderGraphData(G_NODES, G_H_EDGES, G_D_EDGES, skipAutoFit) {
+            skipAutoFit = skipAutoFit || false;
+            
+            if (!G_NODES || G_NODES.length === 0) {
+                const cy = getCytoscapeInstance();
+                cy.elements().remove();
+                return;
             }
-            if (_graphWindowHandlers.wheelHandler) {
-                area.removeEventListener('wheel', _graphWindowHandlers.wheelHandler);
-            }
-
-            _graphWindowHandlers.wheelHandler = function(ev){
-                ev.preventDefault();
-                const r=area.getBoundingClientRect(), mx=ev.clientX-r.left, my=ev.clientY-r.top;
-                const old=gScale, delta=ev.deltaY>0?0.9:1.1;
-                gScale=Math.min(MAX_S,Math.max(MIN_S,gScale*delta));
-                gPanX=mx-(mx-gPanX)*(gScale/old);
-                gPanY=my-(my-gPanY)*(gScale/old);
-                applyGT();
-            };
-            area.addEventListener('wheel', _graphWindowHandlers.wheelHandler, {passive:false});
-
-            area.onmousedown = function(ev){
-                if(ev.button===1){ev.preventDefault();gIsPanning=true;gStartX=ev.clientX;gStartY=ev.clientY;gStartPX=gPanX;gStartPY=gPanY;area.classList.add('panning');}
-            };
-            _graphWindowHandlers.mousemove = function(ev){ if(!gIsPanning)return; gPanX=gStartPX+(ev.clientX-gStartX); gPanY=gStartPY+(ev.clientY-gStartY); applyGT(); };
-            _graphWindowHandlers.mouseup = function(ev){ if(ev.button===1&&gIsPanning){gIsPanning=false;area.classList.remove('panning');} };
-            window.addEventListener('mousemove', _graphWindowHandlers.mousemove);
-            window.addEventListener('mouseup', _graphWindowHandlers.mouseup);
-
-            // 自适应视图
-            setTimeout(function(){
-                const r=area.getBoundingClientRect();
-                const fit=Math.min(r.width/GW, r.height/GH, 1)*0.92;
-                gScale=fit;
-                gPanX=(r.width-GW*gScale)/2;
-                gPanY=Math.max(8,(r.height-GH*gScale)/2);
-                applyGT();
-            }, 100);
-
-            /* ---- 全景文本 ---- */
-            function genGFullText(){
-                const layers={}, vis=new Set(), q=[{id:G_NODES[0].id,l:0}];
-                while(q.length){const item=q.shift();if(vis.has(item.id))continue;vis.add(item.id);(layers[item.l]=layers[item.l]||[]).push(item.id);G_H_EDGES.filter(function(e){return e[0]===item.id;}).forEach(function(e){q.push({id:e[1],l:item.l+1});});}
-                var t='\u3010\u4EFB\u52A1\u56FE\u8C31 \u00B7 \u5168\u666F\u89C6\u56FE\u3011\n\n';
-                for(var l in layers){
-                    t+='Layer '+l+':\n';
-                    layers[l].forEach(function(id){var n=gnodeMap[id];var od=G_D_EDGES.filter(function(e){return e.s===id;}).map(function(e){return e.t;});var ind=G_D_EDGES.filter(function(e){return e.t===id;}).map(function(e){return e.s;});
-                        t+='  ['+id+' '+SICO[n.status]+' '+SZH[n.status]+'] '+n.label;
-                        if(od.length)t+=' \u2500\u2500\u2192 '+od.join(', ');if(ind.length)t+=' \u2190\u2500\u2500 '+ind.join(', ');t+='\n';
-                    });t+='\n';
+            
+            console.log('[Cytoscape] Rendering', G_NODES.length, 'nodes');
+            const startTime = performance.now();
+            
+            // 初始化折叠状态
+            G_NODES.forEach(function(n) {
+                if (!_cyFoldState.has(n.id)) {
+                    _cyFoldState.set(n.id, true);  // 默认展开
                 }
-                var tot=G_NODES.length, done=G_NODES.filter(function(n){return n.status==='completed';}).length;
-                var ing=G_NODES.filter(function(n){return n.status==='in_progress';}).length;
-                var blk=G_NODES.filter(function(n){return n.status==='blocked';}).length;
-                var skp=G_NODES.filter(function(n){return n.status==='skipped';}).length;
-                var adj=G_NODES.filter(function(n){return n.status==='needs_adjust';}).length;
-                t+='\u8FDB\u5EA6: '+done+'/'+tot+' \u5B8C\u6210, '+ing+' \u8FDB\u884C\u4E2D';
-                if(blk)t+=', '+blk+' \u963B\u585E';if(skp)t+=', '+skp+' \u5DF2\u8DF3\u8FC7';if(adj)t+=', '+adj+' \u9700\u8C03\u6574';t+='\n';
-                return t;
-            }
-            document.getElementById('gp-fullText').textContent=genGFullText();
-
-            /* ---- 进度条 ---- */
-            var gTot=G_NODES.length, gDone=G_NODES.filter(function(n){return n.status==='completed'||n.status==='skipped';}).length;
-            document.getElementById('gp-ptext').textContent=gDone+'/'+gTot+' 已完成';
-            document.getElementById('gp-pfill').style.width=(gDone/gTot*100).toFixed(0)+'%';
-
-            /* ---- 详情面板 Tab 切换 ---- */
-            document.querySelectorAll('.gp-tab').forEach(function(btn){
-                btn.onclick = function(){
-                    document.querySelectorAll('.gp-tab').forEach(function(b){b.classList.remove('active');});
-                    btn.classList.add('active');
-                    document.querySelectorAll('.gp-tab-body').forEach(function(b){b.classList.add('hidden');});
-                    document.getElementById(btn.getAttribute('data-gptab')).classList.remove('hidden');
-                };
             });
-
-            // 重置详情面板
-            document.getElementById('gp-detail').innerHTML='<div class="gp-placeholder">点击图谱中的任意节点<br>查看详情和依赖关系</div>';
-            document.getElementById('gp-llm').innerHTML='<div class="gp-placeholder">点击节点后<br>此处生成模型聚焦上下文</div>';
+            
+            // 过滤可见节点（考虑折叠状态）
+            var visibleNodeIds = new Set();
+            var queue = [];
+            
+            // 找到根节点
+            G_NODES.forEach(function(n) {
+                const hasParent = G_H_EDGES.some(function(e) { return e[1] === n.id; });
+                if (!hasParent) {
+                    visibleNodeIds.add(n.id);
+                    queue.push(n.id);
+                }
+            });
+            
+            // BFS遍历
+            while (queue.length > 0) {
+                const parentId = queue.shift();
+                const isExpanded = _cyFoldState.get(parentId) !== false;
+                
+                if (isExpanded) {
+                    G_H_EDGES.forEach(function(e) {
+                        if (e[0] === parentId && !visibleNodeIds.has(e[1])) {
+                            visibleNodeIds.add(e[1]);
+                            queue.push(e[1]);
+                        }
+                    });
+                }
+            }
+            
+            // 构造Cytoscape元素
+            const elements = [];
+            
+            // 添加节点
+            G_NODES.forEach(function(n) {
+                if (!visibleNodeIds.has(n.id)) return;
+                
+                const lines = (n.label || '').split(/[:：]/);
+                const displayLabel = lines.length > 1 ? lines[0] + '\n' + lines[1] : n.label;
+                
+                elements.push({
+                    group: 'nodes',
+                    data: {
+                        id: n.id,
+                        label: displayLabel,
+                        type: n.type || 'task',
+                        status: n.status || 'pending',
+                        desc: n.desc || '',
+                        files: n.files || [],
+                        address: n.address || ''
+                    }
+                });
+            });
+            
+            // 添加层级边
+            G_H_EDGES.forEach(function(e) {
+                if (visibleNodeIds.has(e[0]) && visibleNodeIds.has(e[1])) {
+                    elements.push({
+                        group: 'edges',
+                        data: {
+                            id: 'h_' + e[0] + '_' + e[1],
+                            source: e[0],
+                            target: e[1],
+                            edgeType: 'hierarchy'
+                        }
+                    });
+                }
+            });
+            
+            // 添加依赖边
+            if (G_D_EDGES) {
+                G_D_EDGES.forEach(function(e) {
+                    if (visibleNodeIds.has(e.s) && visibleNodeIds.has(e.t)) {
+                        const srcNode = G_NODES.find(n => n.id === e.s);
+                        const satisfied = srcNode && (srcNode.status === 'completed' || srcNode.status === 'skipped');
+                        
+                        elements.push({
+                            group: 'edges',
+                            data: {
+                                id: 'd_' + e.s + '_' + e.t,
+                                source: e.s,
+                                target: e.t,
+                                edgeType: 'dependency',
+                                via: e.via || '',
+                                satisfied: satisfied ? 'true' : 'false'
+                            }
+                        });
+                    }
+                });
+            }
+            
+            // 获取Cytoscape实例并渲染
+            const cy = getCytoscapeInstance();
+            if (!cy) {
+                console.error('[Cytoscape] Failed to get instance');
+                return;
+            }
+            
+            console.log('[Cytoscape] Elements to render:', elements.length, 'items');
+            
+            // 清空并添加新元素
+            cy.elements().remove();
+            cy.add(elements);
+            
+            // 执行布局
+            cy.layout({
+                name: 'dagre',
+                rankDir: 'TB',
+                nodeSep: 60,
+                rankSep: 80,
+                padding: 60,
+                animate: false,
+                fit: false
+            }).run();
+            
+            // 首次加载时自适应视图
+            if (!skipAutoFit) {
+                setTimeout(function() {
+                    cy.fit(undefined, 20);
+                }, 100);
+            }
+            
+            const renderTime = performance.now() - startTime;
+            console.log('[Cytoscape] Render completed in', renderTime.toFixed(2), 'ms');
+            
+            // 更新进度条
+            updateGraphProgress(G_NODES);
+        }
+        
+        // 更新进度条
+        function updateGraphProgress(nodes) {
+            const total = nodes.length;
+            const done = nodes.filter(n => n.status === 'completed' || n.status === 'skipped').length;
+            
+            const gpPtext = document.getElementById('gp-ptext');
+            const gpPfill = document.getElementById('gp-pfill');
+            
+            if (gpPtext) gpPtext.textContent = done + '/' + total + ' 已完成';
+            if (gpPfill) gpPfill.style.width = (done/total*100).toFixed(0) + '%';
         }
 
         // 图谱选中/取消
@@ -5390,6 +6160,32 @@
                     clearGraphSvg();
                 }
             }
+        }
+
+        // ── 后端状态自动同步/重建 ──
+        function syncBackendState() {
+            // 通过 REST API 拉取后端活跃任务图谱和会话，重建前端状态
+            fetch('/api/task-graph/active')
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (data.status === 'ok' && data.graph) {
+                        addTaskGraph(data.graph);
+                        console.log('[Sync] 已从后端同步任务图谱, nodes=' + (data.node_count || 0));
+                    }
+                })
+                .catch(function(e) { console.warn('[Sync] 同步任务图谱失败:', e); });
+            fetch('/api/ide/sessions')
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (data.sessions) {
+                        data.sessions.forEach(function(s) {
+                            if (s.session_id && !_ideSessionMap[s.session_id]) {
+                                _ideSessionMap[s.session_id] = s.session_id;
+                            }
+                        });
+                    }
+                })
+                .catch(function(e) { console.warn('[Sync] 同步IDE会话失败:', e); });
         }
 
         function renderCodeAnchorsSection(anchorIds, containerId) {

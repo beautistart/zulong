@@ -101,7 +101,7 @@ export class CliEnvServiceClient implements EnvServiceClientInterface {
 		return proto.host.GetHostVersionResponse.create({
 			version: CLI_VERSION,
 			platform: "Zulong CLI - Node.js",
-			zulongType: ZulongClient.Cli,
+			clineType: ZulongClient.Cli,
 			// remoteName is intentionally omitted — the CLI runs locally on the user's machine.
 			// If CLI-in-container scenarios arise, populate this field to enable remote cadence tuning.
 		})

@@ -1,0 +1,59 @@
+test_case_id: test_complex_001
+name: 多步骤代码审查任务
+type: complex_task
+description: 模拟一个包含多步骤依赖和条件分支的复杂代码审查任务
+
+config:
+  timeout_seconds: 1800
+  on_step_fail: abort
+  progress_interval_turns: 5
+
+steps:
+  - step_id: step_1
+    name: 读取项目文件列表
+    tool: read_file
+    tool_input:
+      path: "."
+    timeout_seconds: 30
+    assertions:
+      - assertion_type: status_match
+        field_path: "status"
+        expected: "success"
+        message: "文件列表读取应成功"
+
+  - step_id: step_2
+    name: 分析代码结构
+    tool: analyze_code
+    tool_input:
+      source: "$step_1.output"
+      mode: "structure"
+    depends_on: ["step_1"]
+    timeout_seconds: 60
+    assertions:
+      - assertion_type: value_match
+        field_path: "files_count"
+        expected: 0
+        message: "应检测到文件"
+
+  - step_id: step_3
+    name: 执行代码审查
+    tool: code_review
+    tool_input:
+      analysis: "$step_2.output"
+    depends_on: ["step_2"]
+    condition: "step_2_output_files_count > 0"
+    timeout_seconds: 120
+    assertions:
+      - assertion_type: pattern_match
+        field_path: "summary"
+        expected: ".*\\d+.*"
+        message: "审查摘要应包含数字"
+
+  - step_id: step_4
+    name: 生成审查报告
+    tool: generate_report
+    tool_input:
+      review: "$step_3.output"
+      format: "markdown"
+    depends_on: ["step_3"]
+    timeout_seconds: 60

@@ -74,6 +74,7 @@ export class AutoApprove {
 				case ZulongDefaultTool.NEW_RULE:
 				case ZulongDefaultTool.FILE_NEW:
 				case ZulongDefaultTool.FILE_EDIT:
+				case ZulongDefaultTool.FILE_DELETE:
 				case ZulongDefaultTool.APPLY_PATCH:
 				case ZulongDefaultTool.BASH:
 				case ZulongDefaultTool.USE_SUBAGENTS:
@@ -97,6 +98,7 @@ export class AutoApprove {
 				case ZulongDefaultTool.NEW_RULE:
 				case ZulongDefaultTool.FILE_NEW:
 				case ZulongDefaultTool.FILE_EDIT:
+				case ZulongDefaultTool.FILE_DELETE:
 				case ZulongDefaultTool.APPLY_PATCH:
 				case ZulongDefaultTool.BASH:
 				case ZulongDefaultTool.USE_SUBAGENTS:
@@ -122,6 +124,7 @@ export class AutoApprove {
 			case ZulongDefaultTool.NEW_RULE:
 			case ZulongDefaultTool.FILE_NEW:
 			case ZulongDefaultTool.FILE_EDIT:
+			case ZulongDefaultTool.FILE_DELETE:
 			case ZulongDefaultTool.APPLY_PATCH:
 				return [autoApprovalSettings.actions.editFiles, autoApprovalSettings.actions.editFilesExternally ?? false]
 			case ZulongDefaultTool.BASH:

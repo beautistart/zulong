@@ -91,7 +91,7 @@ _GLOBAL_FORCE_TRIGGERS: Set[str] = {
 }
 
 # 工具结果最大字符数（超出截断）
-MAX_TOOL_RESULT_CHARS = 2000
+MAX_TOOL_RESULT_CHARS = 10000
 
 
 class AttentionWindowManager:
@@ -124,10 +124,14 @@ class AttentionWindowManager:
         self.reserved_tokens = reserved_tokens
 
         # 可用预算 = (上下文 - 预留) × 90%
-        self.budget = max(
+        self._base_budget = max(
             int((context_window_size - reserved_tokens) * 0.90),
             1024,
         )
+        self.budget = self._base_budget
+
+        # P2-13: 动态budget调整因子
+        self._budget_multiplier: float = 1.0  # 由任务图节点数动态调整
 
         self.mode: AttentionMode = AttentionMode.GLOBAL
         self.envelopes: List[MessageEnvelope] = []
@@ -406,6 +410,9 @@ class AttentionWindowManager:
         if not self.envelopes:
             return []
 
+        # P2-13: 动态调整budget（基于任务图节点数和当前模式）
+        self._adjust_budget()
+
         # 1. 对所有消息评分
         for env in self.envelopes:
             env.weight = self._score_message(env)
@@ -445,7 +452,7 @@ class AttentionWindowManager:
                     kept.sort(key=lambda e: e.seq)
                     result = [e.msg for e in essential]
                     result.extend(e.msg for e in kept)
-                    return result
+                    return self._normalize_system_prefix(result)
             # 兜底：仍然只返回 pinned
             return [e.msg for e in sorted_pinned]
 
@@ -511,7 +518,33 @@ class AttentionWindowManager:
             result.append(summary_msg)
 
         result.extend(e.msg for e in kept_envs)
-        return result
+        return self._normalize_system_prefix(result)
+
+    def _normalize_system_prefix(self, messages: List[Dict]) -> List[Dict]:
+        """确保所有 role=system 消息位于数组开头（API 兼容性要求）
+
+        SiliconFlow/Qwen 等 API 要求 system message 必须在 messages 数组起始位置，
+        Circuit Breaker / 淘汰摘要等组件可能注入 role=system 到对话中间，需要前置。
+        """
+        if not messages:
+            return messages
+
+        # 快速路径：无 system 消息或只有第一条是 system
+        first_non_sys_idx = next(
+            (i for i, m in enumerate(messages) if m.get("role") != "system"),
+            len(messages),
+        )
+        # 检查 first_non_sys_idx 之后是否还有 system 消息
+        has_scattered = any(
+            m.get("role") == "system" for m in messages[first_non_sys_idx:]
+        )
+        if not has_scattered:
+            return messages  # 已经是合法顺序
+
+        # 需要重排：所有 system 前置，其余保持相对顺序
+        system_msgs = [m for m in messages if m.get("role") == "system"]
+        non_system_msgs = [m for m in messages if m.get("role") != "system"]
+        return system_msgs + non_system_msgs
 
     # ── 评分逻辑 ──
 
@@ -921,6 +954,36 @@ class AttentionWindowManager:
         }
 
     # ── 序列化/反序列化（IDE 跨请求 Session 持久化）──
+
+    # ── P2-13: 动态budget调整 ──
+
+    def _adjust_budget(self) -> None:
+        """根据任务复杂度动态调整budget
+
+        规则：
+        - 任务图节点数 > 20: budget × 1.3（复杂任务需要更多上下文）
+        - 任务图节点数 > 50: budget × 1.5
+        - FOCUS模式: budget × 0.8（聚焦模式精简上下文）
+        - SINGLE_CHAIN模式: budget × 0.6
+        """
+        multiplier = 1.0
+        if self.task_graph is not None:
+            try:
+                node_count = len(self.task_graph._nodes) if hasattr(self.task_graph, '_nodes') else 0
+                if node_count > 50:
+                    multiplier *= 1.5
+                elif node_count > 20:
+                    multiplier *= 1.3
+            except Exception:
+                pass
+
+        if self.mode == AttentionMode.FOCUS:
+            multiplier *= 0.8
+        elif self.mode == AttentionMode.SINGLE_CHAIN:
+            multiplier *= 0.6
+
+        self._budget_multiplier = multiplier
+        self.budget = max(int(self._base_budget * multiplier), 1024)
 
     def serialize(self) -> Dict[str, Any]:
         """序列化当前状态，用于 AgentSession 跨请求持久化"""

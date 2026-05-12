@@ -1369,6 +1369,114 @@ class DialogueAdapter(BaseGraphAdapter):
                 f"({total_turns} turns, {status})"
             )
 
+    # ── Web 前端 API 辅助方法 ──────────────────────────────────
+
+    @staticmethod
+    def list_sessions(graph: MemoryGraph) -> List[Dict]:
+        """获取所有对话会话节点的摘要信息（供 Web 前端会话列表使用）
+
+        Returns:
+            按 last_active_at 降序排列的会话摘要列表
+        """
+        dialogue_nodes = graph.get_nodes_by_type(NodeType.DIALOGUE)
+        sessions = [n for n in dialogue_nodes if n.metadata.get("sub_type") == "session"]
+
+        result = []
+        for sess in sessions:
+            # 获取最新 round 的 goal 作为预览
+            preview = ""
+            rounds = []
+            if hasattr(graph, '_graph') and sess.node_id in graph._graph:
+                for child_id in graph._graph.successors(sess.node_id):
+                    child = graph.get_node(child_id)
+                    if child and child.metadata.get("sub_type") == "round":
+                        rounds.append(child)
+
+            if rounds:
+                rounds.sort(key=lambda n: n.created_at, reverse=True)
+                preview = rounds[0].metadata.get("goal", "")[:60]
+
+            result.append({
+                "id": sess.node_id,
+                "title": sess.label or sess.metadata.get("topic_summary", "")[:40],
+                "created_at": sess.created_at,
+                "last_active_at": sess.metadata.get("last_active_at", sess.created_at),
+                "round_count": sess.metadata.get("round_count", len(rounds)),
+                "bound_task_id": sess.metadata.get("bound_task_id", ""),
+                "preview": preview,
+            })
+
+        # 按 last_active_at 降序
+        result.sort(key=lambda s: s["last_active_at"], reverse=True)
+        return result
+
+    @staticmethod
+    def get_session_messages(graph: MemoryGraph, session_id: str) -> List[Dict]:
+        """获取指定会话的所有消息（扁平化 round → sub-dialogue）
+
+        Returns:
+            按时间顺序排列的消息列表，每条包含 role/content/node_id/ts
+        """
+        if not graph.has_node(session_id):
+            return []
+
+        # 获取 session 下所有 round 节点
+        rounds = []
+        if hasattr(graph, '_graph') and session_id in graph._graph:
+            for child_id in graph._graph.successors(session_id):
+                child = graph.get_node(child_id)
+                if child and child.metadata.get("sub_type") == "round":
+                    rounds.append(child)
+
+        rounds.sort(key=lambda n: n.created_at)
+
+        messages = []
+        for rnd in rounds:
+            # user 消息来自 round.goal
+            goal = rnd.metadata.get("goal", "")
+            if goal:
+                messages.append({
+                    "role": "user",
+                    "content": goal,
+                    "node_id": rnd.node_id,
+                    "round_id": rnd.node_id,
+                    "ts": rnd.created_at,
+                })
+
+            # assistant/tool 消息来自 sub-dialogue 子节点
+            sub_dialogues = []
+            if hasattr(graph, '_graph') and rnd.node_id in graph._graph:
+                for sub_id in graph._graph.successors(rnd.node_id):
+                    sub = graph.get_node(sub_id)
+                    if sub and sub.metadata.get("sub_type") == "agent_turn":
+                        sub_dialogues.append(sub)
+
+            sub_dialogues.sort(key=lambda n: n.metadata.get("turn", 0))
+
+            for sub in sub_dialogues:
+                content = sub.metadata.get("content", "")
+                role = sub.metadata.get("role", "assistant")
+                tool_name = sub.metadata.get("tool_name", "")
+
+                if not content:
+                    continue
+
+                # tool 角色用工具名标注
+                if tool_name and role != "user":
+                    display_content = f"[{tool_name}] {content}"
+                else:
+                    display_content = content
+
+                messages.append({
+                    "role": role,
+                    "content": display_content,
+                    "node_id": sub.node_id,
+                    "round_id": rnd.node_id,
+                    "ts": sub.created_at,
+                })
+
+        return messages
+
 
 # ============================================================
 # Episode 适配器

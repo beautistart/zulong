@@ -1,13 +1,15 @@
 # File: zulong/core/websocket_server.py
 """
-WebSocket 服务器 - 用于 OpenClaw Bridge 连接
+WebSocket 服务器 - 用于 OpenClaw Bridge 连接 [已弃用 → ide/ide_server.py]
 
-实现基于 websockets 库的 WebSocket 服务器
-支持：
-1. OpenClaw Bridge 连接
-2. 事件发布/订阅
-3. 多客户端支持
-4. EventBus 远程桥接（/eventbus 端点）
+本文件原实现基于 websockets 库的 WebSocket 服务器，用于 OpenClaw Bridge 连接。
+现已被 zulong/ide/ide_server.py 中的 FastAPI WebSocket 端点替代，后者同时提供：
+1. IDE WebSocket 通信（/ws 端点）
+2. 监控事件广播（broadcast_monitor_event）
+3. HTTP API 端点
+
+本模块仅保留 EventBusBridge 远程桥接功能，如不再需要 OpenClaw Bridge，
+可安全删除本文件及对应导入。
 """
 
 import asyncio
@@ -60,15 +62,17 @@ class EventBusBridge:
             event_types: 需要转发的本地事件类型列表
         """
         def create_handler(event_type_str: str):
+            _is_thinking = event_type_str == "L2_THINKING_STEP"
+
             def handler(event: ZulongEvent):
-                # 转发到所有远程订阅者（高频事件不打印日志，避免干扰显示）
                 _silent = event_type_str in ("L2_OUTPUT", "L2_OUTPUT_STREAM", "L2_THINKING_STEP")
                 if not _silent:
                     logger.debug(f"[EventBusBridge] 收到本地事件：{event_type_str}")
-                if event_type_str in self._subscriptions:
+                callbacks = self._subscriptions.get(event_type_str, [])
+                if callbacks:
                     if not _silent:
-                        logger.debug(f"[EventBusBridge] 找到 {len(self._subscriptions[event_type_str])} 个订阅者")
-                    for callback in self._subscriptions[event_type_str]:
+                        logger.debug(f"[EventBusBridge] 找到 {len(callbacks)} 个订阅者")
+                    for callback in callbacks:
                         try:
                             if not _silent:
                                 logger.debug(f"[EventBusBridge] 正在调用回调：{callback}")
@@ -76,7 +80,9 @@ class EventBusBridge:
                         except Exception as e:
                             logger.error(f"转发事件失败：{e}")
                 else:
-                    if not _silent:
+                    if _is_thinking:
+                        logger.debug(f"[EventBusBridge] {event_type_str} 无远程订阅者，事件未转发（请确保Bridge客户端已连接到/eventbus端点）")
+                    elif not _silent:
                         logger.debug(f"[EventBusBridge] 没有订阅者：{event_type_str}")
             return handler
         

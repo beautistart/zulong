@@ -30,7 +30,8 @@ _IGNORE_DIRS = {
 _LANG_EXTENSIONS = {
     "python": {".py"},
     "javascript": {".js", ".jsx"},
-    "typescript": {".ts", ".tsx"},
+    "typescript": {".ts"},
+    "tsx": {".tsx"},
 }
 
 

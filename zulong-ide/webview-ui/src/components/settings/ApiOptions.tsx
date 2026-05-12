@@ -4,7 +4,28 @@ import { VSCodeTextField } from "@vscode/webview-ui-toolkit/react"
 import Fuse from "fuse.js"
 import { KeyboardEvent, useEffect, useMemo, useRef, useState } from "react"
 import styled from "styled-components"
-import { normalizeApiConfiguration } from "@/components/settings/utils/providerUtils"
+import {
+	normalizeApiConfiguration,
+	extractCurrentProviderConfig,
+	cacheProviderConfig,
+	restoreProviderConfig,
+} from "@/components/settings/utils/providerUtils"
+
+function useDebounceSearch(value: string, delay: number = 300): string {
+	const [debouncedValue, setDebouncedValue] = useState(value)
+
+	useEffect(() => {
+		const timer = setTimeout(() => {
+			setDebouncedValue(value)
+		}, delay)
+
+		return () => {
+			clearTimeout(timer)
+		}
+	}, [value, delay])
+
+	return debouncedValue
+}
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { PLATFORM_CONFIG, PlatformType } from "@/config/platform.config"
 import { useExtensionState } from "@/context/ExtensionStateContext"
@@ -56,6 +77,9 @@ const ApiOptions = ({
 	const itemRefs = useRef<(HTMLDivElement | null)[]>([])
 	const dropdownListRef = useRef<HTMLDivElement>(null)
 
+	// Debounce search term for performance optimization
+	const debouncedSearchTerm = useDebounceSearch(searchTerm, 300)
+
 	const providerOptions = useMemo(() => {
 		let providers = PROVIDERS.list
 		// Filter by platform
@@ -103,11 +127,32 @@ const ApiOptions = ({
 	}, [searchableItems])
 
 	const providerSearchResults = useMemo(() => {
-		return searchTerm && searchTerm !== currentProviderLabel ? fuse.search(searchTerm)?.map((r) => r.item) : searchableItems
-	}, [searchableItems, searchTerm, fuse, currentProviderLabel])
+		return debouncedSearchTerm && debouncedSearchTerm !== currentProviderLabel ? fuse.search(debouncedSearchTerm)?.map((r) => r.item) : searchableItems
+	}, [searchableItems, debouncedSearchTerm, fuse, currentProviderLabel])
 
-	const handleProviderChange = (newProvider: string) => {
-		handleModeFieldChange({ plan: "planModeApiProvider", act: "actModeApiProvider" }, newProvider as any, currentMode)
+	const handleProviderChange = async (newProvider: string) => {
+		console.log("[ApiOptions] Provider change initiated:", {
+			currentProvider: selectedProvider,
+			newProvider,
+			currentMode,
+		})
+
+		if (selectedProvider && selectedProvider !== newProvider) {
+			const currentConfig = extractCurrentProviderConfig(apiConfiguration, selectedProvider as any)
+			cacheProviderConfig(selectedProvider as any, currentConfig)
+			console.log("[ApiOptions] Cached current provider config:", {
+				provider: selectedProvider,
+				config: currentConfig,
+			})
+		}
+
+		await handleModeFieldChange({ plan: "planModeApiProvider", act: "actModeApiProvider" }, newProvider as any, currentMode)
+
+		console.log("[ApiOptions] Provider change completed:", {
+			newProvider,
+			apiConfiguration: apiConfiguration ? "exists" : "undefined",
+		})
+
 		setIsDropdownVisible(false)
 		setSelectedIndex(-1)
 	}
@@ -129,7 +174,7 @@ const ApiOptions = ({
 			case "Enter":
 				event.preventDefault()
 				if (selectedIndex >= 0 && selectedIndex < providerSearchResults.length) {
-					handleProviderChange(providerSearchResults[selectedIndex].value)
+					void handleProviderChange(providerSearchResults[selectedIndex].value)
 				}
 				break
 			case "Escape":
@@ -248,7 +293,7 @@ const ApiOptions = ({
 									data-testid={`provider-option-${item.value}`}
 									isSelected={index === selectedIndex}
 									key={item.value}
-									onClick={() => handleProviderChange(item.value)}
+									onClick={() => void handleProviderChange(item.value)}
 									onMouseEnter={() => setSelectedIndex(index)}
 									ref={(el) => {
 										itemRefs.current[index] = el
@@ -262,8 +307,14 @@ const ApiOptions = ({
 				</ProviderDropdownWrapper>
 			</DropdownContainer>
 
-			{apiConfiguration && selectedProvider === "zulong" && (
+			{apiConfiguration && selectedProvider === "zulong" ? (
 				<ZulongProvider currentMode={currentMode} isPopup={isPopup} showModelOptions={showModelOptions} />
+			) : (
+				!apiConfiguration && (
+					<p style={{ fontSize: 12, color: "var(--vscode-descriptionForeground)", marginTop: 5 }}>
+						正在加载配置...
+					</p>
+				)
 			)}
 
 			{apiErrorMessage && (

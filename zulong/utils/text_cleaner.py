@@ -148,6 +148,51 @@ def clean_text_for_tts(text: str) -> str:
     return text
 
 
+def split_into_sentences(text: str) -> list:
+    """
+    将文本按句子边界分割
+    
+    Args:
+        text: 输入文本
+    
+    Returns:
+        list: 句子列表
+    """
+    # 按句号、问号、感叹号、换行符分割
+    sentences = re.split(r'([。！？\n]+)', text)
+    
+    # 合并句子和标点
+    result = []
+    for i in range(0, len(sentences) - 1, 2):
+        sentence = sentences[i] + (sentences[i+1] if i+1 < len(sentences) else '')
+        if sentence.strip():
+            result.append(sentence.strip())
+    
+    # 处理最后一个可能没有标点的句子
+    if len(sentences) % 2 == 1 and sentences[-1].strip():
+        result.append(sentences[-1].strip())
+    
+    return result
+
+
+def clean_text_streaming(text: str):
+    """
+    流式清洗文本：按句子边界逐句清洗并 yield
+    
+    Args:
+        text: 原始文本
+    
+    Yields:
+        str: 清洗后的句子
+    """
+    sentences = split_into_sentences(text)
+    
+    for sentence in sentences:
+        cleaned = clean_text_for_tts(sentence)
+        if cleaned:
+            yield cleaned
+
+
 # 测试
 if __name__ == "__main__":
     test_cases = [

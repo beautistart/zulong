@@ -549,12 +549,14 @@ class ToolEngine:
                     RecallMemoryTool, ReadMemoryNodeTool,
                     SaveMemoryNoteTool, DiscoverRelatedTool,
                     ActivateMemoryNetworkTool, ListMemoryTool,
-                    SetImportanceTool,
+                    SetImportanceTool, DeleteMemoryNodeTool,
+                    DeleteMemoryEdgeTool,
                 )
                 for tool_cls in [RecallMemoryTool, ReadMemoryNodeTool,
                                  SaveMemoryNoteTool, DiscoverRelatedTool,
                                  ActivateMemoryNetworkTool, ListMemoryTool,
-                                 SetImportanceTool]:
+                                 SetImportanceTool, DeleteMemoryNodeTool,
+                                 DeleteMemoryEdgeTool]:
                     tool_inst = tool_cls()
                     if self.register_tool(tool_inst):
                         logger.info(f"[ToolEngine] 已注册 {tool_inst.name} 工具")

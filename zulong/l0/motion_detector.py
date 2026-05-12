@@ -8,9 +8,8 @@ import threading
 from typing import Tuple, Optional
 from dataclasses import dataclass
 from enum import Enum
-import logging
 
-logger = logging.getLogger("MotionDetector")
+from zulong.ide.video_logger import logger
 
 
 class MotionState(Enum):

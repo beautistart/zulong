@@ -1,7 +1,7 @@
 # File: zulong/tools/memory_graph_tools.py
 # MemoryGraph FC 工具集 — 让模型通过 Function Calling 自主访问图记忆系统
 #
-# 7 个工具:
+# 8 个工具:
 # - recall_memory: 检索记忆（语义搜索 + 热数据遍历）
 # - read_memory_node: 读取特定节点详情及邻域
 # - save_memory_note: 保存笔记/观察到记忆图
@@ -9,6 +9,7 @@
 # - activate_memory_network: BFS 扩散激活记忆网络（P1-2）
 # - list_memory: 按类型/温度/重要性浏览记忆节点（P1-3）
 # - set_importance: 设置节点重要性级别（P2-2）
+# - delete_memory_node: 删除记忆节点（P2-8）
 
 import logging
 import time
@@ -872,6 +873,128 @@ class ListMemoryTool(BaseTool):
 
 
 # ============================================================
+# P2-9: 记忆边删除工具
+# ============================================================
+
+class DeleteMemoryEdgeTool(BaseTool):
+    """delete_memory_edge — 删除记忆图中的边
+
+    从图记忆系统中删除指定节点之间的关联边。
+    支持按源-目标节点对删除单条边，或按节点ID删除其所有关联边。
+    """
+
+    def __init__(self):
+        super().__init__(name="delete_memory_edge", category=ToolCategory.CUSTOM)
+        self.description = (
+            "删除记忆图中的边（关联关系）。当用户要求删除、移除两个记忆节点之间的关联时调用。"
+            "关键词：删除关联、移除关系、断开连接。"
+            "支持按 source_id + target_id 删除单条边，或按 node_id 删除该节点的所有关联边。"
+        )
+
+    def initialize(self) -> bool:
+        return True
+
+    def cleanup(self) -> None:
+        pass
+
+    def execute(self, request: ToolRequest) -> ToolResult:
+        start_time = time.time()
+        source_id = request.parameters.get("source_id", "")
+        target_id = request.parameters.get("target_id", "")
+        node_id = request.parameters.get("node_id", "")
+
+        if not source_id and not node_id:
+            return self._create_result(
+                success=False,
+                error="必须提供 source_id+target_id（删除单条边）或 node_id（删除该节点所有关联边）",
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
+            )
+
+        try:
+            from zulong.memory.memory_graph import get_memory_graph
+            mg = get_memory_graph()
+            if mg is None:
+                return self._create_result(
+                    success=False,
+                    error="MemoryGraph 未初始化",
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
+
+            deleted_edges = []
+
+            if source_id and target_id:
+                if mg.remove_edge(source_id, target_id):
+                    deleted_edges.append({"source": source_id, "target": target_id})
+                else:
+                    return self._create_result(
+                        success=False,
+                        error=f"边 ({source_id} → {target_id}) 不存在",
+                        execution_time=time.time() - start_time,
+                        request_id=request.request_id,
+                    )
+            elif node_id:
+                neighbors_in = list(mg._graph.predecessors(node_id)) if mg._graph.has_node(node_id) else []
+                neighbors_out = list(mg._graph.successors(node_id)) if mg._graph.has_node(node_id) else []
+                if not neighbors_in and not neighbors_out:
+                    return self._create_result(
+                        success=True,
+                        data={"deleted_count": 0, "deleted_edges": [], "message": f"节点 {node_id} 无关联边"},
+                        execution_time=time.time() - start_time,
+                        request_id=request.request_id,
+                    )
+                for src in neighbors_in:
+                    if mg.remove_edge(src, node_id):
+                        deleted_edges.append({"source": src, "target": node_id})
+                for tgt in neighbors_out:
+                    if mg.remove_edge(node_id, tgt):
+                        deleted_edges.append({"source": node_id, "target": tgt})
+
+            logger.info(f"[delete_memory_edge] 删除 {len(deleted_edges)} 条边")
+
+            return self._create_result(
+                success=True,
+                data={
+                    "deleted_count": len(deleted_edges),
+                    "deleted_edges": deleted_edges,
+                    "message": f"已删除 {len(deleted_edges)} 条记忆边",
+                },
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
+            )
+
+        except Exception as e:
+            logger.error(f"[delete_memory_edge] 删除失败: {e}", exc_info=True)
+            return self._create_result(
+                success=False,
+                error=f"记忆边删除失败: {e}",
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
+            )
+
+    def _get_parameters_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "source_id": {
+                    "type": "string",
+                    "description": "边的源节点 ID（与 target_id 配对使用，删除单条边）",
+                },
+                "target_id": {
+                    "type": "string",
+                    "description": "边的目标节点 ID（与 source_id 配对使用，删除单条边）",
+                },
+                "node_id": {
+                    "type": "string",
+                    "description": "节点 ID，删除该节点的所有入边和出边",
+                },
+            },
+            "required": [],
+        }
+
+
+# ============================================================
 # P2-2: 重要性设置工具
 # ============================================================
 
@@ -1008,4 +1131,200 @@ class SetImportanceTool(BaseTool):
                 },
             },
             "required": ["node_id", "importance"],
+        }
+
+
+# ============================================================
+# P2-8: 记忆节点删除工具
+# ============================================================
+
+class DeleteMemoryNodeTool(BaseTool):
+    """delete_memory_node — 删除记忆节点
+
+    从图记忆系统中删除指定节点及其关联边。
+    支持单个删除和批量删除。
+    带有安全防护：不允许删除 identity 级别的核心记忆。
+    """
+
+    def __init__(self):
+        super().__init__(name="delete_memory_node", category=ToolCategory.CUSTOM)
+        self.description = (
+            "删除记忆节点。当用户明确要求删除、移除、清除某条记忆或相关信息时调用。"
+            "关键词：删除、移除、清除、忘记、去掉、不要记住。"
+            "支持按节点 ID 删除单个节点，或按关键词批量搜索删除。"
+            "注意：identity 级别的核心记忆受保护，不能删除。"
+        )
+
+    def initialize(self) -> bool:
+        return True
+
+    def cleanup(self) -> None:
+        pass
+
+    def execute(self, request: ToolRequest) -> ToolResult:
+        start_time = time.time()
+        node_ids = request.parameters.get("node_ids", [])
+        keyword = request.parameters.get("keyword", "")
+        confirm = request.parameters.get("confirm", False)
+
+        if not node_ids and not keyword:
+            return self._create_result(
+                success=False,
+                error="必须提供 node_ids（节点 ID 列表）或 keyword（搜索关键词）之一",
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
+            )
+
+        try:
+            from zulong.memory.memory_graph import get_memory_graph, Importance
+            mg = get_memory_graph()
+            if mg is None:
+                return self._create_result(
+                    success=False,
+                    error="MemoryGraph 未初始化",
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
+
+            # 如果通过关键词搜索，先找到匹配的节点
+            if keyword and not node_ids:
+                search_results = mg.search_nodes(query=keyword, max_results=20)
+                node_ids = [r.get("node_id") for r in search_results if r.get("node_id")]
+
+                if not node_ids:
+                    return self._create_result(
+                        success=True,
+                        data={
+                            "keyword": keyword,
+                            "deleted_count": 0,
+                            "message": f"未找到与 '{keyword}' 相关的记忆节点",
+                        },
+                        execution_time=time.time() - start_time,
+                        request_id=request.request_id,
+                    )
+
+                # 若未确认，返回待删除列表供确认
+                if not confirm:
+                    preview = []
+                    for nid in node_ids:
+                        node = mg.get_node(nid)
+                        if node:
+                            preview.append({
+                                "node_id": nid,
+                                "type": node.node_type.value,
+                                "label": node.label,
+                            })
+                    return self._create_result(
+                        success=True,
+                        data={
+                            "keyword": keyword,
+                            "action": "preview",
+                            "candidates": preview,
+                            "message": (
+                                f"找到 {len(preview)} 个与 '{keyword}' 相关的节点。"
+                                f"请使用 confirm=true 确认删除，或指定具体 node_ids。"
+                            ),
+                        },
+                        execution_time=time.time() - start_time,
+                        request_id=request.request_id,
+                    )
+
+            # 执行删除
+            deleted = []
+            protected = []
+            not_found = []
+
+            for nid in node_ids:
+                node = mg.get_node(nid)
+                if node is None:
+                    not_found.append(nid)
+                    continue
+
+                # 安全防护：identity 级别节点不可删除
+                imp = mg.get_importance(nid)
+                if imp and imp == Importance.IDENTITY:
+                    protected.append({
+                        "node_id": nid,
+                        "label": node.label,
+                        "reason": "identity 级别核心记忆受保护",
+                    })
+                    continue
+
+                # 执行删除（MemoryGraph）
+                ok = mg.remove_node(nid)
+                if ok:
+                    deleted.append({
+                        "node_id": nid,
+                        "type": node.node_type.value,
+                        "label": node.label,
+                    })
+                    # 如果是任务节点，同步从 TaskGraph 中移除
+                    if nid.startswith("task:tg_"):
+                        try:
+                            from zulong.tools.task_tools import get_active_task_graph
+                            tg = get_active_task_graph()
+                            if tg and tg.get_node(nid):
+                                tg.remove_node(nid)
+                                logger.debug(
+                                    f"[delete_memory_node] 同步从 TaskGraph 移除: {nid}"
+                                )
+                        except Exception as _tg_err:
+                            logger.debug(
+                                f"[delete_memory_node] TaskGraph 同步移除跳过: {_tg_err}"
+                            )
+
+            logger.info(
+                f"[delete_memory_node] 删除 {len(deleted)} 个节点，"
+                f"保护 {len(protected)} 个，未找到 {len(not_found)} 个"
+            )
+
+            return self._create_result(
+                success=True,
+                data={
+                    "deleted_count": len(deleted),
+                    "deleted": deleted,
+                    "protected_count": len(protected),
+                    "protected": protected,
+                    "not_found": not_found,
+                    "message": (
+                        f"已删除 {len(deleted)} 个记忆节点"
+                        + (f"，{len(protected)} 个核心记忆受保护未删除" if protected else "")
+                        + (f"，{len(not_found)} 个节点未找到" if not_found else "")
+                    ),
+                },
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
+            )
+
+        except Exception as e:
+            logger.error(f"[delete_memory_node] 删除失败: {e}", exc_info=True)
+            return self._create_result(
+                success=False,
+                error=f"记忆节点删除失败: {e}",
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
+            )
+
+    def _get_parameters_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "node_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "要删除的节点 ID 列表，如 ['note:xxx', 'task:tg_xxx']",
+                },
+                "keyword": {
+                    "type": "string",
+                    "description": (
+                        "按关键词搜索要删除的节点（与 node_ids 二选一）。"
+                        "首次调用会返回预览列表，需设置 confirm=true 确认删除。"
+                    ),
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "确认执行批量删除（keyword 模式下需要确认，默认 false）",
+                },
+            },
+            "required": [],
         }

@@ -169,6 +169,9 @@ class UnifiedFCRunner:
         response = state.get("response")
         fc_turn = state.get("fc_turn", 0)
 
+        # 记录终止原因到 engine，供 Orchestrator 感知 API 错误
+        self.engine._last_fc_terminate_reason = state.get("should_terminate", "")
+
         logger.info(
             f"[UnifiedFC] FC 循环完成: "
             f"共 {fc_turn} 轮, response={'有' if response else '无'}"

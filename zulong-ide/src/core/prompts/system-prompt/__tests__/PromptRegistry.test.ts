@@ -20,7 +20,7 @@ describe("PromptRegistry", () => {
 		} as unknown as McpHub,
 		focusChainSettings: {
 			enabled: true,
-			remindZulongInterval: 6,
+			remindClineInterval: 6,
 		},
 		browserSettings: {
 			viewport: {

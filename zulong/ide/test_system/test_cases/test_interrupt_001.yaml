@@ -1,0 +1,48 @@
+test_case_id: test_interrupt_001
+name: 中断恢复测试
+type: interrupt_resume
+description: 测试步骤3中断后的断点续传恢复
+
+config:
+  timeout_seconds: 1800
+  on_step_fail: continue
+  snapshot_on_interrupt: true
+
+steps:
+  - step_id: step_1
+    name: 初始化测试环境
+    tool: setup_environment
+    tool_input:
+      mode: "test"
+    timeout_seconds: 30
+
+  - step_id: step_2
+    name: 执行前置操作
+    tool: execute_task
+    tool_input:
+      task: "pre_check"
+    depends_on: ["step_1"]
+    timeout_seconds: 60
+
+  - step_id: step_3
+    name: 执行核心任务（将在此时中断）
+    tool: execute_task
+    tool_input:
+      task: "core_task"
+      iterations: 100
+    depends_on: ["step_2"]
+    timeout_seconds: 300
+
+  - step_id: step_4
+    name: 中断后验证恢复
+    tool: verify_result
+    tool_input:
+      expected_steps: ["step_1", "step_2", "step_3"]
+      result: "$step_3.output"
+    depends_on: ["step_3"]
+    timeout_seconds: 30
+    assertions:
+      - assertion_type: value_match
+        field_path: "resumed"
+        expected: true
+        message: "应成功从断点恢复"

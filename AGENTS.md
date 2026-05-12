@@ -6,6 +6,20 @@
 
 Zulong IDE is a VS Code extension based on Cline v3.82.0, serving as the frontend for the Zulong multi-layer adaptive intelligent agent system. UI has been fully localized to Chinese (zh-CN).
 
+## Dependencies
+
+```bash
+# Python 后端依赖 (使用 zulong_env/ 虚拟环境):
+pip install -r requirements.txt
+```
+
+Key packages:
+- **Kokoro-82M**: TTS 主引擎 (82M参数, CPU实时推理 <0.3s)
+- **edge-tts**: TTS 备选引擎 (微软云端, 需网络)
+- **CosyVoice3-0.5B**: TTS 备选, 需单独下载权重
+- **SenseVoice-Small**: ASR 主引擎 (ONNX GPU, 含情感/事件检测, ~244M)
+- **Whisper**: ASR 备选 (多语言 fallback, tiny/base/small)
+
 ## Build Pipeline
 
 ```bash

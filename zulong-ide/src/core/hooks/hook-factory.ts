@@ -207,7 +207,7 @@ export abstract class HookRunner<Name extends HookName> {
 		}
 
 		return {
-			zulongVersion,
+			clineVersion: zulongVersion,
 			hookName: this.hookName,
 			timestamp: Date.now().toString(),
 			workspaceRoots,

@@ -34,6 +34,9 @@ from zulong.launcher.web_chat_router import router as web_chat_router, set_launc
 
 logger = logging.getLogger(__name__)
 
+# 全局单例引用（供其他模块访问）
+_app_instance = None
+
 _LAUNCHER_STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 _DASHBOARD_STATIC = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "openclaw_bridge", "web", "static"
@@ -63,7 +66,11 @@ class LauncherApp:
         self.phase = "selecting"   # selecting → launching → running
         self._start_time = time.time()
         self._progress_clients: Set[WebSocket] = set()
-
+        
+        # 设置全局单例引用
+        global _app_instance
+        _app_instance = self
+        
         self._register_all_modules()
         self._register_routes()
 

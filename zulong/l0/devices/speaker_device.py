@@ -85,8 +85,8 @@ class SpeakerDevice:
         self._on_play_start: Optional[Callable] = None
         self._on_play_end: Optional[Callable] = None
         
-        # 🎯 事件循环用于处理异步任务
-        self._event_loop = asyncio.new_event_loop()
+        # 🎯 事件循环用于处理异步任务（延迟创建）
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         
         # 🎯 订阅 ACTION_SPEAK 事件 (TSD v1.7 规范)
         self._register_event_handlers()
@@ -94,12 +94,8 @@ class SpeakerDevice:
         logger.info("🔊 扬声器设备初始化完成")
         logger.info("🎙️ 已订阅 ACTION_SPEAK 事件")
         
-        # 🎯 自动启动扬声器
-        try:
-            self._event_loop.run_until_complete(self.start())
-            logger.info("✅ 扬声器自动启动成功")
-        except Exception as e:
-            logger.warning(f"⚠️ 扬声器自动启动失败：{e}，将在首次播放时启动")
+        # 🎯 不再自动启动，由调用者负责调用 start()
+        # 这样避免在模块加载时与事件循环冲突
     
     def _register_event_handlers(self):
         """注册事件处理器"""
@@ -118,6 +114,10 @@ class SpeakerDevice:
         Args:
             event: ACTION_SPEAK 事件
         """
+        # 🎯 确保事件循环已创建
+        if self._event_loop is None or self._event_loop.is_closed():
+            self._event_loop = asyncio.new_event_loop()
+        
         # 🎯 在事件循环中运行异步方法
         try:
             self._event_loop.run_until_complete(self._on_speak_command(event))
@@ -160,23 +160,38 @@ class SpeakerDevice:
             
             tts_expert = TTSExpertNode()
             
-            logger.info("📥 开始 TTS 合成...")
+            logger.info("📥 开始 TTS 流式合成...")
             
-            # 使用清洗后的文本生成音频
-            result = tts_expert.execute({
-                "task_description": "将文本转为语音",
+            # 🎯 使用流式 TTS：边生成边播放
+            audio_chunks_count = 0
+            total_samples = 0
+            
+            for chunk_result in tts_expert.execute_streaming({
+                "task_description": "将文本转为语音（流式）",
                 "text": text,  # 🔥 使用清洗后的纯净文本
                 "sample_rate": 24000
-            })
+            }):
+                chunk_type = chunk_result.get("type")
+                
+                if chunk_type == "audio_chunk":
+                    audio_data = chunk_result.get("audio_data")
+                    if audio_data is not None:
+                        # 立即播放当前音频块（流式模式）
+                        await self.play_audio(audio_data, sample_rate=24000, is_streaming=True)
+                        audio_chunks_count += 1
+                        total_samples += len(audio_data)
+                        logger.debug(f"🎵 已播放音频块 #{audio_chunks_count} ({len(audio_data)} 采样点)")
+                
+                elif chunk_type == "complete":
+                    exec_time = chunk_result.get("execution_time", 0)
+                    logger.info(f"✅ TTS 流式合成完成，共播放 {audio_chunks_count} 个音频块 ({total_samples} 采样点, {exec_time:.2f}秒)")
+                
+                elif chunk_type == "error":
+                    error_msg = chunk_result.get("error", "未知错误")
+                    logger.error(f"❌ TTS 流式合成失败: {error_msg}")
             
-            audio_data = result.get("audio_data")
-            
-            if audio_data is not None:
-                logger.info(f"✅ TTS 合成完成，播放音频...")
-                await self.play_audio(audio_data, sample_rate=24000)
-                logger.info("✅ 语音播放完成")
-            else:
-                logger.warning("⚠️ TTS 合成失败，无音频数据")
+            if audio_chunks_count == 0:
+                logger.warning("⚠️ TTS 未生成任何音频块")
             
         except Exception as e:
             logger.error(f"❌ ACTION_SPEAK 处理失败：{e}", exc_info=True)
@@ -332,13 +347,14 @@ class SpeakerDevice:
                 logger.error(f"音频播放循环错误：{e}")
                 await asyncio.sleep(0.1)
     
-    async def play_audio(self, audio_data: np.ndarray, sample_rate: int = 24000):
+    async def play_audio(self, audio_data: np.ndarray, sample_rate: int = 24000, is_streaming: bool = False):
         """
         播放音频数据
         
         Args:
             audio_data: 音频数据（numpy 数组，归一化到 -1.0 ~ 1.0）
             sample_rate: 音频原始采样率
+            is_streaming: 是否为流式播放（流式模式下减少日志和等待）
         
         Returns:
             bool: 播放是否成功
@@ -353,11 +369,13 @@ class SpeakerDevice:
             device_rate = int(device_info['defaultSampleRate'])
             device_channels = device_info['maxOutputChannels']
             
-            logger.info(f"🔊 设备信息：采样率={device_rate}Hz, 声道数={device_channels}")
+            if not is_streaming:
+                logger.info(f"🔊 设备信息：采样率={device_rate}Hz, 声道数={device_channels}")
             
             # 🎯 关键修复 1: 重采样到设备采样率
             if sample_rate != device_rate:
-                logger.info(f"🔄 重采样：{sample_rate}Hz -> {device_rate}Hz")
+                if not is_streaming:
+                    logger.info(f"🔄 重采样：{sample_rate}Hz -> {device_rate}Hz")
                 import scipy.signal as signal
                 num_samples = int(len(audio_data) * device_rate / sample_rate)
                 audio_data = signal.resample(audio_data, num_samples)
@@ -368,26 +386,28 @@ class SpeakerDevice:
             
             # 🎯 关键修复 3: 单声道 -> 立体声 (如果设备是立体声)
             if device_channels == 2:
-                logger.info("🔄 转换为立体声 (单声道 -> 双声道)")
+                if not is_streaming:
+                    logger.info("🔄 转换为立体声 (单声道 -> 双声道)")
                 # 将单声道数据复制为双声道 (左右声道相同)
                 audio_stereo = np.repeat(audio_int16, 2).reshape(-1, 2)
                 audio_bytes = audio_stereo.tobytes()
             else:
                 audio_bytes = audio_int16.tobytes()
             
-            logger.info(f"🔊 播放音频：{len(audio_bytes)} 字节，采样率={sample_rate}Hz, 声道数={device_channels}")
-            logger.info(f"   - 数据类型：{audio_int16.dtype}")
-            logger.info(f"   - 最小值：{audio_int16.min()}, 最大值：{audio_int16.max()}")
-            logger.info(f"   - 时长：{len(audio_data) / sample_rate:.2f}秒")
+            if not is_streaming:
+                logger.info(f"🔊 播放音频：{len(audio_bytes)} 字节，采样率={sample_rate}Hz, 声道数={device_channels}")
+                logger.info(f"   - 数据类型：{audio_int16.dtype}")
+                logger.info(f"   - 最小值：{audio_int16.min()}, 最大值：{audio_int16.max()}")
+                logger.info(f"   - 时长：{len(audio_data) / sample_rate:.2f}秒")
             
-            # 发布播放开始事件
-            self._publish_event(EventType.SPEAKER_PLAYING, {
-                "sample_rate": sample_rate,
-                "duration": len(audio_data) / sample_rate
-            })
+            # 发布播放开始事件（仅非流式模式）
+            if not is_streaming:
+                self._publish_event(EventType.SPEAKER_PLAYING, {
+                    "sample_rate": sample_rate,
+                    "duration": len(audio_data) / sample_rate
+                })
             
             # 🎯 关键修复 4: 直接播放完整音频块，不分块
-            logger.info("🔊 开始播放...")
             self.stream.write(audio_bytes, exception_on_underflow=False)
             
             # 🎯 关键修复 5: 正确计算播放时长
@@ -396,13 +416,14 @@ class SpeakerDevice:
             bytes_per_sample = 2 * device_channels  # 16-bit = 2 bytes × 声道数
             duration = len(audio_bytes) / (sample_rate * bytes_per_sample)
             
-            logger.info(f"   等待播放：{duration + 0.1:.2f}秒 (音频时长：{duration:.2f}秒)")
+            # 流式模式下不等待，让调用者控制播放节奏
+            if not is_streaming:
+                logger.info(f"   等待播放：{duration + 0.1:.2f}秒 (音频时长：{duration:.2f}秒)")
+                # 等待播放完成 (音频时长 + 缓冲时间)
+                import time
+                time.sleep(duration + 0.1)
+                logger.info(f"✅ 音频播放完成")
             
-            # 等待播放完成 (音频时长 + 缓冲时间)
-            import time
-            time.sleep(duration + 0.1)
-            
-            logger.info(f"✅ 音频播放完成")
             return True
             
         except Exception as e:

@@ -44,6 +44,8 @@ interface GraphActions {
 	getCompletedCount: () => number
 	getProgress: () => ProgressInfo
 	getVisibleNodeIds: (viewport: ViewportState, bufferRatio: number) => string[]
+	getNodeChildren: (parentId: string) => string[]
+	getNodeDescendants: (nodeId: string) => string[]
 }
 
 const INITIAL_VIEWPORT: ViewportState = {
@@ -362,5 +364,34 @@ export const useGraphStore = create<GraphState & GraphActions>()((set, get) => (
 			}
 		}
 		return result
+	},
+
+	getNodeChildren: (parentId: string): string[] => {
+		const { nodes } = get()
+		const children: string[] = []
+		for (const [id, node] of nodes) {
+			if (node.parentId === parentId) {
+				children.push(id)
+			}
+		}
+		return children
+	},
+
+	getNodeDescendants: (nodeId: string): string[] => {
+		const { nodes } = get()
+		const descendants = new Set<string>()
+		const queue: string[] = [nodeId]
+
+		while (queue.length > 0) {
+			const currentId = queue.shift()!
+			for (const [id, node] of nodes) {
+				if (node.parentId === currentId && !descendants.has(id)) {
+					descendants.add(id)
+					queue.push(id)
+				}
+			}
+		}
+
+		return Array.from(descendants)
 	},
 }))

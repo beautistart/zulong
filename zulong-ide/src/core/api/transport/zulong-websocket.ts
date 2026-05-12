@@ -43,6 +43,14 @@ export class ZulongWebSocket extends EventEmitter {
 	private disposed = false
 	private pendingMessages: Array<Record<string, any>> = []
 
+	// Heartbeat mechanism
+	private heartbeatInterval: NodeJS.Timeout | null = null
+	private pongTimeout: NodeJS.Timeout | null = null
+	private missedPongs = 0
+	private readonly HEARTBEAT_INTERVAL = 30000 // 30 seconds
+	private readonly PONG_TIMEOUT = 5000 // 5 seconds
+	private readonly MAX_MISSED_PONGS = 3
+
 	constructor(serverUrl: string) {
 		super()
 		// Normalize URL: ensure ws:// or wss://
@@ -89,6 +97,8 @@ export class ZulongWebSocket extends EventEmitter {
 			this.ws.onopen = () => {
 				Logger.info("[ZulongWS] WebSocket connected")
 				this.reconnectAttempts = 0
+				this.missedPongs = 0
+				this.startHeartbeat()
 				this.emit("connected")
 			}
 
@@ -109,6 +119,12 @@ export class ZulongWebSocket extends EventEmitter {
 						clearTimeout(timeout)
 						this.sessionId = msg.payload?.session_id || msg.session_id
 						Logger.info(`[ZulongWS] Session established: ${this.sessionId?.slice(0, 12)}`)
+						if (msg.payload?.context_window_size && typeof msg.payload.context_window_size === "number") {
+							this.emit("model_info", {
+								contextWindow: msg.payload.context_window_size,
+							})
+							Logger.info(`[ZulongWS] Backend context_window_size: ${msg.payload.context_window_size}`)
+						}
 						// Flush pending messages
 						for (const pending of this.pendingMessages) {
 							this.sendRaw(pending)
@@ -132,6 +148,7 @@ export class ZulongWebSocket extends EventEmitter {
 
 			this.ws.onclose = (event: CloseEvent) => {
 				clearTimeout(timeout)
+				this.stopHeartbeat()
 				Logger.warn(`[ZulongWS] WebSocket closed: code=${event.code} reason=${event.reason}`)
 				this.emit("disconnected", event.code, event.reason)
 				if (!this.disposed) {
@@ -144,12 +161,16 @@ export class ZulongWebSocket extends EventEmitter {
 	/**
 	 * Send session_start to begin a new task.
 	 */
-	sendSessionStart(task: string, cwd: string, zulongSystemPrompt?: string): void {
-		this.send("session_start", {
+	sendSessionStart(task: string, cwd: string, zulongSystemPrompt?: string, projectId?: string): void {
+		const payload: Record<string, string> = {
 			task,
 			cwd,
 			ide_system_prompt: zulongSystemPrompt || "",
-		})
+		}
+		if (projectId) {
+			payload.project_id = projectId
+		}
+		this.send("session_start", payload)
 	}
 
 	/**
@@ -187,12 +208,40 @@ export class ZulongWebSocket extends EventEmitter {
 	}
 
 	/**
+	 * Send audio data for real-time transcription.
+	 * @param audioBase64 Base64 encoded audio data
+	 * @param format Audio format (webm, mp4, wav)
+	 */
+	sendAudioChunk(audioBase64: string, format: string = "webm"): void {
+		this.send("audio_chunk", {
+			audio: audioBase64,
+			format,
+			sample_rate: 16000,
+		})
+	}
+
+	/**
+	 * Signal audio stream start.
+	 */
+	sendAudioStart(): void {
+		this.send("audio_start", {})
+	}
+
+	/**
+	 * Signal audio stream end.
+	 */
+	sendAudioEnd(): void {
+		this.send("audio_end", {})
+	}
+
+	/**
 	 * Disconnect and clean up.
 	 */
 	dispose(): void {
 		Logger.info("[ZulongWS] Transport disposed")
 		this.disposed = true
 		this.pendingMessages = []
+		this.stopHeartbeat()
 		if (this.ws) {
 			this.ws.onclose = null
 			this.ws.onerror = null
@@ -235,6 +284,12 @@ export class ZulongWebSocket extends EventEmitter {
 	}
 
 	private handleMessage(msg: ZulongMessage): void {
+		// Handle pong first (heartbeat)
+		if (msg.type === "pong") {
+			this.handlePong()
+			return
+		}
+
 		// Emit typed events that ZulongHandler listens to
 		switch (msg.type) {
 			case "tool_request":
@@ -258,6 +313,9 @@ export class ZulongWebSocket extends EventEmitter {
 			case "session_ack":
 				// Handled in connect()
 				break
+			case "audio_transcript":
+				this.emit("audio_transcript", msg.payload.text || "", msg.payload.is_final || false)
+				break
 			default:
 				this.emit("unknown_message", msg)
 		}
@@ -280,6 +338,58 @@ export class ZulongWebSocket extends EventEmitter {
 				})
 			}
 		}, delay)
+	}
+
+	// ── Heartbeat ─────────────────────────────────────
+
+	private startHeartbeat(): void {
+		this.stopHeartbeat()
+		this.heartbeatInterval = setInterval(() => {
+			if (this.isConnected) {
+				this.sendRaw({
+					msg_id: this.generateMsgId(),
+					type: "ping",
+					session_id: this.sessionId,
+					ts: Date.now() / 1000,
+					payload: {},
+				})
+				this.startPongTimeout()
+			}
+		}, this.HEARTBEAT_INTERVAL)
+	}
+
+	private stopHeartbeat(): void {
+		if (this.heartbeatInterval) {
+			clearInterval(this.heartbeatInterval)
+			this.heartbeatInterval = null
+		}
+		if (this.pongTimeout) {
+			clearTimeout(this.pongTimeout)
+			this.pongTimeout = null
+		}
+	}
+
+	private startPongTimeout(): void {
+		if (this.pongTimeout) {
+			clearTimeout(this.pongTimeout)
+		}
+		this.pongTimeout = setTimeout(() => {
+			this.missedPongs++
+			Logger.warn(`[ZulongWS] Pong timeout, missed ${this.missedPongs}/${this.MAX_MISSED_PONGS}`)
+			if (this.missedPongs >= this.MAX_MISSED_PONGS) {
+				Logger.error("[ZulongWS] Too many missed pongs, closing connection")
+				this.ws?.close()
+			}
+		}, this.PONG_TIMEOUT)
+	}
+
+	private handlePong(): void {
+		if (this.pongTimeout) {
+			clearTimeout(this.pongTimeout)
+			this.pongTimeout = null
+		}
+		this.missedPongs = 0
+		Logger.debug("[ZulongWS] Received pong")
 	}
 
 	private generateMsgId(): string {

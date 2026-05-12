@@ -35,7 +35,8 @@ _GRAPH_BACKUP_DIR = os.path.join(".", "data", "graph_backups")
 # ─── 守卫常量 ─────────────────────────────────────────────
 DUPLICATE_LABEL_THRESHOLD = 0.65   # bigram Jaccard 阈值，>=此值视为重复
 SEMANTIC_DEDUP_THRESHOLD = 0.85    # SequenceMatcher(label+desc) 阈值，>=此值视为语义重复
-MAX_LEAF_NODES = 30                # 叶子节点数量上限
+MAX_LEAF_NODES = 0                 # 叶子节点数量上限（0=不限制，超大项目可达数千节点）
+LEAF_SOFT_WARNING_THRESHOLD = 100  # 软警告阈值，超过此值提示LLM优先执行而非继续拆解
 FUZZY_AUTO_CORRECT_THRESHOLD = 0.7 # 模糊匹配自动纠正阈值
 
 # 中文序号映射
@@ -260,13 +261,91 @@ def set_active_task_graph(tg, graph_id, workspace_dir=None):
         except Exception as e:
             logger.debug(f"[TaskTools] TaskStateManager 同步跳过: {e}")
 
+    # 同步到 MemoryGraph（保持双重持久化一致）
+    if tg is not None:
+        try:
+            from zulong.memory.memory_graph import get_memory_graph
+            from zulong.memory.graph_adapters import TaskGraphAdapter
+            mg = get_memory_graph()
+            if mg is not None:
+                adapter = TaskGraphAdapter()
+                adapter.sync(mg, tg)
+                logger.debug(f"[TaskTools] TaskGraph {graph_id} 已同步到 MemoryGraph")
+        except Exception as e:
+            logger.debug(f"[TaskTools] MemoryGraph 同步跳过: {e}")
 
-def _create_task_workspace(graph_id: str) -> str:
+
+def _create_task_workspace(
+    graph_id: str,
+    project_mode: bool = False,
+    project_name: str = "",
+    project_desc: str = "",
+) -> str:
     """为任务创建独立工作目录，返回绝对路径
 
-    目录结构: ./agent_workspace/{YYYYMMDD}_{HHMMSS}_{graph_id}/
+    Args:
+        graph_id: 任务图 ID
+        project_mode: 是否使用项目模式（创建到统一工作空间）
+        project_name: 项目名称（project_mode=True 时使用）
+        project_desc: 项目描述/任务全文（project_mode=True 时使用）
+
+    Returns:
+        工作目录绝对路径
+
+    目录结构:
+        project_mode=False: ./agent_workspace/{YYYYMMDD}_{HHMMSS}_{graph_id}/
+        project_mode=True:  <workspace_root>/<project_name>/
     """
     from pathlib import Path
+
+    if project_mode and project_name:
+        try:
+            from zulong.workspace.project_registry import get_project_registry
+            from zulong.workspace.vscode_launcher import launch_vscode_window
+
+            registry = get_project_registry()
+            info = registry.create_project(
+                name=project_name,
+                description=project_desc,
+                task_graph_id=graph_id,
+                source="web",
+            )
+
+            # 自动打开 VS Code（如果配置启用）
+            try:
+                from zulong.config.config_manager import get_config
+                if get_config("workspace.auto_open_vscode", True):
+                    launch_vscode_window(info.path)
+            except Exception as e:
+                logger.warning(f"[Workspace] VS Code 启动失败（不影响任务）: {e}")
+
+            # 广播 PROJECT_CREATED 事件到 Web 前端
+            try:
+                from zulong.core.event_bus import get_event_bus
+                from zulong.core.types import EventType, ZulongEvent
+                bus = get_event_bus()
+                if bus:
+                    bus.publish(ZulongEvent(
+                        type=EventType.PROJECT_CREATED,
+                        source="workspace",
+                        payload={
+                            "project_id": info.project_id,
+                            "name": info.name,
+                            "path": info.path,
+                            "task_graph_id": graph_id,
+                            "status": info.status,
+                        },
+                    ))
+            except Exception as e:
+                logger.debug(f"[Workspace] PROJECT_CREATED 事件发送跳过: {e}")
+
+            logger.info(f"[Workspace] 项目模式工作目录: {info.path}")
+            return info.path
+        except Exception as e:
+            logger.error(f"[Workspace] 项目模式创建失败，回退到默认模式: {e}")
+            # 回退到默认行为
+
+    # 默认行为：agent_workspace 下的时间戳目录
     root = "./agent_workspace"
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     folder_name = f"{timestamp}_{graph_id}"
@@ -675,8 +754,13 @@ class TaskCreatePlanTool(BaseTool):
                 desc=title,
             )
 
-            # 创建独立工作目录
-            workspace_dir = _create_task_workspace(graph_id)
+            # 创建独立工作目录（使用项目模式）
+            workspace_dir = _create_task_workspace(
+                graph_id,
+                project_mode=True,
+                project_name=title,
+                project_desc=title,
+            )
             tg.metadata["workspace_dir"] = workspace_dir
 
             set_active_task_graph(tg, graph_id, workspace_dir=workspace_dir)
@@ -746,8 +830,8 @@ class TaskAddNodeTool(BaseTool):
         self.description = (
             "向当前任务图添加一个子节点。"
             "通过 parent_id 指定父节点：顶层模块挂到 'req'，具体步骤挂到模块节点的 ID 下。"
-            "系统自动根据深度确定节点类型（分析/大纲/任务/子任务）。"
-            "建议先创建阶段节点再创建子步骤，保持 2-3 层深度。"
+            "系统自动根据深度确定节点类型（分析/大纲/任务/子任务/微任务）。"
+            "建议先创建阶段节点再创建子步骤，保持 3-5 层深度以支持复杂任务分解。"
         )
 
     def initialize(self) -> bool:
@@ -859,22 +943,23 @@ class TaskAddNodeTool(BaseTool):
                         request_id=request.request_id,
                     )
 
-            # ── 守卫 B: 节点数量上限 ──
+            # ── 守卫 B: 节点数量软警告 ──
             leaf_nodes = tg.get_leaf_nodes()
-            if len(leaf_nodes) >= MAX_LEAF_NODES:
+            leaf_count = len(leaf_nodes)
+            if MAX_LEAF_NODES > 0 and leaf_count >= MAX_LEAF_NODES:
                 uncompleted = [n for n in leaf_nodes if n.status != "completed"][:5]
                 hint_nodes = ", ".join(f"{n.id}({n.label})" for n in uncompleted)
                 logger.info(
-                    f"[task_add_node] 节点数量达上限: {len(leaf_nodes)}/{MAX_LEAF_NODES}"
+                    f"[task_add_node] 节点数量达上限: {leaf_count}/{MAX_LEAF_NODES}"
                 )
                 return self._create_result(
                     success=True,
                     data={
                         "cap_reached": True,
-                        "leaf_count": len(leaf_nodes),
+                        "leaf_count": leaf_count,
                         "max_allowed": MAX_LEAF_NODES,
                         "message": (
-                            f"任务图已有 {len(leaf_nodes)} 个工作项，达到上限。"
+                            f"任务图已有 {leaf_count} 个工作项，达到上限。"
                             f"请调用 task_view_overview 查看现有节点，"
                             f"然后用 task_mark_status 逐个执行。"
                             f"待执行: {hint_nodes}"
@@ -882,6 +967,10 @@ class TaskAddNodeTool(BaseTool):
                     },
                     execution_time=time.time() - start_time,
                     request_id=request.request_id,
+                )
+            elif leaf_count >= LEAF_SOFT_WARNING_THRESHOLD:
+                logger.info(
+                    f"[task_add_node] 节点数量软警告: {leaf_count}/{LEAF_SOFT_WARNING_THRESHOLD}"
                 )
 
             # ── 守卫 C: parent_id 有效性检查 ──
@@ -936,7 +1025,7 @@ class TaskAddNodeTool(BaseTool):
                     "label": label,
                     "parent_id": parent_id,
                     "depth": depth,
-                    "hint": f"可用 parent_id='{node_id}' 为此节点添加子步骤" if depth < 3 else "",
+                    "hint": f"可用 parent_id='{node_id}' 为此节点添加子步骤" if depth < 5 else "",
                 },
                 execution_time=time.time() - start_time,
                 request_id=request.request_id,
@@ -1214,6 +1303,48 @@ class TaskMarkStatusTool(BaseTool):
             },
             "required": ["node_id", "status"],
         }
+
+
+class TaskRollbackNodeTool(BaseTool):
+    """task_rollback_node — 回滚任务节点到pending状态（失败后重试）"""
+
+    def __init__(self):
+        super().__init__(name="task_rollback_node", category=ToolCategory.CUSTOM)
+
+    @property
+    def description(self) -> str:
+        return "回滚任务节点及其子节点到pending状态，清除执行结果，允许重新执行"
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string", "description": "要回滚的节点ID"},
+                "include_children": {
+                    "type": "boolean",
+                    "description": "是否同时回滚所有子节点（默认true）",
+                    "default": True,
+                },
+            },
+            "required": ["node_id"],
+        }
+
+    def execute(self, params: Dict[str, Any]) -> Any:
+        node_id = params.get("node_id", "")
+        include_children = params.get("include_children", True)
+        tg = get_active_task_graph()
+        if not tg:
+            return {"error": "无活跃任务图"}
+        node = tg.get_node(node_id)
+        if not node:
+            return {"error": f"节点 {node_id} 不存在"}
+        if include_children:
+            count = tg.rollback_subtree(node_id)
+            return {"success": True, "rolled_back": count, "message": f"已回滚 {count} 个节点"}
+        else:
+            ok = tg.rollback_node(node_id)
+            return {"success": ok, "message": "节点已回滚" if ok else "节点不可回滚"}
 
 
 class TaskViewOverviewTool(BaseTool):

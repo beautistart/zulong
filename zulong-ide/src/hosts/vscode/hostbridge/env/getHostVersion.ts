@@ -8,8 +8,8 @@ export async function getHostVersion(_: EmptyRequest): Promise<GetHostVersionRes
 	return {
 		platform: vscode.env.appName,
 		version: vscode.version,
-		zulongType: ZulongClient.VSCode,
-		zulongVersion: ExtensionRegistryInfo.version,
+		clineType: ZulongClient.VSCode,
+		clineVersion: ExtensionRegistryInfo.version,
 		// vscode.env.remoteName is a non-empty string when connected to a remote workspace
 		// (e.g. "ssh-remote", "dev-container", "codespaces") and undefined otherwise.
 		// We coerce falsy values (undefined, null, "") to undefined so the proto optional

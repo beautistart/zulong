@@ -27,8 +27,8 @@ export async function buildBasicZulongHeaders(): Promise<Record<string, string>>
 		const host = await HostProvider.env.getHostVersion(EmptyRequest.create({}))
 		headers[ZulongHeaders.PLATFORM] = host.platform || "unknown"
 		headers[ZulongHeaders.PLATFORM_VERSION] = host.version || "unknown"
-		headers[ZulongHeaders.CLIENT_TYPE] = host.zulongType || "unknown"
-		headers[ZulongHeaders.CLIENT_VERSION] = host.zulongVersion || "unknown"
+		headers[ZulongHeaders.CLIENT_TYPE] = host.clineType || "unknown"
+		headers[ZulongHeaders.CLIENT_VERSION] = host.clineVersion || "unknown"
 	} catch (error) {
 		Logger.log("Failed to get IDE/platform info via HostBridge EnvService.getHostVersion", error)
 		headers[ZulongHeaders.PLATFORM] = "unknown"

@@ -28,7 +28,7 @@ try:
 except ImportError:
     Image = None
 
-logger = logging.getLogger(__name__)
+from zulong.ide.video_logger import logger
 
 
 @dataclass

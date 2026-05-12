@@ -1,4 +1,9 @@
 audio:
+  asr:
+    backend: sensevoice
+    device: cuda
+    language: zh
+    model_path: ./models/OpenASR/sensevoice-small-onnx
   microphone:
     channels: 1
     chunk_size: 1024
@@ -11,10 +16,12 @@ audio:
     enabled: true
     sample_rate: 44100
   tts:
-    backend: cosyvoice
+    backend: kokoro
     device: cuda
-    model_path: iic/CosyVoice2-0.5B
-    voice: 中文女声
+    model_path: ./models/hexgrad/Kokoro-82M
+    sample_rate: 24000
+    speed: 1.0
+    voice: zf_xiaoxiao
 environments:
   development:
     llm:
@@ -75,6 +82,40 @@ ide:
   session:
     max_sessions: 50
     ttl_seconds: 7200
+intent_classification:
+  albert:
+    confidence_threshold: 0.6
+    device: cpu
+    labels:
+    - task_code
+    - task_analysis
+    - task_search
+    - task_write
+    - task_read
+    - task_execute
+    - vision_query
+    - vision_control
+    - audio_query
+    - audio_control
+    - command_start
+    - command_stop
+    - command_config
+    - chat
+    - unknown
+    max_length: 128
+    model_name: albert-tiny-chinese
+    model_path: ./models/albert-tiny-chinese
+  backend: albert
+  enabled: true
+voice_intent_classification:
+  enabled: true
+  backend: albert
+  albert:
+    model_path: ./models/albert-tiny-chinese
+    device: cpu
+    max_length: 128
+    confidence_threshold: 0.6
+    head_weights_path: voice_intent_head.pt
 l2_inference:
   backup_model: qwen3.5:cloud
   circuit_breaker:
@@ -114,22 +155,22 @@ l2_inference:
     enable_streaming: true
     enabled: true
     large_project_threshold: 10
-    max_redo_per_subtask: 3
-    max_replan_count: 2
+    max_redo_per_subtask: 5
+    max_replan_count: 3
     reflection_max_tokens: 512
-    subtask_fc_budget: 30
+    subtask_fc_budget: 50
     use_langgraph: true
     use_langgraph_checkpointer: false
-  request_interval: 1.0
+  request_interval: 2.0
   retry:
     backoff_factor: 2.0
     delay: 1.0
     max_attempts: 3
   step_limits:
     enabled: true
-    hard_limit: 100
-    max_fc_turns: 100
-    soft_limit: 50
+    hard_limit: 200
+    max_fc_turns: 200
+    soft_limit: 80
     warning_interval: 10
   task_suspension:
     auto_suspend_on_time_limit: true
@@ -138,9 +179,10 @@ l2_inference:
     max_suspended_tasks: 20
     persistence_path: ./data/suspended_tasks
   timeout:
-    backup: 120
-    core: 600
-    fc_loop: 600
+    backup: 30
+    core: 90
+    fc_loop: 90
+    remote_tool: 600
   visual_keywords_strong:
   - 摄像头
   - 镜头
@@ -215,10 +257,10 @@ llm:
     schedule_policy: lpm
     tp_size: 1
   siliconflow:
-    api_key: sk-aannnlesdgfgwpwwdkobkvrvqjlacmayteudkmfcjlctqddk
+    api_key: sk-fmylzckwftjrirdovmqygassifruqckzjsqzpbmyjrbqivcy
     backend: siliconflow
     base_url: https://api.siliconflow.cn/v1
-    model_id: Qwen/Qwen3.6-27B
+    model_id: deepseek-ai/DeepSeek-V4-Flash
     num_ctx: 131072
   transformer:
     backend: transformer
@@ -253,6 +295,16 @@ memory:
     enabled: true
     max_experiences: 1000
     vector_index_path: ./data/experience_db/vectors.index
+  hybrid_storage:
+    batch_read_size: 100
+    bfs_max_depth: 3
+    bfs_max_nodes: 1000
+    data_dir: ./data/memory_graph_hybrid
+    enable_vector_index: false
+    enabled: true
+    map_size_gb: 10
+    max_active_shards: 3
+    shard_strategy: month
   rag:
     data_dir: ./data/rag
     embedding_dim: 512
@@ -360,3 +412,7 @@ web:
     host: localhost
     port: 8080
     static_dir: ./web/static
+workspace:
+  auto_open_vscode: true
+  root: D:/AI/workspace
+  vscode_command: code

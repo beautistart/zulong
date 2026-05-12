@@ -46,7 +46,7 @@ export async function updateSettingsCli(controller: Controller, request: UpdateS
 				telemetrySetting,
 				yoloModeToggled,
 				useAutoCondense,
-				zulongWebToolsEnabled,
+				clineWebToolsEnabled,
 				worktreesEnabled,
 				subagentsEnabled,
 				focusChainSettings,
@@ -149,11 +149,11 @@ export async function updateSettingsCli(controller: Controller, request: UpdateS
 			}
 
 			// Update Zulong web tools setting (requires telemetry)
-			if (zulongWebToolsEnabled !== undefined) {
+			if (clineWebToolsEnabled !== undefined) {
 				if (controller.task) {
-					telemetryService.captureZulongWebToolsToggle(controller.task.ulid, zulongWebToolsEnabled)
+					telemetryService.captureZulongWebToolsToggle(controller.task.ulid, clineWebToolsEnabled)
 				}
-				controller.stateManager.setGlobalState("zulongWebToolsEnabled", zulongWebToolsEnabled)
+				controller.stateManager.setGlobalState("zulongWebToolsEnabled", clineWebToolsEnabled)
 			}
 
 			// Update worktrees setting
@@ -180,7 +180,7 @@ export async function updateSettingsCli(controller: Controller, request: UpdateS
 
 				const newFocusChainSettings = {
 					enabled: isEnabled,
-					remindZulongInterval: focusChainSettings.remindZulongInterval,
+					remindClineInterval: focusChainSettings.remindClineInterval,
 				}
 				controller.stateManager.setGlobalState("focusChainSettings", newFocusChainSettings)
 

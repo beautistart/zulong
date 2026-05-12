@@ -1,0 +1,68 @@
+# 祖龙 (ZULONG) 系统 Python 依赖
+# 使用 zulong_env/ 虚拟环境 (pip install -r requirements.txt)
+
+# 核心框架
+torch>=2.0.0
+transformers>=4.30.0
+accelerate>=0.20.0
+bitsandbytes>=0.40.0
+
+# 视觉处理
+Pillow>=9.5.0
+opencv-python>=4.7.0
+
+# 自然语言处理
+nltk>=3.8.0
+jieba>=0.42.0
+
+# 向量数据库
+qdrant-client>=1.3.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Web 服务
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+pydantic>=2.0.0
+python-multipart>=0.0.6
+
+# 异步支持
+aiohttp>=3.8.0
+
+# 监控
+prometheus-client>=0.17.0
+psutil>=5.9.0
+pynvml>=11.5.0
+
+# 日志
+python-json-logger>=2.0.0
+
+# 配置
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# 工具
+tqdm>=4.65.0
+requests>=2.31.0
+
+# TTS - Kokoro-82M (主引擎, 超轻量CPU推理)
+kokoro>=0.9.0
+
+# TTS - edge-tts (备选引擎, 云端)
+edge-tts>=6.1.0
+
+# 音频
+pyaudio>=0.2.11
+soundfile>=0.12.0
+
+# ASR - SenseVoice-Small (ONNX GPU, 主引擎)
+funasr>=1.0.0
+onnxruntime-gpu>=1.15.0
+
+# ASR - Whisper (备选 fallback)
+openai-whisper>=20231117
+
+# 测试
+pytest>=7.3.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0

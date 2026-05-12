@@ -20,16 +20,17 @@ import { ApiHandler, ApiHandlerModel, CommonApiHandlerOptions } from "../index"
 import { ApiStream, ApiStreamChunk } from "../transform/stream"
 import { ZulongWebSocket, ZulongToolRequest } from "../transport/zulong-websocket"
 import { Logger } from "@/shared/services/Logger"
+import fs from "fs"
+import path from "path"
 
 export interface ZulongHandlerOptions extends CommonApiHandlerOptions {
 	zulongServerUrl?: string
 }
 
-// Default model info for Zulong backend-managed model
 const ZULONG_MODEL_INFO: ModelInfo = {
 	name: "zulong-agent",
-	maxTokens: 8192,
-	contextWindow: 32768,
+	maxTokens: 16384,
+	contextWindow: 131072,
 	supportsImages: false,
 	supportsPromptCache: false,
 	supportsReasoning: false,
@@ -39,6 +40,7 @@ export class ZulongHandler implements ApiHandler {
 	private options: ZulongHandlerOptions
 	private transport: ZulongWebSocket | null = null
 	private abortController: AbortController | null = null
+	private dynamicModelInfo: ModelInfo = { ...ZULONG_MODEL_INFO }
 
 	constructor(options: ZulongHandlerOptions) {
 		this.options = options
@@ -47,8 +49,13 @@ export class ZulongHandler implements ApiHandler {
 	getModel(): ApiHandlerModel {
 		return {
 			id: "zulong-agent",
-			info: ZULONG_MODEL_INFO,
+			info: this.dynamicModelInfo,
 		}
+	}
+
+	updateModelInfo(updates: Partial<ModelInfo>): void {
+		this.dynamicModelInfo = { ...this.dynamicModelInfo, ...updates }
+		Logger.info(`[ZulongHandler] Model info updated: contextWindow=${this.dynamicModelInfo.contextWindow}, maxTokens=${this.dynamicModelInfo.maxTokens}`)
 	}
 
 	async *createMessage(
@@ -107,6 +114,10 @@ export class ZulongHandler implements ApiHandler {
 		try {
 			await this.transport.connect()
 			Logger.info("[ZulongHandler] Connected to backend")
+
+			this.transport.on("audio_transcript", (text: string, isFinal: boolean) => {
+				Logger.info(`[ZulongHandler] ← audio_transcript: "${text}" (is_final=${isFinal})`)
+			})
 		} catch (err) {
 			Logger.error(`[ZulongHandler] Connection failed: ${err}`)
 			yield {
@@ -176,9 +187,22 @@ export class ZulongHandler implements ApiHandler {
 			pushChunk({ type: "error", error })
 		})
 
+		// P2-15: 监听FC循环状态更新（进度展示）
+		this.transport.on("status_update", (payload: { turn?: number; phase?: string }) => {
+			Logger.info(`[ZulongHandler] \u2190 status_update: turn=${payload.turn} phase=${payload.phase}`)
+			// Push as chunk so the stream loop can check abort flag
+			pushChunk({ type: "status_update", turn: payload.turn, phase: payload.phase })
+		})
+
 		this.transport.on("error", (err: Error) => {
 			Logger.error(`[ZulongHandler] \u2190 transport error: ${err.message}`)
 			pushChunk({ type: "error", error: err.message })
+		})
+
+		this.transport.on("model_info", (info: { contextWindow?: number }) => {
+			if (info.contextWindow && info.contextWindow > 0) {
+				this.updateModelInfo({ contextWindow: info.contextWindow })
+			}
 		})
 
 		this.transport.on("disconnected", (code: number, reason: string) => {
@@ -194,11 +218,24 @@ export class ZulongHandler implements ApiHandler {
 			Logger.info(`[ZulongHandler] \u2192 session_resume (detected prior history), cwd=${cwd}, graph_id=${graphId || "none"}`)
 			this.transport.sendSessionResume(taskText, cwd, systemPrompt, graphId)
 		} else {
-			Logger.info(`[ZulongHandler] \u2192 session_start, cwd=${cwd}`)
-			this.transport.sendSessionStart(taskText, cwd, systemPrompt)
+			// 检测当前 cwd 是否为祖龙项目，提取 project_id
+			let projectId: string | undefined
+			try {
+				const projectJsonPath = path.join(cwd, ".zulong", "project.json")
+				if (fs.existsSync(projectJsonPath)) {
+					const projData = JSON.parse(fs.readFileSync(projectJsonPath, "utf-8"))
+					projectId = projData.project_id
+				}
+			} catch {
+				// 忽略读取失败
+			}
+			Logger.info(`[ZulongHandler] \u2192 session_start, cwd=${cwd}, project_id=${projectId || "none"}`)
+			this.transport.sendSessionStart(taskText, cwd, systemPrompt, projectId)
 		}
 
 		// Yield chunks from the queue
+		const STREAM_TIMEOUT_MS = 5 * 60 * 1000 // 5分钟无数据超时，防止IDE永久卡在"思考中"
+		let lastChunkTime = Date.now()
 		try {
 			while (true) {
 				if (this.abortController?.signal.aborted) {
@@ -208,21 +245,26 @@ export class ZulongHandler implements ApiHandler {
 				}
 
 				if (chunkQueue.length === 0) {
-					// Wait for next chunk
+					// Wait for next chunk with timeout protection
+					const timeoutMs = STREAM_TIMEOUT_MS - (Date.now() - lastChunkTime)
+					if (timeoutMs <= 0) {
+						Logger.error("[ZulongHandler] Stream timeout - no data received, forcing done")
+						pushChunk({ type: "done" })
+						continue
+					}
 					await new Promise<void>((resolve) => {
-						resolveWaiting = resolve
-						// Also resolve on abort
+						let resolved = false
+						const done = () => { if (!resolved) { resolved = true; resolve() } }
+						resolveWaiting = done
 						if (this.abortController) {
-							this.abortController.signal.addEventListener(
-								"abort",
-								() => resolve(),
-								{ once: true },
-							)
+							this.abortController.signal.addEventListener("abort", done, { once: true })
 						}
+						setTimeout(done, timeoutMs)
 					})
 					continue
 				}
 
+				lastChunkTime = Date.now()
 				const chunk = chunkQueue.shift()!
 
 				if ("type" in chunk && chunk.type === "done") {

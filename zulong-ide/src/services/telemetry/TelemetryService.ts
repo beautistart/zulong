@@ -359,7 +359,7 @@ export class TelemetryService {
 			extension_version: extensionVersion,
 			platform: hostVersion.platform || "unknown",
 			platform_version: hostVersion.version || "unknown",
-			zulong_type: hostVersion.zulongType || "unknown",
+			zulong_type: hostVersion.clineType || "unknown",
 			os_type: os.platform(),
 			os_version: os.version(),
 			// `remoteName` is normalized by the host bridge to `undefined` for local workspaces.

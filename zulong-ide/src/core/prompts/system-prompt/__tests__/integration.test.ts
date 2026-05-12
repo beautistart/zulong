@@ -143,7 +143,7 @@ const baseContext: SystemPromptContext = {
 			},
 		],
 	} as unknown as McpHub,
-	focusChainSettings: { enabled: true, remindZulongInterval: 6 },
+	focusChainSettings: { enabled: true, remindClineInterval: 6 },
 	browserSettings: { viewport: { width: 1280, height: 720 } },
 	globalZulongRulesFileInstructions: "Follow global rules",
 	localZulongRulesFileInstructions: "Follow local rules",
@@ -186,7 +186,7 @@ const contextVariations: Array<{ name: string; override: Partial<SystemPromptCon
 	{ name: "basic", override: {} },
 	{ name: "no-browser", override: { supportsBrowserUse: false } },
 	{ name: "no-mcp", override: { mcpHub: { getServers: () => [] } as unknown as McpHub } },
-	{ name: "no-focus-chain", override: { focusChainSettings: { enabled: false, remindZulongInterval: 0 } } },
+	{ name: "no-focus-chain", override: { focusChainSettings: { enabled: false, remindClineInterval: 0 } } },
 ]
 
 const modelTestCases = [

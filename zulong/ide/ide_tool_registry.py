@@ -6,7 +6,10 @@ IDE 工具分类注册表
 - 远程工具 (remote): 暂停 FC 循环，转译为 XML 返回给 IDE 插件 客户端执行
 """
 
+import hashlib
 import logging
+import time
+from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -16,6 +19,7 @@ IDE_REMOTE_TOOLS = {
     "read_file",
     "write_to_file",
     "replace_in_file",
+    "delete_file",
     "execute_command",
     "search_files",
     "list_files",
@@ -37,6 +41,83 @@ _RESUME_EXCLUDED_INTERNAL_TOOLS = {
     "task_create_plan",
     "task_add_node",
 }
+
+
+@dataclass
+class CachedSchema:
+    """缓存的工具Schema"""
+    schema: Dict[str, Any]
+    definition_hash: str
+    created_at: float = field(default_factory=time.time)
+    hit_count: int = 0
+
+
+class SchemaCache:
+    """工具Schema缓存管理器"""
+
+    def __init__(self):
+        self._cache: Dict[str, CachedSchema] = {}
+        self._total_requests = 0
+        self._cache_hits = 0
+
+    @staticmethod
+    def _compute_hash(definition: Any) -> str:
+        """计算工具定义的SHA-256哈希值（取前16位）"""
+        try:
+            content = str(definition)
+            return hashlib.sha256(content.encode()).hexdigest()[:16]
+        except Exception:
+            return ""
+
+    def get(self, tool_name: str, definition: Any) -> Optional[Dict[str, Any]]:
+        """从缓存获取Schema，检查哈希值是否匹配"""
+        self._total_requests += 1
+
+        cached = self._cache.get(tool_name)
+        if not cached:
+            return None
+
+        current_hash = self._compute_hash(definition)
+        if cached.definition_hash != current_hash:
+            del self._cache[tool_name]
+            logger.debug(f"[SchemaCache] 工具 {tool_name} 定义变更，缓存失效")
+            return None
+
+        self._cache_hits += 1
+        cached.hit_count += 1
+        logger.debug(f"[SchemaCache] 命中: {tool_name} (hit_count={cached.hit_count})")
+        return cached.schema
+
+    def set(self, tool_name: str, schema: Dict[str, Any], definition: Any) -> None:
+        """写入Schema缓存"""
+        definition_hash = self._compute_hash(definition)
+        self._cache[tool_name] = CachedSchema(
+            schema=schema,
+            definition_hash=definition_hash,
+        )
+        logger.debug(f"[SchemaCache] 写入: {tool_name}")
+
+    def get_hit_rate(self) -> float:
+        """计算缓存命中率"""
+        if self._total_requests == 0:
+            return 0.0
+        return self._cache_hits / self._total_requests
+
+    def get_stats(self) -> Dict[str, Any]:
+        """返回缓存统计信息"""
+        return {
+            "total_requests": self._total_requests,
+            "cache_hits": self._cache_hits,
+            "hit_rate": f"{self.get_hit_rate():.2%}",
+            "cached_tools": len(self._cache),
+        }
+
+    def clear(self) -> None:
+        """清空缓存"""
+        self._cache.clear()
+        self._total_requests = 0
+        self._cache_hits = 0
+        logger.info("[SchemaCache] 缓存已清空")
 
 # IDE 远程工具的 OpenAI Function Calling Schema
 # 参考 IDE 源码中的 XML 工具定义
@@ -84,6 +165,20 @@ _IDE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "diff": {"type": "string", "description": "SEARCH/REPLACE 格式的替换块"},
                 },
                 "required": ["path", "diff"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_file",
+            "description": "删除指定文件。需谨慎使用，删除后不可恢复。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "要删除的文件路径（相对于工作目录）"},
+                },
+                "required": ["path"],
             },
         },
     },
@@ -220,6 +315,7 @@ class IDEToolRegistry:
             tool_engine: 祖龙 ToolEngine 实例（用于获取内部工具 schema）
         """
         self.tool_engine = tool_engine
+        self._schema_cache = SchemaCache()
 
     def classify(self, tool_name: str) -> Literal["internal", "remote"]:
         """判断工具是内部执行还是远程执行"""
@@ -237,6 +333,23 @@ class IDEToolRegistry:
             f"内部={len(internal)}, 远程={len(remote)}, 总计={len(combined)}"
         )
         return combined
+
+    def update_remote_tool_schema(self, tool_name: str, new_schema: Dict[str, Any]) -> bool:
+        """P2-21: 动态更新远程工具Schema（前端工具定义变更时调用）
+
+        Args:
+            tool_name: 工具名称
+            new_schema: 完整的OpenAI FC schema（含function.name, function.parameters等）
+        """
+        global _IDE_TOOL_SCHEMAS
+        for i, schema in enumerate(_IDE_TOOL_SCHEMAS):
+            func = schema.get("function", {})
+            if func.get("name") == tool_name:
+                _IDE_TOOL_SCHEMAS[i] = new_schema
+                logger.info(f"[IDEToolRegistry] 已更新远程工具Schema: {tool_name}")
+                return True
+        logger.warning(f"[IDEToolRegistry] 未找到远程工具: {tool_name}")
+        return False
 
     def get_combined_tool_definitions_for_intent(
         self, intent: str = "complex"
@@ -282,11 +395,27 @@ class IDEToolRegistry:
             if extra_exclude and name in extra_exclude:
                 logger.info(f"[IDEToolRegistry] RESUME 排除工具: {name}")
                 continue
+
+            # 使用缓存获取schema
+            cached_schema = self._schema_cache.get(name, tool)
+            if cached_schema:
+                tool_definitions.append(cached_schema)
+                continue
+
             try:
                 schema = tool.get_function_schema()
+                self._schema_cache.set(name, schema, tool)
                 tool_definitions.append(schema)
             except Exception as e:
                 logger.warning(f"[IDEToolRegistry] 工具 {name} schema 获取失败: {e}")
+
+        # 追加 TaskGraph CRUD 工具 schema
+        try:
+            from zulong.ide.graph_crud_tools import get_crud_tool_schemas
+            crud_schemas = get_crud_tool_schemas()
+            tool_definitions.extend(crud_schemas)
+        except Exception as e:
+            logger.warning(f"[IDEToolRegistry] CRUD工具schema加载失败: {e}")
 
         return tool_definitions
 
@@ -304,3 +433,7 @@ class IDEToolRegistry:
             and name not in _ZULONG_TOOLS_DISABLED_IN_IDE_MODE
             and name not in IDE_REMOTE_TOOLS
         ]
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """返回Schema缓存统计信息"""
+        return self._schema_cache.get_stats()

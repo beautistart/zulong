@@ -12,7 +12,7 @@ const makeContext = (modelId: string): SystemPromptContext => ({
 	ide: "TestIde",
 	supportsBrowserUse: true,
 	zulongWebToolsEnabled: true,
-	focusChainSettings: { enabled: true, remindZulongInterval: 6 },
+	focusChainSettings: { enabled: true, remindClineInterval: 6 },
 	browserSettings: { viewport: { width: 1280, height: 720 } },
 	isTesting: true,
 	enableNativeToolCalls: true,

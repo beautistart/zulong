@@ -23,8 +23,8 @@ import { Controller } from ".."
  */
 export async function updateSettings(controller: Controller, request: UpdateSettingsRequest): Promise<Empty> {
 	try {
-		if (request.zulongEnv !== undefined) {
-			ZulongEnv.setEnvironment(request.zulongEnv)
+		if (request.clineEnv !== undefined) {
+			ZulongEnv.setEnvironment(request.clineEnv)
 		}
 
 		if (request.apiConfiguration) {
@@ -153,11 +153,11 @@ export async function updateSettings(controller: Controller, request: UpdateSett
 		}
 
 		// Update zulong web tools setting
-		if (request.zulongWebToolsEnabled !== undefined) {
+		if (request.clineWebToolsEnabled !== undefined) {
 			if (controller.task) {
-				telemetryService.captureZulongWebToolsToggle(controller.task.ulid, request.zulongWebToolsEnabled)
+				telemetryService.captureZulongWebToolsToggle(controller.task.ulid, request.clineWebToolsEnabled)
 			}
-			controller.stateManager.setGlobalState("zulongWebToolsEnabled", request.zulongWebToolsEnabled)
+			controller.stateManager.setGlobalState("zulongWebToolsEnabled", request.clineWebToolsEnabled)
 		}
 
 		// Update worktrees setting
@@ -198,7 +198,7 @@ export async function updateSettings(controller: Controller, request: UpdateSett
 
 				const focusChainSettings = {
 					enabled: isEnabled,
-					remindZulongInterval: request.focusChainSettings.remindZulongInterval,
+					remindClineInterval: request.focusChainSettings.remindClineInterval,
 				}
 				controller.stateManager.setGlobalState("focusChainSettings", focusChainSettings)
 

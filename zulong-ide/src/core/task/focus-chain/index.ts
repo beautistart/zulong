@@ -343,7 +343,7 @@ export class FocusChainManager {
 		const userUpdatedList = this.taskState.todoListWasUpdatedByUser
 		// Include when reaching the reminder interval, configured by settings
 		const reachedReminderInterval =
-			this.taskState.apiRequestsSinceLastTodoUpdate >= this.focusChainSettings.remindZulongInterval
+			this.taskState.apiRequestsSinceLastTodoUpdate >= this.focusChainSettings.remindClineInterval
 		// Include on first API request or if list does not exist
 		const isFirstApiRequest = this.taskState.apiRequestCount === 1 && !this.taskState.currentFocusChainChecklist
 		// Include if no list has been created and multiple requests have completed

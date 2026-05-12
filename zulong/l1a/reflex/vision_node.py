@@ -31,8 +31,7 @@ from zulong.l1a.vision_short_term_memory import VisionShortTermMemory
 from zulong.l1a.l1a_config import PROJECT_ROOT, MODEL_ROOT, SHARED_VISION_DIR, VIDEO_BACKTRACK_DIR
 from zulong.models.container import ModelContainer
 from zulong.models.config import ModelID
-
-logger = logging.getLogger(__name__)
+from zulong.ide.video_logger import logger
 
 
 class VisionNode:

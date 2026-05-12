@@ -18,6 +18,8 @@ class L2Status(Enum):
     IDLE = "IDLE"  # 空闲
     BUSY = "BUSY"  # 忙碌
     WAITING = "WAITING"  # 等待间隙（任务未结束，但在等待反馈）
+    PROCESSING = "PROCESSING"  # 处理中（后台复盘任务执行中）
+    ERROR = "ERROR"  # 错误
     UNLOADED = "UNLOADED"  # 卸载
     REVIEW_WAITING = "REVIEW_WAITING"      # 🔥 v3.0 新增：等待用户输入
     REVIEW_ANALYZING = "REVIEW_ANALYZING"  # 🔥 v3.0 新增：分析中
@@ -112,6 +114,9 @@ class EventType(Enum):
     # 🧠 记忆图谱事件类型 (v3.0)
     MEMORY_GRAPH_UPDATED = "MEMORY_GRAPH_UPDATED"  # 图谱已更新
     MEMORY_GRAPH_PRUNED = "MEMORY_GRAPH_PRUNED"    # 图谱已修剪
+
+    # 📁 工作空间/项目事件
+    PROJECT_CREATED = "PROJECT_CREATED"  # 项目已创建（统一工作空间）
 
 
 # 事件优先级

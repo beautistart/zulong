@@ -5,11 +5,10 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-import logging
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-logger = logging.getLogger("GPUOpticalFlow")
+from zulong.ide.video_logger import logger
 
 
 @dataclass

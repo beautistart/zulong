@@ -26,8 +26,7 @@ from datetime import datetime
 
 from zulong.core.types import ZulongEvent, EventType, EventPriority
 from zulong.core.event_bus import event_bus
-
-logger = logging.getLogger(__name__)
+from zulong.ide.video_logger import logger
 
 
 class CameraDevice:

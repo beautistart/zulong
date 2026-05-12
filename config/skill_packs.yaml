@@ -15,7 +15,7 @@ skill_packs:
     enabled: false  # 后续实现
     path: "zulong.skill_packs.packs.ide_coder"
     config:
-      workspace: "/workspace"
+      workspace: "./agent_workspace"
       allowed_languages: ["python", "javascript"]
 
 # 内化评估参数

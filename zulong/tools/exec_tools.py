@@ -17,7 +17,7 @@ from .base import BaseTool, ToolCategory, ToolRequest, ToolResult
 logger = logging.getLogger(__name__)
 
 # 工作区根目录（安全边界）
-WORKSPACE_DIR = os.environ.get("ZULONG_WORKSPACE", "./workspace")
+WORKSPACE_DIR = os.environ.get("ZULONG_WORKSPACE", "./agent_workspace")
 
 # 命令白名单
 COMMAND_WHITELIST = {

@@ -147,6 +147,13 @@ _CHAT_TOOLS = {
     "recall_memory", "read_memory_node", "save_memory_note",
     "discover_related", "navigate_attention", "search_experience",
     "web_search", "search_tools",
+    "delete_memory_node", "delete_memory_edge", "set_importance",
+    "list_memory",
+    # 文件操作
+    "exec_write_file", "exec_run_command",
+    # 代码智能
+    "search_code_symbols", "get_symbol_context", "get_impact_analysis",
+    "index_code_file", "index_project", "analyze_module",
 }
 
 _RESUME_TOOLS = {
@@ -217,7 +224,7 @@ def _build_time_header() -> str:
 
 
 def _inject_memory_context(system_parts: list, user_input: str, rag_manager=None,
-                           attn_stats: dict = None):
+                           attn_stats: dict = None, pre_retrieved_memory: str = None):
     """注入记忆上下文（MemoryGraph 检索 + 思维导航 + 容量感知）
 
     Args:
@@ -225,6 +232,7 @@ def _inject_memory_context(system_parts: list, user_input: str, rag_manager=None
         user_input: 用户输入（用于记忆检索）
         rag_manager: RAGManager 实例
         attn_stats: AttentionWindowManager.stats 字典（可选）
+        pre_retrieved_memory: L1-B 预检索的记忆上下文（如果提供则跳过重复检索）
     """
     # 思维导航注入
     try:
@@ -239,39 +247,62 @@ def _inject_memory_context(system_parts: list, user_input: str, rag_manager=None
         logger.debug(f"[思维导航] 注入跳过: {e}")
 
     # MemoryGraph 记忆检索
-    try:
-        from zulong.memory.memory_graph import get_memory_graph
-        _mg = get_memory_graph()
-        if _mg:
-            if not getattr(_mg, '_rag_manager', None) and rag_manager:
-                _mg.set_rag_manager(rag_manager)
+    # 🎯 优化：如果 L1-B 已预检索记忆，则跳过重复检索
+    if pre_retrieved_memory:
+        logger.info(f"[MemoryGraph] 使用 L1-B 预检索记忆 ({len(pre_retrieved_memory)} 字符)，跳过重复检索")
+        system_parts.append(
+            "\n【记忆上下文】\n" + pre_retrieved_memory + "\n"
+        )
+    else:
+        # 没有预检索记忆，执行 MemoryGraph 检索
+        try:
+            from zulong.memory.memory_graph import get_memory_graph
+            _mg = get_memory_graph()
+            if _mg:
+                if not getattr(_mg, '_rag_manager', None) and rag_manager:
+                    _mg.set_rag_manager(rag_manager)
 
-            def _run_async_bridge(coro):
-                try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    loop = None
-                if loop is not None and loop.is_running():
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                        return pool.submit(asyncio.run, coro).result(timeout=30)
-                else:
-                    return asyncio.run(coro)
+                def _run_async_bridge(coro):
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = None
+                    if loop is not None and loop.is_running():
+                        import concurrent.futures
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                            return pool.submit(asyncio.run, coro).result(timeout=30)
+                    else:
+                        return asyncio.run(coro)
 
-            # 动态 top_k：根据注意力窗口剩余预算调整检索量
-            _top_k = 8  # 默认值
-            if attn_stats:
-                _ratio = attn_stats.get("usage_ratio", 0)
+                # 动态 top_k + BFS扩散深度：根据上下文窗口和剩余预算动态调整
+                _top_k = 8
+                _context_window_size = 131072
+                _usage_ratio = 0.0
+                if attn_stats:
+                    _ratio = attn_stats.get("usage_ratio", 0)
+                    _usage_ratio = _ratio
+                    _context_window_size = attn_stats.get("context_window_size", 131072)
                 if _ratio > 0.8:
-                    _top_k = 3  # 容量紧张，减少检索
+                    _top_k = 3
                 elif _ratio > 0.6:
                     _top_k = 5
-                # else: 保持 8
 
-            mg_results = _run_async_bridge(
-                _mg.retrieve_context(user_input, top_k=_top_k, session_id="")
-            )
+            if hasattr(_mg, 'retrieve_context_dynamic'):
+                mg_results = _run_async_bridge(
+                    _mg.retrieve_context_dynamic(
+                        user_input,
+                        context_window_size=_context_window_size,
+                        usage_ratio=_usage_ratio,
+                        session_id="",
+                    )
+                )
+            else:
+                mg_results = _run_async_bridge(
+                    _mg.retrieve_context(user_input, top_k=_top_k, session_id="")
+                )
             if mg_results:
+                remaining_ratio = max(0.0, 1.0 - _usage_ratio)
+                _content_limit = max(100, min(500, int(500 * remaining_ratio)))
                 memory_sections = []
                 for r in mg_results:
                     ntype = r.get("node_type", "")
@@ -280,30 +311,30 @@ def _inject_memory_context(system_parts: list, user_input: str, rag_manager=None
                     if not content:
                         continue
                     if ntype == "experience":
-                        continue  # EXPERIENCE 由 search_experience FC 工具按需获取
+                        continue
                     elif ntype == "dialogue":
-                        memory_sections.append(f"【历史对话】{content[:200]}")
+                        memory_sections.append(f"【历史对话】{content[:_content_limit]}")
                     elif ntype == "task":
                         status = r.get("metadata", {}).get("status", "")
                         memory_sections.append(
                             f"【相关任务】{label}" + (f"（状态：{status}）" if status else "")
                         )
                     elif ntype == "knowledge":
-                        memory_sections.append(f"【知识参考】{content[:300]}")
+                        memory_sections.append(f"【知识参考】{content[:_content_limit]}")
                     elif ntype == "episode":
-                        memory_sections.append(f"【历史摘要】{content[:200]}")
+                        memory_sections.append(f"【历史摘要】{content[:_content_limit]}")
                     elif ntype in ("person", "concept"):
-                        memory_sections.append(f"【知识参考】{label}: {content[:200]}")
+                        memory_sections.append(f"【知识参考】{label}: {content[:_content_limit]}")
                     else:
-                        memory_sections.append(f"【参考】{content[:200]}")
+                        memory_sections.append(f"【参考】{content[:_content_limit]}")
 
                 if memory_sections:
                     system_parts.append(
                         "\n【记忆上下文】\n" + "\n".join(memory_sections) + "\n"
                     )
                     logger.info(f"[MemoryGraph] 注入 {len(memory_sections)} 条记忆到上下文")
-    except Exception as e:
-        logger.warning(f"[MemoryGraph] 记忆检索失败，降级跳过: {e}")
+        except Exception as e:
+            logger.warning(f"[MemoryGraph] 记忆检索失败，降级跳过: {e}")
 
     # 注意力状态 + 容量仪表盘
     _mem_count = sum(1 for p in system_parts if "【记忆上下文】" in p or "【历史对话】" in p)
@@ -338,7 +369,8 @@ def _inject_memory_context(system_parts: list, user_input: str, rag_manager=None
 
 def _build_chat_prompt(user_input: str, rag_context: Optional[str],
                        visual_context: Optional[str], rag_manager=None,
-                       attn_stats: dict = None) -> list:
+                       attn_stats: dict = None, enable_voice_hint: bool = False,
+                       pre_retrieved_memory: str = None) -> list:
     """构建 CHAT 场景的 messages（~800 token）
 
     不包含任何任务管理规则。仅保留身份、交流风格、RAG、记忆。
@@ -350,6 +382,17 @@ def _build_chat_prompt(user_input: str, rag_context: Optional[str],
         "用自然、友好的口语和用户对话，就像朋友聊天一样。\n"
         "⚠️ 必须使用用户输入的语言回复。用户用中文提问就用中文回答，用英文就用英文回答。\n"
     )
+
+    # 仅在语音交互模式下注入语音功能提示
+    if enable_voice_hint:
+        system_parts.append(
+            "\n【语音功能】\n"
+            "✅ 你拥有 TTS (Text-To-Speech) 语音合成功能，可以直接用语音回复用户。\n"
+            "当用户要求语音回复或使用语音触发词（如'用语音'、'大声点'、'说给我听'）时，\n"
+            "系统会自动将你的文字回复转换为语音播放给用户。\n"
+            "因此，请正常生成回复内容，不要告诉用户你只能用文字交流。\n"
+            "如果用户明确要求语音回复，你可以在文字回复中包含'好的，我用语音回复你'等自然回应。\n"
+        )
 
     if visual_context:
         is_simple_greeting = any(kw in visual_context for kw in ["挥手", "注视", "走近"])
@@ -413,7 +456,7 @@ def _build_chat_prompt(user_input: str, rag_context: Optional[str],
     except Exception:
         pass
 
-    _inject_memory_context(system_parts, user_input, rag_manager, attn_stats)
+    _inject_memory_context(system_parts, user_input, rag_manager, attn_stats, pre_retrieved_memory)
 
     system_parts.append(
         "\n⚠️ 语言要求：必须使用与用户输入相同的语言回复。\n"
@@ -430,7 +473,9 @@ def _build_chat_prompt(user_input: str, rag_context: Optional[str],
 
 def _build_complex_prompt(user_input: str, rag_context: Optional[str],
                           visual_context: Optional[str], scaffold_data: dict,
-                          rag_manager=None, attn_stats: dict = None) -> list:
+                          rag_manager=None, attn_stats: dict = None,
+                          enable_voice_hint: bool = False,
+                          pre_retrieved_memory: str = None) -> list:
     """构建 COMPLEX 场景的 messages（~1500 token）
 
     包含任务创建规则（但不包含恢复规则）。scaffold_data 中包含已创建的任务图信息。
@@ -442,6 +487,17 @@ def _build_complex_prompt(user_input: str, rag_context: Optional[str],
         "用自然、友好的口语和用户对话，就像朋友聊天一样。\n"
         "⚠️ 必须使用用户输入的语言回复。用户用中文提问就用中文回答，用英文就用英文回答。\n"
     )
+
+    # 仅在语音交互模式下注入语音功能提示
+    if enable_voice_hint:
+        system_parts.append(
+            "\n【语音功能】\n"
+            "✅ 你拥有 TTS (Text-To-Speech) 语音合成功能，可以直接用语音回复用户。\n"
+            "当用户要求语音回复或使用语音触发词（如'用语音'、'大声点'、'说给我听'）时，\n"
+            "系统会自动将你的文字回复转换为语音播放给用户。\n"
+            "因此，请正常生成回复内容，不要告诉用户你只能用文字交流。\n"
+            "如果用户明确要求语音回复，你可以在文字回复中包含'好的，我用语音回复你'等自然回应。\n"
+        )
 
     # 任务管理规则（仅创建部分，不包含恢复规则）
     system_parts.append(
@@ -536,7 +592,7 @@ def _build_complex_prompt(user_input: str, rag_context: Optional[str],
     if rag_context:
         system_parts.append(f"\n【参考知识】\n{rag_context}\n")
 
-    _inject_memory_context(system_parts, user_input, rag_manager, attn_stats)
+    _inject_memory_context(system_parts, user_input, rag_manager, attn_stats, pre_retrieved_memory)
 
     system_parts.append(
         "\n⚠️ 语言要求：用户的输入是中文还是英文，你的所有输出就必须用同一种语言，"
@@ -555,7 +611,9 @@ def _build_complex_prompt(user_input: str, rag_context: Optional[str],
 
 def _build_resume_prompt(user_input: str, rag_context: Optional[str],
                          visual_context: Optional[str], scaffold_data: dict,
-                         rag_manager=None, attn_stats: dict = None) -> list:
+                         rag_manager=None, attn_stats: dict = None,
+                         enable_voice_hint: bool = False,
+                         pre_retrieved_memory: str = None) -> list:
     """构建 RESUME 场景的 messages（~1000 token）
 
     包含恢复指令和已恢复的任务信息。物理排除 task_create_plan 和 task_add_node。
@@ -567,6 +625,17 @@ def _build_resume_prompt(user_input: str, rag_context: Optional[str],
         "用自然、友好的口语和用户对话，就像朋友聊天一样。\n"
         "⚠️ 必须使用用户输入的语言回复。用户用中文提问就用中文回答，用英文就用英文回答。\n"
     )
+
+    # 仅在语音交互模式下注入语音功能提示
+    if enable_voice_hint:
+        system_parts.append(
+            "\n【语音功能】\n"
+            "✅ 你拥有 TTS (Text-To-Speech) 语音合成功能，可以直接用语音回复用户。\n"
+            "当用户要求语音回复或使用语音触发词（如'用语音'、'大声点'、'说给我听'）时，\n"
+            "系统会自动将你的文字回复转换为语音播放给用户。\n"
+            "因此，请正常生成回复内容，不要告诉用户你只能用文字交流。\n"
+            "如果用户明确要求语音回复，你可以在文字回复中包含'好的，我用语音回复你'等自然回应。\n"
+        )
 
     # 任务恢复规则
     task_desc = scaffold_data.get("description", "")
@@ -676,7 +745,7 @@ def _build_resume_prompt(user_input: str, rag_context: Optional[str],
     if rag_context:
         system_parts.append(f"\n【参考知识】\n{rag_context}\n")
 
-    _inject_memory_context(system_parts, user_input, rag_manager, attn_stats)
+    _inject_memory_context(system_parts, user_input, rag_manager, attn_stats, pre_retrieved_memory)
 
     system_parts.append(
         "\n⚠️ 语言要求：必须使用与用户输入相同的语言回复，包括工具调用中的所有字段。\n"
@@ -696,7 +765,9 @@ def build_round2_system_prompt(intent_type: IntentType, user_input: str,
                                visual_context: Optional[str],
                                scaffold_data: dict,
                                rag_manager=None,
-                               attn_stats: dict = None) -> list:
+                               attn_stats: dict = None,
+                               voice_mode: str = "TEXT_ONLY",
+                               pre_retrieved_memory: str = None) -> list:
     """构建 Round 2 场景化系统提示词
 
     根据 Round 1 分类结果构建对应场景的 messages 列表。
@@ -709,16 +780,21 @@ def build_round2_system_prompt(intent_type: IntentType, user_input: str,
         scaffold_data: Round 1 scaffold 操作的返回数据
         rag_manager: RAGManager 实例（用于 MemoryGraph 注入）
         attn_stats: AttentionWindowManager.stats 字典（可选，用于容量仪表盘）
+        voice_mode: 语音模式 (TEXT_ONLY / AUTO_TTS / FORCED_TTS)
+        pre_retrieved_memory: L1-B 预检索的记忆上下文（如果提供则跳过重复检索）
 
     Returns:
         构建好的 messages 列表 [{"role": "system", ...}, {"role": "user", ...}]
     """
+    # 只有在语音交互模式下才注入语音功能提示
+    enable_voice_hint = voice_mode in ("AUTO_TTS", "FORCED_TTS")
+
     if intent_type == IntentType.CHAT:
-        return _build_chat_prompt(user_input, rag_context, visual_context, rag_manager, attn_stats)
+        return _build_chat_prompt(user_input, rag_context, visual_context, rag_manager, attn_stats, enable_voice_hint, pre_retrieved_memory)
     elif intent_type == IntentType.COMPLEX:
-        return _build_complex_prompt(user_input, rag_context, visual_context, scaffold_data, rag_manager, attn_stats)
+        return _build_complex_prompt(user_input, rag_context, visual_context, scaffold_data, rag_manager, attn_stats, enable_voice_hint, pre_retrieved_memory)
     elif intent_type == IntentType.RESUME:
-        return _build_resume_prompt(user_input, rag_context, visual_context, scaffold_data, rag_manager, attn_stats)
+        return _build_resume_prompt(user_input, rag_context, visual_context, scaffold_data, rag_manager, attn_stats, enable_voice_hint, pre_retrieved_memory)
     else:
         logger.warning(f"[IntentPrompt] 未知意图类型 {intent_type}，降级为 CHAT")
-        return _build_chat_prompt(user_input, rag_context, visual_context, rag_manager, attn_stats)
+        return _build_chat_prompt(user_input, rag_context, visual_context, rag_manager, attn_stats, enable_voice_hint, pre_retrieved_memory)

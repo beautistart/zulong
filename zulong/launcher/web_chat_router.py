@@ -98,6 +98,7 @@ def _subscribe_eventbus() -> None:
         event_bus.subscribe(EventType.L2_THINKING_STEP, _on_l2_thinking_step, "WebChatRouter")
         event_bus.subscribe(EventType.MEMORY_GRAPH_UPDATED, _on_memory_graph_updated, "WebChatRouter")
         event_bus.subscribe(EventType.ACTION_SPEAK, _on_action_speak, "WebChatRouter")
+        event_bus.subscribe(EventType.PROJECT_CREATED, _on_project_created, "WebChatRouter")
         _eventbus_subscribed = True
         logger.info("[WebChatRouter] 已订阅 EventBus 下行事件")
     except Exception as e:
@@ -189,6 +190,20 @@ def _on_action_speak(event) -> None:
         })
 
 
+def _on_project_created(event) -> None:
+    """项目创建事件 → 通知 Web 前端"""
+    payload = event.payload
+    if payload:
+        _schedule_broadcast({
+            "type": "PROJECT_CREATED",
+            "project_id": payload.get("project_id", ""),
+            "name": payload.get("name", ""),
+            "path": payload.get("path", ""),
+            "task_graph_id": payload.get("task_graph_id", ""),
+            "status": payload.get("status", ""),
+        })
+
+
 # ── 消息处理 ──────────────────────────────────────────
 
 async def _handle_chat_message(ws: WebSocket, data: dict) -> None:
@@ -245,8 +260,15 @@ async def _chat_via_eventbus(text, request_id, session_id, referenced_nodes):
 
 
 async def _chat_via_engine(ws, text, request_id, session_id, referenced_nodes):
-    """IDE 模式: 直接调用 InferenceEngine 流式生成"""
-    from zulong.ide.ide_server import _get_engine
+    """IDE 模式: 直接调用 InferenceEngine 流式生成，同时广播状态与IDE端同步"""
+    from zulong.ide.ide_server import _get_engine, broadcast_monitor_event
+
+    # 广播会话开始状态到IDE端
+    await broadcast_monitor_event("WEB_SESSION_START", {
+        "session_id": session_id,
+        "request_id": request_id,
+        "task_preview": text[:100],
+    })
 
     engine = _get_engine()
     if engine is None:
@@ -260,6 +282,10 @@ async def _chat_via_engine(ws, text, request_id, session_id, referenced_nodes):
     cancel_evt = asyncio.Event()
     if request_id:
         _chat_cancels[request_id] = cancel_evt
+
+    # 同步IDE端的cancel_event到Web端的cancel_evt
+    _ide_cancel_sync_task = asyncio.create_task(
+        _sync_ide_cancel(cancel_evt, session_id))
 
     try:
         system_prompt = "你是祖龙智能助手。请用中文简洁友好地回答用户的问题。"
@@ -344,6 +370,14 @@ async def _chat_via_engine(ws, text, request_id, session_id, referenced_nodes):
                 except Exception:
                     break
 
+        # 广播会话结束状态到IDE端
+        end_status = "cancelled" if cancel_evt.is_set() else "completed"
+        await broadcast_monitor_event("WEB_SESSION_END", {
+            "session_id": session_id,
+            "request_id": request_id,
+            "status": end_status,
+        })
+
         await ws.send_json({
             "type": "CHAT_RESPONSE",
             "text": full_text or "(无输出)",
@@ -363,20 +397,54 @@ async def _chat_via_engine(ws, text, request_id, session_id, referenced_nodes):
             pass
     finally:
         _chat_cancels.pop(request_id, None)
+        _ide_cancel_sync_task.cancel()
+
+
+async def _sync_ide_cancel(cancel_evt: asyncio.Event, session_id: str):
+    """监听IDE端cancel_event并同步到Web端cancel_evt"""
+    while True:
+        await asyncio.sleep(1.0)
+        try:
+            from zulong.ide.ide_server import _sessions
+            # 检查是否有IDE端对应session被取消
+            for sid, sess in _sessions.items():
+                if hasattr(sess, 'cancel_event') and sess.cancel_event.is_set():
+                    cancel_evt.set()
+                    logger.info(f"[WebChatRouter] IDE端取消已同步到Web端")
+                    return
+            # 也检查引擎级中断标志
+            from zulong.l2.inference_engine import get_inference_engine
+            engine = get_inference_engine()
+            if engine and engine._interrupt_flag:
+                cancel_evt.set()
+                logger.info(f"[WebChatRouter] 引擎中断标志已同步到Web端")
+                return
+        except Exception:
+            pass
 
 
 async def _handle_stop_generation(data: dict) -> None:
-    """处理停止生成请求 — 同时触达 IDE FC Runner 的 cancel_event"""
+    """处理停止生成请求 — 支持单session停止和全局停止"""
     request_id = data.get("request_id")
+    session_id = data.get("session_id")
 
-    # ── 核心：直接设置 IDE FC Runner 的 cancel_event ──
+    # ── 核心：设置 IDE FC Runner 的 cancel_event ──
     stopped_sessions = 0
     try:
         from zulong.ide.ide_server import _sessions, _engine_instance
-        for sid, sess in _sessions.items():
-            if hasattr(sess, 'cancel_event') and sess.cancel_event:
+        if session_id:
+            # 停止指定 session
+            sess = _sessions.get(session_id)
+            if sess and hasattr(sess, 'cancel_event') and sess.cancel_event:
                 sess.cancel_event.set()
-                stopped_sessions += 1
+                stopped_sessions = 1
+                logger.info(f"[WebChatRouter] 停止指定 session: {session_id[:12]}")
+        else:
+            # 无 session_id 时停止所有 session
+            for sid, sess in _sessions.items():
+                if hasattr(sess, 'cancel_event') and sess.cancel_event:
+                    sess.cancel_event.set()
+                    stopped_sessions += 1
         if _engine_instance and hasattr(_engine_instance, '_interrupt_flag'):
             _engine_instance._interrupt_flag = True
         if stopped_sessions:
@@ -451,6 +519,254 @@ async def _handle_expand_node(node_id: str, ws: WebSocket) -> None:
         logger.debug(f"[WebChatRouter] 展开节点失败: {e}")
 
 
+# ── 对话会话管理（Web 前端会话栏重建） ─────────────────
+
+async def _handle_list_dialogue_sessions(ws: WebSocket) -> None:
+    """查询 MemoryGraph 中所有对话会话节点，返回会话列表"""
+    try:
+        from zulong.memory.memory_graph import get_memory_graph
+        from zulong.memory.graph_adapters import DialogueAdapter
+
+        mg = get_memory_graph()
+        if not mg:
+            await ws.send_json({
+                "type": "SESSION_LIST",
+                "ts": time.time(),
+                "sessions": [],
+            })
+            return
+
+        sessions = DialogueAdapter.list_sessions(mg)
+        await ws.send_json({
+            "type": "SESSION_LIST",
+            "ts": time.time(),
+            "sessions": sessions,
+        })
+        logger.info(f"[WebChatRouter] SESSION_LIST: 返回 {len(sessions)} 个会话")
+    except Exception as e:
+        logger.error(f"[WebChatRouter] LIST_DIALOGUE_SESSIONS 失败: {e}", exc_info=True)
+        await ws.send_json({
+            "type": "SESSION_LIST",
+            "ts": time.time(),
+            "sessions": [],
+            "error": str(e),
+        })
+
+
+async def _handle_get_session_messages(ws: WebSocket, session_id: str) -> None:
+    """获取指定会话的完整消息列表"""
+    try:
+        from zulong.memory.memory_graph import get_memory_graph
+        from zulong.memory.graph_adapters import DialogueAdapter
+
+        mg = get_memory_graph()
+        if not mg:
+            await ws.send_json({
+                "type": "SESSION_MESSAGES",
+                "ts": time.time(),
+                "session_id": session_id,
+                "messages": [],
+            })
+            return
+
+        messages = DialogueAdapter.get_session_messages(mg, session_id)
+        await ws.send_json({
+            "type": "SESSION_MESSAGES",
+            "ts": time.time(),
+            "session_id": session_id,
+            "messages": messages,
+        })
+        logger.info(
+            f"[WebChatRouter] SESSION_MESSAGES: {session_id} → {len(messages)} 条消息")
+    except Exception as e:
+        logger.error(f"[WebChatRouter] GET_SESSION_MESSAGES 失败: {e}", exc_info=True)
+        await ws.send_json({
+            "type": "SESSION_MESSAGES",
+            "ts": time.time(),
+            "session_id": session_id,
+            "messages": [],
+            "error": str(e),
+        })
+
+
+async def _handle_delete_dialogue_session(ws: WebSocket, session_id: str) -> None:
+    """删除对话会话及其所有子节点（BFS 级联删除），同步清理 TaskGraph/AgentSessionStore/IDESession"""
+    try:
+        from zulong.memory.memory_graph import get_memory_graph
+
+        mg = get_memory_graph()
+        if not mg or not mg.has_node(session_id):
+            await ws.send_json({
+                "type": "SESSION_DELETED",
+                "ts": time.time(),
+                "session_id": session_id,
+                "nodes_deleted": 0,
+                "error": "会话不存在",
+            })
+            return
+
+        # BFS 收集 HIERARCHY 子节点
+        nodes_to_remove = [session_id]
+        queue = [session_id]
+        while queue:
+            parent = queue.pop(0)
+            if hasattr(mg, '_graph') and parent in mg._graph:
+                for child_id in list(mg._graph.successors(parent)):
+                    edge_data = mg._graph[parent].get(child_id, {})
+                    if edge_data.get("edge_type") == "hierarchy":
+                        nodes_to_remove.append(child_id)
+                        queue.append(child_id)
+
+        # 从叶子到根逐个删除 MemoryGraph 节点
+        mg_deleted_count = 0
+        for nid in reversed(nodes_to_remove):
+            if mg.remove_node(nid):
+                mg_deleted_count += 1
+
+        mg.save()
+
+        # 同步清理 TaskGraph 中的任务节点
+        tg_deleted_count = 0
+        for nid in nodes_to_remove:
+            if nid.startswith("task:tg_"):
+                try:
+                    from zulong.tools.task_tools import get_active_task_graph
+                    tg = get_active_task_graph()
+                    if tg and tg.has_node(nid):
+                        tg.remove_node(nid)
+                        tg_deleted_count += 1
+                except Exception:
+                    pass
+            else:
+                try:
+                    from zulong.tools.task_tools import get_active_task_graph
+                    tg = get_active_task_graph()
+                    if tg and tg.has_node(nid):
+                        tg.remove_node(nid)
+                        tg_deleted_count += 1
+                except Exception:
+                    pass
+
+        # 同步清理 AgentSessionStore
+        try:
+            from zulong.ide.ide_server import get_session_store
+            store = get_session_store()
+            store.delete(session_id)
+        except Exception:
+            pass
+
+        # 同步清理 IDE _sessions（如存在）
+        ide_session_cleared = False
+        try:
+            from zulong.ide.ide_server import _sessions
+            if session_id in _sessions:
+                sess = _sessions[session_id]
+                if sess.fc_task and not sess.fc_task.done():
+                    sess.cancel_event.set()
+                    sess.fc_task.cancel()
+                _sessions.pop(session_id, None)
+                ide_session_cleared = True
+        except Exception:
+            pass
+
+        # 广播删除事件
+        try:
+            from zulong.ide.ide_server import broadcast_monitor_event
+            await broadcast_monitor_event("SESSION_DELETED", {
+                "session_id": session_id,
+                "mg_nodes_deleted": mg_deleted_count,
+                "tg_nodes_deleted": tg_deleted_count,
+            })
+        except Exception:
+            pass
+
+        await ws.send_json({
+            "type": "SESSION_DELETED",
+            "ts": time.time(),
+            "session_id": session_id,
+            "nodes_deleted": mg_deleted_count,
+            "tg_nodes_deleted": tg_deleted_count,
+        })
+        logger.info(
+            f"[WebChatRouter] DELETE_DIALOGUE_SESSION: {session_id} → "
+            f"MG删除{mg_deleted_count}个, TG删除{tg_deleted_count}个, "
+            f"IDE session={'已清除' if ide_session_cleared else '无'}")
+    except Exception as e:
+        logger.error(f"[WebChatRouter] DELETE_DIALOGUE_SESSION 失败: {e}", exc_info=True)
+        await ws.send_json({
+            "type": "SESSION_DELETED",
+            "ts": time.time(),
+            "session_id": session_id,
+            "nodes_deleted": 0,
+            "error": str(e),
+        })
+
+
+# ── REST API 端点 ────────────────────────────────────
+
+@router.delete("/api/chat/sessions/{session_id}")
+async def delete_session_rest(session_id: str, cascade: bool = True):
+    """REST API 删除会话（级联清理 MemoryGraph/TaskGraph/AgentSessionStore）"""
+    mg_nodes_deleted = 0
+    tg_nodes_deleted = 0
+
+    if cascade:
+        try:
+            from zulong.memory.memory_graph import get_memory_graph
+            mg = get_memory_graph()
+            if mg and mg.has_node(session_id):
+                nodes_to_remove = [session_id]
+                queue = [session_id]
+                while queue:
+                    parent = queue.pop(0)
+                    if hasattr(mg, '_graph') and parent in mg._graph:
+                        for child_id in list(mg._graph.successors(parent)):
+                            edge_data = mg._graph[parent].get(child_id, {})
+                            if edge_data.get("edge_type") == "hierarchy":
+                                nodes_to_remove.append(child_id)
+                                queue.append(child_id)
+                for nid in reversed(nodes_to_remove):
+                    if mg.remove_node(nid):
+                        mg_nodes_deleted += 1
+                mg.save()
+        except Exception as e:
+            logger.warning(f"[REST] 级联删除MG失败: {e}")
+
+        try:
+            from zulong.tools.task_tools import get_active_task_graph
+            tg = get_active_task_graph()
+            if tg and tg.has_node(session_id):
+                if tg.remove_node(session_id):
+                    tg_nodes_deleted += 1
+        except Exception:
+            pass
+
+        try:
+            from zulong.ide.ide_server import get_session_store
+            store = get_session_store()
+            store.delete(session_id)
+        except Exception:
+            pass
+
+        try:
+            from zulong.ide.ide_server import _sessions
+            if session_id in _sessions:
+                sess = _sessions[session_id]
+                if sess.fc_task and not sess.fc_task.done():
+                    sess.cancel_event.set()
+                    sess.fc_task.cancel()
+                _sessions.pop(session_id, None)
+        except Exception:
+            pass
+
+    return {
+        "session_id": session_id,
+        "deleted": True,
+        "mg_nodes_deleted": mg_nodes_deleted,
+        "tg_nodes_deleted": tg_nodes_deleted,
+    }
+
+
 # ── WebSocket 端点 ────────────────────────────────────
 
 @router.websocket("/ws")
@@ -513,6 +829,14 @@ async def ws_chat_endpoint(ws: WebSocket):
         pass
 
     # 发送 WELCOME
+    # 收集活跃 IDE 会话元数据
+    _active_sessions_info = []
+    try:
+        from zulong.ide.ide_server import _sessions as _ide_sessions
+        _active_sessions_info = [s.to_info_dict() for s in _ide_sessions.values()]
+    except Exception:
+        pass
+
     await ws.send_json({
         "type": "WELCOME",
         "ts": time.time(),
@@ -522,6 +846,7 @@ async def ws_chat_endpoint(ws: WebSocket):
             "task_graph": task_graph_snapshot,
             "memory_graph_stats": memory_graph_stats,
             "code_anchor_stats": code_anchor_stats,
+            "active_sessions": _active_sessions_info,
         },
     })
 
@@ -549,6 +874,22 @@ async def ws_chat_endpoint(ws: WebSocket):
                     node_id = data.get("node_id")
                     if node_id:
                         asyncio.create_task(_handle_expand_node(node_id, ws))
+                elif msg_type == "LIST_DIALOGUE_SESSIONS":
+                    asyncio.create_task(_handle_list_dialogue_sessions(ws))
+                elif msg_type == "GET_SESSION_MESSAGES":
+                    session_id = data.get("session_id")
+                    if session_id:
+                        asyncio.create_task(_handle_get_session_messages(ws, session_id))
+                elif msg_type == "DELETE_DIALOGUE_SESSION":
+                    session_id = data.get("session_id")
+                    if session_id:
+                        asyncio.create_task(_handle_delete_dialogue_session(ws, session_id))
+                elif msg_type == "audio_start":
+                    asyncio.create_task(_handle_audio_start_web(ws, data))
+                elif msg_type == "audio_chunk":
+                    asyncio.create_task(_handle_audio_chunk_web(ws, data))
+                elif msg_type == "audio_end":
+                    asyncio.create_task(_handle_audio_end_web(ws, data))
             except json.JSONDecodeError:
                 pass
             except Exception as e:
@@ -565,3 +906,85 @@ async def ws_chat_endpoint(ws: WebSocket):
         except Exception:
             pass
         logger.info(f"[WebChatRouter] /ws 已断开 (total={len(_ws_clients)})")
+
+
+# ── 音频处理（Web 前端） ────────────────────────────────
+
+async def _handle_audio_start_web(ws: WebSocket, data: dict):
+    """处理 Web 前端音频流开始 - 触发麦克风设备录音"""
+    try:
+        from zulong.l0.devices.microphone_device import MicrophoneDevice
+        from zulong.launcher.app import LauncherApp
+        
+        mic_device = None
+        
+        # 从 LauncherApp 全局单例获取
+        try:
+            import zulong.launcher.app as app_module
+            if hasattr(app_module, '_app_instance') and app_module._app_instance:
+                launcher_app = app_module._app_instance
+                mm = launcher_app.manager
+                mic_module = mm._modules.get("microphone")
+                if mic_module and hasattr(mic_module, '_mic') and mic_module._mic:
+                    mic_device = mic_module._mic
+                    logger.debug("[WebChatRouter] 获取麦克风设备成功")
+        except Exception as e:
+            logger.error(f"[WebChatRouter] 获取麦克风设备失败: {e}")
+        
+        if mic_device and hasattr(mic_device, 'start_manual_recording'):
+            mic_device.start_manual_recording()
+            logger.info(f"[WebChatRouter] 手动录音已启动")
+            await ws.send_json({
+                "type": "audio_start_ack",
+                "ts": time.time(),
+                "payload": {"status": "ok"},
+            })
+        else:
+            logger.warning("[WebChatRouter] 麦克风设备不可用")
+            await ws.send_json({
+                "type": "audio_start_ack",
+                "ts": time.time(),
+                "payload": {"status": "error", "message": "microphone_not_available"},
+            })
+    except Exception as e:
+        logger.error(f"[WebChatRouter] audio_start 失败: {e}")
+
+
+async def _handle_audio_chunk_web(ws: WebSocket, data: dict):
+    """处理 Web 前端音频块 - 已废弃，使用麦克风设备直接采集"""
+    pass
+
+
+async def _handle_audio_end_web(ws: WebSocket, data: dict):
+    """处理 Web 前端音频流结束 - 停止麦克风录音并触发 ASR"""
+    try:
+        from zulong.l0.devices.microphone_device import MicrophoneDevice
+        from zulong.launcher.app import LauncherApp
+        
+        mic_device = None
+        
+        # 从 LauncherApp 获取
+        try:
+            import zulong.launcher.app as app_module
+            if hasattr(app_module, '_app_instance') and app_module._app_instance:
+                launcher_app = app_module._app_instance
+                mm = launcher_app.manager
+                mic_module = mm._modules.get("microphone")
+                if mic_module and hasattr(mic_module, '_mic') and mic_module._mic:
+                    mic_device = mic_module._mic
+                    logger.debug("[WebChatRouter] 获取麦克风设备成功")
+        except Exception as e:
+            logger.error(f"[WebChatRouter] 获取麦克风设备失败: {e}")
+        
+        if mic_device and hasattr(mic_device, 'stop_manual_recording'):
+            try:
+                audio_data = await mic_device.stop_manual_recording()
+                if audio_data is None:
+                    audio_data = b""
+                logger.info(f"[WebChatRouter] 手动录音结束：{len(audio_data)} bytes")
+            except Exception as e:
+                logger.error(f"[WebChatRouter] stop_manual_recording 异常: {e}")
+        else:
+            logger.warning("[WebChatRouter] 麦克风设备不可用或方法不存在")
+    except Exception as e:
+        logger.error(f"[WebChatRouter] audio_end 失败: {e}", exc_info=True)

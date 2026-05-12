@@ -1,8 +1,9 @@
 # File: zulong/plugins/voice/l1d_audio_plugin.py
 """
 L1-D 听觉系统 - 三层注意力音频插件 (增强版)
+ASR: SenseVoice-Small ONNX GPU + Whisper 备选
 
-TSD v1.8 对应:
+TSD v2.x 对应:
 - 2.2.0 三层注意力机制
 - 4.1.2 静默注意实现规范
 - 4.2.1 L1-B 注意力控制器
@@ -10,12 +11,13 @@ TSD v1.8 对应:
 架构:
 - L0_SENSOR: 音频流采集、预加重、低切滤波
 - L1_SILENT: YAMNet 环境音分类、VAD 检测
-- L2_INTERACTIVE: Whisper 语音转文本、事件生成
+- L2_INTERACTIVE: SenseVoice-Small 语音转文本 (ONNX GPU)、事件生成
 
 功能:
 - 三层注意力过滤（无需注意、静默注意、交互注意）
 - YAMNet 环境音分类 (521 类)
-- Whisper 语音转文本
+- SenseVoice-Small 语音转文本 (ONNX GPU, 含情感/事件检测)
+- Whisper 语音转文本 (备选 fallback)
 - WebRTC VAD 高精度语音活动检测
 - 能量和过零率特征提取
 """
@@ -72,7 +74,7 @@ class L1D_AudioPlugin(L1PluginBase):
     职责:
     - L0: 音频采集、预加重、低切滤波
     - L1: YAMNet 分类、VAD 检测、特征提取
-    - L2: Whisper 转录、事件生成
+    - L2: SenseVoice-Small 转录、事件生成
     
     输入 (shared_memory):
     - "audio.raw_frame": 原始音频帧 (np.ndarray, 16kHz, int16)
@@ -83,11 +85,13 @@ class L1D_AudioPlugin(L1PluginBase):
     - "audio.speech_buffer": 语音缓冲区
     - "audio.env_log": 环境噪音日志
     - "audio.sound_label": YAMNet 分类标签
-    - "audio.transcription": Whisper 转录文本
+    - "audio.transcription": SenseVoice/Whisper 转录文本
+    - "audio.emotion": 语音情感 (angry/happy/sad/neutral)
+    - "audio.events": 语音事件 (music/applause/laughter/cry)
     
     输出 (ZulongEvent):
     - AUDIO_SPEECH_START: 语音开始事件
-    - AUDIO_SPEECH_END: 语音结束事件 (包含转录文本)
+    - AUDIO_SPEECH_END: 语音结束事件 (包含转录文本、情感、事件)
     """
     
     @property
@@ -116,6 +120,7 @@ class L1D_AudioPlugin(L1PluginBase):
             self._speech_collect_window = self.get_config("speech_collect_window", 1.5)
             
             self._enable_yamnet = self.get_config("enable_yamnet", True)
+            self._enable_sensevoice = self.get_config("enable_sensevoice", True)
             self._enable_whisper = self.get_config("enable_whisper", True)
             self._yamnet_classify_interval = self.get_config("yamnet_classify_interval", 1.0)
             
@@ -129,27 +134,34 @@ class L1D_AudioPlugin(L1PluginBase):
             
             self._audio_model_container = None
             self._yamnet_enabled = False
+            self._sensevoice_enabled = False
             self._whisper_enabled = False
             
-            if self._enable_yamnet or self._enable_whisper:
+            if self._enable_yamnet or self._enable_sensevoice or self._enable_whisper:
                 try:
                     from zulong.models.audio_model_container import get_audio_model_container
                     self._audio_model_container = get_audio_model_container()
                     
                     success = self._audio_model_container.initialize(
                         enable_yamnet=self._enable_yamnet,
+                        enable_sensevoice=self._enable_sensevoice,
                         enable_whisper=self._enable_whisper,
+                        sensevoice_device="cuda",
                         whisper_device="cuda",
-                        yamnet_device="cuda"
+                        yamnet_device="cuda",
+                        sensevoice_model_path="./models/OpenASR/sensevoice-small-onnx",
                     )
                     
                     self._yamnet_enabled = self._audio_model_container.yamnet_enabled
+                    self._sensevoice_enabled = self._audio_model_container.sensevoice_enabled
                     self._whisper_enabled = self._audio_model_container.whisper_enabled
                     
                     if self._yamnet_enabled:
                         logger.info("   - YAMNet 环境音分类已启用 (GPU)")
+                    if self._sensevoice_enabled:
+                        logger.info("   - SenseVoice-Small 语音转文本已启用 (ONNX GPU)")
                     if self._whisper_enabled:
-                        logger.info("   - Whisper 语音转文本已启用 (GPU)")
+                        logger.info("   - Whisper 语音转文本已启用 (GPU, 备选)")
                         
                 except Exception as e:
                     logger.warning(f"   - 音频模型加载失败: {e}，将使用备用方案")
@@ -179,6 +191,8 @@ class L1D_AudioPlugin(L1PluginBase):
             shared_memory["audio.sound_label"] = ""
             shared_memory["audio.sound_category"] = ""
             shared_memory["audio.transcription"] = ""
+            shared_memory["audio.emotion"] = "neutral"
+            shared_memory["audio.events"] = []
             
             logger.info(f"   - 采样率: {self._sample_rate} Hz")
             logger.info(f"   - 帧时长: {self._frame_duration_ms} ms")
@@ -295,25 +309,40 @@ class L1D_AudioPlugin(L1PluginBase):
                 if self._is_speaking:
                     speech_duration = current_time - self._speech_start_time
                     if speech_duration >= self._min_speech_duration:
-                        transcription = ""
-                        confidence = 0.0
+                        result = None
                         
-                        if self._whisper_enabled and len(self._speech_buffer) > 0:
-                            transcription, confidence = self._transcribe_speech(shared_memory)
+                        if (self._sensevoice_enabled or self._whisper_enabled) and len(self._speech_buffer) > 0:
+                            result = self._transcribe_speech(shared_memory)
                         
-                        logger.info(f"🎙️ [L1D/Audio] 语音结束 (时长={speech_duration:.2f}s, 转录='{transcription}')")
+                        if result:
+                            logger.info(
+                                f"🎙️ [L1D/Audio] 语音结束 "
+                                f"(时长={speech_duration:.2f}s, 转录='{result.text}', "
+                                f"情感={result.emotion}, 事件={result.events})"
+                            )
+                        else:
+                            logger.info(f"🎙️ [L1D/Audio] 语音结束 (时长={speech_duration:.2f}s, 无转录)")
                         
-                        speech_end_event = create_event(
-                            event_type=EventType.USER_SPEECH,
-                            priority=EventPriority.HIGH,
-                            source=self.module_id,
-                            event_subtype="AUDIO_SPEECH_END",
-                            duration=speech_duration,
-                            buffer_frames=len(self._speech_buffer),
-                            transcription=transcription,
-                            confidence=confidence,
-                            timestamp=current_time
-                        )
+                        speech_end_kwargs = {
+                            "event_type": EventType.USER_SPEECH,
+                            "priority": EventPriority.HIGH,
+                            "source": self.module_id,
+                            "event_subtype": "AUDIO_SPEECH_END",
+                            "duration": speech_duration,
+                            "buffer_frames": len(self._speech_buffer),
+                            "timestamp": current_time,
+                        }
+                        if result:
+                            speech_end_kwargs["transcription"] = result.text
+                            speech_end_kwargs["confidence"] = result.confidence
+                            speech_end_kwargs["emotion"] = result.emotion
+                            speech_end_kwargs["events"] = result.events
+                            speech_end_kwargs["asr_engine"] = result.engine
+                        else:
+                            speech_end_kwargs["transcription"] = ""
+                            speech_end_kwargs["confidence"] = 0.0
+                        
+                        speech_end_event = create_event(**speech_end_kwargs)
                         events.append(speech_end_event)
                     
                     self._is_speaking = False
@@ -358,8 +387,13 @@ class L1D_AudioPlugin(L1PluginBase):
         except Exception as e:
             logger.error(f"❌ [YAMNet] 分类失败: {e}")
     
-    def _transcribe_speech(self, shared_memory: Dict) -> tuple:
-        """使用 Whisper 转录语音"""
+    def _transcribe_speech(self, shared_memory: Dict) -> Optional['TranscriptionResult']:
+        """
+        转录语音 (SenseVoice-Small 优先, Whisper 备选)
+        
+        Returns:
+            TranscriptionResult: 转录结果 (含文本、情感、事件、置信度)
+        """
         try:
             audio_segment = np.concatenate(self._speech_buffer)
             
@@ -368,19 +402,24 @@ class L1D_AudioPlugin(L1PluginBase):
             else:
                 audio_float = audio_segment.astype(np.float32)
             
-            text, confidence = self._audio_model_container.transcribe_speech(
-                audio_float, 
+            # 使用 container.transcribe_speech()
+            # 内部自动优先 SenseVoice -> Whisper fallback
+            result = self._audio_model_container.transcribe_speech(
+                audio_float,
                 self._sample_rate,
-                language="zh"
+                language="zh",
             )
             
-            shared_memory["audio.transcription"] = text
+            # 更新 shared_memory
+            shared_memory["audio.transcription"] = result.text
+            shared_memory["audio.emotion"] = result.emotion
+            shared_memory["audio.events"] = result.events
             
-            return text, confidence
+            return result
             
         except Exception as e:
-            logger.error(f"❌ [Whisper] 转录失败: {e}")
-            return "", 0.0
+            logger.error(f"[ASR] 转录失败: {e}")
+            return None
     
     def _low_cut_filter(self, data: np.ndarray, cutoff_hz: float = 80.0) -> np.ndarray:
         """L0: 低切滤波，去除低频噪音"""
@@ -492,6 +531,7 @@ class L1D_AudioPlugin(L1PluginBase):
                 "frame_count": self._frame_count,
                 "last_voice_time": self._last_voice_time,
                 "yamnet_enabled": self._yamnet_enabled,
+                "sensevoice_enabled": self._sensevoice_enabled,
                 "whisper_enabled": self._whisper_enabled
             },
             "last_update": time.time()

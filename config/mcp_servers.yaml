@@ -7,7 +7,7 @@ servers:
   filesystem:
     enabled: false  # 默认禁用，需要时启用
     command: "npx"
-    args: ["-y", "@anthropic/mcp-server-filesystem", "/workspace"]
+    args: ["-y", "@anthropic/mcp-server-filesystem", "./agent_workspace"]
     description: "文件系统操作（读写文件、目录遍历等）"
     timeout: 30
 

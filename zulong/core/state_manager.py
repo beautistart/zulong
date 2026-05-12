@@ -28,13 +28,16 @@ class StateManager:
     def __init__(self):
         """初始化状态管理器"""
         if not hasattr(self, '_initialized'):
-            self._power_state = PowerState.ACTIVE  # 默认活跃状态
-            self._l2_status = L2Status.IDLE  # 默认空闲状态
-            self._active_task_id = None  # 记录当前是否有挂起的任务ID
-            self._interrupt_flag = False  # 中断标志，供 InterruptHandler 使用
+            self._power_state = PowerState.ACTIVE
+            self._l2_status = L2Status.IDLE
+            self._active_task_id = None
+            self._interrupt_flag = False
             self._context = {}
             self._lock = threading.Lock()
+            self._last_activity_time = 0.0
             self._initialized = True
+            import time
+            self.touch_activity()
             logger.info("StateManager initialized")
     
     def get_power_state(self) -> PowerState:
@@ -80,11 +83,13 @@ class StateManager:
             
             logger.info(f"L2 status changed to: {status.name} (Task: {task_id})")
             
-            # 关键逻辑：如果是分段任务完成，进入 WAITING 而不是 IDLE
             if status == L2Status.IDLE and self._active_task_id is not None:
-                # 如果还有任务ID挂着，说明任务没做完，只是暂停了
-                self._l2_status = L2Status.WAITING
-                logger.warning(f"⚠️  Task {self._active_task_id} is suspended. Status forced to WAITING.")
+                if task_id and task_id == self._active_task_id:
+                    self._active_task_id = None
+                    logger.info(f"Task {task_id} completed, cleared active_task_id.")
+                else:
+                    self._l2_status = L2Status.WAITING
+                    logger.warning(f"Task {self._active_task_id} is suspended (different from completed {task_id}). Status forced to WAITING.")
     
     def clear_task(self):
         """当任务彻底完成或取消时调用"""
@@ -163,6 +168,33 @@ class StateManager:
         """清空上下文"""
         with self._lock:
             self._context.clear()
+
+    def touch_activity(self):
+        """更新最后活动时间（任何用户交互或FC循环活动时调用）"""
+        import time
+        with self._lock:
+            self._last_activity_time = time.time()
+
+    def get_idle_seconds(self) -> float:
+        """获取系统空闲秒数"""
+        import time
+        with self._lock:
+            if self._last_activity_time == 0.0:
+                import time as _t
+                self._last_activity_time = _t.time()
+            return time.time() - self._last_activity_time
+
+    def is_system_idle(self, threshold: float = 300.0) -> bool:
+        """判断系统是否空闲（超过阈值时间无用户活动即视为空闲，不检查任务状态）
+        
+        FC循环可能在长时间等待工具结果，此时虽L2=BUSY但无用户活动，
+        应视为空闲以允许节点审批利用等待时间。
+        """
+        import time
+        with self._lock:
+            if self._last_activity_time == 0.0:
+                self._last_activity_time = time.time()
+            return (time.time() - self._last_activity_time) >= threshold
 
 
 # 全局状态管理器实例

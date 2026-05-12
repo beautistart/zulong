@@ -17,4 +17,5 @@ export type HistoryItem = {
 	checkpointManagerErrorMessage?: string
 
 	modelId?: string
+	graphId?: string // TaskGraph ID for session resume
 }

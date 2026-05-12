@@ -75,7 +75,8 @@ class ToolCallCircuitBreaker:
     ACTION_TOOLS = {
         "exec_run_command", "exec_write_file", "task_mark_status",
         "task_add_node", "task_create_plan", "submit_final_answer",
-        "navigate_attention",
+        "navigate_attention", "save_memory_note", "delete_memory_node",
+        "delete_memory_edge", "set_importance",
     }
 
     # 终结类工具（重复调用豁免 _signal_repetition 检测）
@@ -212,17 +213,21 @@ class ToolCallCircuitBreaker:
         )
         self._call_history.append(record)
 
-    def evaluate(self, iteration: int, messages: List[Dict]) -> Tuple[CircuitBreakerState, str]:
-        """综合 6 个信号，返回状态和原因"""
+    def evaluate(self, iteration: int, messages: List[Dict],
+                 attn_usage_ratio: float = -1.0) -> Tuple[CircuitBreakerState, str]:
+        """综合 6 个信号，返回状态和原因
+
+        Args:
+            attn_usage_ratio: AttentionWindow.usage_ratio，若>=0则作为上下文压力信号源
+        """
         if not self.enabled:
-            # 禁用时全部返回 GREEN，等价于旧版行为
             return CircuitBreakerState.GREEN, ""
 
         signals: List[Tuple[CircuitBreakerState, str]] = [
             self._signal_repetition(),
             self._signal_pattern_loop(),
             self._signal_info_gain(),
-            self._signal_context_pressure(messages),
+            self._signal_context_pressure(messages, attn_usage_ratio=attn_usage_ratio),
             self._signal_elapsed_time(),
             self._signal_no_progress(),
         ]
@@ -358,15 +363,25 @@ class ToolCallCircuitBreaker:
 
         return CircuitBreakerState.GREEN, ""
 
-    def _signal_context_pressure(self, messages: List[Dict]) -> Tuple[CircuitBreakerState, str]:
-        """信号 4: 上下文窗口压力"""
-        total_tokens = self._estimate_messages_tokens(messages)
-        ratio = total_tokens / self._context_window_size if self._context_window_size > 0 else 0
+    def _signal_context_pressure(self, messages: List[Dict], attn_usage_ratio: float = -1.0) -> Tuple[CircuitBreakerState, str]:
+        """信号 4: 上下文窗口压力
+
+        优先使用 AttentionWindow.usage_ratio 作为统一压力源，
+        避免与 AttentionWindow 判断不一致。
+        回退: 若 attn_usage_ratio < 0，则独立估算 tokens 比率。
+        """
+        if attn_usage_ratio >= 0:
+            ratio = attn_usage_ratio
+            source = "AW.usage_ratio"
+        else:
+            total_tokens = self._estimate_messages_tokens(messages)
+            ratio = total_tokens / self._context_window_size if self._context_window_size > 0 else 0
+            source = f"独立估算({total_tokens}t/{self._context_window_size})"
 
         if ratio >= self._context_red_ratio:
-            return CircuitBreakerState.RED, f"上下文窗口压力过高: {ratio:.0%} (≥{self._context_red_ratio:.0%})，约 {total_tokens} tokens"
+            return CircuitBreakerState.RED, f"上下文窗口压力过高: {ratio:.0%} (≥{self._context_red_ratio:.0%}) [{source}]"
         if ratio >= self._context_yellow_ratio:
-            return CircuitBreakerState.YELLOW, f"上下文窗口压力警告: {ratio:.0%} (≥{self._context_yellow_ratio:.0%})，约 {total_tokens} tokens"
+            return CircuitBreakerState.YELLOW, f"上下文窗口压力警告: {ratio:.0%} (≥{self._context_yellow_ratio:.0%}) [{source}]"
 
         return CircuitBreakerState.GREEN, ""
 

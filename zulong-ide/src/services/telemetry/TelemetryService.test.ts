@@ -65,13 +65,13 @@ describe("Telemetry system is abstracted and can easily switch between providers
 			hostVersionStub.onFirstCall().resolves({
 				platform: "VS Code",
 				version: "1.103.0",
-				zulongType: "VSCode Extension",
+				clineType: "VSCode Extension",
 				remoteName: "ssh-remote",
 			})
 			hostVersionStub.onSecondCall().resolves({
 				platform: "VS Code",
 				version: "1.103.0",
-				zulongType: "VSCode Extension",
+				clineType: "VSCode Extension",
 			})
 			createProvidersStub.onFirstCall().resolves([remoteProvider])
 			createProvidersStub.onSecondCall().resolves([localProvider])

@@ -1,6 +1,8 @@
 import { WebviewProvider } from "./core/webview"
 import "./utils/path" // necessary to have access to String.prototype.toPosix
 
+import fs from "fs/promises"
+import path from "path"
 import { HostProvider } from "@/hosts/host-provider"
 import { Logger } from "@/shared/services/Logger"
 import type { StorageContext } from "@/shared/storage/storage-context"
@@ -67,6 +69,8 @@ export async function initialize(storageContext: StorageContext): Promise<Webvie
 	showVersionUpdateAnnouncement(stateManager)
 	// Check if this workspace was opened from worktree quick launch
 	await checkWorktreeAutoOpen(stateManager)
+	// Check if this workspace is a Zulong project pending execution (auto-start)
+	checkZulongProjectAutoStart() // non-blocking, uses setTimeout internally
 
 	// =============== Background sync and cleanup tasks ===============
 	// Use remote config blobStoreConfig if available, otherwise fall back to env vars
@@ -144,6 +148,69 @@ async function checkWorktreeAutoOpen(stateManager: StateManager): Promise<void> 
 		}
 	} catch (error) {
 		Logger.error("Error checking worktree auto-open", error)
+	}
+}
+
+/**
+ * 检测当前工作区是否为祖龙项目（含 .zulong/project.json 且 status 为 pending_execution）。
+ * 如果是，自动打开侧边栏并启动任务执行。
+ */
+async function checkZulongProjectAutoStart(): Promise<void> {
+	try {
+		const workspacePaths = (await HostProvider.workspace.getWorkspacePaths({})).paths
+		if (workspacePaths.length === 0) {
+			return
+		}
+
+		const currentPath = workspacePaths[0]
+		const projectJsonPath = path.join(currentPath, ".zulong", "project.json")
+
+		// 检查 .zulong/project.json 是否存在
+		try {
+			await fs.access(projectJsonPath)
+		} catch {
+			return // 文件不存在，非项目工作区
+		}
+
+		// 读取项目配置
+		const content = await fs.readFile(projectJsonPath, "utf-8")
+		const projectInfo = JSON.parse(content)
+
+		// 仅在 pending_execution 状态时自动启动
+		if (projectInfo.status !== "pending_execution") {
+			return
+		}
+
+		const taskDescription = projectInfo.task_description || projectInfo.description || projectInfo.name || ""
+		if (!taskDescription) {
+			Logger.log("[ZulongProject] project.json 中缺少任务描述，跳过自动启动")
+			return
+		}
+
+		Logger.log(`[ZulongProject] 检测到待执行项目: ${projectInfo.name}, 自动启动任务...`)
+
+		// 更新状态为 executing 防止重复触发
+		projectInfo.status = "executing"
+		projectInfo.updated_at = new Date().toISOString()
+		await fs.writeFile(projectJsonPath, JSON.stringify(projectInfo, null, 2), "utf-8")
+
+		// 打开侧边栏
+		await HostProvider.workspace.openZulongSidebarPanel({})
+
+		// 延迟确保 webview 已经就绪后再 initTask
+		setTimeout(async () => {
+			try {
+				const instance = WebviewProvider.getInstance()
+				if (instance && instance.controller) {
+					await instance.controller.initTask(taskDescription)
+					Logger.log(`[ZulongProject] 任务已自动启动: ${taskDescription.substring(0, 100)}`)
+				}
+			} catch (err) {
+				Logger.error("[ZulongProject] 自动启动任务失败", err)
+			}
+		}, 3000)
+	} catch (error) {
+		Logger.error("[ZulongProject] 检查项目自动启动出错", error)
 	}
 }
 

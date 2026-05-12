@@ -1543,6 +1543,15 @@ export class Task {
 			// can properly detect the abort state
 			this.taskState.abort = true
 
+			// Immediately abort the API handler to send user_cancel to backend
+			// Without this, the WebSocket cancel message is never sent when
+			// the stream loop is blocked waiting for nextChunk()
+			try {
+				this.api.abort?.()
+			} catch (e) {
+				Logger.error("Failed to abort API handler during task abort", e)
+			}
+
 			// PHASE 3: Cancel any running hook execution
 			const activeHook = await this.getActiveHookExecution()
 			if (activeHook) {
@@ -1873,7 +1882,7 @@ export class Task {
 		const providerInfo = this.getCurrentProviderInfo()
 		const host = await HostProvider.env.getHostVersion({})
 		const ide = host?.platform || "Unknown"
-		const isCliEnvironment = host.zulongType === ZulongClient.Cli
+		const isCliEnvironment = host.clineType === ZulongClient.Cli
 		const browserSettings = this.stateManager.getGlobalSettingsKey("browserSettings")
 		const disableBrowserTool = browserSettings.disableToolUse ?? false
 		// zulong browser tool uses image recognition for navigation (requires model image support).

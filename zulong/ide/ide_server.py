@@ -47,6 +47,13 @@ if not any(isinstance(h, logging.handlers.RotatingFileHandler) for h in _root.ha
     logger.info(f"[ZulongIDE] 日志文件: {os.path.abspath(_LOG_FILE)}")
 
 app = FastAPI(title="Zulong IDE Server")
+_main_loop: Optional[asyncio.AbstractEventLoop] = None
+
+from zulong.ide.ide_session import AgentSessionStore
+_global_session_store = AgentSessionStore()
+
+def get_session_store() -> AgentSessionStore:
+    return _global_session_store
 
 # IDE 路由器 — 可独立使用或由 Launcher 挂载到其 FastAPI app 上
 ide_router = APIRouter()
@@ -71,6 +78,21 @@ class IDESession:
         self.fc_task: Optional[asyncio.Task] = None
         # Runner 实例（FC 循环期间持续存活）
         self.runner = None
+        # 会话元数据（任务-项目关联）
+        self.cwd: Optional[str] = None
+        self.project_id: Optional[str] = None
+        self.task_graph_id: Optional[str] = None
+
+    def to_info_dict(self) -> Dict[str, Any]:
+        """序列化会话元数据（用于 REST API / WELCOME 消息）"""
+        return {
+            "session_id": self.session_id,
+            "cwd": self.cwd,
+            "project_id": self.project_id,
+            "task_graph_id": self.task_graph_id,
+            "created_at": self.created_at,
+            "has_fc_task": self.fc_task is not None and not self.fc_task.done(),
+        }
 
     async def send_msg(self, msg_type: str, payload: Dict[str, Any]) -> None:
         """向插件发送消息"""
@@ -95,19 +117,24 @@ async def broadcast_monitor_event(event_type: str, payload: dict) -> None:
     """向所有 Web 监控连接广播事件（fire-and-forget）"""
     global _monitor_connections
     if not _monitor_connections:
+        logger.debug(f"[Monitor] broadcast_monitor_event: {event_type}, 无监控连接")
         return
     msg = {
         "type": event_type,
         "ts": time.time(),
         "payload": payload,
     }
+    sent_count = 0
     dead: Set[WebSocket] = set()
     for ws in list(_monitor_connections):
         try:
             await ws.send_json(msg)
+            sent_count += 1
         except Exception:
             dead.add(ws)
     _monitor_connections -= dead
+    if sent_count > 0:
+        logger.info(f"[Monitor] broadcast {event_type} → {sent_count} 个监控连接")
 
 
 # ── 消息处理 ──────────────────────────────────────────
@@ -122,6 +149,29 @@ async def _handle_session_start(session: IDESession, payload: Dict) -> None:
         return
 
     logger.info(f"[ZulongIDE] session_start: task={task_text[:100]}, cwd={cwd}")
+
+    # 检测项目模式：如果 cwd 下存在 .zulong/project.json，更新项目状态为 executing
+    _detected_project_id = None
+    _detected_task_graph_id = None
+    _project_json_path = os.path.join(cwd, ".zulong", "project.json")
+    if os.path.isfile(_project_json_path):
+        try:
+            from zulong.workspace.project_registry import get_project_registry
+            _registry = get_project_registry()
+            _proj = _registry.get_project_by_path(cwd)
+            if _proj:
+                _detected_project_id = _proj.project_id
+                _detected_task_graph_id = _proj.task_graph_id
+                if _proj.status == "pending_execution":
+                    _registry.update_project_status(_proj.project_id, "executing")
+                    logger.info(f"[ZulongIDE] 项目 {_proj.project_id} 状态更新为 executing")
+        except Exception as _e:
+            logger.debug(f"[ZulongIDE] 项目状态更新跳过: {_e}")
+
+    # 设置会话元数据（供 Web 监控和 REST API 使用）
+    session.cwd = cwd
+    session.project_id = _detected_project_id
+    session.task_graph_id = _detected_task_graph_id
 
     # 如果有正在运行的 FC 循环，先取消
     if session.fc_task and not session.fc_task.done():
@@ -154,6 +204,8 @@ async def _handle_session_start(session: IDESession, payload: Dict) -> None:
         "task_preview": _clean_task[:200],
         "task_title": _clean_task[:40],
         "cwd": cwd,
+        "project_id": _detected_project_id,
+        "task_graph_id": _detected_task_graph_id,
     })
 
 
@@ -180,6 +232,76 @@ async def _handle_user_cancel(session: IDESession, _payload: Dict) -> None:
     """处理用户取消"""
     logger.info(f"[ZulongIDE] user_cancel: session={session.session_id[:12]}")
     session.cancel_event.set()
+    # 同步设置 engine._interrupt_flag，确保所有取消检查路径都生效
+    try:
+        from zulong.l2.inference_engine import get_inference_engine
+        engine = get_inference_engine()
+        if engine:
+            engine._interrupt_flag = True
+            logger.info("[ZulongIDE] user_cancel: engine._interrupt_flag 已设置")
+    except Exception as e:
+        logger.warning(f"[ZulongIDE] user_cancel: 设置 interrupt_flag 失败: {e}")
+    # 广播取消状态到Web端
+    await broadcast_monitor_event("IDE_SESSION_CANCEL", {
+        "session_id": session.session_id,
+    })
+
+
+async def _handle_ping(session: IDESession, _payload: Dict) -> None:
+    """处理心跳ping消息，立即返回pong"""
+    pong = {
+        "msg_id": uuid.uuid4().hex[:12],
+        "type": "pong",
+        "session_id": session.session_id,
+        "ts": time.time(),
+        "payload": {},
+    }
+    await session.ws.send_json(pong)
+
+
+async def _handle_audio_start(session: IDESession, _payload: Dict) -> None:
+    """处理音频流开始"""
+    from zulong.ide.audio_handler import handle_audio_start
+    result = await handle_audio_start(session.session_id)
+    if result:
+        msg = {
+            "msg_id": uuid.uuid4().hex[:12],
+            "type": "audio_start_ack",
+            "session_id": session.session_id,
+            "ts": time.time(),
+            "payload": result,
+        }
+        await session.ws.send_json(msg)
+
+
+async def _handle_audio_chunk(session: IDESession, payload: Dict) -> None:
+    """处理音频块,执行实时转录"""
+    from zulong.ide.audio_handler import handle_audio_chunk
+    result = await handle_audio_chunk(session.session_id, payload)
+    if result and result.get("text"):
+        msg = {
+            "msg_id": uuid.uuid4().hex[:12],
+            "type": "audio_transcript",
+            "session_id": session.session_id,
+            "ts": time.time(),
+            "payload": result,
+        }
+        await session.ws.send_json(msg)
+
+
+async def _handle_audio_end(session: IDESession, _payload: Dict) -> None:
+    """处理音频流结束,返回最终转录结果"""
+    from zulong.ide.audio_handler import handle_audio_end
+    result = await handle_audio_end(session.session_id)
+    if result:
+        msg = {
+            "msg_id": uuid.uuid4().hex[:12],
+            "type": "audio_transcript",
+            "session_id": session.session_id,
+            "ts": time.time(),
+            "payload": result,
+        }
+        await session.ws.send_json(msg)
 
 
 def _load_graph_deterministic(graph_id: str) -> bool:
@@ -235,6 +357,21 @@ async def _handle_session_resume(session: IDESession, payload: Dict) -> None:
 
     logger.info(f"[ZulongIDE] session_resume: task={task_text[:100]}")
 
+    # 通知 Web 前端：任务恢复（在已有会话中继续，而非新建窗口）
+    try:
+        from zulong.tools.task_tools import _active_graph_id
+        await broadcast_monitor_event("IDE_SESSION_START", {
+            "session_id": session.session_id,
+            "task_preview": task_text[:200],
+            "task_title": ("恢复: " + task_text[:33]) if len(task_text) > 33 else ("恢复: " + task_text),
+            "cwd": cwd,
+            "project_id": None,
+            "task_graph_id": graph_id or _active_graph_id,
+            "is_resume": True,
+        })
+    except Exception:
+        pass
+
     # 如果有正在运行的 FC 循环，先取消
     if session.fc_task and not session.fc_task.done():
         session.cancel_event.set()
@@ -280,6 +417,10 @@ _MESSAGE_HANDLERS = {
     "session_resume": _handle_session_resume,
     "tool_result": _handle_tool_result,
     "user_cancel": _handle_user_cancel,
+    "ping": _handle_ping,
+    "audio_start": _handle_audio_start,
+    "audio_chunk": _handle_audio_chunk,
+    "audio_end": _handle_audio_end,
 }
 
 
@@ -428,6 +569,7 @@ async def _run_fc_loop(
         runner = IDEFCRunner(engine, ide_session, tool_registry)
         runner.cwd = cwd  # 保存工作目录，供 CRG 自动锚定读取文件
         runner.force_graph_id = force_graph_id  # 确定性恢复锚点
+        runner.ide_session = session  # WS层IDESession引用，供 _notify_session_linked 使用
         session.runner = runner
 
         # 注入 TaskGraph Web 广播回调
@@ -445,6 +587,12 @@ async def _run_fc_loop(
 
         await session.send_msg("status_update", {"turn": 0, "phase": "running"})
 
+        try:
+            from zulong.core.state_manager import state_manager
+            state_manager.touch_activity()
+        except Exception:
+            pass
+
         # 运行异步 FC 循环
         result = await runner.run_loop_async(
             messages=messages,
@@ -453,17 +601,28 @@ async def _run_fc_loop(
             cancel_event=session.cancel_event,
         )
 
-        # FC 循环完成（task_complete 已在 FC Runner 内部发送，此处仅做兜底）
-        if result and result.text_response:
-            try:
-                await session.send_msg("task_complete", {"result": result.text_response})
-            except Exception:
-                pass  # WS 可能已断开，FC Runner 已提前发送过
-        else:
-            try:
-                await session.send_msg("task_complete", {"result": "(任务完成，无输出)"})
-            except Exception:
-                pass
+        # FC 循环完成 — 根据终止原因发送 task_complete 或 task_error
+        _reason = getattr(result, "reason", None) or "done"
+        _completion_result = (result.text_response if result and result.text_response
+                              else "(任务完成，无输出)")
+        _is_error = _reason not in ("done", None)
+        _msg_type = "task_error" if _is_error else "task_complete"
+        _msg_payload = ({"error": _completion_result} if _is_error
+                        else {"result": _completion_result})
+        try:
+            await session.send_msg(_msg_type, _msg_payload)
+        except Exception:
+            pass
+        # 兜底：直接通过WS发送，防止队列消费者已退出导致消息丢失
+        try:
+            await session.ws.send_json({
+                "type": _msg_type,
+                "session_id": session.session_id,
+                "payload": _msg_payload,
+            })
+            logger.info(f"[ZulongIDE] 兜底WS直发成功: type={_msg_type}, session={session.session_id[:12]}")
+        except Exception as e:
+            logger.warning(f"[ZulongIDE] 兜底WS直发失败: type={_msg_type}, error={e}")
 
         # Web 监控: IDE 会话结束
         await broadcast_monitor_event("IDE_SESSION_END", {
@@ -471,15 +630,38 @@ async def _run_fc_loop(
 
     except asyncio.CancelledError:
         logger.info(f"[ZulongIDE] FC 循环被取消: session={session.session_id[:12]}")
-        await session.send_msg("task_error", {"error": "任务已取消"})
+        try:
+            await session.send_msg("task_error", {"error": "任务已取消"})
+        except Exception:
+            pass
+        try:
+            await session.ws.send_json({
+                "type": "task_error",
+                "session_id": session.session_id,
+                "payload": {"error": "任务已取消"},
+            })
+        except Exception:
+            pass
         await broadcast_monitor_event("IDE_SESSION_END", {
             "session_id": session.session_id, "status": "cancelled"})
     except Exception as e:
         logger.error(f"[ZulongIDE] FC 循环异常: {e}", exc_info=True)
-        await session.send_msg("task_error", {"error": str(e)})
+        error_msg = str(e)[:500]
+        try:
+            await session.send_msg("task_error", {"error": error_msg})
+        except Exception:
+            pass
+        try:
+            await session.ws.send_json({
+                "type": "task_error",
+                "session_id": session.session_id,
+                "payload": {"error": error_msg},
+            })
+        except Exception:
+            pass
         await broadcast_monitor_event("IDE_SESSION_END", {
             "session_id": session.session_id, "status": "error",
-            "error": str(e)[:200]})
+            "error": error_msg[:200]})
 
 
 def _build_initial_messages(
@@ -602,13 +784,24 @@ async def websocket_endpoint(ws: WebSocket):
     _sessions[session_id] = session
     logger.info(f"[ZulongIDE] WebSocket 已连接: session={session_id[:12]}")
 
-    # 发送 session_ack
+    # 发送 session_ack (包含后端模型上下文窗口信息)
+    _context_window_size = 131072
+    try:
+        from zulong.l2.inference_engine import InferenceEngine
+        _engine = InferenceEngine.get_instance()
+        if _engine and getattr(_engine, "_context_window_size", 0) > 0:
+            _context_window_size = _engine._context_window_size
+    except Exception:
+        pass
     ack = {
         "msg_id": uuid.uuid4().hex[:12],
         "type": "session_ack",
         "session_id": session_id,
         "ts": time.time(),
-        "payload": {"session_id": session_id},
+        "payload": {
+            "session_id": session_id,
+            "context_window_size": _context_window_size,
+        },
     }
     await ws.send_json(ack)
 
@@ -618,6 +811,11 @@ async def websocket_endpoint(ws: WebSocket):
     try:
         while True:
             raw = await ws.receive_text()
+            try:
+                from zulong.core.state_manager import state_manager
+                state_manager.touch_activity()
+            except Exception:
+                pass
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
@@ -642,7 +840,11 @@ async def websocket_endpoint(ws: WebSocket):
         sender_task.cancel()
         if session.fc_task and not session.fc_task.done():
             session.cancel_event.set()
-            session.fc_task.cancel()
+            # 给FC任务一个短窗口完成收尾（如发送task_complete），而非立即取消
+            try:
+                await asyncio.wait_for(session.fc_task, timeout=3.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                session.fc_task.cancel()
         _sessions.pop(session_id, None)
         logger.info(f"[ZulongIDE] 会话清理完成: session={session_id[:12]}")
 
@@ -656,6 +858,20 @@ async def _outbound_sender(session: IDESession):
                 await session.ws.send_json(msg)
             except Exception as e:
                 logger.warning(f"[ZulongIDE] 发送失败: {e}")
+                # WS断开时，尝试排空队列中的关键消息（task_error/task_complete）
+                # 通过直接发送确保IDE不会卡在"思考中"状态
+                remaining = [msg]
+                while not session.outbound_queue.empty():
+                    try:
+                        remaining.append(session.outbound_queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                for m in remaining:
+                    if m.get("type") in ("task_error", "task_complete"):
+                        try:
+                            await session.ws.send_json(m)
+                        except Exception:
+                            pass
                 break
     except asyncio.CancelledError:
         pass
@@ -670,6 +886,18 @@ async def health():
         "active_sessions": len(_sessions),
         "engine_ready": _engine_instance is not None,
     }
+
+
+@ide_router.get("/api/ide/sessions")
+async def get_active_ide_sessions():
+    """查询所有活跃 IDE 会话及其任务/项目关联"""
+    now = time.time()
+    sessions = []
+    for s in _sessions.values():
+        info = s.to_info_dict()
+        info["uptime_seconds"] = round(now - s.created_at, 1)
+        sessions.append(info)
+    return {"sessions": sessions, "count": len(sessions)}
 
 
 # ── Web 监控前端 ──────────────────────────────────────
@@ -735,7 +963,7 @@ async def monitor_websocket(ws: WebSocket):
         "type": "WELCOME",
         "ts": time.time(),
         "payload": {
-            "active_sessions": list(_sessions.keys()),
+            "active_sessions": [s.to_info_dict() for s in _sessions.values()],
             "engine_ready": _engine_instance is not None,
             "task_graph": task_graph_snapshot,
             "memory_graph_stats": memory_graph_stats,
@@ -791,7 +1019,7 @@ async def _push_memory_graph_snapshot(ws: WebSocket) -> None:
         mg = get_memory_graph()
         if not mg:
             return
-        snapshot = mg.get_snapshot_for_frontend() if hasattr(mg, "get_snapshot_for_frontend") else None
+        snapshot = mg.to_frontend_dict() if hasattr(mg, "to_frontend_dict") else None
         if snapshot:
             await ws.send_json({
                 "type": "MEMORY_GRAPH_UPDATE",
@@ -1272,6 +1500,27 @@ async def delete_chat_message(session_id: str, message_id: str):
         return {"status": "error", "message": str(e)}
 
 
+@ide_router.get("/api/task-graph/active")
+async def get_active_task_graph_snapshot():
+    """获取当前活跃任务图谱快照（前端按需拉取/重建用）"""
+    try:
+        from zulong.tools.task_tools import get_active_task_graph, _active_graph_id
+        tg = get_active_task_graph()
+        if not tg:
+            return {"status": "ok", "graph": None, "graph_id": None}
+        graph_data = tg.to_frontend_dict()
+        return {
+            "status": "ok",
+            "graph": graph_data,
+            "graph_id": _active_graph_id,
+            "node_count": len(tg._nodes),
+            "edge_count": len(tg._h_edges) + len(tg._d_edges),
+        }
+    except Exception as e:
+        logger.error(f"[TaskGraph] 获取活跃图谱快照失败: {e}")
+        return {"status": "error", "message": str(e), "graph": None}
+
+
 @ide_router.delete("/api/task-graph/{graph_id}")
 async def delete_task_graph(graph_id: str):
     """删除指定任务图谱（清除活跃图 + 删除磁盘备份）"""
@@ -1334,11 +1583,35 @@ async def startup():
     logger.info(f"[ZulongIDE]   监控 WebSocket: ws://127.0.0.1:8090/monitor")
 
 
+@app.on_event("shutdown")
+async def shutdown():
+    """独立运行时的关闭钩子，优雅关闭线程池"""
+    try:
+        from zulong.ide.ide_fc_runner import ThreadPoolManager
+        logger.info("[ZulongIDE] 服务关闭中...")
+        ThreadPoolManager.get_instance().graceful_shutdown()
+        logger.info("[ZulongIDE] 服务已关闭")
+    except Exception as e:
+        logger.warning(f"[ZulongIDE] 关闭时发生异常: {e}")
+
+
 def main():
+    # P2-22: 从配置读取端口号，默认8090
+    port = 8090
+    try:
+        import yaml
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "..", "..", "config", "zulong_config.yaml")
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            port = (cfg.get("ide") or {}).get("port") or (cfg.get("launcher") or {}).get("port") or 8090
+    except Exception:
+        pass
     uvicorn.run(
         "zulong.ide.ide_server:app",
         host="127.0.0.1",
-        port=8090,
+        port=port,
         log_level="info",
         ws_ping_interval=None,
         ws_ping_timeout=None,

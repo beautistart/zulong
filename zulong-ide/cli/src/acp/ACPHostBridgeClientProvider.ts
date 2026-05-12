@@ -132,7 +132,7 @@ class ACPEnvServiceClient implements EnvServiceClientInterface {
 		return proto.host.GetHostVersionResponse.create({
 			version: this.version,
 			platform: "Zulong ACP Agent",
-			zulongType: ZulongClient.Cli,
+			clineType: ZulongClient.Cli,
 		})
 	}
 

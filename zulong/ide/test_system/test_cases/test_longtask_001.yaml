@@ -1,0 +1,41 @@
+test_case_id: test_longtask_001
+name: 长任务中途汇报测试
+type: long_task_report
+description: 验证长耗时任务的周期性进度报告和停滞检测
+
+config:
+  timeout_seconds: 7200
+  progress_interval_turns: 10
+  max_renewals: 5
+
+steps:
+  - step_id: step_1
+    name: 启动大规模代码重构
+    tool: refactor_codebase
+    tool_input:
+      scope: "full_project"
+      strategy: "incremental"
+    timeout_seconds: 3600
+
+  - step_id: step_2
+    name: 监控进度并验证周期报告
+    tool: monitor_progress
+    tool_input:
+      task_ref: "$step_1.output"
+      check_interval_seconds: 30
+      min_reports: 3
+    depends_on: ["step_1"]
+    timeout_seconds: 600
+    assertions:
+      - assertion_type: value_match
+        field_path: "periodic_reports_received"
+        expected: true
+        message: "应收到周期性进度报告"
+
+  - step_id: step_3
+    name: 验证最终完成状态
+    tool: verify_completion
+    tool_input:
+      result: "$step_1.output"
+    depends_on: ["step_1", "step_2"]
+    timeout_seconds: 60

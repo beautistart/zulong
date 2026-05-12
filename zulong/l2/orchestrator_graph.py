@@ -301,9 +301,11 @@ def schedule_node(state: OrchestratorState, engine) -> OrchestratorState:
             state["phase"] = PHASE_SYNTHESIZE
             return state
 
-    # 选择第一个可执行节点
+    # P2-16: 选择可执行节点（支持同层并行）
+    # 当有多个无依赖的叶节点时，记录全部以支持并行执行
     subtask_id = next_executable[0]
     state["current_subtask_id"] = subtask_id
+    state["parallel_subtask_ids"] = next_executable  # 同层可并行节点列表
 
     # 切换注意力到 FOCUS 模式
     if engine._attn_window:
@@ -350,7 +352,7 @@ def execute_node(state: OrchestratorState, engine) -> OrchestratorState:
             dep_node = tg.get_node(dep_id)
             if dep_node and dep_node.status == "completed" and dep_node.result:
                 dep_msg = {
-                    "role": "system",
+                    "role": "user",
                     "content": (
                         f"[依赖产出 {dep_node.label}] "
                         f"{dep_node.result[:1500]}"
@@ -373,7 +375,7 @@ def execute_node(state: OrchestratorState, engine) -> OrchestratorState:
     # 构建执行提示
     messages = list(state["messages"])
     messages.append({
-        "role": "system",
+        "role": "user",
         "content": (
             f"[编排器-执行阶段] 当前子任务: {subtask_id}（{node.label}）\n"
             f"描述: {node.desc}\n"
@@ -438,6 +440,31 @@ def reflect_node(state: OrchestratorState, engine) -> OrchestratorState:
 
     node = tg.get_node(subtask_id) if subtask_id else None
 
+    # API 错误检测：如果上一轮 FC 因 API 错误终止，跳过 REDO 避免请求风暴
+    _last_reason = getattr(engine, '_last_fc_terminate_reason', '')
+    if _last_reason in ("api_error", "backup_model"):
+        _api_fail_count = state.get("_consecutive_api_failures", 0) + 1
+        state["_consecutive_api_failures"] = _api_fail_count
+        if _api_fail_count >= 2:
+            logger.warning(
+                f"[Orchestrator] REFLECT: 连续 {_api_fail_count} 次 API 错误，"
+                f"终止编排避免请求风暴"
+            )
+            state["should_terminate"] = "api_error"
+            state["phase"] = PHASE_SYNTHESIZE
+            return state
+        logger.warning(
+            f"[Orchestrator] REFLECT: API 错误 ({_last_reason})，跳过 REDO"
+        )
+        # 强制跳过当前子任务，进入下一个
+        if node and node.status != "completed":
+            tg.update_node_status(subtask_id, "skipped", result="API 错误，自动跳过")
+        state["phase"] = PHASE_SCHEDULE
+        return state
+    else:
+        # API 成功时重置计数
+        state["_consecutive_api_failures"] = 0
+
     # 初始化反思计数
     if "subtask_reflection_count" not in state:
         state["subtask_reflection_count"] = {}
@@ -449,7 +476,7 @@ def reflect_node(state: OrchestratorState, engine) -> OrchestratorState:
         if node.status != "completed":
             # 子任务未完成 → redo
             redo_count = state["subtask_reflection_count"].get(subtask_id, 0)
-            max_redo = state.get("max_redo_per_subtask", 3)
+            max_redo = state.get("max_redo_per_subtask", 5)
             if redo_count < max_redo:
                 decision = "REDO"
                 state["subtask_reflection_count"][subtask_id] = redo_count + 1
@@ -481,7 +508,7 @@ def reflect_node(state: OrchestratorState, engine) -> OrchestratorState:
         state["phase"] = PHASE_EXECUTE
     elif decision == "REPLAN":
         replan_count = state.get("replan_count", 0)
-        max_replan = state.get("max_replan_count", 2)
+        max_replan = state.get("max_replan_count", 3)
         if replan_count < max_replan:
             state["replan_count"] = replan_count + 1
             state["phase"] = PHASE_PLAN

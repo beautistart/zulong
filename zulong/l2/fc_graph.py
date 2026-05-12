@@ -1,13 +1,19 @@
 """
-FC Loop 的 LangGraph StateGraph 实现 [已废弃]
+FC Loop 的 LangGraph StateGraph 实现 [部分废弃]
 
-已被 unified_fc_runner.py 替代。本文件中的节点工厂函数
-(_make_check_node, _make_call_model_node, _make_exec_tools_node,
- _make_eval_response_node) 仍被 UnifiedFCRunner 复用，
-但 LangGraph StateGraph 构建和 run_fc_loop() 入口已废弃。
+LangGraph StateGraph 构建和 run_fc_loop() 入口已废弃。
+本文件中的节点工厂函数仍被以下模块复用：
+1. unified_fc_runner.py — 统一FC运行器（LangGraph 模式）
+2. ide_fc_runner.py — IDE模式FC运行器（while循环模式）
+
+复用内容包括：
+- _make_check_node, _make_call_model_node, _make_exec_tools_node, _make_eval_response_node
+- FCLoopState TypedDict
+- 各种安全网逻辑
 
 新代码请使用:
-    from zulong.l2.unified_fc_runner import run_fc_loop
+    from zulong.l2.unified_fc_runner import run_fc_loop   # LangGraph 模式
+    from zulong.ide.ide_fc_runner import IDEFCRunner       # IDE 模式
 """
 
 import concurrent.futures
@@ -174,7 +180,7 @@ def _make_call_model_node(engine: "InferenceEngine"):
                 f"⚠️ [FC][Graph] Turn {fc_turn} 超时 (>{engine._fc_loop_timeout}s)，继续尝试..."
             )
             api_timeout_count = state.get("api_timeout_count", 0) + 1
-            _MAX_API_TIMEOUTS = 2
+            _MAX_API_TIMEOUTS = 1  # 超时 1 次即切换备用模型，避免用户长时间等待
 
             if fc_turn >= engine._hard_limit:
                 logger.error("[FC][Graph] 🚨 超时且达到硬限制，使用降级回复")
@@ -345,6 +351,17 @@ def _make_exec_tools_node(engine: "InferenceEngine"):
                         direction=tool_args.get("direction", ""),
                         target_node_id=tool_args.get("target_node_id"),
                     )
+                # P2-14: task_mark_status完成后自动导航注意力
+                if tool_name == "task_mark_status":
+                    new_status = tool_args.get("status", "")
+                    node_id = tool_args.get("node_id", "")
+                    if new_status == "completed" and node_id:
+                        try:
+                            engine._attn_window.auto_navigate_on_status_change(
+                                node_id, new_status
+                            )
+                        except Exception:
+                            pass
 
             # 构造类 tool_call 对象供 _execute_tool_call 使用
             class _ToolCallProxy:
@@ -409,7 +426,7 @@ def _make_exec_tools_node(engine: "InferenceEngine"):
             logger.warning(f"[FC][Graph][CB] RED 触发 (turn={fc_turn}): {cb_reason}")
             cb_force_no_tools = True
             cb_convergence = {
-                "role": "system",
+                "role": "user",
                 "content": (
                     f"[Circuit Breaker 强制收敛] {cb_reason}\n"
                     "你必须立刻基于已有信息生成最终回复，不允许再调用任何工具。"
@@ -422,7 +439,7 @@ def _make_exec_tools_node(engine: "InferenceEngine"):
         elif cb_state == CircuitBreakerState.YELLOW:
             logger.warning(f"[FC][Graph][CB] YELLOW 警告 (turn={fc_turn}): {cb_reason}")
             cb_hint = {
-                "role": "system",
+                "role": "user",
                 "content": (
                     f"[Circuit Breaker 警告] {cb_reason}\n"
                     "请尽快总结当前信息并回复用户，避免继续调用更多工具。"
@@ -636,7 +653,7 @@ def _make_eval_response_node(engine: "InferenceEngine"):
             )
             if block:
                 correction = {
-                    "role": "system",
+                    "role": "user",
                     "content": (
                         f"[规则守护] {block_reason}\n"
                         "请调用 task_view_overview 查看任务图，"
@@ -665,7 +682,7 @@ def _make_eval_response_node(engine: "InferenceEngine"):
             # 确保下一轮 call_model 不提供工具，模型必须生成最终文本回复
             if new_null_count >= 2:
                 convergence_msg = {
-                    "role": "system",
+                    "role": "user",
                     "content": (
                         "[强制收敛] 多次拦截检测到任务图有未完成节点，"
                         "但模型持续尝试直接回复。请立即基于已有信息生成最终回复。"
@@ -752,7 +769,7 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                         pass
                 else:
                     gap_hint = {
-                        "role": "system",
+                        "role": "user",
                         "content": (
                             f"[信息缺口提示] 当前子任务缺少前置结果: {gap_desc}\n"
                             "请先用 task_view_overview 查看任务图，找到并执行未完成的前置子任务，"
@@ -854,7 +871,7 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                                 f" ({next_node.label}), 标记 in_progress"
                             )
                             continuation = {
-                                "role": "system",
+                                "role": "user",
                                 "content": (
                                     f"[自动进度更新] 节点 {target.id}（{target.label}）已完成。\n"
                                     f"请继续执行节点 {next_node.id}（{next_node.label}）"
@@ -980,7 +997,7 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                             n for n in _leaves if n.status == "completed"
                         ])
                         nudge = {
-                            "role": "system",
+                            "role": "user",
                             "content": (
                                 f"[空回复拦截] 你的回复为空，但任务图还有 "
                                 f"{len(_uncompleted)}/{len(_leaves)} 个未完成节点。\n"

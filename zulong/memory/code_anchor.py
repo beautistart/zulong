@@ -231,6 +231,10 @@ class CodeAnchorStore:
         anchor_ids = self._owner_index.get(owner_ref, set())
         return [self._anchors[aid] for aid in anchor_ids if aid in self._anchors]
 
+    def get_all_anchors(self) -> List[CodeAnchor]:
+        """获取所有锚点"""
+        return list(self._anchors.values())
+
     def query_by_file_and_symbol(
         self,
         file_path: str,

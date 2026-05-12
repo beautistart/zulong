@@ -16,8 +16,7 @@ from zulong.core.types import ZulongEvent, EventType, EventPriority
 from zulong.core.event_bus import event_bus
 from zulong.core.attention_atoms import AttentionEvent, AttentionLayer, SensorFusionData
 from zulong.l1a.reflex.vision_node import VisionNode
-
-logger = logging.getLogger("VisionProcessor")
+from zulong.ide.video_logger import logger
 
 
 class VisionShortTermMemory:

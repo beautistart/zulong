@@ -12,6 +12,7 @@ export enum ZulongDefaultTool {
 	FILE_EDIT = "replace_in_file",
 	FILE_READ = "read_file",
 	FILE_NEW = "write_to_file",
+	FILE_DELETE = "delete_file",
 	SEARCH = "search_files",
 	LIST_FILES = "list_files",
 	LIST_CODE_DEF = "list_code_definition_names",

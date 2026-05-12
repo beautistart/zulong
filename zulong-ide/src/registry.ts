@@ -88,10 +88,10 @@ export const HostRegistryInfo = {
 	init: async (distinctId: string) => {
 		const host = await HostProvider.env.getHostVersion({})
 		const hostVersion = host.version
-		const extensionVersion = host.zulongVersion || ExtensionRegistryInfo.version
+		const extensionVersion = host.clineVersion || ExtensionRegistryInfo.version
 		const platform = host.platform || "unknown"
 		const os = process.platform || "unknown"
-		const ide = host.zulongType || "unknown"
+		const ide = host.clineType || "unknown"
 		hostInfo = { hostVersion, extensionVersion, platform, os, ide, distinctId }
 	},
 	get: () => hostInfo,

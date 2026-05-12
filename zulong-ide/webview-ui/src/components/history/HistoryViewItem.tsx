@@ -9,6 +9,7 @@ import {
 	ChevronsDownUpIcon,
 	ChevronsUpDownIcon,
 	DownloadIcon,
+	PlayIcon,
 	StarIcon,
 	TrashIcon,
 } from "lucide-react"
@@ -215,6 +216,25 @@ const HistoryViewItem = ({
 											</Button>
 										</span>
 									</div>
+
+									{item.graphId && (
+										<div className="flex justify-between items-center w-full gap-1 text-xs">
+											<span className="font-medium text-description">任务图：</span>
+											<span className="items-center gap-2 flex text-description">
+												<span className="truncate max-w-[120px]">{item.graphId}</span>
+												<Button
+													aria-label="恢复执行"
+													className="m-0 p-0"
+													onClick={(e) => {
+														e.stopPropagation()
+														handleShowTaskWithId(item.id)
+													}}
+													variant="ghost">
+													<PlayIcon className="text-green-500" />
+												</Button>
+											</span>
+										</div>
+									)}
 								</div>
 							</div>
 						</div>

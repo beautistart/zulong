@@ -24,8 +24,8 @@ describe("Hostbridge - Env - getHostVersion", () => {
 
 			assert.strictEqual(response.platform, vscode.env.appName)
 			assert.strictEqual(response.version, vscode.version)
-			assert.strictEqual(response.zulongType, ZulongClient.VSCode)
-			assert.strictEqual(response.zulongVersion, ExtensionRegistryInfo.version)
+			assert.strictEqual(response.clineType, ZulongClient.VSCode)
+			assert.strictEqual(response.clineVersion, ExtensionRegistryInfo.version)
 			assert.strictEqual(response.remoteName, remoteName)
 
 			remoteNameStub.restore()

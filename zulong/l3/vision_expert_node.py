@@ -2,13 +2,11 @@
 # 视觉专家节点 - 实现物体识别、场景理解、深度估计功能
 
 from typing import Dict, Any, List
-import logging
 import time
 import random
 
 from .base_expert_node import BaseExpertNode
-
-logger = logging.getLogger(__name__)
+from zulong.ide.video_logger import logger
 
 
 class VisionExpertNode(BaseExpertNode):

@@ -1,0 +1,66 @@
+test_case_id: test_attention_001
+name: 注意力切换测试
+type: attention_switch
+description: 验证双任务并行和注意力切换的上下文保存恢复
+
+config:
+  timeout_seconds: 1800
+
+steps:
+  - step_id: step_1
+    name: 启动双任务并行
+    tool: start_parallel_tasks
+    tool_input:
+      task_a:
+        name: "代码审查"
+        config: { scope: "src/" }
+      task_b:
+        name: "测试生成"
+        config: { scope: "tests/" }
+    timeout_seconds: 60
+
+  - step_id: step_2
+    name: 执行注意力切换（A→B）
+    tool: switch_attention
+    tool_input:
+      from_task: "task_a"
+      to_task: "task_b"
+    depends_on: ["step_1"]
+    timeout_seconds: 30
+    assertions:
+      - assertion_type: value_match
+        field_path: "restore_status"
+        expected: "restored"
+        message: "注意力应成功恢复"
+
+  - step_id: step_3
+    name: 在任务B上下文中执行操作
+    tool: execute_in_context
+    tool_input:
+      task: "task_b"
+      action: "generate_tests"
+    depends_on: ["step_2"]
+    timeout_seconds: 120
+
+  - step_id: step_4
+    name: 切换回任务A（B→A）
+    tool: switch_attention
+    tool_input:
+      from_task: "task_b"
+      to_task: "task_a"
+    depends_on: ["step_3"]
+    timeout_seconds: 30
+
+  - step_id: step_5
+    name: 验证任务A上下文完整性
+    tool: verify_context
+    tool_input:
+      task: "task_a"
+      expected_state: "$step_1.output"
+    depends_on: ["step_4"]
+    timeout_seconds: 30
+    assertions:
+      - assertion_type: value_match
+        field_path: "context_intact"
+        expected: true
+        message: "任务A上下文应保持完整"

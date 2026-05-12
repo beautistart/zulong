@@ -55,6 +55,8 @@ class TaskNode:
     content_version: int = 0                   # 内容版本号（支持修订追踪）
     # ── 任务域感知 ──
     task_domain: str = "general"               # "code"|"research"|"creative"|"data"|"general"
+    # ── 扩展元数据 ──
+    metadata: Dict[str, Any] = field(default_factory=dict)  # 代码锚点等扩展信息
 
     def add_file(self, name: str, path: str):
         """添加关联文件（去重）"""
@@ -84,6 +86,12 @@ class TaskNode:
             d["content_version"] = self.content_version
         if self.task_domain != "general":
             d["task_domain"] = self.task_domain
+        # 输出该节点关联的代码锚点
+        code_anchors = self.metadata.get("code_anchors", [])
+        if code_anchors:
+            d["code_anchors"] = code_anchors
+        if self.metadata:
+            d["metadata"] = self.metadata
         return d
 
     @classmethod
@@ -101,6 +109,7 @@ class TaskNode:
             semantic_summary=data.get("semantic_summary"),
             content_version=data.get("content_version", 0),
             task_domain=data.get("task_domain", "general"),
+            metadata=data.get("metadata", {}),
         )
 
 
@@ -133,6 +142,8 @@ class TaskGraph:
     - 模型通过 update_node_status 更新节点状态 pending -> in_progress -> completed/blocked
     - 模型通过 submit_final_answer 完成任务
     """
+
+    _SCHEMA_VERSION = "1.0"
 
     def __init__(self, title: str, graph_id: str = None):
         self.id: str = graph_id or uuid.uuid4().hex[:12]
@@ -202,10 +213,11 @@ class TaskGraph:
 
     def add_file_to_node(self, node_id: str, file_name: str, file_path: str) -> bool:
         """向节点添加关联文件"""
-        node = self._nodes.get(node_id)
-        if not node:
-            return False
-        node.add_file(file_name, file_path)
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if not node:
+                return False
+            node.add_file(file_name, file_path)
         if self.on_change_callback:
             try:
                 self.on_change_callback(
@@ -425,12 +437,13 @@ class TaskGraph:
         visited = set()
         while current in child_to_parent:
             if current in visited:
-                logger.warning(f"[TaskGraph] 循环检测: 节点 {node_id} 的祖先链存在循环")
+                logger.warning(f"[TaskGraph] 循环引用检测: 节点 {node_id} 的祖先链存在环")
                 return depth
             visited.add(current)
             current = child_to_parent[current]
             depth += 1
-            if depth > 50:
+            if depth > 100:
+                logger.warning(f"[TaskGraph] 节点深度超过100: {node_id}, 截断")
                 break
         return depth
 
@@ -439,10 +452,16 @@ class TaskGraph:
         """根据深度返回节点类型
 
         深度0: requirement, 深度1: analysis, 深度2: outline,
-        深度3: task, 深度4+: subtask
+        深度3: task, 深度4: subtask, 深度5: micro_task,
+        深度6+: step_N (带数字后缀，永不语义坍缩)
         """
-        mapping = {0: "requirement", 1: "analysis", 2: "outline", 3: "task"}
-        return mapping.get(depth, "subtask")
+        mapping = {
+            0: "requirement", 1: "analysis", 2: "outline",
+            3: "task", 4: "subtask", 5: "micro_task",
+        }
+        if depth in mapping:
+            return mapping[depth]
+        return f"step_{depth}"
 
     def find_duplicate_node(self, label: str, desc: str = "",
                             threshold: float = 0.8) -> Optional[str]:
@@ -505,27 +524,26 @@ class TaskGraph:
         Returns:
             修改是否成功
         """
-        node = self._nodes.get(node_id)
-        if not node:
-            logger.warning(f"[TaskGraph] update_node_content: 节点 {node_id} 不存在")
-            return False
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if not node:
+                logger.warning(f"[TaskGraph] update_node_content: 节点 {node_id} 不存在")
+                return False
 
-        if label is not None:
-            node.label = label
-        if desc is not None:
-            node.desc = desc
-        if result is not None:
-            node.result = result
-        if analysis_content is not None:
-            node.analysis_content = analysis_content
-            node.content_version += 1
-        if semantic_summary is not None:
-            node.semantic_summary = semantic_summary
+            if label is not None:
+                node.label = label
+            if desc is not None:
+                node.desc = desc
+            if result is not None:
+                node.result = result
+            if analysis_content is not None:
+                node.analysis_content = analysis_content
+                node.content_version += 1
+            if semantic_summary is not None:
+                node.semantic_summary = semantic_summary
 
-        # 同步到 MemoryGraph
-        self._sync_node_to_memory_graph(node_id, node.status, result)
+            self._sync_node_to_memory_graph(node_id, node.status, result)
 
-        # 触发变化回调（推送到前端）
         if self.on_change_callback:
             try:
                 self.on_change_callback(
@@ -554,39 +572,36 @@ class TaskGraph:
         Returns:
             被移除的所有节点 ID 列表
         """
-        if node_id in ("req", "analysis"):
-            logger.warning(f"[TaskGraph] 不能移除根节点: {node_id}")
-            return []
+        with self._lock:
+            if node_id in ("req", "analysis"):
+                logger.warning(f"[TaskGraph] 不能移除根节点: {node_id}")
+                return []
 
-        if node_id not in self._nodes:
-            return []
+            if node_id not in self._nodes:
+                return []
 
-        # 收集所有要移除的节点
-        descendants = self.get_all_descendants(node_id)
-        removed = [node_id] + descendants
+            descendants = self.get_all_descendants(node_id)
+            removed = [node_id] + descendants
 
-        removed_set = set(removed)
-        for nid in removed:
-            self._nodes.pop(nid, None)
+            removed_set = set(removed)
+            for nid in removed:
+                self._nodes.pop(nid, None)
 
-        # 清理层级边
-        self._h_edges = [
-            (s, t) for s, t in self._h_edges
-            if s not in removed_set and t not in removed_set
-        ]
-        # 清理依赖边
-        self._d_edges = [
-            e for e in self._d_edges
-            if e.s not in removed_set and e.t not in removed_set
-        ]
-        # 清理并行组
-        self.parallel_groups = [
-            [nid for nid in group if nid not in removed_set]
-            for group in self.parallel_groups
-        ]
-        self.parallel_groups = [g for g in self.parallel_groups if g]
+            self._h_edges = [
+                (s, t) for s, t in self._h_edges
+                if s not in removed_set and t not in removed_set
+            ]
+            self._d_edges = [
+                e for e in self._d_edges
+                if e.s not in removed_set and e.t not in removed_set
+            ]
+            self.parallel_groups = [
+                [nid for nid in group if nid not in removed_set]
+                for group in self.parallel_groups
+            ]
+            self.parallel_groups = [g for g in self.parallel_groups if g]
 
-        logger.info(f"[TaskGraph] 移除节点: {node_id} 及 {len(descendants)} 个后代")
+            logger.info(f"[TaskGraph] 移除节点: {node_id} 及 {len(descendants)} 个后代")
 
         if self.on_change_callback:
             try:
@@ -597,6 +612,50 @@ class TaskGraph:
                 logger.debug(f"[TaskGraph] 移除回调失败（非致命）: {e}")
 
         return removed
+
+    # ─── 回滚机制 ─────────────────────────────────────────────
+
+    def rollback_node(self, node_id: str) -> bool:
+        """P2-18: 回滚节点到上一个稳定状态
+
+        将 in_progress/needs_adjust 节点回退为 pending，
+        清除 result，保留 desc 和子节点结构。
+        blocked 节点回退为 pending（允许重试）。
+        """
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if not node:
+                return False
+            if node.status in ("in_progress", "needs_adjust", "blocked"):
+                old_status = node.status
+                node.status = "pending"
+                node.result = None
+                logger.info(f"[TaskGraph] 回滚节点: {node_id} {old_status} → pending")
+                if self.on_change_callback:
+                    try:
+                        self.on_change_callback("node_rollback", {
+                            "node_id": node_id, "old_status": old_status, "new_status": "pending",
+                        })
+                    except Exception:
+                        pass
+                self._mark_dirty()
+                return True
+            return False
+
+    def rollback_subtree(self, node_id: str) -> int:
+        """P2-18: 回滚节点及其所有后代中非终态的节点
+
+        Returns:
+            回滚的节点数
+        """
+        with self._lock:
+            descendants = self.get_all_descendants(node_id)
+            all_ids = [node_id] + descendants
+        count = 0
+        for nid in all_ids:
+            if self.rollback_node(nid):
+                count += 1
+        return count
 
     # ─── 边操作 ─────────────────────────────────────────────
 
@@ -645,23 +704,41 @@ class TaskGraph:
         """导出为前端 addTaskGraph() 兼容格式（线程安全快照）
 
         非叶子节点的 status 从子节点状态动态聚合（不修改原始数据）。
-        每个节点附带完整层级地址。
+        每个节点附带完整层级地址和关联代码锚点。
         """
         with self._lock:
             h_edges_snapshot = list(self._h_edges)
             d_edges_snapshot = list(self._d_edges)
             nodes_snapshot = list(self._nodes.values())
 
+        # 批量获取 CodeAnchor 信息
+        anchor_by_owner = {}
+        try:
+            from zulong.memory.code_anchor import get_code_anchor_store
+            anchor_store = get_code_anchor_store()
+            if anchor_store:
+                all_anchors = anchor_store.get_all_anchors()
+                for a in all_anchors:
+                    owner = a.owner_ref
+                    if owner not in anchor_by_owner:
+                        anchor_by_owner[owner] = []
+                    anchor_by_owner[owner].append(a.to_dict())
+        except Exception:
+            pass
+
         parent_ids = {s for s, t in h_edges_snapshot}
         aggregated_nodes = []
 
         for n in nodes_snapshot:
             d = n.to_dict()
-            # 非叶子、非模板节点 → 动态聚合 status
             if n.id in parent_ids and n.id not in ("req", "analysis"):
                 d["status"] = self._aggregate_status(n.id)
-            # 附带完整层级地址
             d["address"] = self.get_node_address(n.id)
+            # 注入该节点的代码锚点
+            owner_key = f"tg:{self.id}/{n.id}"
+            node_anchors = anchor_by_owner.get(owner_key, [])
+            if node_anchors:
+                d["code_anchors"] = node_anchors
             aggregated_nodes.append(d)
 
         return {
@@ -800,6 +877,7 @@ class TaskGraph:
             nd["address"] = self.get_node_address(nid)
             nodes_data[nid] = nd
         return {
+            "version": self._SCHEMA_VERSION,
             "id": self.id,
             "title": self.title,
             "created_at": self.created_at,
@@ -819,7 +897,15 @@ class TaskGraph:
             raise ValueError(f"TaskGraph.deserialize: 数据类型错误，期望 dict，实际 {type(data)}")
         if "title" not in data or "id" not in data:
             raise ValueError(f"TaskGraph.deserialize: 缺少必要字段 title/id，keys={list(data.keys())}")
-        
+
+        # 版本号校验
+        file_version = data.get("version", "unknown")
+        if file_version != cls._SCHEMA_VERSION:
+            logger.warning(
+                f"[TaskGraph] 序列化版本不匹配: 文件={file_version}, "
+                f"当前={cls._SCHEMA_VERSION}，将尝试兼容加载"
+            )
+
         graph = cls(title=data["title"], graph_id=data["id"])
         graph.created_at = data.get("created_at", time.time())
 
@@ -1118,6 +1204,14 @@ class TaskScheduler:
             if node.status not in ("pending", "blocked"):
                 continue
             dep_ids = self.tg.get_dependencies(node.id)
+            # P2-17: 检测是否有blocked依赖，自动将下游标记为skipped
+            blocked_deps = [d for d in dep_ids
+                           if self.tg.get_node(d) is not None
+                           and self.tg.get_node(d).status == "blocked"]
+            if blocked_deps and node.status not in ("completed", "skipped", "blocked"):
+                self.tg.update_node_status(node.id, "skipped",
+                                          reason=f"依赖blocked: {','.join(blocked_deps)}")
+                continue
             # 无依赖或所有依赖已完成/跳过 → 可执行
             all_met = all(
                 self.tg.get_node(d) is not None

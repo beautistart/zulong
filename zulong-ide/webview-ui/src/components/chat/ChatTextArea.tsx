@@ -5,7 +5,7 @@ import { PlanActMode, TogglePlanActModeRequest } from "@shared/proto/zulong/stat
 import { type SlashCommand } from "@shared/slashCommands"
 import { Mode } from "@shared/storage/types"
 import { VSCodeButton } from "@vscode/webview-ui-toolkit/react"
-import { AtSignIcon, PlusIcon } from "lucide-react"
+import { AtSignIcon, PlusIcon, MicIcon } from "lucide-react"
 import type React from "react"
 import { forwardRef, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import DynamicTextArea from "react-textarea-autosize"
@@ -43,6 +43,7 @@ import {
 } from "@/utils/slash-commands"
 import ZulongRulesToggleModal from "../zulong-rules/ZulongRulesToggleModal"
 import ServersToggleModal from "./ServersToggleModal"
+import VoiceInputButton from "./VoiceInputButton"
 
 const { MAX_IMAGES_AND_FILES_PER_MESSAGE } = CHAT_CONSTANTS
 
@@ -1542,6 +1543,16 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 							<ServersToggleModal />
 
 							<ZulongRulesToggleModal />
+
+							<VoiceInputButton
+								onTranscript={(text) => {
+									setInputValue(inputValue + text)
+								}}
+								onError={(error) => {
+									console.error("[VoiceInput]", error)
+								}}
+								disabled={sendingDisabled}
+							/>
 
 							<ModelContainer>
 								<ModelButtonWrapper>

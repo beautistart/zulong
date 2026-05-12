@@ -27,8 +27,7 @@ from typing import Dict, Any, Optional, List, Tuple
 from collections import deque
 
 from zulong.l1a.l1a_config import SHARED_VISION_DIR
-
-logger = logging.getLogger(__name__)
+from zulong.ide.video_logger import logger
 
 
 class VisionShortTermMemory:

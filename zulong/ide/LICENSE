@@ -1,0 +1,24 @@
+本目录下的核心文件采用 GNU Affero General Public License v3.0
+
+详见项目根目录的 LICENSE_AGPL.txt
+
+IDE模式核心，包括：
+
+核心文件：
+├─ ide_server.py          (62KB)   WebSocket服务器
+├─ ide_fc_runner.py       (167KB)  IDE FC循环执行器
+├─ ide_tool_registry.py   (16KB)   工具注册与路由
+└─ ide_session.py                  会话管理
+
+技术亮点：
+- WebSocket实时通信
+- 工具智能路由（内部工具/远程工具）
+- 会话状态管理
+- 实时音频处理
+
+使用这些代码即表示您同意 AGPL-3.0 的条款：
+- 使用、修改、分发必须以 AGPL-3.0 开源
+- SaaS服务使用也必须开源全部代码
+- 闭源商业使用需要购买授权
+
+详见项目根目录 LICENSE 文件。
