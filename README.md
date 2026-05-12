@@ -523,8 +523,8 @@ Server("zulong-memory")
 
 **一个室内设计师，用 AI 助手在 2 个月内独立开发了祖龙系统**
 
-- 知乎: [@zhiaoimn](https://www.zhihu.com/people/zhiaoimn)
 - GitHub: [@beautistart](https://github.com/beautistart)
+- 邮箱: beautistart@qq.com
 
 ---
 
