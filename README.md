@@ -23,6 +23,12 @@
 
 > **祖龙不是又一个 Agent 框架。祖龙给 AI 代理装上了能保持跨年级别完整记忆的"海马体"，让长周期复杂陪伴变成现实。**
 
+<p align="center">
+  <a href="https://discord.gg/zZMgtSyHV" target="_blank">
+    <img src="https://dcbadge.limes.pink/api/server/zZMgtSyHV?style=flat" alt="Join Discord" />
+  </a>
+</p>
+
 ---
 
 ## 为何一个室内设计师，敢去造 AI 大脑？

@@ -23,6 +23,12 @@
 
 > **Zulong is not just another Agent framework. Zulong equips AI agents with a "hippocampus" capable of maintaining year-level complete memory, making long-cycle complex companionship a reality.**
 
+<p align="center">
+  <a href="https://discord.gg/zZMgtSyHV" target="_blank">
+    <img src="https://dcbadge.limes.pink/api/server/zZMgtSyHV?style=flat" alt="Join Discord" />
+  </a>
+</p>
+
 ---
 
 ## Why Would an Interior Designer Dare to Build an AI Brain?
