@@ -2,9 +2,9 @@
 
 # 🐉 Zulong (祖龙)
 
-### Multi-Layer Adaptive Cognitive Agent Operating System
+### The "Hippocampus" That Gives AI Agents Year-Level Complete Memory
 
-**82K+ Lines Python | Runs on Consumer Hardware | Built by a Designer with AI**
+**82K+ Lines Python | Built by a Designer with AI**
 
 [![License](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://www.python.org/)
@@ -15,6 +15,10 @@
 [English](./README_EN.md) | [简体中文](../README.md)
 
 </div>
+
+---
+
+> **Zulong is not just another Agent framework. Zulong equips AI agents with a "hippocampus" capable of maintaining year-level complete memory, making long-cycle complex companionship a reality.**
 
 ---
 
@@ -33,7 +37,7 @@ I designed Zulong's architectural blueprint and used AI-powered coding IDEs to h
 
 **What is Zulong?**
 
-> Zulong is an AI Agent cognitive system with a unified memory graph, employing Hebbian learning and Ebbinghaus decay algorithms under dynamic attention control, achieving year-level complete memory. It implements infinite context at the system level, and can run full memory + inference + multimodal capabilities on consumer-grade hardware.
+> Zulong is an AI Agent cognitive system with a unified memory graph, employing Hebbian learning and Ebbinghaus decay algorithms under dynamic attention control, achieving year-level complete memory. It implements infinite context at the system level, and can run full memory + inference + multimodal capabilities.
 
 **🎬 Video Demo**
 
