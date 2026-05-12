@@ -35,7 +35,13 @@
 
 > 祖龙是一个具有统一记忆图谱并采用赫布学习、艾宾浩斯衰减等算法，在动态注意力控制的系统下，实现了年级别完整记忆的 AI 代理认知系统，并且在系统层面实现了无限上下文，在消费级硬件（AI MAX 395 128G）上就可以运行完整的记忆 + 推理 + 多模态能力等。
 
->  **[1 分钟看懂祖龙](./docs/videos/zulong_demo.mp4)** - 祖龙系统三层注意力机制演示和超复杂项目记忆文件展示
+**🎬 视频演示**
+
+> [![视频预览](https://img.shields.io/badge/视频-1分钟看懂祖龙-blue?style=for-the-badge)](./docs/videos/zulong_demo.mp4)
+>
+> 祖龙系统三层注意力机制演示和超复杂项目记忆文件展示
+
+<video src="./docs/videos/zulong_demo.mp4" controls width="100%"></video>
 
 ---
 
