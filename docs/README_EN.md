@@ -1,6 +1,8 @@
 <div align="center">
 
-# 🐉 Zulong (祖龙)
+<img src="./images/zulong_logo.png" alt="Zulong Logo" width="120" height="120" />
+
+# Zulong (祖龙)
 
 ### The "Hippocampus" That Gives AI Agents Year-Level Complete Memory
 

@@ -1,6 +1,8 @@
 <div align="center">
 
-# 🐉 祖龙 (ZULONG)
+<img src="./docs/images/zulong_logo.png" alt="Zulong Logo" width="120" height="120" />
+
+# 祖龙 (ZULONG)
 
 ### 给 AI 代理装上能保持跨年级别完整记忆的"海马体"
 
