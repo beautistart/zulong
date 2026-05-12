@@ -18,7 +18,7 @@
 
 ---
 
-> 🎥 **[1 分钟看懂祖龙](https://youtu.be/demo)** _(视频演示占位符)_
+> 🎥 **[1 分钟看懂祖龙](./docs/videos/zulong_demo.mp4)** - 演示视频
 >
 > 💡 **可在消费级 CPU 上纯运行**（AI MAX 395 128G，无需 GPU）
 
