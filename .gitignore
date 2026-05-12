@@ -32,10 +32,13 @@ stability_test_data/
 camera_test_data/
 gesture_test_data/
 test_reports/
+logs/
+*.log
 
 # ===== 本地配置 =====
 config.yaml
 docker-compose.yml
+docker-compose.searxng.yml
 .env
 .env.*
 !.env.example
@@ -52,23 +55,29 @@ backups/
 node_modules/
 **/node_modules/
 
-# ===== 测试临时文件 =====
-test/
-test_dir/
-test_lmdb/
-tests/auto_e2e_visual_test.py
-tests/test_storage_hybrid.py
-
-# ===== IDE =====
+# ===== IDE配置 (内部使用) =====
+.arts/
+.codeartsdoer/
+.qoder/
+.trae/
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# ===== 日志 =====
-logs/
-*.log
+# ===== 测试和临时文件 =====
+tests/
+test/
+test_dir/
+test_lmdb/
+test_*.py
+nul
+temp_check.js
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
 
 # ===== 工作空间 =====
 agent_workspace/
@@ -80,17 +89,30 @@ zulong/workspace/
 openclaw/
 TSD/
 
-# ===== 测试和临时文件 =====
-tests/
-nul
-temp_check.js
-test_*.py
+# ===== Unity游戏开发文件 (无关项目) =====
+Assets/
+Packages/
+ProjectSettings/
+
+# ===== Docker和部署 =====
+Dockerfile
+.dockerignore
+searxng/
+
+# ===== 构建和工具脚本 =====
+build_release.py
+start.py
+
+# ===== 临时和调试文件 =====
+debug_result_*.json
+e2e_*_result_*.json
+test_*_result_*.json
+*_test_report*.md
+*_test_report*.txt
+memory_test_report_*.txt
+
+# ===== 额外文档 (非核心) =====
 AI_Agent_Technology_Trends_2024.md
 VOICE_INTEGRATION_SUMMARY.md
-
-# ===== 其他 =====
-.arts/
-.codeartsdoer/
-.qoder/
-.trae/
-.temp_check.js
+COMMERCIAL_LICENSE.md
+LICENSE_AGPL_RAW.txt
