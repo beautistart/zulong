@@ -1,0 +1,33 @@
+GNU AFFERO GENERAL PUBLIC LICENSE
+Version 3, 19 November 2007
+
+Copyright (C) 2026 祖龙项目组
+
+本程序是自由软件：您可以在自由软件基金会发布的 GNU Affero 通用公共许可证的条款下，
+许可证第三版或者（随您选择）任何后续版本下，重新分发和/或修改它。
+
+分发本程序是希望它有用，但没有任何保证，甚至没有适销性或特定用途适用性的默示保证。
+详见 GNU Affero 通用公共许可证。
+
+您应该已经收到 GNU Affero 通用公共许可证的副本。
+如果没有，请参阅 <https://www.gnu.org/licenses/>.
+
+--------------------------------------------------------------------------------
+
+GNU AFFERO GENERAL PUBLIC LICENSE
+Version 3, 19 November 2007
+
+Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+Everyone is permitted to copy and distribute verbatim copies
+of this license document, but changing it is not allowed.
+
+Preamble
+
+The GNU Affero General Public License is a free, copyleft license for
+software and other kinds of works, specifically designed to ensure
+cooperation with the community in the case of network server software.
+
+[完整AGPL-3.0文本请访问 https://www.gnu.org/licenses/agpl-3.0.txt]
+
+本文件仅包含AGPL-3.0的部分文本和中文说明。
+完整法律文本请访问上述链接。

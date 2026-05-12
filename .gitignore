@@ -48,94 +48,31 @@ backups/
 # ===== 内部文档 (含核心架构细节) =====
 资料/
 
-# ===== 独立子仓库 =====
-openclaw/
+# ===== node_modules =====
+node_modules/
+**/node_modules/
 
-# ===== 闭源核心模块 (企业版，完全不公开) =====
-zulong/memory/knowledge_graph.py
-zulong/memory/person_profile.py
-zulong/memory/llm_memory_reviewer.py
-zulong/memory/summary_store.py
-zulong/memory/memory_evolution.py
-# short_term_memory.py -> 已开放给社区版
-zulong/memory/hot_update_engine.py
-zulong/memory/three_libraries.py
-zulong/memory/enhanced_experience_store.py
-zulong/memory/episodic_memory.py
-zulong/memory/semantic_drift_detector.py
-zulong/l1b/hotswap_scheduler.py
-zulong/l1b/scheduler_gatekeeper.py
-zulong/l1b/dynamic_threshold_manager.py
-zulong/l1b/memory_config_initializer.py
-zulong/l3/dual_brain_container.py
-zulong/l2/inference_engine.py
-zulong/l1c/optimized_vision_processor.py
-zulong/replay/
-zulong/review/
+# ===== 测试临时文件 =====
+test/
+test_dir/
+test_lmdb/
+tests/auto_e2e_visual_test.py
+tests/test_storage_hybrid.py
 
-# ===== 开发过程文档 (含实现细节) =====
-ARCHITECTURE_*.md
-ASYNC_*.md
-CLEANUP_*.md
-CROSS_SESSION_*.md
-DOWNGRADE_*.md
-FIX_*.md
-GATEKEEPER_*.md
-L2_*.md
-MEMORY_*.md
-PHASE_*.md
-QUICK_REVIEW_*.md
-RAG_*.md
-REVIEW_*.md
-RUNTIME_*.md
-SHARED_POOL_*.md
-SOFTWARE_*.md
-TODO_ENHANCEMENTS.md
-WEB_RESPONSE_*.md
-TESTING_GUIDE.md
-code_review_files.txt
-
-# ===== 根目录临时测试文件 =====
-/test_*.py
-/test_*.txt
-/test_*.json
-/test_*.html
-/test2_output.txt
-/nul
-
-# ===== 启动脚本 (含本地路径) =====
-start_all.bat
-start_console.bat
-start_l2_backup_vllm.bat
-start_web.bat
-start_both.bat
-start_bridge.bat
-start_ollama.bat
-start_ollama_fixed.bat
-start_ollama_with_env.bat
-start_zulong.bat
-restart_ollama_service.bat
-启动说明.md
-
-# ===== 根目录截图/调试图片 =====
-/*.png
-/*.jpg
-
-# ===== 大型打包文件 (含冗余源码) =====
-zulong_graph_memory_full_source.py
-zulong_memory_task_bundle.py
-
-# ===== 临时工作目录 =====
-agent_workspace/
-workspace/
-logs/
-rw/
-rz/
-TSD/
-
-# ===== IDE/系统 =====
+# ===== IDE =====
 .vscode/
 .idea/
 *.swp
+*.swo
+*~
+
+# ===== 日志 =====
+logs/
 *.log
-screenshots/
+
+# ===== 其他 =====
+.arts/
+.codeartsdoer/
+.qoder/
+.trae/
+.temp_check.js
