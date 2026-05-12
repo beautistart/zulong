@@ -12,7 +12,7 @@
 [![GitHub release](https://img.shields.io/github/release/beautistart/zulong.svg)](https://github.com/beautistart/zulong/releases)
 [![Stars](https://img.shields.io/github/stars/beautistart/zulong?style=social)](https://github.com/beautistart/zulong)
 
-[English](./docs/README_EN.md) | 简体中文
+
 
 </div>
 
