@@ -528,9 +528,61 @@ Server("zulong-memory")
 
 ---
 
-## 🙏 致谢
+##  致谢
 
-本项目基于 [Cline](https://github.com/cline/cline) v3.82.0 开发，感谢 Cline 团队的优秀工作。
+祖龙系统的开发离不开众多优秀的开源项目与社区贡献。在此向以下项目团队表示诚挚感谢：
+
+### 核心基础框架
+
+- **[Cline](https://github.com/cline/cline)** v3.82.0 - 祖龙 IDE 基于 Cline 框架开发，感谢 Cline 团队的优秀工作
+- **[PyTorch](https://github.com/pytorch/pytorch)** - 深度学习框架，提供模型推理与计算核心
+- **[FastAPI](https://github.com/fastapi/fastapi)** + **[Uvicorn](https://github.com/encode/uvicorn)** - 高性能异步 Web 服务框架
+- **[Hugging Face Transformers](https://github.com/huggingface/transformers)** - 预训练模型加载与推理
+
+### 记忆系统与向量计算
+
+- **[NetworkX](https://github.com/networkx/networkx)** - 记忆图谱核心图计算引擎
+- **[LMDB](https://lmdb.readthedocs.io/)** - 高性能嵌入式键值数据库（图谱持久化）
+- **[FAISS](https://github.com/facebookresearch/faiss)** - Facebook AI 向量相似度搜索引擎
+- **[Qdrant](https://github.com/qdrant/qdrant)** - 向量数据库与语义检索
+
+### 语音交互能力
+
+- **[FunASR / SenseVoice](https://github.com/modelscope/FunASR)** - 阿里巴巴达摩院开源语音识别引擎（ASR 主引擎）
+- **[Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)** - 轻量级文本转语音模型（TTS 主引擎，82M 参数）
+- **[edge-tts](https://github.com/rany2/edge-tts)** - 微软云端 TTS 备选方案
+- **[Whisper](https://github.com/openai/whisper)** - OpenAI 开源多语言语音识别模型（备选 fallback）
+
+### 前端与 UI
+
+- **[React](https://github.com/facebook/react)** - 前端 UI 框架
+- **[Tailwind CSS](https://tailwindcss.com/)** - 原子类 CSS 框架
+- **[Radix UI](https://www.radix-ui.com/)** - 无头 UI 组件库
+- **[Vite](https://vitejs.dev/)** - 前端构建工具
+- **[esbuild](https://esbuild.github.io/)** - 极速 JavaScript/TypeScript 打包器
+
+### 开发工具与基础设施
+
+- **[Model Context Protocol (MCP)](https://modelcontextprotocol.io/)** - 模型上下文协议 SDK
+- **[OpenTelemetry](https://opentelemetry.io/)** - 可观测性与链路追踪
+- **[Playwright](https://playwright.dev/)** - 浏览器自动化测试
+- **[Mermaid](https://mermaid.js.org/)** - 图表与流程图渲染
+
+### 模型与权重
+
+- **[Qwen 系列模型](https://github.com/QwenLM/Qwen)** - 阿里巴巴通义千问（祖龙核心推理模型）
+- **[CosyVoice3-0.5B](https://github.com/FunAudioLLM/CosyVoice)** - 阿里通义实验室开源 TTS 模型
+- **[BAAI BGE 系列](https://github.com/FlagOpen/FlagEmbedding)** - 北京智源研究院文本嵌入模型
+- **[MediaPipe](https://google.github.io/mediapipe/)** - Google 开源跨平台机器学习管道（人脸/手部/姿态检测）
+
+### AI 编程工具
+
+感谢以下 AI 编程工具在祖龙开发过程中的帮助：
+
+- **千问桌面端** - 项目顾问
+- **trae** - 前期后端代码工程师
+- **qoder** - 后期项目纠偏+功能板块实现
+- **codearts** - 后期项目纠偏+代码审查+功能板块实现
 
 ---
 
