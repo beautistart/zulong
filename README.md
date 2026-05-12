@@ -573,7 +573,6 @@ Server("zulong-memory")
 #### 意图与推理模型
 
 - **[Qwen 系列模型](https://github.com/QwenLM/Qwen)** - 阿里巴巴通义千问（祖龙核心推理模型）
-- **[DeepSeek-V4-Flash](https://github.com/deepseek-ai/DeepSeek-V4)** - 深度求索 LLM（世界意图理解主模型，通过 SiliconFlow API）
 - **[ALBERT-tiny-chinese](https://github.com/ymcui/Chinese-ALBERT)** - 哈尔滨工业大学中文轻量级意图识别模型（15类意图分类）
 
 #### 语音交互模型
@@ -581,7 +580,6 @@ Server("zulong-memory")
 - **[SenseVoice-Small](https://github.com/modelscope/FunASR)** - 阿里巴巴达摩院开源语音识别引擎（ASR 主引擎，244M 参数，ONNX INT8 量化，支持中/英/日/韩/粤语 + 情感识别 + 事件检测）
 - **[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)** - 语音识别 ONNX 推理引擎
 - **[Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)** - 轻量级文本转语音模型（TTS 主引擎，82M 参数，CPU 实时推理 <0.3s）
-- **[CosyVoice3-0.5B](https://github.com/FunAudioLLM/CosyVoice)** - 阿里通义实验室开源 TTS 模型
 - **[Whisper](https://github.com/openai/whisper)** - OpenAI 开源多语言语音识别模型（ASR 备选 fallback）
 - **[edge-tts](https://github.com/rany2/edge-tts)** - 微软云端 TTS 备选方案
 
