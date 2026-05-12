@@ -37,7 +37,7 @@
 
 **🎬 视频演示**
 
-<p align="center">祖龙系统三层注意力机制演示和超复杂项目记忆文件展示</p>
+<p align="center">祖龙系统三层注意力机制和超复杂项目记忆文件展示</p>
 
 <p align="center">
   <a href="https://youtu.be/-W-WYg_eQz4" target="_blank">
