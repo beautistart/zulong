@@ -126,8 +126,8 @@ except Exception as e:
 # 🧠 [BOOTSTRAP] 初始化 MemoryGraph (记忆图谱)
 logger.info("🧠 [BOOTSTRAP] 初始化 MemoryGraph...")
 try:
-    from zulong.memory.memory_graph import MemoryGraph
-    _memory_graph = MemoryGraph(persist_path="./data/memory_graph")
+    from zulong.memory.memory_graph_factory import create_memory_graph
+    _memory_graph = create_memory_graph(persist_path="./data/memory_graph")
     from zulong.memory.graph_adapters import register_all_adapters
     register_all_adapters(_memory_graph)
     logger.info(f"✅ [BOOTSTRAP] MemoryGraph 初始化完成: {_memory_graph.stats['total_nodes']} 节点")

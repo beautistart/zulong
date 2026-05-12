@@ -127,13 +127,13 @@ class EventBus:
             self._route_to_l1b(event)
             return
         
-        # 传感器事件路由到 L1-B
+        # 传感器事件分发给所有订阅者（L1-A 反射层 + L1-B 调度层）
         if event.type in [EventType.SENSOR_VISION, EventType.SENSOR_VISION_STATE, 
                           EventType.SENSOR_VIDEO_MOTION, EventType.SENSOR_VIDEO_FRAME,
                           EventType.SENSOR_OBSTACLE, EventType.SENSOR_MOTION, 
                           EventType.SENSOR_SOUND, EventType.SENSOR_FALL]:
-            logger.info(f"📡 [EventBus] 传感器事件 {event.type.name} -> 路由给 L1-B")
-            self._route_to_l1b(event)
+            logger.info(f"📡 [EventBus] 传感器事件 {event.type.name} -> 分发给所有订阅者")
+            self._dispatch_event(event)
             return
         
         # 流式输出和思考步骤事件直接分发，不需要进入队列（低延迟）

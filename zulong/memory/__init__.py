@@ -17,6 +17,7 @@ ZULONG 记忆系统模块
 - LLM 记忆审查 (LLMMemoryReviewer) ⭐ NEW v2.5
 - 双索引摘要库 (DualIndexSummaryStore) ⭐ NEW v2.5
 - 记忆图谱 (MemoryGraph) ⭐ NEW v3.0
+- 混合存储 (MemoryGraphHybrid) ⭐ NEW v3.1
 """
 
 from .short_term_memory import ShortTermMemory
@@ -30,6 +31,12 @@ from .llm_memory_reviewer import LLMMemoryReviewer, get_llm_memory_reviewer
 from .summary_store import DualIndexSummaryStore, get_dual_index_summary_store
 from .memory_graph import MemoryGraph, get_memory_graph
 from .task_search_index import HistoricalTaskIndex, get_task_search_index
+
+from .memory_graph_factory import (
+    create_memory_graph,
+    get_memory_graph_type,
+    get_memory_graph_stats
+)
 
 __all__ = [
     "ShortTermMemory",
@@ -53,4 +60,7 @@ __all__ = [
     "get_memory_graph",
     "HistoricalTaskIndex",
     "get_task_search_index",
+    "create_memory_graph",
+    "get_memory_graph_type",
+    "get_memory_graph_stats",
 ]

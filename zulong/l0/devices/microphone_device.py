@@ -424,9 +424,21 @@ class MicrophoneDevice:
                     
                     logger.debug(f"🎤 录音中：层={self._attention_layer}, 块数={len(self.manual_audio_chunks)}")
                 
-                # 自动检测模式（保留原有逻辑）
-                elif self._detect_sound_change(data):
-                    await self._publish_audio_event(data)
+                # 非手动录音模式：仅写入 shared_memory，不发布事件
+                # 防止环境噪音误触发 SENSOR_SOUND 事件导致 LLM 崩溃
+                else:
+                    audio_array = np.frombuffer(data, dtype=np.int16)
+                    shared_memory = await self._get_shared_memory()
+                    if shared_memory and hasattr(shared_memory, 'set'):
+                        try:
+                            shared_memory.set(
+                                "audio.raw_frame",
+                                audio_array,
+                                zone="raw",
+                                metadata={"sample_rate": self.SAMPLE_RATE, "timestamp": time.time()}
+                            )
+                        except Exception as e:
+                            logger.debug(f"写入 shared_memory 失败: {e}")
                 
                 await asyncio.sleep(0)
                 
@@ -715,7 +727,7 @@ class MicrophoneDevice:
             priority=EventPriority.NORMAL
         )
         
-        await self.event_bus.publish(event)
+        self.event_bus.publish(event)
         logger.debug(f"📨 发布音频事件：{event.id}")
     
     def start_manual_recording(self):

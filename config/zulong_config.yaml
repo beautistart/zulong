@@ -305,6 +305,7 @@ memory:
     map_size_gb: 10
     max_active_shards: 3
     shard_strategy: month
+    use_sharding: false
   rag:
     data_dir: ./data/rag
     embedding_dim: 512
