@@ -39,9 +39,13 @@
 
 <p align="center">祖龙系统三层注意力机制演示和超复杂项目记忆文件展示</p>
 
-<div align="center">
-  <iframe width="100%" height="500" src="https://www.youtube.com/embed/-W-WYg_eQz4" title="1分钟看懂祖龙" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen></iframe>
-</div>
+<p align="center">
+  <a href="https://youtu.be/-W-WYg_eQz4" target="_blank">
+    <img src="https://img.youtube.com/vi/-W-WYg_eQz4/maxresdefault.jpg" alt="1分钟看懂祖龙" width="100%" />
+  </a>
+</p>
+
+<p align="center"><b>👆 点击图片观看视频</b></p>
 
 ---
 
