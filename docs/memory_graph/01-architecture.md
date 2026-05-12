@@ -487,77 +487,74 @@ _IMPORTANCE_HALF_LIFE = {
 
 ## 💾 持久化机制
 
-### JSON 持久化格式
+### LMDB + GraphML 持久化
 
-```json
-{
-  "version": "1.0",
-  "saved_at": 1234567890,
-  "meta": {
-    "node_count": 150,
-    "edge_count": 280,
-    "last_focus_context": {"node_id": "task:o1_1"}
-  },
-  "nodes": {
-    "task:o1_1": {
-      "node_type": "task",
-      "label": "爬取天气数据",
-      "activation": 0.85,
-      "created_at": 1234567890,
-      "last_accessed": 1234567890,
-      "access_count": 5,
-      "backend_ref": "taskgraph:o1_1",
-      "metadata": {
+祖龙记忆图谱现已采用 **LMDB (Lightning Memory-Mapped Database) + GraphML** 的混合持久化方案，取代原有的纯 JSON 方案。
+
+**架构优势**：
+- **LMDB**: 高性能内存映射数据库，支持 ACID 事务，读取速度 <1ms
+- **GraphML**: 标准图交换格式，兼容 Neo4j/NetworkX/Cytoscape 等工具
+- **增量更新**: LMDB 支持原地修改，无需全图重写
+- **大规模存储**: 支持百万级节点，不受内存限制
+
+### 持久化文件结构
+
+```
+./data/memory_graph/
+├── memory_graph.lmdb/              # LMDB 数据库目录
+│   ├── data.mdb                    # 主数据文件
+│   └── lock.mdb                    # 锁文件
+├── graph.graphml                   # GraphML 格式（用于导出/可视化）
+└── summary_sidecar.index           # FAISS 索引文件
+```
+
+### LMDB 数据结构
+
+```python
+# 节点存储格式 (key-value)
+key: "node:{node_id}"
+value: {
+    "node_type": "task",
+    "label": "爬取天气数据",
+    "activation": 0.85,
+    "created_at": 1234567890,
+    "last_accessed": 1234567890,
+    "access_count": 5,
+    "backend_ref": "taskgraph:o1_1",
+    "metadata": {
         "temperature": "hot",
         "importance": "important",
         "content": "帮我写一个 Python 脚本，爬取天气数据"
-      }
-    },
-    "dialogue:42": {
-      "node_type": "dialogue",
-      "label": "询问天气 API 用法",
-      "activation": 0.65,
-      "metadata": {
-        "temperature": "warm",
-        "importance": "normal",
-        "trace_id": "trace_memory_000042"
-      }
     }
-  },
-  "edges": [
-    {
-      "source": "task:o1_1",
-      "target": "dialogue:42",
-      "edge_type": "reference",
-      "weight": 0.75,
-      "protected": false,
-      "created_at": 1234567890,
-      "last_activated": 1234567890
-    }
-  ]
+}
+
+# 边存储格式 (key-value)
+key: "edge:{source}:{target}:{edge_type}"
+value: {
+    "weight": 0.75,
+    "protected": false,
+    "created_at": 1234567890,
+    "last_activated": 1234567890
 }
 ```
 
-### FAISS 摘要索引持久化
+### GraphML 导出
 
-```
-持久化文件结构:
-./data/memory_graph/
-├── graph.json                      # 图结构（NetworkX 序列化）
-├── summary_sidecar.index           # FAISS 索引文件
-└── summary_sidecar.maps.json       # node_id ↔ faiss_id 映射
-
-summary_sidecar.maps.json 格式:
-{
-  "node_to_faiss": {
-    "dialogue:42": "summary_dialogue_42",
-    "dialogue:43": "summary_dialogue_43"
-  },
-  "faiss_to_node": {
-    "summary_dialogue_42": "dialogue:42",
-    "summary_dialogue_43": "dialogue:43"
-  }
-}
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<graphml xmlns="http://graphml.graphdrawing.org/xmlns">
+  <graph id="memory_graph" edgedefault="directed">
+    <node id="task:o1_1">
+      <data key="node_type">task</data>
+      <data key="label">爬取天气数据</data>
+      <data key="activation">0.85</data>
+    </node>
+    <edge source="task:o1_1" target="dialogue:42">
+      <data key="edge_type">reference</data>
+      <data key="weight">0.75</data>
+    </edge>
+  </graph>
+</graphml>
 ```
 
 ### 自动保存（防抖写盘）

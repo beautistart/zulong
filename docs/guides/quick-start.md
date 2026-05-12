@@ -1,8 +1,8 @@
 # 祖龙 (ZULONG) 系统 - 快速启动指南
 
-**版本**: v1.7  
-**更新日期**: 2026-03-21  
-**适用环境**: Windows + NVIDIA GPU (RTX 3060 6GB 或更高)
+**版本**: v2.0  
+**更新日期**: 2026-05-12  
+**适用环境**: Windows + NVIDIA GPU (6GB 显存或更高)
 
 ---
 
@@ -19,7 +19,7 @@ pip install -r requirements.txt
 #### 1.2 检查硬件
 确保以下硬件可用:
 - ✅ Windows 系统
-- ✅ NVIDIA GPU (RTX 3060 6GB 或更高)
+- ✅ NVIDIA GPU (6GB 显存或更高)
 - ✅ 麦克风设备
 - ✅ 扬声器/耳机设备
 
@@ -37,18 +37,18 @@ python scripts/verify_new_models.py
 
 ---
 
-## 🎯 启动模式
+## 🎯 启动服务
 
-### 模式 1: 真实环境启动 (推荐)
+### 统一启动方式
 
-**用途**: 使用真实硬件 (麦克风、扬声器) 进行交互
+**祖龙系统现已统一使用 `start.py` 启动服务**
 
 ```bash
-# 快速启动 (默认模式)
-python -m scripts.run_real_test
+# 启动祖龙系统（默认真实环境模式）
+python start.py
 
-# 或者使用 bootstrap.py
-python -m zulong.bootstrap
+# 或使用带传感器模拟模式
+python start.py --mock-sensors
 ```
 
 **启动后可用功能**:
@@ -59,12 +59,12 @@ python -m zulong.bootstrap
 
 ---
 
-### 模式 2: 带传感器模拟启动
+### 模式 2: 带传感器模拟启动（已整合到 start.py）
 
 **用途**: 测试/演示模式，模拟传感器数据
 
 ```bash
-python -m scripts.run_real_test --mock-sensors
+python start.py --mock-sensors
 ```
 
 **模拟的传感器**:

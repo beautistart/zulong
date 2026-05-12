@@ -634,8 +634,8 @@ if intent == "RESUME":
     pattern_window = 20
     max_repeated = 5
 
-# 4B 模型专项补偿
-if model_size <= "4B":
+# 小模型专项补偿
+if model_size <= "7B":
     pattern_window *= 2
     max_repeated *= 2
 ```
@@ -734,7 +734,7 @@ async def eval_response(state: IDEFCState) -> IDEFCState:
     
     # Layer 4: RESUME AutoMark 安全网
     if state.intent == "RESUME" and not tool_called:
-        # 4B 模型忘记调 task_mark_status
+        # 模型忘记调 task_mark_status
         # 自动标记当前节点为 completed
         auto_mark_current_node(state)
         state.resume_automark_count += 1
@@ -887,6 +887,7 @@ class IDESession:
 
 ## 9.3 整体延迟
 
+**本地模式延迟**:
 ```
 用户说话
   ↓
@@ -904,6 +905,11 @@ TTS 合成 (<0.3s)
 ────────────────
 总计: 3-4s
 ```
+
+**云端 API 调用模式延迟**:
+- 云端 LLM 调用增加网络延迟
+- **整体延迟**: 3-4s（语音输入 → 语音输出）
+- 适用于使用 GPT-4/Claude 等云端模型的场景
 
 ---
 
@@ -1033,7 +1039,7 @@ async def list_tools() -> List[Tool]:
 |------|---------|---------|--------|
 | **Twitter/X** | 英文 thread + 架构图 + demo 视频 | 全球 AI 开发者、投资人 | 最高 |
 | **知乎** | 技术长文 | 中文 AI 技术社区 | 高 |
-| **Reddit r/LocalLLaMA** | 技术帖，强调 RTX 3060 可跑 | 本地模型爱好者 | 高 |
+| **Reddit r/LocalLLaMA** | 技术帖，强调本地部署可跑 | 本地模型爱好者 | 高 |
 | **Hacker News** | Show HN 帖 | 全球技术圈 | 高 |
 | **B站** | demo 录屏讲解 | 中文开发者 + 泛 AI 圈 | 中 |
 
@@ -1107,8 +1113,8 @@ async def list_tools() -> List[Tool]:
 
 | 指标 | 数值 | 测试环境 |
 |------|------|---------|
-| **热记忆检索** | <50ms | RTX 3060 6GB |
-| **冷记忆检索** | <200ms | RTX 3060 6GB |
+| **热记忆检索** | <50ms | GPU 6GB+ |
+| **冷记忆检索** | <200ms | GPU 6GB+ |
 | **ASR 推理** | 0.5-1s | CPU, SenseVoice-Small |
 | **TTS 推理** | <0.3s | CPU, Kokoro-82M |
 | **端到端延迟** | 3-4s | 语音输入 → 语音输出 |
