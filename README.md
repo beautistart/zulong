@@ -575,6 +575,31 @@ Server("zulong-memory")
 - **[BAAI BGE 系列](https://github.com/FlagOpen/FlagEmbedding)** - 北京智源研究院文本嵌入模型
 - **[MediaPipe](https://google.github.io/mediapipe/)** - Google 开源跨平台机器学习管道（人脸/手部/姿态检测）
 
+### Agent 框架与编排
+
+- **[LangGraph](https://github.com/langchain-ai/langgraph)** - 图式 AI Agent 编排框架
+- **[LangChain](https://github.com/langchain-ai/langchain)** - 多 LLM 应用开发框架
+- **[VLLM](https://github.com/vllm-project/vllm)** - 高性能 LLM 推理与服务引擎
+
+### 视觉与多模态
+
+- **[OpenCV](https://github.com/opencv/opencv)** - 计算机视觉库（摄像头模块与运动检测）
+
+### 自然语言处理
+
+- **[NLTK](https://www.nltk.org/)** - 自然语言处理工具包
+- **[jieba](https://github.com/fxsjy/jieba)** - 中文分词工具
+
+### 数值计算与科学计算
+
+- **[NumPy](https://numpy.org/)** - 数值计算与多维数组
+- **[SciPy](https://scipy.org/)** - 科学计算与线性代数
+
+### 安全与解析
+
+- **[PyJWT](https://github.com/jpadilla/pyjwt)** - JSON Web Token 创建与验证
+- **[Tree-sitter](https://tree-sitter.github.io/)** - 增量代码解析器生成器
+
 ### AI 编程工具
 
 感谢以下 AI 编程工具在祖龙开发过程中的帮助：
