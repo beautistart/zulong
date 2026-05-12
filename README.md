@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="./docs/images/zulong_logo.png" alt="Zulong Logo" width="120" height="120" />
+<img src="./docs/images/zulong_logo_transparent.png" alt="Zulong Logo" width="120" height="120" />
 
 # 祖龙 (ZULONG)
 
