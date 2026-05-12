@@ -37,11 +37,18 @@
 
 **🎬 视频演示**
 
-> [![视频预览](https://img.shields.io/badge/视频-1分钟看懂祖龙-blue?style=for-the-badge)](./docs/videos/zulong_demo.mp4)
->
+<details>
+<summary><b>点击播放：祖龙系统三层注意力机制演示</b></summary>
+
 > 祖龙系统三层注意力机制演示和超复杂项目记忆文件展示
 
-<video src="./docs/videos/zulong_demo.mp4" controls width="100%"></video>
+[![视频预览](https://img.shields.io/badge/🎬_播放视频-1分钟看懂祖龙-blue?style=for-the-badge)](./docs/videos/zulong_demo.mp4)
+
+<video src="https://raw.githubusercontent.com/beautistart/zulong/main/docs/videos/zulong_demo.mp4" controls preload="metadata" style="max-width: 100%; height: auto;">
+  你的浏览器不支持视频播放，请<a href="./docs/videos/zulong_demo.mp4">点击此处下载观看</a>
+</video>
+
+</details>
 
 ---
 
