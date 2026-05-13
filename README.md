@@ -13,6 +13,7 @@
 [![VS Code](https://img.shields.io/badge/VS%20Code-Extension-green.svg)](https://code.visualstudio.com/)
 [![GitHub release](https://img.shields.io/github/release/beautistart/zulong.svg)](https://github.com/beautistart/zulong/releases)
 [![Discord](https://dcbadge.limes.pink/api/server/zZMgtSyHV?style=flat)](https://discord.gg/zZMgtSyHV)
+[![Juejin](https://img.shields.io/badge/📖_掘金技术解析-1E80FF?style=flat&logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cGF0aCBkPSJNMTIgMkwxNS4wOSA1LjA5TDE4IDJMMjAuOTEgNS4wOUwyNCAyTDIwLjkxIDguMDlMMjQgMTFMMjAuOTEgMTQuMDlMMjQgMTdMMjAuOTEgMjAuMDlMMjQgMjNMMTggMjBMMTUuMDkgMjNMMTIgMjBMOCAyM0w0LjkxIDIwTDEgMjNMNC4wOSAyMEwxIDE3TDQuMDkgMTQuMDlMMSAxMUw0LjA5IDguMDlMMSA1TDQuOTEgMi4wOUw4IDVMMTEuMDkgMkwxMiAyWiIgZmlsbD0iIzFFODBGRiIvPjwvc3ZnPg==)](https://juejin.cn/post/7639026628014014473)
 [![Stars](https://img.shields.io/github/stars/beautistart/zulong?style=social)](https://github.com/beautistart/zulong)
 
 [English](./docs/README_EN.md) | 简体中文

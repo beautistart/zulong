@@ -13,6 +13,7 @@
 [![VS Code](https://img.shields.io/badge/VS%20Code-Extension-green.svg)](https://code.visualstudio.com/)
 [![GitHub release](https://img.shields.io/github/release/beautistart/zulong.svg)](https://github.com/beautistart/zulong/releases)
 [![Discord](https://dcbadge.limes.pink/api/server/zZMgtSyHV?style=flat)](https://discord.gg/zZMgtSyHV)
+[![Juejin](https://img.shields.io/badge/📖_Tech_Analysis-1E80FF?style=flat)](https://juejin.cn/post/7639026628014014473)
 [![Stars](https://img.shields.io/github/stars/beautistart/zulong?style=social)](https://github.com/beautistart/zulong)
 
 [English](./README_EN.md) | [简体中文](../README.md)
