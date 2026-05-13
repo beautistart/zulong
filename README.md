@@ -30,6 +30,11 @@
   </a>
 </p>
 
+<p align="center">
+  <a href="https://zhuanlan.zhihu.com/p/2037757466839085217" target="_blank"> 知乎深度解析</a> · 
+  <a href="https://juejin.cn/post/7639026628014014473" target="_blank">📖 掘金技术解析</a>
+</p>
+
 ---
 
 ## 为何一个室内设计师，敢去造 AI 大脑？

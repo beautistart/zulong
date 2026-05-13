@@ -30,6 +30,10 @@
   </a>
 </p>
 
+<p align="center">
+  <a href="https://juejin.cn/post/7639026628014014473" target="_blank"> Tech Analysis</a>
+</p>
+
 ---
 
 ## Why Would an Interior Designer Dare to Build an AI Brain?
