@@ -357,15 +357,30 @@ class IDEToolRegistry:
         """根据意图返回过滤后的合并工具定义
 
         Args:
-            intent: "chat" 返回空列表; "complex" 返回全部工具; "resume" 排除 task_create_plan/task_add_node
+            intent: "chat" 返回基础工具（记忆/上下文）;
+                   "complex" 返回全部工具;
+                   "resume" 排除 task_create_plan/task_add_node
 
         Returns:
             过滤后的 OpenAI FC tool schema 列表
         """
-        # CHAT意图：简单对话，不需要工具
+        # CHAT意图：简单对话，仅加载基础工具（记忆相关）
         if intent == "chat":
-            logger.info(f"[IDEToolRegistry] 意图 {intent} 工具定义: 内部=0, 远程=0, 总计=0")
-            return []
+            # CHAT基础工具：记忆检索/读取/保存/发现相关
+            _CHAT_BASE_TOOLS = {
+                "recall_memory",      # 记忆检索
+                "read_memory_node",   # 读取记忆节点
+                "save_memory_note",   # 保存记忆
+                "discover_related",   # 发现相关内容
+            }
+            internal = self._get_filtered_internal_tools(
+                extra_include=_CHAT_BASE_TOOLS)
+            # CHAT不加载远程IDE工具
+            logger.info(
+                f"[IDEToolRegistry] 意图 {intent} 工具定义: "
+                f"内部={len(internal)}, 远程=0, 总计={len(internal)}"
+            )
+            return internal
         
         extra_exclude = _RESUME_EXCLUDED_INTERNAL_TOOLS if intent == "resume" else None
         internal = self._get_filtered_internal_tools(extra_exclude=extra_exclude)
@@ -378,12 +393,14 @@ class IDEToolRegistry:
         return combined
 
     def _get_filtered_internal_tools(
-        self, extra_exclude: Optional[set] = None
+        self, extra_exclude: Optional[set] = None,
+        extra_include: Optional[set] = None
     ) -> List[Dict[str, Any]]:
         """获取过滤后的祖龙内部工具 schema
 
         IDE 模式下禁用与远程工具功能重叠的执行工具。
         extra_exclude 用于 RESUME 场景排除 task_create_plan/task_add_node。
+        extra_include 用于 CHAT 场景仅加载指定工具。
         """
         if not self.tool_engine:
             return []
@@ -392,14 +409,20 @@ class IDEToolRegistry:
         for name, tool in self.tool_engine.registry.tools.items():
             if not tool.enabled:
                 continue
-            if name in _ZULONG_TOOLS_DISABLED_IN_IDE_MODE:
-                logger.debug(f"[IDEToolRegistry] 跳过 IDE 模式禁用工具: {name}")
-                continue
-            if name in IDE_REMOTE_TOOLS:
-                continue
-            if extra_exclude and name in extra_exclude:
-                logger.info(f"[IDEToolRegistry] RESUME 排除工具: {name}")
-                continue
+            # CHAT模式：仅加载extra_include中的工具
+            if extra_include is not None:
+                if name not in extra_include:
+                    continue
+            else:
+                # 非CHAT模式的正常过滤
+                if name in _ZULONG_TOOLS_DISABLED_IN_IDE_MODE:
+                    logger.debug(f"[IDEToolRegistry] 跳过 IDE 模式禁用工具: {name}")
+                    continue
+                if name in IDE_REMOTE_TOOLS:
+                    continue
+                if extra_exclude and name in extra_exclude:
+                    logger.info(f"[IDEToolRegistry] RESUME 排除工具: {name}")
+                    continue
 
             # 使用缓存获取schema
             cached_schema = self._schema_cache.get(name, tool)
@@ -414,13 +437,15 @@ class IDEToolRegistry:
             except Exception as e:
                 logger.warning(f"[IDEToolRegistry] 工具 {name} schema 获取失败: {e}")
 
-        # 追加 TaskGraph CRUD 工具 schema
-        try:
-            from zulong.ide.graph_crud_tools import get_crud_tool_schemas
-            crud_schemas = get_crud_tool_schemas()
-            tool_definitions.extend(crud_schemas)
-        except Exception as e:
-            logger.warning(f"[IDEToolRegistry] CRUD工具schema加载失败: {e}")
+        # CHAT模式不加载CRUD工具
+        if extra_include is None:
+            # 追加 TaskGraph CRUD 工具 schema
+            try:
+                from zulong.ide.graph_crud_tools import get_crud_tool_schemas
+                crud_schemas = get_crud_tool_schemas()
+                tool_definitions.extend(crud_schemas)
+            except Exception as e:
+                logger.warning(f"[IDEToolRegistry] CRUD工具schema加载失败: {e}")
 
         return tool_definitions
 
