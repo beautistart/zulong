@@ -136,11 +136,12 @@ Round 2: 场景化执行
 
 - **L0 设备层**：USB 摄像头 / 麦克风 / 扬声器驱动，GPU 加速光流运动检测（RTX 3060, 150+ FPS），多关节执行器模拟（位置/速度/扭矩跟踪）
 - **L1 模块化插件架构**：松耦合热插拔设计，4 级优先级调度（CRITICAL > HIGH > NORMAL > LOW）
-  - **L1-A 感知与受控反射层**：障碍物自动刹车（<50ms 响应），紧急停止，跌落保护，音频融合控制
-  - **L1-B 调度与意图守门层**：三层注意力机制（L0 静默采集 → L1 静默注意 → L2 交互注意），ALBERT-tiny 15类细粒度意图分类，事件风暴削减 ~90%
-  - **L1-C 静默视觉注意层**：YOLOv10 人体检测 → MediaPipe 姿态/手势(10种) → MobileNetV4-TSM 动作分类(5类交互意图: WAVING/APPROACHING/GAZING/STILL/UNKNOWN) → 几何规则交互意图确认
-  - **L1-D 听觉层**：音频采集 → 预加重+滤波(80Hz) → YAMNet环境音分类(521类) → VAD → SenseVoice-Small单次推理(转录+情感+事件+语种) → 后处理意图判断(交互/非交互) → L1-B串行协作(ALBERT 15类)；唤醒词("你好"/"救命"/"小紫")，"救命"CRITICAL直达L1-B
+  - **L1-A 感知与受控反射层**：障碍物自动刹车（<50ms 响应），紧急停止，跌落保护，音频融合控制，运动控制（可接入厂家运动控制模块或端到端模型），与L1-C/L1-D紧密协作
+  - **L1-B 调度与意图守门层**：三层注意力机制（无需注意 → 静默注意 → 交互注意），ALBERT-tiny 15类细粒度意图分类（与L1-C/D的交互意图判断不同），事件风暴削减 ~90%
+  - **L1-C 静默视觉注意层**：YOLOv10 人体检测 → MediaPipe 姿态/手势(10种) → MobileNetV4-TSM 动作分类 → 交互意图判断(5类: WAVING/APPROACHING/GAZING/STILL/UNKNOWN)，可接入轻量视觉交互意图模型
+  - **L1-D 听觉层**：音频采集 → 预加重+滤波(80Hz) → YAMNet环境音分类(521类) → VAD → SenseVoice-Small单次推理(转录+情感+事件+语种) → 交互意图判断(基于事件标签) → L1-B串行协作(ALBERT 15类)；唤醒词("你好"/"救命"/"小紫")，"救命"CRITICAL直达L1-B
   - **L1-E 安全层**：MQ-2烟雾传感器 → 气体浓度检测(阈值500ppm) → CRITICAL事件穿透直达L1-B + 语音报警，60秒冷却
+- **L2 认知层**：推理与决策，不做意图判断
 - **L3 导航专家**：A* 路径规划 + DWA 动态窗口避障（2s 轨迹预测，0.5m 安全距离）
 - **OpenClaw Bridge**：实体机器人桥接模块，通过 EventBus 与祖龙 L1-B 实时通信
 
@@ -155,17 +156,17 @@ Round 2: 场景化执行
 ### 四层推理模型
 
 ```
-L3 专家层 (Expert Layer)           - 7 种专家模型池，热切换 < 10ms
+L3 专家层 (Expert Layer)           - 专家模型池，热切换 < 10ms
   ↓
-L2 认知层 (Cognitive Layer)        - InferenceEngine (5700+ 行)，两阶段推理 + FC 循环
+L2 认知层 (Cognitive Layer)        - InferenceEngine (5700+ 行)，推理与决策(不做意图判断)
   ↓
 L1-B 调度层 (Scheduler Layer)      - Gatekeeper + AttentionController，事件优先级路由
   ↓
-L1-A 反射层 (Reflex Layer)         - 障碍物刹车/紧急停止/跌落保护 + 音频融合
-L1-C 视觉层 (Vision Layer)         - YOLOv10 → MediaPipe → MobileNetV4-TSM → 交互意图确认
+L1-A 反射层 (Reflex Layer)         - 障碍物刹车/紧急停止/运动控制 + 与L1-C/D协作
+L1-C 视觉层 (Vision Layer)         - YOLOv10 → MediaPipe → MobileNetV4-TSM → 交互意图判断
 L1-D 听觉层 (Auditory Layer)       - YAMNet → VAD → SenseVoice-Small → 交互意图判断
 L1-E 安全层 (Safety Layer)         - MQ-2 气体检测 → CRITICAL 穿透
-  ↓
+  ↓ → 输出(文本/语音/动作)
 L0 设备层 (Device Layer)           - USB 摄像头/麦克风/扬声器驱动，运动检测
 ```
 

@@ -42,9 +42,9 @@ code --install-extension zulong-ide-0.1.0.vsix --force  # Install
 ### 四层推理模型
 
 ```
-L3 专家层 ──── DualBrainContainer(双脑热备) + 7种专家(TTS/视觉/导航/操控/校准)
+L3 专家层 ──── DualBrainContainer(双脑热备) + 专家模型池
 L2 认知层 ──── InferenceEngine(3934行) + FC循环 + TaskGraph(递归DAG) + CircuitBreaker(6信号)
-L1 感知层 ──── L1-A反射 + L1-B调度 + L1-C视觉 + L1-D听觉 + L1-E安全
+L1 感知层 ──── L1-A反射/运动控制 + L1-B调度 + L1-C视觉 + L1-D听觉 + L1-E安全 → 输出(文本/语音/动作)
 L0 设备层 ──── 摄像头/麦克风/扬声器/传感器驱动
 ```
 
@@ -52,10 +52,10 @@ L0 设备层 ──── 摄像头/麦克风/扬声器/传感器驱动
 
 | 子层 | 名称 | 核心模块 | 模型 | 意图识别 |
 |------|------|---------|------|---------|
-| L1-A | 感知与受控反射层 | ReflexController + AudioPreprocessor + FusionController | 无独立模型 | 无 |
-| L1-B | 调度与意图守门层 | Gatekeeper(2652行) + AttentionController + IntentFilter | ALBERT-tiny(15类) + VoiceIntentClassifier(3类) | 细粒度15类意图分类 |
-| L1-C | 静默视觉注意层 | OptimizedVisionProcessor + MobileNetV4-TSM + MediaPipeGestureRecognizer | YOLOv10+MediaPipe+MobileNetV4-TSM | 5类交互意图(WAVING/APPROACHING/GAZING/STILL/UNKNOWN) |
-| L1-D | 听觉层 | L1D_VoicePlugin + L1D_AudioPlugin(三层注意力) | YAMNet+SenseVoice-Small(主ASR)+Whisper(备选) | 粗粒度交互/非交互判断(基于事件标签) |
+| L1-A | 感知与受控反射层 | ReflexController + AudioPreprocessor + FusionController + 运动控制(可接入厂家运动控制模块或端到端模型) | 可接入端到端运动模型 | 无(与L1-C/L1-D紧密协作) |
+| L1-B | 调度与意图守门层 | Gatekeeper(2652行) + AttentionController + IntentFilter | ALBERT-tiny(15类) + VoiceIntentClassifier(3类) | 细粒度15类意图分类(与L1-C/D的交互意图判断不同) |
+| L1-C | 静默视觉注意层 | OptimizedVisionProcessor + MobileNetV4-TSM + MediaPipeGestureRecognizer | YOLOv10+MediaPipe+MobileNetV4-TSM+可接入轻量视觉交互意图模型 | 交互意图判断(5类:WAVING/APPROACHING/GAZING/STILL/UNKNOWN) |
+| L1-D | 听觉层 | L1D_VoicePlugin + L1D_AudioPlugin(三层注意力) | YAMNet+SenseVoice-Small(主ASR)+Whisper(备选) | 交互意图判断(基于事件标签的交互/非交互判断) |
 | L1-E | 安全层 | L1E_GasPlugin | MQ-2烟雾传感器 | CRITICAL事件穿透 |
 
 ### L1-D听觉处理流水线
@@ -67,18 +67,24 @@ L0 设备层 ──── 摄像头/麦克风/扬声器/传感器驱动
 - Whisper-tiny: 仅SenseVoice不可用时启用
 
 ### 三层注意力机制
+
+**感知层三层注意力**(L1-C视觉和L1-D听觉均为此设计):
 | 层级 | 职责 | 行为 |
 |------|------|------|
-| L0_SENSOR | 纯数据采集 | 无注意力，无事件 |
-| L1_SILENT | 静默注意 | 持续推理，状态翻转时生成事件 |
-| L2_INTERACTIVE | 交互注意 | 已生成事件，等待路由 |
-| L3_COGNITIVE | 认知层 | L2正在处理 |
+| 无需注意 | 纯数据采集 | 无注意力，无事件产生 |
+| 静默注意 | 持续推理 | 状态翻转时生成事件 |
+| 交互注意 | 已生成事件 | 等待路由到L1-B |
 
-### 意图识别四级体系
-1. **L1-C交互意图**: MobileNetV4-TSM动作分类 → 5类(挥手/注视/靠近/静止/未知)
-2. **L1-D音频意图**: SenseVoice事件标签后处理 → 交互/非交互二分
-3. **L1-B细粒度意图**: ALBERT-tiny语义分类 → 15类(task_code/task_analysis/vision_query等)
-4. **L2兜底意图**: LLM语义判断 → CHAT/COMPLEX/RESUME
+**记忆动态注意力机制**(L2推理阶段):
+- 全局注意(GLOBAL): 关注完整上下文
+- 单链注意(SINGLE_CHAIN): 聚焦单条推理链
+- 局部注意(FOCUS): 聚焦局部关键信息
+
+### 意图识别体系
+1. **L1-C交互意图判断**: MobileNetV4-TSM动作分类(可接入轻量视觉交互意图模型) → 5类(挥手/注视/靠近/静止/未知)
+2. **L1-D交互意图判断**: SenseVoice事件标签后处理 → 交互/非交互二分
+3. **L1-B细粒度意图分类**: ALBERT-tiny语义分类 → 15类(task_code/task_analysis/vision_query等)，与L1-C/D的交互意图判断不同
+4. **L2**: 认知推理与决策，不做意图判断
 
 ### 记忆系统核心
 - **MemoryGraph**(3547行): 异构图(NetworkX DiGraph), 11种节点+7种边, BFS扩散+赫布学习+艾宾浩斯衰减
