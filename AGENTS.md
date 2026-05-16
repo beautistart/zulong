@@ -39,6 +39,59 @@ code --install-extension zulong-ide-0.1.0.vsix --force  # Install
 - **Communication**: WebSocket at `ws://127.0.0.1:8090/ide`
 - **Config**: `config/zulong_config.yaml` (port: 8090)
 
+### 四层推理模型
+
+```
+L3 专家层 ──── DualBrainContainer(双脑热备) + 7种专家(TTS/视觉/导航/操控/校准)
+L2 认知层 ──── InferenceEngine(3934行) + FC循环 + TaskGraph(递归DAG) + CircuitBreaker(6信号)
+L1 感知层 ──── L1-A反射 + L1-B调度 + L1-C视觉 + L1-D听觉 + L1-E安全
+L0 设备层 ──── 摄像头/麦克风/扬声器/传感器驱动
+```
+
+### L1五个子层
+
+| 子层 | 名称 | 核心模块 | 模型 | 意图识别 |
+|------|------|---------|------|---------|
+| L1-A | 感知与受控反射层 | ReflexController + AudioPreprocessor + FusionController | 无独立模型 | 无 |
+| L1-B | 调度与意图守门层 | Gatekeeper(2652行) + AttentionController + IntentFilter | ALBERT-tiny(15类) + VoiceIntentClassifier(3类) | 细粒度15类意图分类 |
+| L1-C | 静默视觉注意层 | OptimizedVisionProcessor + MobileNetV4-TSM + MediaPipeGestureRecognizer | YOLOv10+MediaPipe+MobileNetV4-TSM | 5类交互意图(WAVING/APPROACHING/GAZING/STILL/UNKNOWN) |
+| L1-D | 听觉层 | L1D_VoicePlugin + L1D_AudioPlugin(三层注意力) | YAMNet+SenseVoice-Small(主ASR)+Whisper(备选) | 粗粒度交互/非交互判断(基于事件标签) |
+| L1-E | 安全层 | L1E_GasPlugin | MQ-2烟雾传感器 | CRITICAL事件穿透 |
+
+### L1-D听觉处理流水线
+```
+音频采集(L0) → 预加重+滤波(80Hz) → YAMNet(521类) → VAD → SenseVoice-Small单次推理(转录+情感+事件+语种) → 后处理意图判断 → L1-B串行协作(ALBERT 15类)
+```
+- 唤醒词: "你好"/"小紫"(NORMAL), "救命"(CRITICAL直达L1-B)
+- SenseVoice-Small: ONNX INT8 + sherpa-onnx, 一次推理产出4类信息
+- Whisper-tiny: 仅SenseVoice不可用时启用
+
+### 三层注意力机制
+| 层级 | 职责 | 行为 |
+|------|------|------|
+| L0_SENSOR | 纯数据采集 | 无注意力，无事件 |
+| L1_SILENT | 静默注意 | 持续推理，状态翻转时生成事件 |
+| L2_INTERACTIVE | 交互注意 | 已生成事件，等待路由 |
+| L3_COGNITIVE | 认知层 | L2正在处理 |
+
+### 意图识别四级体系
+1. **L1-C交互意图**: MobileNetV4-TSM动作分类 → 5类(挥手/注视/靠近/静止/未知)
+2. **L1-D音频意图**: SenseVoice事件标签后处理 → 交互/非交互二分
+3. **L1-B细粒度意图**: ALBERT-tiny语义分类 → 15类(task_code/task_analysis/vision_query等)
+4. **L2兜底意图**: LLM语义判断 → CHAT/COMPLEX/RESUME
+
+### 记忆系统核心
+- **MemoryGraph**(3547行): 异构图(NetworkX DiGraph), 11种节点+7种边, BFS扩散+赫布学习+艾宾浩斯衰减
+- **双路径检索**: 热路径BFS(<50ms) + 冷路径FAISS(<200ms), asyncio.gather并行
+- **三维标签**: Temperature(HOT/WARM/COLD) x Importance(6级) x TimeScope(RECENT/NON_RECENT)
+- **经验库**: 混合检索(向量0.7+BM25 0.3) + 时间衰减 + 多标签过滤
+- **FC工具暴露**: 4个工具(recall_memory/read_memory_node/save_memory_note/discover_related)暴露53个公开方法
+
+### 层间通信
+- **EventBus**: 单例, 优先级队列(CRITICAL>HIGH>NORMAL>LOW), 后台线程分发
+- **SharedMemory**: L1插件持续写入多模态融合数据(SensorFusionData)
+- **WebSocket**: IDE前端↔Python后端, 心跳30s, 超时5s, 3次丢失断连
+
 ## Critical File Map
 
 | File | Role |
@@ -49,8 +102,39 @@ code --install-extension zulong-ide-0.1.0.vsix --force  # Install
 | `zulong-ide/webview-ui/src/components/settings/ApiOptions.tsx` | Provider selection & conditional render |
 | `zulong-ide/src/shared/providers/providers.json` | Provider list (Zulong is first entry) |
 | `zulong/ide/ide_server.py` | Python backend entry (FastAPI + WebSocket) |
-| `zulong/ide/ide_fc_runner.py` | FC loop executor |
+| `zulong/ide/ide_fc_runner.py` | FC loop executor (3556行) |
 | `zulong/ide/ide_tool_registry.py` | Tool registry & smart routing |
+| `zulong/l2/inference_engine.py` | Core inference engine (3934行, FC循环+记忆+5层防护) |
+| `zulong/l2/circuit_breaker.py` | 6信号智能死循环检测器 (521行) |
+| `zulong/l2/task_graph.py` | 递归DAG任务图 (1265行) |
+| `zulong/memory/memory_graph.py` | 异构记忆图谱 (3547行, BFS+赫布+衰减+FAISS) |
+| `zulong/l1b/scheduler_gatekeeper.py` | L1-B核心调度器 (2652行) |
+| `zulong/l1b/intent_filter.py` | ALBERT意图过滤器 (15类) |
+| `zulong/l1c/optimized_vision_processor.py` | L1-C四层级联视觉处理器 |
+| `zulong/plugins/voice/l1d_audio_plugin.py` | L1-D三层注意力音频插件 |
+| `zulong/plugins/voice/l1d_voice_plugin.py` | L1-D语音唤醒插件 |
+| `zulong/plugins/gas/l1e_gas_plugin.py` | L1-E气体检测插件 |
+| `zulong/models/audio_model_container.py` | 音频模型容器 (SenseVoice+Whisper) |
+| `zulong/core/event_bus.py` | 事件总线 (单例, 优先级队列) |
+
+## Model Ecosystem
+
+| 模型 | 用途 | 规模 | 量化 | 推理引擎 |
+|------|------|------|------|----------|
+| YOLOv10-Nano | L1-C人体检测 | Nano | FP16 | PyTorch/CUDA |
+| MediaPipe | L1-C姿态+手势(10种) | - | - | MediaPipe/CPU |
+| MobileNetV4-TSM | L1-C动作分类(5类) | 轻量级 | - | PyTorch/CPU |
+| YAMNet | L1-D环境音(521类) | 轻量级 | - | TF/CPU |
+| SenseVoice-Small | L1-D ASR主引擎 | 244M | INT8 | ONNX GPU |
+| Whisper-tiny | L1-D ASR备选 | 39M | - | PyTorch/CPU |
+| ALBERT-tiny-chinese | L1-B意图(15类+3类) | 16M | - | PyTorch/CPU |
+| Kokoro-82M | L3 TTS主引擎 | 82M | - | Kokoro/CPU |
+| edge-tts | L3 TTS备选(云端) | 云端 | - | HTTP |
+| CosyVoice3-0.5B | L3 TTS备选 | 0.5B | - | PyTorch |
+| Qwen3.5-0.8B-int4 | L1-B/L2-BACKUP | 0.8B | INT4 | Transformers/GPU |
+| Qwen3.5-2B-int4 | L2-CORE主推理 | 2B | INT4 | Transformers/GPU |
+| bge-small-zh-v1.5 | Embedding向量 | 轻量级 | - | ST/CPU |
+| DeepSeek-V4-Flash | L2云端推理 | 云端 | - | SiliconFlow API |
 
 ## Coding Conventions
 
