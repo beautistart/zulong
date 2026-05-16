@@ -49,7 +49,18 @@ class IDEServerModule(Module):
             launcher_app.mount("/static", StaticFiles(directory=static_dir), name="static")
             logger.info(f"[IDEServerModule] /static 已挂载: {static_dir}")
 
-        # 4. 标记 IDE 就绪（Launcher 用此切换根路由）
+        # 4. 预热 Embedding 模型（避免首次对话时加载耗时导致前端超时）
+        try:
+            from zulong.memory.embedding_manager import get_embedding_manager
+            emb_mgr = get_embedding_manager()
+            if emb_mgr._model is None:
+                logger.info("[IDEServerModule] 预热 Embedding 模型...")
+                emb_mgr.encode("预热")
+                logger.info("[IDEServerModule] Embedding 模型预热完成")
+        except Exception as e:
+            logger.warning(f"[IDEServerModule] Embedding 模型预热失败（非致命）: {e}")
+
+        # 5. 标记 IDE 就绪（Launcher 用此切换根路由）
         self._context["ide_ready"] = True
 
         self.state = ModuleState.RUNNING

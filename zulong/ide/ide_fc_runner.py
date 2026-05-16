@@ -856,6 +856,17 @@ class IDEFCRunner:
             from zulong.memory.semantic_drift_detector import get_semantic_drift_detector
             self._drift_detector = get_semantic_drift_detector()
             logger.info("[IDEFCRunner] SemanticDriftDetector 已创建")
+            
+            # 🔥 预热 Embedding 模型，避免首次对话时加载耗时导致前端超时
+            try:
+                from zulong.memory.embedding_manager import get_embedding_manager
+                emb_mgr = get_embedding_manager()
+                if emb_mgr._model is None:
+                    logger.info("[IDEFCRunner] 预热 Embedding 模型...")
+                    emb_mgr.encode("预热")  # 触发懒加载
+                    logger.info("[IDEFCRunner] Embedding 模型预热完成")
+            except Exception as e:
+                logger.warning(f"[IDEFCRunner] Embedding 模型预热失败: {e}")
         except Exception as e:
             logger.warning(f"[IDEFCRunner] SemanticDriftDetector 创建失败: {e}")
 
