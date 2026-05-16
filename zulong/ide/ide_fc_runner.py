@@ -1077,7 +1077,8 @@ class IDEFCRunner:
         0. Session 上下文：如果上一次 FC 处于 waiting_remote 且有活跃 TG → RESUME
         1. 存在活跃 TaskGraph 且有未完成节点 → RESUME
         2. 用户输入包含恢复关键词 → RESUME
-        3. 其余 → COMPLEX（IDE 模式无 CHAT，因为 IDE 只在有任务时才调用）
+        3. 简单问候/闲聊 → CHAT（直接文本回复，不调用工具）
+        4. 其余 → COMPLEX（IDE 模式默认）
 
         Returns:
             (intent: str, has_active_task_graph: bool)
@@ -1139,6 +1140,18 @@ class IDEFCRunner:
                     return "resume", True
             except Exception as e:
                 logger.debug(f"[IDEFCRunner] 备份加载尝试失败: {e}")
+
+        # 规则 3: 简单问候/闲聊 → CHAT（避免加载工具导致LLM返回空回复）
+        _chat_patterns = (
+            "你好", "您好", "hello", "hi", "hey",
+            "早上好", "下午好", "晚上好", "good morning", "good afternoon",
+            "怎么样", "how are you", "最近好吗",
+            "谢谢", "感谢", "thanks", "thank you",
+        )
+        # 短文本（<20字符）且匹配问候模式 → CHAT
+        if len(stripped) < 20 and any(p in stripped for p in _chat_patterns):
+            logger.info("[IDEFCRunner] 意图检测: CHAT（简单问候）")
+            return "chat", has_active_tg
 
         # 默认: COMPLEX
         logger.info("[IDEFCRunner] 意图检测: COMPLEX")
