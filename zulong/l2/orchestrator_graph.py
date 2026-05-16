@@ -28,7 +28,12 @@ logger = logging.getLogger(__name__)
 # ✅ 导入 LangGraph
 try:
     from langgraph.graph import StateGraph, END
-    from langgraph.checkpoint.sqlite import SqliteSaver
+    # LangGraph 0.2.x 使用 MemorySaver 替代 SqliteSaver
+    try:
+        from langgraph.checkpoint.memory import MemorySaver
+        SqliteSaver = MemorySaver  # 别名兼容
+    except ImportError:
+        from langgraph.checkpoint.sqlite import SqliteSaver
     LANGGRAPH_AVAILABLE = True
 except ImportError:
     LANGGRAPH_AVAILABLE = False
@@ -297,6 +302,55 @@ def schedule_node(state: OrchestratorState, engine) -> OrchestratorState:
                 f"[Orchestrator] 无可执行节点，{len(blocked)} 个阻塞: "
                 f"{[n.id for n in blocked[:5]]}"
             )
+            
+            # 🔥 详细诊断：分析每个阻塞节点的原因
+            for node in blocked:
+                deps = tg.get_dependencies(node.id)
+                dep_info = []
+                for dep_id in deps:
+                    dep_node = tg.get_node(dep_id)
+                    if dep_node:
+                        dep_info.append(f"{dep_id}({dep_node.status})")
+                    else:
+                        dep_info.append(f"{dep_id}(missing)")
+                
+                logger.warning(
+                    f"[Orchestrator] 阻塞诊断 - 节点: {node.id}, "
+                    f"状态: {node.status}, "
+                    f"依赖: {dep_info if dep_info else '无'}, "
+                    f"标签: {node.label}"
+                )
+            
+            # 检查是否有工具结果可用
+            tool_results = state.get("tool_results_buffer", [])
+            if tool_results:
+                logger.info(
+                    f"[Orchestrator] all_blocked 时工具结果缓冲区有 {len(tool_results)} 条记录，"
+                    f"可能包含有效结果"
+                )
+            
+            # 🔧 恢复机制：尝试将依赖失败的节点标记为 skipped
+            recovered = False
+            for node in blocked:
+                deps = tg.get_dependencies(node.id)
+                if not deps:
+                    continue
+                # 检查是否所有依赖都已失败
+                all_deps_failed = all(
+                    tg.get_node(d).status in ("failed", "error", "blocked")
+                    for d in deps
+                    if tg.get_node(d)
+                )
+                if all_deps_failed and len(deps) > 0:
+                    node.status = "skipped"
+                    node.result = "依赖失败，自动跳过"
+                    logger.info(f"[Orchestrator] 恢复：节点 {node.id} 因依赖失败被跳过")
+                    recovered = True
+            
+            # 如果有节点被恢复，重新调度而不是终止
+            if recovered:
+                return state
+            
             state["should_terminate"] = "all_blocked"
             state["phase"] = PHASE_SYNTHESIZE
             return state

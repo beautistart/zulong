@@ -316,6 +316,9 @@ export class ZulongWebSocket extends EventEmitter {
 			case "audio_transcript":
 				this.emit("audio_transcript", msg.payload.text || "", msg.payload.is_final || false)
 				break
+			case "system_ready":
+				this.emit("system_ready", msg.payload)
+				break
 			default:
 				this.emit("unknown_message", msg)
 		}

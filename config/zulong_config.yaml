@@ -179,9 +179,9 @@ l2_inference:
     max_suspended_tasks: 20
     persistence_path: ./data/suspended_tasks
   timeout:
-    backup: 30
-    core: 90
-    fc_loop: 90
+    backup: 120
+    core: 300
+    fc_loop: 600
     remote_tool: 600
   visual_keywords_strong:
   - 摄像头

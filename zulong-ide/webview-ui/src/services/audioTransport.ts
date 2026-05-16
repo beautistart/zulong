@@ -16,11 +16,7 @@ class AudioTransportService extends EventEmitter {
 		return AudioTransportService.instance
 	}
 
-	setTransport(
-		sendAudioChunk: AudioChunkHandler,
-		sendAudioStart: AudioSignalHandler,
-		sendAudioEnd: AudioSignalHandler
-	): void {
+	setTransport(sendAudioChunk: AudioChunkHandler, sendAudioStart: AudioSignalHandler, sendAudioEnd: AudioSignalHandler): void {
 		this._sendAudioChunk = sendAudioChunk
 		this._sendAudioStart = sendAudioStart
 		this._sendAudioEnd = sendAudioEnd

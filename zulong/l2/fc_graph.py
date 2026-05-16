@@ -25,12 +25,15 @@ from typing import Any, Dict, List, Optional, Tuple, TypedDict, TYPE_CHECKING
 
 try:
     from langgraph.graph import StateGraph, END
-    from langgraph.checkpoint.sqlite import SqliteSaver
+    # LangGraph 0.2.x 使用 MemorySaver 替代 SqliteSaver
+    try:
+        from langgraph.checkpoint.memory import MemorySaver
+        SqliteSaver = MemorySaver  # 别名兼容
+    except ImportError:
+        from langgraph.checkpoint.sqlite import SqliteSaver
     LANGGRAPH_AVAILABLE = True
 except ImportError:
     LANGGRAPH_AVAILABLE = False
-    from langgraph.graph import StateGraph, END
-    SqliteSaver = None
 
 if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
@@ -449,90 +452,115 @@ def _make_exec_tools_node(engine: "InferenceEngine"):
             if engine._attn_window:
                 engine._attn_window.register_message(cb_hint, turn=fc_turn)
 
-        # ── MemoryGraph: BFS 扩散激活（以当前活跃节点为种子）──
+        # ── MemoryGraph: BFS 扩散激活（惰性触发）──
+        # BFS扩散仅在以下情况执行：
+        # 1. 首次执行（_bfs_first_run=False）
+        # 2. LLM主动调用记忆检索工具（_bfs_memory_triggered=True）
+        # 3. 动态注意力触发（_bfs_attention_triggered=True）
+        _bfs_first_run = state.get("_bfs_first_run", False)
+        _bfs_memory_triggered = state.get("_bfs_memory_triggered", False)
+        _bfs_attention_triggered = state.get("_bfs_attention_triggered", False)
+        
+        # 检查全局BFS触发标记（来自记忆工具）
         try:
-            from zulong.memory.memory_graph import get_memory_graph
-            from zulong.tools.task_tools import get_active_task_graph
-            _mg = get_memory_graph()
-            _tg = get_active_task_graph()
-            logger.info(
-                f"[FC][Graph] BFS 前置检查: mg={'有' if _mg else '无'}, "
-                f"tg={'有' if _tg else '无'}"
-            )
-            if _mg and _tg:
-                # 确保 TaskGraph 节点已投射到 MemoryGraph（首次创建时未同步）
-                try:
-                    from zulong.memory.graph_adapters import TaskGraphAdapter
-                    _tga = TaskGraphAdapter()
-                    _synced = _tga.sync(_mg, _tg)
-                    if _synced:
-                        logger.info(f"[FC][Graph] TaskGraph→MemoryGraph 同步: {_synced} 个节点")
-                except Exception as _sync_err:
-                    logger.info(f"[FC][Graph] TaskGraph 同步跳过: {_sync_err}")
+            from zulong.tools.memory_graph_tools import get_bfs_memory_trigger
+            if get_bfs_memory_trigger():
+                _bfs_memory_triggered = True
+                logger.info("[FC][Graph] 检测到记忆工具触发BFS扩散")
+        except ImportError:
+            pass
+        
+        _should_run_bfs = (not _bfs_first_run) or _bfs_memory_triggered or _bfs_attention_triggered
+        
+        if _should_run_bfs:
+            try:
+                from zulong.memory.memory_graph import get_memory_graph
+                from zulong.tools.task_tools import get_active_task_graph
+                _mg = get_memory_graph()
+                _tg = get_active_task_graph()
+                logger.info(
+                    f"[FC][Graph] BFS 前置检查: mg={'有' if _mg else '无'}, "
+                    f"tg={'有' if _tg else '无'}, trigger={'首次' if not _bfs_first_run else '记忆触发' if _bfs_memory_triggered else '注意力触发'}"
+                )
+                if _mg and _tg:
+                    # 确保 TaskGraph 节点已投射到 MemoryGraph（首次创建时未同步）
+                    try:
+                        from zulong.memory.graph_adapters import TaskGraphAdapter
+                        _tga = TaskGraphAdapter()
+                        _synced = _tga.sync(_mg, _tg)
+                        if _synced:
+                            logger.info(f"[FC][Graph] TaskGraph→MemoryGraph 同步: {_synced} 个节点")
+                    except Exception as _sync_err:
+                        logger.info(f"[FC][Graph] TaskGraph 同步跳过: {_sync_err}")
 
-                _in_progress = _tg.get_nodes_by_status("in_progress")
-                if _in_progress:
-                    _seed_ids = [f"task:{_tg.id}/{n.id}" for n in _in_progress]
-                    # P1-3: 将最近 retrieve_context 命中的 top-3 节点也加入种子
-                    # 类比：人回忆起一件事后，该记忆自动触发关联联想
-                    _retrieved_seeds = getattr(_mg, '_last_retrieved_node_ids', [])
-                    if _retrieved_seeds:
-                        _seed_ids.extend(_retrieved_seeds)
-                    # 过滤掉 MemoryGraph 中不存在的种子 ID（去重）
-                    _seen_seeds = set()
-                    _valid_seeds = []
-                    for s in _seed_ids:
-                        if s not in _seen_seeds and _mg.has_node(s):
-                            _valid_seeds.append(s)
-                            _seen_seeds.add(s)
-                    logger.info(
-                        f"[FC][Graph] BFS 种子: seed_ids={_seed_ids}, "
-                        f"valid={len(_valid_seeds)}/{len(_seed_ids)}"
-                    )
-                    if _valid_seeds:
-                        _activations = _mg.compute_activations(
-                            _valid_seeds, max_depth=3, decay=0.5,
-                        )
+                    _in_progress = _tg.get_nodes_by_status("in_progress")
+                    if _in_progress:
+                        _seed_ids = [f"task:{_tg.id}/{n.id}" for n in _in_progress]
+                        # P1-3: 将最近 retrieve_context 命中的 top-3 节点也加入种子
+                        # 类比：人回忆起一件事后，该记忆自动触发关联联想
+                        _retrieved_seeds = getattr(_mg, '_last_retrieved_node_ids', [])
+                        if _retrieved_seeds:
+                            _seed_ids.extend(_retrieved_seeds)
+                        # 过滤掉 MemoryGraph 中不存在的种子 ID（去重）
+                        _seen_seeds = set()
+                        _valid_seeds = []
+                        for s in _seed_ids:
+                            if s not in _seen_seeds and _mg.has_node(s):
+                                _valid_seeds.append(s)
+                                _seen_seeds.add(s)
                         logger.info(
-                            f"[FC][Graph] BFS 激活扩散完成: "
-                            f"seeds={[n.id for n in _in_progress]}"
+                            f"[FC][Graph] BFS 种子: seed_ids={_seed_ids}, "
+                            f"valid={len(_valid_seeds)}/{len(_seed_ids)}"
                         )
+                        if _valid_seeds:
+                            _activations = _mg.compute_activations(
+                                _valid_seeds, max_depth=3, decay=0.5,
+                            )
+                            logger.info(
+                                f"[FC][Graph] BFS 激活扩散完成: "
+                                f"seeds={[n.id for n in _in_progress]}"
+                            )
 
-                        # ── 思维导航: 自动焦点漂移 ──
-                        # 如果最高激活节点不在当前种子中，自动迁移焦点
-                        if _activations:
-                            _focus_ctx = _mg.get_last_focus_context()
-                            _current_focus = (
-                                _focus_ctx.get("focused_task_node_id", "")
-                                if _focus_ctx else ""
-                            )
-                            _top_node = max(
-                                _activations, key=_activations.get,
-                            )
-                            # 仅当最高激活节点不是当前焦点且激活值 > 0.6 时漂移
-                            if (_top_node != _current_focus
-                                    and _activations[_top_node] > 0.6
-                                    and _top_node not in _valid_seeds):
-                                _mg.update_focus_to_node(_top_node)
-                                # 联动 AttentionWindow 模式切换
-                                if engine._attn_window:
-                                    engine._attn_window.on_navigate_attention(
-                                        direction="jump",
-                                        target_node_id=_top_node,
-                                    )
-                                logger.info(
-                                    f"[FC][Graph] 焦点自动漂移: "
-                                    f"{_current_focus} → {_top_node} "
-                                    f"(activation={_activations[_top_node]:.2f})"
+                            # ── 思维导航: 自动焦点漂移 ──
+                            # 如果最高激活节点不在当前种子中，自动迁移焦点
+                            if _activations:
+                                _focus_ctx = _mg.get_last_focus_context()
+                                _current_focus = (
+                                    _focus_ctx.get("focused_task_node_id", "")
+                                    if _focus_ctx else ""
                                 )
-        except Exception as _mg_err:
-            logger.info(f"[FC][Graph] MemoryGraph 激活扩散跳过: {_mg_err}")
+                                _top_node = max(
+                                    _activations, key=_activations.get,
+                                )
+                                # 仅当最高激活节点不是当前焦点且激活值 > 0.6 时漂移
+                                if (_top_node != _current_focus
+                                        and _activations[_top_node] > 0.6
+                                        and _top_node not in _valid_seeds):
+                                    _mg.update_focus_to_node(_top_node)
+                                    # 联动 AttentionWindow 模式切换
+                                    if engine._attn_window:
+                                        engine._attn_window.on_navigate_attention(
+                                            direction="jump",
+                                            target_node_id=_top_node,
+                                        )
+                                    logger.info(
+                                        f"[FC][Graph] 焦点自动漂移: "
+                                        f"{_current_focus} → {_top_node} "
+                                        f"(activation={_activations[_top_node]:.2f})"
+                                    )
+            except Exception as _mg_err:
+                logger.info(f"[FC][Graph] MemoryGraph 激活扩散跳过: {_mg_err}")
+        else:
+            logger.debug(f"[FC][Graph] BFS 扩散跳过（非触发条件）: first_run={_bfs_first_run}, memory={_bfs_memory_triggered}, attention={_bfs_attention_triggered}")
 
         return {
             "cb_force_no_tools": cb_force_no_tools,
             "tool_calls_data": None,
             "response_content": None,
             "should_terminate": "",
+            "_bfs_first_run": True,  # 标记首次执行已完成
+            "_bfs_memory_triggered": False,  # 重置记忆触发标记
+            "_bfs_attention_triggered": False,  # 重置注意力触发标记
         }
 
     return exec_tools_node

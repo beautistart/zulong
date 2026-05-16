@@ -609,6 +609,10 @@ async def _run_fc_loop(
         _msg_type = "task_error" if _is_error else "task_complete"
         _msg_payload = ({"error": _completion_result} if _is_error
                         else {"result": _completion_result})
+        
+        # 等待短暂时间确保 display_text 被前端消费，避免 WebSocket 提前断开
+        await asyncio.sleep(0.5)
+        
         try:
             await session.send_msg(_msg_type, _msg_payload)
         except Exception:
@@ -748,6 +752,7 @@ def _build_initial_messages(
 
 _engine_instance = None
 _engine_lock = asyncio.Lock()
+_preload_manager = None
 
 
 def _get_engine():
@@ -793,6 +798,31 @@ async def websocket_endpoint(ws: WebSocket):
             _context_window_size = _engine._context_window_size
     except Exception:
         pass
+    
+    # 🔥 检查预加载就绪状态
+    if _preload_manager and not _preload_manager.is_ready():
+        ack = {
+            "msg_id": uuid.uuid4().hex[:12],
+            "type": "session_ack",
+            "session_id": session_id,
+            "ts": time.time(),
+            "payload": {
+                "session_id": session_id,
+                "context_window_size": _context_window_size,
+                "system_status": "booting",
+            },
+        }
+        await ws.send_json(ack)
+        await ws.send_json({
+            "msg_id": uuid.uuid4().hex[:12],
+            "type": "task_error",
+            "session_id": session_id,
+            "ts": time.time(),
+            "payload": {"error": "系统正在启动中，请稍候重试"},
+        })
+        _sessions.pop(session_id, None)
+        return
+    
     ack = {
         "msg_id": uuid.uuid4().hex[:12],
         "type": "session_ack",
@@ -1574,9 +1604,19 @@ if os.path.isdir(_STATIC_DIR):
 @app.on_event("startup")
 async def startup():
     """独立运行时的启动钩子（Launcher 模式下不走此路径）"""
-    global _main_event_loop
+    global _main_event_loop, _preload_manager
     _main_event_loop = asyncio.get_running_loop()
     await _init_engine()
+    
+    # 🔥 系统启动预加载
+    if _engine_instance is not None:
+        try:
+            from zulong.l2.preload_manager import PreloadManager
+            _preload_manager = PreloadManager(_engine_instance)
+            await _preload_manager.start_preload()
+        except Exception as e:
+            logger.error(f"[ZulongIDE] 预加载失败: {e}", exc_info=True)
+    
     logger.info(f"[ZulongIDE] 服务启动完成")
     logger.info(f"[ZulongIDE]   IDE WebSocket: ws://127.0.0.1:8090/ide")
     logger.info(f"[ZulongIDE]   Web 监控前端: http://127.0.0.1:8090/")

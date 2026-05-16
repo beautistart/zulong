@@ -27,6 +27,12 @@ from zulong.l2.attention_window import (
 from zulong.l2.circuit_breaker import ToolCallCircuitBreaker, CircuitBreakerState
 from zulong.l2.rule_guardian import RuleGuardian
 from zulong.l2.unified_fc_runner import run_fc_loop
+from zulong.l2.timeout_calibrator import TimeoutCalibrator
+from zulong.l2.model_health_tracker import ModelHealthTracker, ModelHealthStatus
+from zulong.l2.timeout_event_logger import TimeoutEventLogger
+from zulong.l2.smart_degradation_handler import (
+    SmartDegradationHandler, DegradationContext, TimeoutPhase,
+)
 
 # 导入配置管理器
 from zulong.config.config_manager import get_l2_inference_config
@@ -168,12 +174,29 @@ class InferenceEngine:
             # 工具引擎
             self.tool_engine = ToolEngine()
             
-            # 🔥 加载超时配置（从配置文件读取）
+            # 🔥 加载超时配置（通过 TimeoutCalibrator 校准）
             _l2_config = get_l2_inference_config()
             _timeout_config = _l2_config.get('timeout', {})
-            self._core_timeout = _timeout_config.get('core', 600)  # 核心模型超时（默认 600s）
-            self._backup_timeout = _timeout_config.get('backup', 120)  # 备用模型超时
-            self._fc_loop_timeout = _timeout_config.get('fc_loop', 600)  # FC 循环超时
+            self._calibrator = TimeoutCalibrator(_timeout_config)
+            self._core_timeout = self._calibrator.core_timeout
+            self._backup_timeout = self._calibrator.backup_timeout
+            self._fc_loop_timeout = self._calibrator.fc_loop_timeout
+            
+            # 预加载完成标志（预加载完成后禁用延迟加载）
+            self._preload_completed = False
+            
+            # 🔥 模型健康状态跟踪器
+            self._health_tracker = ModelHealthTracker()
+            
+            # 🔥 超时事件结构化日志器
+            self._event_logger = TimeoutEventLogger()
+            
+            # 🔥 智能降级处理器
+            self._degradation_handler = SmartDegradationHandler()
+            
+            # 超时上下文（供降级处理器使用）
+            self._last_timeout_phase: Optional[TimeoutPhase] = None
+            self._last_timeout_elapsed: float = 0.0
             
             # FC 循环请求间隔（防止 API 被打满）
             self._fc_request_interval = float(_l2_config.get('request_interval', 1.0))
@@ -243,7 +266,9 @@ class InferenceEngine:
 
     
     def _ensure_l2_loaded(self):
-        """确保 L2 模型已加载（延迟加载）"""
+        """确保 L2 模型已加载（延迟加载 / 预加载完成后直接返回）"""
+        if self._preload_completed:
+            return self.l2_model is not None
         if not self._l2_loaded:
             logger.info("🔄 延迟加载 L2 模型...")
             try:
@@ -1009,8 +1034,8 @@ class InferenceEngine:
     def _get_fallback_response(self, user_input: str) -> str:
         """根据用户输入类型提供智能降级回复
         
-        当 vLLM 超时或完全不可用时，根据用户输入的内容
-        返回合理的降级响应，而不是千篇一律的"走神"消息。
+        使用 SmartDegradationHandler 生成自然语言降级消息，
+        同时通过 TimeoutEventLogger 输出结构化诊断日志。
         
         Args:
             user_input: 用户的原始输入文本
@@ -1018,34 +1043,23 @@ class InferenceEngine:
         Returns:
             降级回复文本
         """
-        text = user_input.strip().lower() if user_input else ""
+        timeout_phase = self._last_timeout_phase or TimeoutPhase.CORE_TIMEOUT
+        elapsed = self._last_timeout_elapsed
+        model_id = "CORE" if timeout_phase == TimeoutPhase.CORE_TIMEOUT else "BACKUP"
+        request_id = _current_request_id_var.get()
         
-        # 删除/清除操作类
-        delete_markers = ["删除", "移除", "清除", "忘记", "去掉", "不要记住", "删掉", "抹除"]
-        for d in delete_markers:
-            if d in text:
-                return "抱歉，当前处理能力受限，无法立即执行删除操作。请稍后重试，或尝试更具体的删除指令。"
+        context = DegradationContext(
+            timeout_phase=timeout_phase,
+            elapsed_seconds=elapsed,
+            model_id=model_id,
+            user_input=user_input or "",
+            request_id=request_id,
+        )
         
-        # 问候类
-        greetings = ["你好", "您好", "hello", "hi", "嗨", "早上好", "下午好", "晚上好", "早安", "晚安"]
-        for g in greetings:
-            if g in text:
-                return "你好！有什么我可以帮你的吗？"
+        response = self._degradation_handler.generate_response(context)
+        self._degradation_handler.generate_diagnostic_log(context)
         
-        # 感谢/再见类
-        farewells = ["谢谢", "再见", "拜拜", "bye", "感谢"]
-        for f in farewells:
-            if f in text:
-                return "不客气，有需要随时找我！"
-        
-        # 提问类（包含问号或疑问词）
-        question_markers = ["？", "?", "吗", "什么", "怎么", "为什么", "哪里", "哪个", "如何", "能不能", "可以"]
-        for q in question_markers:
-            if q in text:
-                return "抱歉，我现在处理速度有点慢，请稍后再试一下这个问题。"
-        
-        # 默认降级
-        return "抱歉，我当前响应较慢，请稍后再试。"
+        return response
 
     async def _generate_with_backup(self, messages: List[Dict[str, str]], user_input: str = "") -> str:
         """使用备用模型（L2 BACKUP）生成响应
@@ -1062,11 +1076,28 @@ class InferenceEngine:
         """
         if not self.backup_client or not LLM_MODEL_ID_BACKUP:
             logger.warning("⚠️ [BACKUP] 备用客户端不可用，使用静态降级回复")
+            self._last_timeout_phase = TimeoutPhase.BACKUP_UNAVAILABLE
+            self._event_logger.log_degradation_decision(
+                "fallback_static", "backup_client_unavailable", "BACKUP",
+                _current_request_id_var.get())
             return self._get_fallback_response(user_input)
         
         # 跳过备用模型调用：如果 CORE 和 BACKUP 是同一个模型，直接降级
         if LLM_MODEL_ID_BACKUP == LLM_MODEL_ID and LLM_BASE_URL_BACKUP == LLM_BASE_URL:
             logger.info("⚠️ [BACKUP] CORE 与 BACKUP 是同一模型，跳过备用调用")
+            self._last_timeout_phase = TimeoutPhase.CORE_BACKUP_SAME_MODEL
+            self._event_logger.log_degradation_decision(
+                "fallback_static", "core_backup_same_model", "BACKUP",
+                _current_request_id_var.get())
+            return self._get_fallback_response(user_input)
+        
+        # 检查 BACKUP 健康状态
+        if self._health_tracker.should_skip("BACKUP"):
+            logger.info("⚠️ [BACKUP] 跳过BACKUP请求：健康状态UNAVAILABLE")
+            self._last_timeout_phase = TimeoutPhase.BACKUP_UNAVAILABLE
+            self._event_logger.log_degradation_decision(
+                "skip_backup", "health_unavailable", "BACKUP",
+                _current_request_id_var.get())
             return self._get_fallback_response(user_input)
         
         try:
@@ -1085,21 +1116,40 @@ class InferenceEngine:
                     **self._get_llm_extra_kwargs()
                 )
             
+            _backup_start = time.time()
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             future = executor.submit(call_backup)
             try:
-                response = future.result(timeout=60)
+                response = future.result(timeout=self._backup_timeout)
             except concurrent.futures.TimeoutError:
-                logger.error("🚨 [BACKUP] 备用模型也超时 (>60 秒)")
+                _elapsed = time.time() - _backup_start
+                self._last_timeout_phase = TimeoutPhase.BACKUP_TIMEOUT
+                self._last_timeout_elapsed = _elapsed
+                self._health_tracker.record_timeout("BACKUP")
+                self._event_logger.log_timeout(
+                    "BACKUP_TIMEOUT", _elapsed, self._backup_timeout, "BACKUP",
+                    _current_request_id_var.get(),
+                    self._health_tracker.get_consecutive_timeouts("BACKUP"))
+                self._event_logger.log_degradation_decision(
+                    "fallback_static", "backup_timeout", "BACKUP",
+                    _current_request_id_var.get())
+                logger.error(f"🚨 [BACKUP] 备用模型也超时 (>{self._backup_timeout}秒)")
                 return self._get_fallback_response(user_input)
             finally:
                 executor.shutdown(wait=False)
             
             response_text = response.choices[0].message.content
+            self._health_tracker.record_success("BACKUP")
             logger.info(f"✅ [BACKUP] 备用模型生成完成，长度：{len(response_text)}")
+            response_text = self._degradation_handler.append_backup_hint(response_text)
             return response_text
             
         except Exception as e:
+            self._health_tracker.record_timeout("BACKUP")
+            self._last_timeout_phase = TimeoutPhase.BACKUP_TIMEOUT
+            self._event_logger.log_degradation_decision(
+                "fallback_static", f"backup_exception: {e}", "BACKUP",
+                _current_request_id_var.get())
             logger.error(f"❌ [BACKUP] 备用模型生成失败：{e}")
             return self._get_fallback_response(user_input)
 
@@ -2334,7 +2384,7 @@ class InferenceEngine:
             
             # 获取工具定义
             tool_definitions = self._collect_tool_definitions()
-            from zulong.config import LLM_MODEL_ID
+            from zulong.models.container import LLM_MODEL_ID
             vllm_model_id = LLM_MODEL_ID
             
             self._last_fc_messages = messages

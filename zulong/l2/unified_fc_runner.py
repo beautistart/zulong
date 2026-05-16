@@ -151,6 +151,8 @@ class UnifiedFCRunner:
         except Exception as e:
             err_name = type(e).__name__
             logger.error(f"[UnifiedFC] 循环异常 ({err_name}): {e}")
+            # 记录终止原因，供 Orchestrator 感知异常
+            self.engine._last_fc_terminate_reason = "exception"
             # 从 messages 中恢复最后一条 assistant 回复
             for msg in reversed(messages):
                 if isinstance(msg, dict) and msg.get("role") == "assistant":

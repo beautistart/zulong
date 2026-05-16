@@ -14,11 +14,41 @@
 import logging
 import time
 import asyncio
+import threading
 from typing import Dict, Any, List, Optional
 
 from .base import BaseTool, ToolCategory, ToolRequest, ToolResult
 
 logger = logging.getLogger(__name__)
+
+
+# ── BFS 触发机制（线程安全）───────────────────────────────────
+# 使用 thread-local 存储避免竞态条件
+_bfs_local = threading.local()
+_bfs_global_lock = threading.Lock()
+_bfs_global_triggered = False
+
+def _set_bfs_memory_trigger():
+    """设置BFS记忆触发标记，供FC循环检查（线程安全）"""
+    global _bfs_global_triggered
+    _bfs_local.bfs_triggered = True
+    with _bfs_global_lock:
+        _bfs_global_triggered = True
+    logger.debug("[BFS Trigger] 记忆工具触发BFS扩散标记已设置")
+
+def get_bfs_memory_trigger() -> bool:
+    """获取并重置BFS记忆触发标记（线程安全）"""
+    global _bfs_global_triggered
+    # 优先检查 thread-local 标记
+    triggered = getattr(_bfs_local, 'bfs_triggered', False)
+    _bfs_local.bfs_triggered = False
+    # 同时检查全局标记
+    with _bfs_global_lock:
+        if _bfs_global_triggered:
+            triggered = True
+            _bfs_global_triggered = False
+    return triggered
+# ────────────────────────────────────────────────────
 
 
 def _run_async(coro):
@@ -109,6 +139,9 @@ class RecallMemoryTool(BaseTool):
                 memories.append(entry)
 
             logger.info(f"[recall_memory] 查询 '{query}' 返回 {len(memories)} 条结果")
+
+            # 🔥 BFS触发标记：记忆检索工具调用后触发BFS扩散
+            _set_bfs_memory_trigger()
 
             return self._create_result(
                 success=True,

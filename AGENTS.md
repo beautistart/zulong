@@ -164,3 +164,30 @@ cd zulong-ide && npx tsc --noEmit
 - Usage guide: `docs/Zulong_IDE使用指南.md`
 - Memory export: `docs/Qoder_Quest_Memory_Export.md`
 - Deep analysis: `docs/祖龙系统深度技术分析报告.md`
+
+## 测试记录 (2026-05-16)
+
+### 通信通道测试结果
+
+| 通道 | 端点 | 状态 | 说明 |
+|------|------|------|------|
+| Web端 | `ws://127.0.0.1:8090/ws` | ✅ 正常 | 简化协议，CHAT_MESSAGE/CHAT_RESPONSE |
+| IDE端 | `ws://127.0.0.1:8090/ide` | ✅ 正常 | 完整FC协议，session_start/tool_result/task_complete |
+| EventBus | 内部 | ✅ 正常 | 优先级队列，L1层内部+跨层通信 |
+
+### IDE端消息协议
+
+**前端→后端**：session_start / tool_result / user_cancel / ping / audio_chunk
+**后端→前端**：session_ack / tool_request / display_text / display_reasoning / task_complete / task_error / status_update
+
+### 已知问题
+
+- **SiliconFlow API响应慢**：云端LLM可能限流，返回"响应较慢"fallback
+- **解决方案**：启动Ollama本地模型 或 切换backend为transformer
+- **Ollama模型**：qwen3.5:4b (L2_BACKUP), deepseek-v3.1:671b-cloud (L2_CORE)
+
+### 插件安装
+
+- VSIX位置：`zulong-ide/zulong-ide-0.1.0.vsix` (9.4MB)
+- 安装命令：`code --install-extension zulong-ide-0.1.0.vsix --force`
+- WebSocket配置：`ws://127.0.0.1:8090/ide`

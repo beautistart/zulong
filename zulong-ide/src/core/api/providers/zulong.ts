@@ -211,6 +211,10 @@ export class ZulongHandler implements ApiHandler {
 			pushChunk({ type: "done" })
 		})
 
+		this.transport.on("system_ready", (payload: { status?: string; failed_modules?: string[] }) => {
+			Logger.info(`[ZulongHandler] \u2190 system_ready: status=${payload.status}, failed_modules=${payload.failed_modules?.join(",") || "none"}`)
+		})
+
 		// Detect resume: if there are prior assistant messages, this is a resumed session
 		const hasHistory = messages.some((m) => m.role === "assistant")
 		if (hasHistory) {
@@ -234,7 +238,7 @@ export class ZulongHandler implements ApiHandler {
 		}
 
 		// Yield chunks from the queue
-		const STREAM_TIMEOUT_MS = 5 * 60 * 1000 // 5分钟无数据超时，防止IDE永久卡在"思考中"
+		const STREAM_TIMEOUT_MS = 330 * 1000 // 后端CORE超时300s + 30s缓冲，防止IDE永久卡在"思考中"
 		let lastChunkTime = Date.now()
 		try {
 			while (true) {
@@ -248,7 +252,7 @@ export class ZulongHandler implements ApiHandler {
 					// Wait for next chunk with timeout protection
 					const timeoutMs = STREAM_TIMEOUT_MS - (Date.now() - lastChunkTime)
 					if (timeoutMs <= 0) {
-						Logger.error("[ZulongHandler] Stream timeout - no data received, forcing done")
+						Logger.error("[ZulongHandler] 模型响应超时，请稍后重试")
 						pushChunk({ type: "done" })
 						continue
 					}
