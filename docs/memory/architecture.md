@@ -52,8 +52,17 @@
 |  +-- 三层注意力: L0 采集 -> L1 静默 -> L2 交互               |
 |  +-- 中断处理: 冻结 -> 重组 -> 注入                          |
 +-------------------------------------------------------------+
-|                L1-A/C 感知层                                  |
-|  ReflexController | VisionProcessor | AudioProcessor         |
+|          L1-A 感知与受控反射层                                |
+|  ReflexController | AudioProcessor                           |
++-------------------------------------------------------------+
+|          L1-C 静默视觉注意层                                  |
+|  VisionProcessor | ActionClassifier | GestureRecognizer      |
++-------------------------------------------------------------+
+|          L1-D 听觉层                                         |
+|  VoicePlugin (唤醒词) | AudioPlugin (YAMNet+SenseVoice)     |
++-------------------------------------------------------------+
+|          L1-E 安全层                                         |
+|  GasPlugin (MQ-2 气体检测, CRITICAL)                        |
 +-------------------------------------------------------------+
 |                    L0 传感器层                                 |
 |  CameraDevice | MicrophoneDevice                             |

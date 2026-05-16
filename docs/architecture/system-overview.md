@@ -77,9 +77,20 @@
 │  - attention_controller.py (中断管理与快照)                   │
 │  - 事件优先级路由 (CRITICAL > HIGH > NORMAL > LOW)            │
 ├─────────────────────────────────────────────────────────────┤
-│         L1-A/L1-C 感知与视觉层                               │
-│  - L1-A: 音频处理、融合控制、自反应 (反射弧)                  │
-│  - L1-C: YOLOv10 人体检测 + MediaPipe 姿态                   │
+│         L1-A 感知与受控反射层                                 │
+│  - 障碍物自动刹车、紧急停止、跌落保护                         │
+│  - 音频融合控制、自反射弧                                     │
+├─────────────────────────────────────────────────────────────┤
+│         L1-C 静默视觉注意层                                   │
+│  - YOLOv10 人体检测 → MediaPipe 姿态/手势                    │
+│  - MobileNetV4-TSM 动作分类 → 交互意图确认                   │
+├─────────────────────────────────────────────────────────────┤
+│         L1-D 听觉层                                           │
+│  - 音频采集 → 滤波 → YAMNet → VAD → SenseVoice-Small        │
+│  - 唤醒词检测 ("你好"/"救命"/"小紫")                          │
+├─────────────────────────────────────────────────────────────┤
+│         L1-E 安全层                                           │
+│  - MQ-2 烟雾传感器 → 气体浓度检测 → CRITICAL 报警            │
 ├─────────────────────────────────────────────────────────────┤
 │           L0 设备与传感器层                                   │
 │  - USB 摄像头/麦克风/扬声器驱动                               │
@@ -504,8 +515,9 @@ class IL1Module(ABC):
 |---------|--------|------|----------|
 | `L1A/Motor` | HIGH | 障碍物检测 + 自动刹车 | obstacle_threshold: 0.3m, max_speed: 0.8 |
 | `L1C/Vision` | NORMAL | 视觉分析 + 运动检测 | fps: 30, motion_threshold: 500px |
-| `L1D/Voice` | CRITICAL | 语音唤醒 + 命令 | wake_words: ["你好", "救命", "小紫"] |
-| `L1E/Gas` | CRITICAL | 气体泄漏 + 火灾报警 | threshold: 500 ppm |
+| `L1D/Voice` | CRITICAL | 语音唤醒 + 紧急呼救 | wake_words: ["你好", "救命", "小紫"], silent_commands: ["安静", "睡觉"] |
+| `L1D/Audio` | CRITICAL | 三层注意力音频处理 (YAMNet+SenseVoice+Whisper) | asr_backend: sensevoice, enable_yamnet: true |
+| `L1E/Gas` | CRITICAL | 气体泄漏 + 火灾报警 | threshold: 500 ppm, cooldown: 60s |
 
 **扩展规划**: `L1F/Radar` (毫米波雷达), `L1G/IMU` (惯性测量单元)
 
@@ -585,12 +597,12 @@ LOW      (日志/同步)         → 空闲时处理
 
 ---
 
-#### 3.9.0.4 L1-C 感知层 (Perception Layer)
+#### 3.9.0.4 L1-C 视觉层 (Vision Layer)
 
 **源文件**: `zulong/l1c/` (~36 KB optimized_vision_processor + 22 KB action_classifier + 11 KB gesture_recognizer)
 **成熟度**: 基本可用
 
-L1-C 实现**四层级联视觉处理**，以"人体锚点"驱动逐层精细化:
+L1-C 实现**四层级联视觉处理**，以"人体锚点"驱动逐层精细化，最终输出交互意图:
 
 ```
 Layer 1: YOLOv10-Nano (人体检测)
@@ -599,8 +611,8 @@ Layer 2: MediaPipe Pose (姿态估计)
     ↓ 姿态关键点 → 动作推理
 Layer 3: MobileNetV4-TSM (动作分类)
     ↓ 时序动作识别
-Layer 4: MediaPipe Hands (手势识别)
-    ↓ 手势: 挥手/指向/注视
+Layer 4: 交互意图识别
+    ↓ 动作语义 → 交互意图 (招手=呼唤, 指向=引导, 挥手=告别)
 ```
 
 **级联优势**: 无人时仅运行 Layer 1 (YOLO, ~6ms/帧)，有人时逐层展开。相比全帧全流水线处理节省 ~70% 算力。
@@ -618,7 +630,118 @@ Layer 4: MediaPipe Hands (手势识别)
 
 ---
 
-#### 3.9.0.5 L3 导航专家技能 (Navigation Expert)
+#### 3.9.0.5 L1-D 听觉层 (Auditory Layer)
+
+**源文件**: `zulong/plugins/voice/l1d_voice_plugin.py` + `zulong/plugins/voice/l1d_audio_plugin.py`
+**成熟度**: 基本可用
+
+L1-D 实现**三层注意力音频处理**，从环境音采集到交互意图判断，最终输出结构化语音事件:
+
+```
+Step 1: 音频采集 (L0_SENSOR)
+    ↓ 麦克风 16kHz PCM → shared_memory["audio.raw_frame"]
+Step 2: 预加重 + 低切滤波 (80Hz 高通)
+    ↓ 去除直流偏移和低频噪声
+Step 3: YAMNet 环境音分类 (L1_SILENT, 521类)
+    ↓ 判断音频场景 (语音/音乐/噪音/环境声)
+Step 4: VAD 语音活动检测
+    ↓ WebRTC VAD (模式3) + 能量阈值 fallback
+Step 5: SenseVoice-Small 单次推理 (L2_INTERACTIVE)
+    ↓ ONNX INT8 + sherpa-onnx，一次推理同时产出:
+    ├─ 转录文本 (含逆文本归一化 ITN)
+    ├─ 情感标签: HAPPY/SAD/ANGRY/NEUTRAL/FRIGHTENED/SURPRISED
+    ├─ 语音事件: BGM/Applause/Laugh/Cry/Emphasis
+    └─ 语种标识: zh/en/ja/ko/yue
+Step 6: 后处理意图判断
+    ↓ 基于事件标签判断交互/非交互
+    ├─ 交互语音 (非BGM/非Applause) → 发布 AUDIO_SPEECH_END 事件
+    └─ 非交互事件 (BGM/Applause等) → 更新静默状态，不发布语音事件
+Step 7: L1-B 串行协作
+    ↓ L1-D 粗粒度(交互/非交互) → L1-B 细粒度(ALBERT-tiny 15类意图分类)
+Step 8: Whisper-tiny 备选 fallback
+    └─ 仅当 SenseVoice 不可用或转录结果为空时启用
+```
+
+**语音唤醒** (`l1d_voice_plugin.py`):
+
+| 唤醒词 | 优先级 | 行为 |
+|--------|--------|------|
+| "你好" | NORMAL | 唤醒系统，进入交互模式 |
+| "小紫" | NORMAL | 唤醒系统，进入交互模式 |
+| "救命" | CRITICAL | 紧急呼救，绕过意图识别直达 L1-B，触发紧急中断 |
+
+- 唤醒超时: 30秒无唤醒进入安静模式
+- 安静模式命令: "安静"、"睡觉"、"去休息"
+
+**ASR 引擎对比**:
+
+| 特性 | SenseVoice-Small (主引擎) | Whisper-tiny (备选) |
+|------|--------------------------|---------------------|
+| 运行时 | ONNX + sherpa-onnx (INT8) | PyTorch |
+| 模型大小 | ~239MB (INT8量化) | ~150MB |
+| 情感检测 | 是 (内嵌标签) | 否 (固定 neutral) |
+| 事件检测 | 是 (BGM/Applause/Laugh/Cry) | 否 (固定空列表) |
+| 语种识别 | 是 (zh/en/ja/ko/yue) | 否 (配置指定) |
+| 逆文本归一化 | 是 (use_itn=True) | 否 |
+| 启用条件 | 始终尝试 | 仅 SenseVoice 失败时 |
+
+**与 L1-B 串行协作**:
+- L1-D 粗粒度判断: 基于 SenseVoice 事件标签，区分交互语音与非交互环境音
+- L1-B 细粒度分类: ALBERT-tiny 15类意图 (task_code/task_analysis/task_search/task_write/task_read/task_execute/vision_query/vision_control/audio_query/audio_control/command_start/command_stop/command_config/chat/unknown)
+- 非交互音频不进入 L1-B IntentFilter，节省算力
+
+**意图识别归属**: L1-D 负责粗粒度交互/非交互判断（基于 ASR 事件标签），L1-B 负责细粒度意图分类（基于 ALBERT 语义编码），两者串行协作。
+
+> **最后更新**: 2026-05-16
+
+---
+
+#### 3.9.0.6 L1-E 安全层 (Safety Layer)
+
+**源文件**: `zulong/plugins/gas/l1e_gas_plugin.py`
+**成熟度**: 基本可用
+
+L1-E 实现**气体检测与火灾报警**，所有事件均为 CRITICAL 优先级，穿透任何系统状态:
+
+```
+Step 1: MQ-2 烟雾传感器数据采集
+    ↓ 模拟/真实传感器读取气体浓度
+Step 2: 气体浓度检测
+    ↓ 阈值判定: 500 ppm
+Step 3: 超阈值 → 发布事件
+    ├─ SENSOR_GAS 事件 (CRITICAL 优先级)
+    └─ ACTION_SPEAK 事件 ("检测到烟雾！请立即疏散！")
+Step 4: CRITICAL 事件穿透
+    ↓ 穿透任何系统状态直达 L1-B，中断当前任务
+```
+
+**CRITICAL 优先级穿透机制**:
+
+| 特性 | 说明 |
+|------|------|
+| 优先级 | CRITICAL (最高) |
+| 穿透特性 | 无视 L2 当前任务状态，强制中断 |
+| 直达层级 | L1-B AttentionController → EventQueue |
+| 响应行为 | 立即暂停 L2 推理 → 处理安全事件 → 语音报警 |
+| 报警冷却 | 60秒 (防止重复报警) |
+| 双重保障 | L1-A ReflexController 提供传感器数据接入，L1-E 独立安全判定 |
+
+**插件配置**:
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| 模块 ID | L1E/Gas | 插件标识 |
+| 优先级 | CRITICAL | 最高优先级 |
+| 阈值 | 500 ppm | 气体浓度报警阈值 |
+| 模拟模式 | true | 开发环境使用模拟传感器 |
+
+**与 L1-A 协同**: L1-A 的 ReflexController 订阅 `SENSOR_OBSTACLE` 和 `SENSOR_FALL` 事件提供紧急反射响应，L1-E 独立负责气体/火灾检测。两者共同构成安全防护的双重保障: L1-A 处理物理碰撞/跌落，L1-E 处理环境危险(气体/火灾)。
+
+> **最后更新**: 2026-05-16
+
+---
+
+#### 3.9.0.7 L3 导航专家技能 (Navigation Expert)
 
 **源文件**: `zulong/expert_skills/navigation_skill.py` (16.2 KB) + `dwa_planner.py` (16.5 KB)
 **成熟度**: 基本可用
@@ -656,7 +779,7 @@ score = heading_weight(0.3) × heading_cost
 
 ---
 
-#### 3.9.0.6 OpenClaw Bridge (实体机器人桥接)
+#### 3.9.0.8 OpenClaw Bridge (实体机器人桥接)
 
 **源文件**: `openclaw_bridge/` (16 个文件)
 **成熟度**: 基本可用

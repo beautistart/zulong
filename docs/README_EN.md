@@ -135,10 +135,11 @@ Zulong is positioned as an **Embodied Robot Cognitive Brain Backend**, implement
 
 - **L0 Device Layer**: USB camera/mic/speaker drivers, GPU-accelerated optical flow motion detection (RTX 3060, 150+ FPS), multi-joint actuator simulation (position/velocity/torque tracking)
 - **L1 Modular Plugin Architecture**: Hot-pluggable design with 4-level priority scheduling (CRITICAL > HIGH > NORMAL > LOW)
-  - **L1-A Reflex Layer**: Obstacle auto-braking (<50ms), emergency stop, fall protection
-  - **L1-B Scheduler Layer**: Three-layer attention (L0 silent collection -> L1 silent attention -> L2 interactive attention), ~90% event storm reduction
-  - **L1-C Perception Layer**: YOLOv10 human detection -> MediaPipe pose -> MobileNetV4-TSM action classification -> gesture recognition
-  - **L1-D/E Safety Layer**: Voice wakeup (CRITICAL), gas leak/fire detection (CRITICAL)
+  - **L1-A Reflex Layer**: Obstacle auto-braking (<50ms), emergency stop, fall protection, audio fusion control
+  - **L1-B Scheduler Layer**: Three-layer attention (L0 silent collection -> L1 silent attention -> L2 interactive attention), ALBERT-tiny 15-class fine-grained intent classification, ~90% event storm reduction
+  - **L1-C Vision Layer**: YOLOv10 human detection -> MediaPipe pose/gesture (10 types) -> MobileNetV4-TSM action classification (5 interaction intents: WAVING/APPROACHING/GAZING/STILL/UNKNOWN) -> geometric rule interaction intent confirmation
+  - **L1-D Auditory Layer**: Audio capture -> pre-emphasis+filter(80Hz) -> YAMNet sound classification(521 classes) -> VAD -> SenseVoice-Small single inference(transcription+emotion+event+language) -> post-processing intent judgment(interactive/non-interactive) -> L1-B serial collaboration(ALBERT 15 classes); wake words("你好"/"救命"/"小紫"), "救命" CRITICAL bypass to L1-B
+  - **L1-E Safety Layer**: MQ-2 smoke sensor -> gas concentration detection(threshold 500ppm) -> CRITICAL event penetration to L1-B + voice alarm, 60s cooldown
 - **L3 Navigation Expert**: A* pathfinding + DWA dynamic window obstacle avoidance (2s trajectory prediction, 0.5m safety distance)
 - **OpenClaw Bridge**: Physical robot integration module, real-time EventBus communication with Zulong L1-B
 
@@ -159,7 +160,10 @@ L2 Cognitive Layer           - InferenceEngine (5700+ lines), two-stage inferenc
   ↓
 L1-B Scheduler Layer         - Gatekeeper + AttentionController, event priority routing
   ↓
-L1-A/C Perception Layer      - Audio fusion + YOLOv10 human detection + MediaPipe pose
+L1-A Reflex Layer            - Obstacle braking/emergency stop/fall protection + audio fusion
+L1-C Vision Layer            - YOLOv10 -> MediaPipe -> MobileNetV4-TSM -> interaction intent
+L1-D Auditory Layer          - YAMNet -> VAD -> SenseVoice-Small -> intent judgment
+L1-E Safety Layer            - MQ-2 gas detection -> CRITICAL penetration
   ↓
 L0 Device Layer              - USB camera/mic/speaker drivers, motion detection
 ```
