@@ -419,13 +419,291 @@ Requirement (深度 0)
 
 混合检索: BM25(权重 0.3) + 向量(权重 0.7)，时间衰减系数 0.95
 
-### 3.9 L0/L1 感知层
+### 3.9 L0/L1 感知与具身控制层 (深度技术分析)
 
+**成熟度**: 基本可用（L0 设备驱动 + L1 反射/调度/感知 + L3 导航技能已实现）
+**代码规模**: L0 层 ~130 KB (10 文件) + L1 层 ~600 KB (46 文件) + 导航技能 ~33 KB
+
+祖龙的具身机器人能力通过 L0-L1-L3 三层协同实现，以"认知大脑后端"为定位，不与 ROS 2 在通信协议/驱动生态上竞争，而是通过 L1 适配器层桥接外部机器人系统。
+
+---
+
+#### 3.9.0 L0 设备层 (Device Layer)
+
+**源文件**: `zulong/l0/` (10 个文件, ~130 KB)
+**定位**: 纯硬件抽象层，负责传感器数据采集和执行器指令下发，不包含任何智能逻辑。
+
+**核心组件**:
+
+| 组件 | 文件 | 核心指标 |
+|------|------|----------|
+| **CameraDevice** | `l0/devices/camera_device.py` (14.5 KB) | USB 640×480, 30fps, 帧缓冲 |
+| **MicrophoneDevice** | `l0/devices/microphone_device.py` (31.4 KB) | 16kHz PCM, VAD, 噪声底噪检测 |
+| **SpeakerDevice** | `l0/devices/speaker_device.py` (21.8 KB) | 24kHz 输出, 音量控制 |
+| **OpticalFlowMotionDetector** | `l0/motion_detector.py` (14.7 KB) | Lucas-Kanade 光流, GPU 加速 |
+| **GPUOpticalFlow** | `l0/gpu_optical_flow.py` (10.3 KB) | PyTorch CUDA, RTX 3060 |
+| **ActuatorSimulator** | `l0/actuator_simulator.py` (5.9 KB) | 3 关节, 位置/速度/扭矩追踪 |
+
+**运动检测性能** (基于 `OpticalFlowMotionDetector`):
+
+```
+硬件: RTX 3060, 640×480 分辨率
+GPU 模式: ~6.6ms/帧 (150+ FPS), 加速比 8.28×
+CPU 模式: ~55ms/帧 (18 FPS)
+特性: 动态阈值, 状态机 (IDLE→MOVING→STOPPED), 运动中心坐标输出
+```
+
+**执行器模拟器** (`ActuatorSimulator`):
+- 3 自由度关节: `joint_1`, `joint_2`, `joint_3`
+- 每关节追踪: 位置 (rad), 速度 (rad/s), 扭矩 (N·m), 电流 (A), 温度 (°C)
+- 命令类型: `emergency_stop`, `brake`, `slow_down`, `backup`, `motion`
+- 通过 EventBus 订阅 L1-A 下发的控制指令
+- 集成 `L0Logger` 记录完整命令执行日志（用于回放分析）
+
+**设计原则**:
+- **零智能**: L0 层不做任何决策，纯粹的信号采集/执行
+- **统一事件发布**: 所有传感器数据通过 EventBus 发布到 L1 层
+- **热插拔**: 通过 `SensorManager` 支持设备动态注册/注销
+- **帧同步**: 摄像头采集与运动检测器解耦，通过 `feed_frame()` 接口传递
+
+---
+
+#### 3.9.0.1 L1 模块化插件架构 (Plugin Architecture)
+
+**源文件**: `zulong/modules/l1/core/interface.py` + `plugin_manager.py`
+**配置**: `config/l1_plugins.yaml`
+**成熟度**: 生产级
+
+所有 L1 功能模块实现为**独立插件**，通过统一接口 `IL1Module` 通信:
+
+```python
+class IL1Module(ABC):
+    @property
+    def module_id(self) -> str: ...     # "L1X_ModuleName"
+    def initialize(self, shared_memory: Dict) -> bool: ...
+    def process_cycle(self, shared_memory: Dict) -> List[ZulongEvent]: ...
+    def health_check(self) -> Dict: ...
+    def shutdown(self): ...
+    def on_event(self, event: ZulongEvent, shared_memory: Dict): ...
+```
+
+**架构特性**:
+
+| 特性 | 实现方式 |
+|------|----------|
+| **松耦合** | 插件间通过 `shared_memory` 字典通信，无直接引用 |
+| **热插拔** | `PluginManager.load/unload_plugin()` 动态加载，无需重启 |
+| **异常隔离** | 单个插件崩溃不影响其他插件（try-catch + 错误计数器） |
+| **优先级调度** | CRITICAL > HIGH > NORMAL > LOW，高优先级插件先执行 |
+| **配置化** | YAML 管理所有插件的启用/禁用、优先级、参数 |
+| **性能约束** | 单插件 `process_cycle` < 10ms，总循环 < 33ms (30Hz) |
+
+**当前已实现插件**:
+
+| 模块 ID | 优先级 | 功能 | 关键参数 |
+|---------|--------|------|----------|
+| `L1A/Motor` | HIGH | 障碍物检测 + 自动刹车 | obstacle_threshold: 0.3m, max_speed: 0.8 |
+| `L1C/Vision` | NORMAL | 视觉分析 + 运动检测 | fps: 30, motion_threshold: 500px |
+| `L1D/Voice` | CRITICAL | 语音唤醒 + 命令 | wake_words: ["你好", "救命", "小紫"] |
+| `L1E/Gas` | CRITICAL | 气体泄漏 + 火灾报警 | threshold: 500 ppm |
+
+**扩展规划**: `L1F/Radar` (毫米波雷达), `L1G/IMU` (惯性测量单元)
+
+---
+
+#### 3.9.0.2 L1-A 反射层 (Reflex Layer)
+
+**源文件**: `zulong/l1a/reflex_controller.py` (6.9 KB) + `zulong/plugins/motor/l1a_motor_plugin.py` (9.4 KB)
 **成熟度**: 基本可用
 
-- L0: USB 摄像头/麦克风驱动，光学流运动检测
-- L1-A: VAD + MFCC 音频特征 + 自反应
-- L1-C: YOLOv10-Nano → MediaPipe Pose → 手势识别（级联方案）
+L1-A 是系统的**硬实时反射弧**，负责在 <50ms 内对紧急传感器事件做出响应，无需等待 L2 认知层决策。
+
+**反射控制器** (`ReflexController`):
+
+订阅 5 类传感器事件并评估反射响应:
+
+| 事件类型 | 上下文 | 反射响应 | 延迟 |
+|----------|--------|----------|------|
+| `SENSOR_OBSTACLE` + 快速移动 | MOVING_FAST | `STOP_COMMAND` | <50ms |
+| `SENSOR_OBSTACLE` + 充电中 | CHARGING | **抑制** (不响应) | - |
+| `SENSOR_FALL` | 任何 | `EMERGENCY_STOP` | <10ms |
+| `SENSOR_SOUND` (>70dB) | 任何 | `ALERT` | <30ms |
+| `SENSOR_VISION` | 任何 | 转发 L1-C | <50ms |
+
+**关键设计**: 反射控制器实现了**上下文感知的反射抑制**——充电状态下不会因为近距离障碍物触发刹车（因为充电桩就在旁边）。
+
+**电机控制插件** (`L1A_MotorPlugin`):
+
+```python
+# 核心安全参数
+obstacle_threshold: 0.3    # 障碍物检测距离 (米)
+max_speed: 0.8             # 最大允许速度 (归一化 0.0-1.0)
+brake_decay: 0.5           # 刹车衰减系数
+auto_brake: True           # 自动刹车使能
+```
+
+安全约束链: 障碍物距离 < 0.3m → 自动刹车 → 速度归零 → EventBus 发布 `CMD_BRAKE` → L0 执行器执行
+
+**融合控制器** (`FusionController`, 17 KB):
+- 宏指令 → 微动作翻译（L2 的高层指令转化为 L0 可执行的运动序列）
+- 多模态传感器融合（视觉 + 音频 + 雷达数据综合判断）
+- 微动作生成与序列化执行
+
+---
+
+#### 3.9.0.3 L1-B 调度与守门层 (Scheduler/Gatekeeper)
+
+**源文件**: `zulong/l1b/scheduler_gatekeeper.py` (125.1 KB)
+**成熟度**: 生产级
+
+L1-B 是系统的**事件路由枢纽**，实现三层注意力机制和中断管理:
+
+**三层注意力机制** (市场独有):
+
+| 层级 | 行为模式 | 事件策略 | 算力消耗 |
+|------|----------|----------|----------|
+| **L0 层** | 纯采集 | **不产生事件**，仅写入共享内存 | 极低 |
+| **L1 层** | 静默注意 | 持续推理，仅**状态翻转时**生成事件 | 低 |
+| **L2 层** | 交互注意 | 用户/系统交互触发完整认知 | 高 |
+
+**事件风暴削减效果**: 传统 ROS 2 话题模式下，每帧图像都产生消息；祖龙 L1 静默注意模式下，仅当"无人→有人"状态翻转时才生成事件。实测削减 ~90% 无效事件。
+
+**事件优先级路由**:
+
+```
+CRITICAL (紧急停止/气体泄漏) → 直接中断当前任务
+HIGH     (障碍物/碰撞)       → 等当前工具调用完成后中断
+NORMAL   (语音/视觉)         → 排队等待处理
+LOW      (日志/同步)         → 空闲时处理
+```
+
+**中断冻结与恢复** (与 `attention_controller.py` 协同):
+1. **快照保存**: 当前对话历史 + TaskGraph 状态 + CircuitBreaker 状态 + KV Cache 地址
+2. **中断处理**: 处理高优先级事件
+3. **Prompt 重组**: 将中断前上下文 + 中断事件 + 恢复指令注入新 Prompt
+4. **无缝恢复**: 从快照恢复执行，用户无感知
+
+---
+
+#### 3.9.0.4 L1-C 感知层 (Perception Layer)
+
+**源文件**: `zulong/l1c/` (~36 KB optimized_vision_processor + 22 KB action_classifier + 11 KB gesture_recognizer)
+**成熟度**: 基本可用
+
+L1-C 实现**四层级联视觉处理**，以"人体锚点"驱动逐层精细化:
+
+```
+Layer 1: YOLOv10-Nano (人体检测)
+    ↓ 检测到人体 → 裁剪 ROI
+Layer 2: MediaPipe Pose (姿态估计)
+    ↓ 姿态关键点 → 动作推理
+Layer 3: MobileNetV4-TSM (动作分类)
+    ↓ 时序动作识别
+Layer 4: MediaPipe Hands (手势识别)
+    ↓ 手势: 挥手/指向/注视
+```
+
+**级联优势**: 无人时仅运行 Layer 1 (YOLO, ~6ms/帧)，有人时逐层展开。相比全帧全流水线处理节省 ~70% 算力。
+
+**视觉短期记忆** (`vision_short_term_memory.py`, 25.5 KB):
+- 保存最近 N 帧的检测结果
+- 跨帧目标追踪（简单 IoU 匹配）
+- 为 L2 提供时序化的场景描述
+
+**动作分类器** (`action_classifier.py`, 22.6 KB):
+- 模型: MobileNetV4-TSM (时序移位模块)
+- 识别动作: 站立、行走、坐下、挥手、指向等
+- 时序窗口: 16 帧滑动窗口
+- 推理延迟: <20ms (CPU)
+
+---
+
+#### 3.9.0.5 L3 导航专家技能 (Navigation Expert)
+
+**源文件**: `zulong/expert_skills/navigation_skill.py` (16.2 KB) + `dwa_planner.py` (16.5 KB)
+**成熟度**: 基本可用
+
+导航专家作为 L3 专家技能池的成员，由 L2 认知层通过 FC 工具调用:
+
+**A* 路径规划**:
+- 栅格地图管理 (可配置分辨率)
+- 八向邻域搜索
+- 动态障碍物地图更新
+- 路径平滑后处理
+
+**DWA 动态窗口避障** (`DWADynamicWindowApproach`):
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| max_linear_velocity | 1.0 m/s | 最大线速度 |
+| max_angular_velocity | 1.0 rad/s | 最大角速度 |
+| linear_acceleration | 0.5 m/s² | 线加速度约束 |
+| angular_acceleration | 1.0 rad/s² | 角加速度约束 |
+| safety_distance | 0.5 m | 安全距离 |
+| stop_distance | 0.3 m | 紧急停止距离 |
+| prediction_time | 2.0 s | 轨迹预测时间 |
+| time_step | 0.1 s | 仿真步长 |
+| 采样空间 | 10×20 | 线速度×角速度采样网格 |
+
+**轨迹评估函数** (加权多目标优化):
+```
+score = heading_weight(0.3) × heading_cost
+      + distance_weight(0.5) × obstacle_distance_cost
+      + velocity_weight(0.2) × velocity_cost
+```
+
+**与 L1 的协同**: 导航技能输出运动指令 → L1-B 调度层下发 → L1-A 电机插件安全约束 → L0 执行器执行。全程 L1-A 保持障碍物监测，可随时中断导航进行紧急停止。
+
+---
+
+#### 3.9.0.6 OpenClaw Bridge (实体机器人桥接)
+
+**源文件**: `openclaw_bridge/` (16 个文件)
+**成熟度**: 基本可用
+
+OpenClaw Bridge 是祖龙系统与实体机器人硬件之间的**事件桥接层**，将祖龙的 EventBus 事件映射到 OpenClaw 机器人的执行器指令:
+
+**架构**:
+```
+祖龙 L1-B (EventBus)  ←→  OpenClaw Bridge  ←→  实体机器人
+                            ├─ MicAdapter: 麦克风 → USER_SPEECH 事件
+                            ├─ VisionReporter: 视觉 → SENSOR_VISION 事件
+                            ├─ ExecuteListener: TASK_EXECUTE → 机器人动作
+                            ├─ SpeakListener: ACTION_SPEAK → 语音播报
+                            └─ WebAdapter: HTTP API → Web UI
+```
+
+**事件类型映射** (OpenClawEventType):
+
+| 事件类型 | 方向 | 用途 |
+|----------|------|------|
+| `USER_SPEECH` | 机器人→祖龙 | 语音识别结果上送 L1-B |
+| `SENSOR_VISION` | 机器人→祖龙 | 视觉检测结果上送 |
+| `TASK_EXECUTE` | 祖龙→机器人 | 任务指令下发 (grasp/move_arm 等) |
+| `ACTION_SPEAK` | 祖龙→机器人 | 语音播报指令 |
+| `ACTION_RESULT` | 机器人→祖龙 | 执行结果反馈 |
+
+**设计原则**:
+- Bridge 自身**不加载任何模型**，只做事件转换
+- 所有智能逻辑保留在祖龙主系统中
+- 支持 Mock 模式用于无硬件环境下的开发测试
+- 通过 `bootstrap.py` 统一启动所有适配器和监听器
+
+---
+
+#### 3.9.0.7 安全架构总结
+
+祖龙的具身安全机制分为三个层级:
+
+| 层级 | 机制 | 响应时间 | 示例 |
+|------|------|----------|------|
+| **硬件级** (L0) | 执行器物理限位 + 过流保护 | <1ms | 关节角度极限 |
+| **反射级** (L1-A) | 传感器→反射控制器→执行器 | <50ms | 障碍物→刹车, 跌落→急停 |
+| **认知级** (L2) | TaskGraph + CircuitBreaker | <1s | 长程任务异常→重规划 |
+
+**安全约束叠加**: L1-A 的安全反射**始终运行**，即使 L2 正在执行导航任务，L1-A 仍能在 50ms 内中断导航并执行紧急停止。这类似于人类的脊髓反射不需要经过大脑。
+
+---
 
 #### 3.9.1 具身机器人 OS 市场竞品对标 (v4.0)
 

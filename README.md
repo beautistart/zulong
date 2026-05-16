@@ -130,6 +130,23 @@ Round 2: 场景化执行
 - **ASR (SenseVoice-Small)**：244M (ONNX INT8 量化)，中/英/日/韩/粤语 + 情感识别 + 事件检测
 - **整体延迟**：3-4s (端到端，云端API调用)
 
+### 6. 🤖 具身机器人能力
+
+祖龙定位为**具身机器人认知大脑后端**，通过四层架构实现从传感器到认知决策的完整闭环：
+
+- **L0 设备层**：USB 摄像头 / 麦克风 / 扬声器驱动，GPU 加速光流运动检测（RTX 3060, 150+ FPS），多关节执行器模拟（位置/速度/扭矩跟踪）
+- **L1 模块化插件架构**：松耦合热插拔设计，4 级优先级调度（CRITICAL > HIGH > NORMAL > LOW）
+  - **L1-A 反射层**：障碍物自动刹车（<50ms 响应），紧急停止，跌落保护
+  - **L1-B 调度层**：三层注意力机制（L0 静默采集 → L1 静默注意 → L2 交互注意），事件风暴削减 ~90%
+  - **L1-C 感知层**：YOLOv10 人体检测 → MediaPipe 姿态 → MobileNetV4-TSM 动作分类 → 手势识别
+  - **L1-D/E 安全层**：语音唤醒（CRITICAL）、气体泄漏/火灾检测（CRITICAL）
+- **L3 导航专家**：A* 路径规划 + DWA 动态窗口避障（2s 轨迹预测，0.5m 安全距离）
+- **OpenClaw Bridge**：实体机器人桥接模块，通过 EventBus 与祖龙 L1-B 实时通信
+
+**与 NVIDIA GR00T 互补**：GR00T 处理视觉-动作映射与运动泛化，祖龙处理认知规划、记忆检索与长程推理。两者可同时部署在同一机器人上。
+
+> 详细技术分析请参阅：[深度技术分析报告 §3.9](./docs/architecture/system-overview.md) | [L1 插件开发指南](./docs/architecture/l1-plugin-guide.md)
+
 ---
 
 ## 🏗️ 系统架构
@@ -247,6 +264,8 @@ audio:
 | **死循环检测** | ✅ 6 信号熔断 | ❌ 硬限制 | ❌ 硬限制 | ❌ | ❌ 硬限制 |
 | **任务挂起/恢复** | ✅ 跨天级 | ❌ | ❌ | ❌ | ❌ |
 | **语音交互** | ✅ TTS + ASR | ❌ | ❌ | ❌ | ❌ |
+| **具身机器人能力** | ✅ L0-L3 四层 + 导航 | ❌ | ❌ | ❌ | ❌ |
+| **安全反射机制** | ✅ 三级中断 + 自动刹车 | ❌ | ❌ | ❌ | ❌ |
 
 ---
 
@@ -259,9 +278,14 @@ zulong_beta4/
 │   ├── ide/                    # IDE 模式 (WebSocket 服务 + 工具注册)
 │   ├── l2/                     # L2 推理引擎 (推理 + 记忆 + 熔断 + 任务图)
 │   ├── memory/                 # 记忆系统 (MemoryGraph + RAG)
-│   ├── l1a/ / l1b/ / l1c/     # 感知层 (音频/调度/视觉)
-│   └── l3/                     # L3 多专家模型层
-├── config/                     # 配置文件 (zulong_config.yaml)
+│   ├── l0/                     # L0 设备层 (摄像头/麦克风/执行器/运动检测)
+│   ├── l1a/ / l1b/ / l1c/     # 感知层 (音频融合/调度/视觉)
+│   ├── l3/                     # L3 多专家模型层
+│   ├── expert_skills/          # L3 专家技能 (导航/DWA避障/视觉)
+│   ├── modules/l1/             # L1 模块化插件接口
+│   └── plugins/                # L1 插件实现 (电机/视觉/语音/气体)
+├── openclaw_bridge/            # 实体机器人桥接 (EventBus + 适配器)
+├── config/                     # 配置文件 (zulong_config.yaml, l1_plugins.yaml)
 ├── docs/                       # 技术文档与使用指南
 └── requirements.txt            # Python 依赖
 ```
@@ -276,6 +300,8 @@ zulong_beta4/
 | **CircuitBreaker** | `zulong/l2/circuit_breaker.py` | 800+ 行 | 6 信号检测、状态机 (GREEN→YELLOW→RED) |
 | **TaskGraph** | `zulong/l2/task_graph.py` | 1500+ 行 | 无限深度递归树、模板节点、任务依赖管理 |
 | **InferenceEngine** | `zulong/l2/inference_engine.py` | 5700+ 行 | 两阶段推理、记忆检索、注意力窗口、FC 循环、5 层防护 |
+| **L1 插件管理器** | `zulong/modules/l1/core/plugin_manager.py` | - | 热插拔、优先级调度、异常隔离、共享内存通信 |
+| **导航专家** | `zulong/expert_skills/navigation_skill.py` | 16K | A* 路径规划、DWA 动态窗口避障 |
 
 ---
 
@@ -314,6 +340,8 @@ Server("zulong-memory")
 ### 技术文档
 - [技术规格说明书 (TSD)](./docs/architecture/technical-spec-v3.md) - 完整系统架构设计
 - [深度技术分析报告](./docs/architecture/system-overview.md) - 代码审查与竞品对比
+- [L1 感知与具身控制层](./docs/architecture/system-overview.md#39-l0l1-感知与具身控制层-深度技术分析) - L0/L1 层深度技术分析
+- [L1 插件开发指南](./docs/architecture/l1-plugin-guide.md) - 自定义 L1 插件开发入门
 - [异构图记忆系统详解](./docs/memory_graph/) - MemoryGraph 设计与实现
 - [熔断器设计文档](./docs/CircuitBreaker_Design.md) - 6信号死循环检测机制
 

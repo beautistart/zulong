@@ -129,6 +129,23 @@ With 5-layer protection chain (CB forced convergence, RuleGuardian premature com
 - **ASR (SenseVoice-Small)**: 244M (ONNX INT8 quantized), CN/EN/JP/KR/Cantonese + emotion recognition + event detection
 - **Overall latency**: 3-4s (end-to-end, cloud API calls)
 
+### 6. Embodied Robotics
+
+Zulong is positioned as an **Embodied Robot Cognitive Brain Backend**, implementing a complete sensor-to-cognition pipeline through its four-layer architecture:
+
+- **L0 Device Layer**: USB camera/mic/speaker drivers, GPU-accelerated optical flow motion detection (RTX 3060, 150+ FPS), multi-joint actuator simulation (position/velocity/torque tracking)
+- **L1 Modular Plugin Architecture**: Hot-pluggable design with 4-level priority scheduling (CRITICAL > HIGH > NORMAL > LOW)
+  - **L1-A Reflex Layer**: Obstacle auto-braking (<50ms), emergency stop, fall protection
+  - **L1-B Scheduler Layer**: Three-layer attention (L0 silent collection -> L1 silent attention -> L2 interactive attention), ~90% event storm reduction
+  - **L1-C Perception Layer**: YOLOv10 human detection -> MediaPipe pose -> MobileNetV4-TSM action classification -> gesture recognition
+  - **L1-D/E Safety Layer**: Voice wakeup (CRITICAL), gas leak/fire detection (CRITICAL)
+- **L3 Navigation Expert**: A* pathfinding + DWA dynamic window obstacle avoidance (2s trajectory prediction, 0.5m safety distance)
+- **OpenClaw Bridge**: Physical robot integration module, real-time EventBus communication with Zulong L1-B
+
+**Complementary to NVIDIA GR00T**: GR00T handles vision-action mapping and motion generalization; Zulong handles cognitive planning, memory retrieval, and long-horizon reasoning. Both can be deployed on the same robot.
+
+> Detailed technical analysis: [Deep Analysis Report §3.9](./architecture/system-overview.md) | [L1 Plugin Guide](./architecture/l1-plugin-guide.md)
+
 ---
 
 ## 🏗️ System Architecture
@@ -246,6 +263,8 @@ audio:
 | **Infinite Loop Detection** | ✅ 6-signal circuit breaker | ❌ Hard limit | ❌ Hard limit | ❌ | ❌ Hard limit |
 | **Task Suspend/Resume** | ✅ Cross-day | ❌ | ❌ | ❌ | ❌ |
 | **Voice Interaction** | ✅ TTS + ASR | ❌ | ❌ | ❌ |  |
+| **Embodied Robotics** | ✅ L0-L3 four-layer + navigation | ❌ | ❌ | ❌ | ❌ |
+| **Safety Reflex** | ✅ 3-tier interrupt + auto-brake | ❌ | ❌ | ❌ | ❌ |
 
 ---
 
@@ -258,9 +277,14 @@ zulong_beta4/
 │   ├── ide/                    # IDE Mode (WebSocket Service + Tool Registry)
 │   ├── l2/                     # L2 Inference Engine (Inference + Memory + Breaker + Task Graph)
 │   ├── memory/                 # Memory System (MemoryGraph + RAG)
-│   ├── l1a/ / l1b/ / l1c/     # Perception Layer (Audio/Scheduler/Vision)
-│   └── l3/                     # L3 Multi-Expert Model Layer
-├── config/                     # Configuration (zulong_config.yaml)
+│   ├── l0/                     # L0 Device Layer (Camera/Mic/Actuator/Motion Detection)
+│   ├── l1a/ / l1b/ / l1c/     # Perception Layer (Audio Fusion/Scheduler/Vision)
+│   ├── l3/                     # L3 Multi-Expert Model Layer
+│   ├── expert_skills/          # L3 Expert Skills (Navigation/DWA/Vision)
+│   ├── modules/l1/             # L1 Modular Plugin Interface
+│   └── plugins/                # L1 Plugin Implementations (Motor/Vision/Voice/Gas)
+├── openclaw_bridge/            # Physical Robot Bridge (EventBus + Adapters)
+├── config/                     # Configuration (zulong_config.yaml, l1_plugins.yaml)
 ├── docs/                       # Technical Docs & User Guides
 └── requirements.txt            # Python Dependencies
 ```
@@ -275,6 +299,8 @@ zulong_beta4/
 | **CircuitBreaker** | `zulong/l2/circuit_breaker.py` | 800+ | 6-signal detection, State machine (GREEN→YELLOW→RED) |
 | **TaskGraph** | `zulong/l2/task_graph.py` | 1500+ | Infinite depth recursive tree, template nodes, task dependency management |
 | **InferenceEngine** | `zulong/l2/inference_engine.py` | 5700+ | Two-stage inference, memory retrieval, attention window, FC loop, 5-layer protection |
+| **L1 Plugin Manager** | `zulong/modules/l1/core/plugin_manager.py` | - | Hot-plug, priority scheduling, fault isolation, shared memory |
+| **Navigation Expert** | `zulong/expert_skills/navigation_skill.py` | 16K | A* pathfinding, DWA dynamic window obstacle avoidance |
 
 ---
 
@@ -313,6 +339,8 @@ Server("zulong-memory")
 ### Technical Docs
 - [Technical Specification (TSD)](./docs/architecture/technical-spec-v3.md) - Complete system architecture design
 - [In-Depth Technical Analysis](./docs/architecture/system-overview.md) - Code review and competitor comparison
+- [L1 Perception & Embodied Control](./docs/architecture/system-overview.md#39-l0l1-感知与具身控制层-深度技术分析) - L0/L1 layer deep technical analysis
+- [L1 Plugin Development Guide](./docs/architecture/l1-plugin-guide.md) - Custom L1 plugin development
 - [Heterogeneous Graph Memory System](./docs/memory_graph/) - MemoryGraph design and implementation
 - [CircuitBreaker Design Doc](./docs/CircuitBreaker_Design.md) - 6-signal infinite loop detection mechanism
 

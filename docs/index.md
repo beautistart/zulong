@@ -24,6 +24,13 @@
 - [核心模块说明](./architecture/core-modules.md) - 各核心模块职责
 - [L1 插件架构指南](./architecture/l1-plugin-guide.md) - L1 层插件开发指南
 
+### 具身机器人
+
+- [L1 层深度技术分析](./architecture/system-overview.md#39-l0l1-感知与具身控制层-深度技术分析) - L0/L1 各子层详细分析、安全架构、OpenClaw Bridge
+- [L1 感知与具身控制层规格](./architecture/technical-spec-v3.md#第-95-章l1-感知与具身控制层) - TSD v3.0 中的 L1 层技术规格
+- [L1 插件开发指南](./architecture/l1-plugin-guide.md) - 自定义 L1 插件开发入门
+- [具身机器人 OS 竞品对标](./architecture/system-overview.md#391-具身机器人-os-市场竞品对标-v40) - 与 ROS 2/NVIDIA Isaac/AimRT 对比
+
 ---
 
 ## 🧠 记忆系统

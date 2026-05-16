@@ -913,6 +913,187 @@ TTS 合成 (<0.3s)
 
 ---
 
+# 第 9.5 章：L1 感知与具身控制层
+
+## 9.5.1 设计定位
+
+祖龙的 L1 层是连接硬件传感器（L0）与认知大脑（L2）的**桥梁层**，包含三个子层：
+
+```
+L2 认知层 (决策)
+    ↕ 事件路由
+L1-B 调度层 (事件路由 + 中断管理 + 三层注意力)
+    ↕ 共享内存
+L1-A 反射层 (硬实时安全反射) + L1-C 感知层 (多模态感知)
+    ↕ 传感器数据 / 执行器指令
+L0 设备层 (硬件驱动)
+```
+
+**核心原则**: L1 层实现**无 LLM 开销**的实时感知与安全保障。所有 L1 模块的处理延迟要求 <50ms。
+
+## 9.5.2 L0 设备层规格
+
+| 设备 | 源文件 | 接口规格 | 数据格式 |
+|------|--------|----------|----------|
+| USB 摄像头 | `l0/devices/camera_device.py` | 640×480, 30fps | BGR 帧 (numpy array) |
+| 麦克风 | `l0/devices/microphone_device.py` | 16kHz, 16bit, 单声道 | PCM int16 |
+| 扬声器 | `l0/devices/speaker_device.py` | 24kHz, 16bit | PCM int16 |
+| 运动检测器 | `l0/motion_detector.py` | Lucas-Kanade 光流 | MotionResult dataclass |
+| 执行器模拟器 | `l0/actuator_simulator.py` | 3-DOF 关节 | 位置/速度/扭矩/电流/温度 |
+
+**运动检测器状态机**:
+
+```
+IDLE (静止) ──motion_pixels > threshold──→ MOVING (运动中)
+  ↑                                              │
+  │               motion_pixels < threshold      │
+  │               持续 N 帧                       ↓
+  └────────────────────────────────────── STOPPED (已停止)
+```
+
+**GPU 加速光流**: PyTorch CUDA 实现，RTX 3060 实测 150+ FPS (vs CPU 18 FPS)，加速比 8.28×。通过 `gpu_optical_flow.py` 自动检测 CUDA 可用性并降级。
+
+## 9.5.3 L1 模块化插件架构
+
+所有 L1 功能模块通过统一接口 `IL1Module` 实现为可热插拔插件：
+
+```python
+# 核心接口 (zulong/modules/l1/core/interface.py)
+class IL1Module(ABC):
+    @property
+    def module_id(self) -> str: ...
+    @property
+    def priority(self) -> EventPriority: ...
+    def initialize(self, shared_memory: Dict) -> bool: ...
+    def process_cycle(self, shared_memory: Dict) -> List[ZulongEvent]: ...
+    def health_check(self) -> Dict: ...
+    def shutdown(self): ...
+```
+
+**插件配置** (`config/l1_plugins.yaml`):
+
+```yaml
+plugins:
+  - module_id: "L1A/Motor"
+    class_path: "zulong.plugins.motor.l1a_motor_plugin.L1A_MotorPlugin"
+    enabled: true
+    priority: "HIGH"
+    config:
+      obstacle_threshold: 0.3  # 米
+      max_speed: 0.8
+      brake_decay: 0.5
+      auto_brake: true
+
+  - module_id: "L1C/Vision"
+    class_path: "zulong.plugins.vision.l1c_vision_plugin.L1C_VisionPlugin"
+    enabled: true
+    priority: "NORMAL"
+    config:
+      fps: 30
+      motion_threshold: 500
+
+  - module_id: "L1D/Voice"
+    class_path: "zulong.plugins.voice.l1d_voice_plugin.L1D_VoicePlugin"
+    enabled: true
+    priority: "CRITICAL"
+    config:
+      wake_words: ["你好", "救命", "小紫"]
+
+  - module_id: "L1E/Gas"
+    class_path: "zulong.plugins.gas.l1e_gas_plugin.L1E_GasPlugin"
+    enabled: true
+    priority: "CRITICAL"
+    config:
+      threshold: 500  # ppm
+```
+
+**共享内存键值规范**:
+
+| 命名空间 | 键名 | 类型 | 说明 |
+|----------|------|------|------|
+| `motor.*` | `motor.speed`, `motor.target_speed`, `motor.mode` | float/str | 电机状态 |
+| `obstacle.*` | `obstacle.distance`, `obstacle.detected` | float/bool | 障碍物检测 |
+| `vision.*` | `vision.frame_count`, `vision.motion_detected` | int/bool | 视觉状态 |
+| `voice.*` | `voice.wakeup_detected`, `audio.text`, `audio.confidence` | bool/str/float | 语音状态 |
+| `gas.*` | `gas.concentration`, `gas.alarm` | int/bool | 气体检测 |
+
+## 9.5.4 L1-A 反射层安全规格
+
+**反射控制器事件响应表**:
+
+| 传感器事件 | 优先级 | 响应指令 | 最大延迟 |
+|-----------|--------|----------|----------|
+| SENSOR_FALL | CRITICAL | EMERGENCY_STOP | <10ms |
+| SENSOR_GAS (>500ppm) | CRITICAL | EMERGENCY_STOP + ALARM | <10ms |
+| SENSOR_OBSTACLE (<0.3m) + MOVING | HIGH | CMD_BRAKE | <50ms |
+| SENSOR_OBSTACLE (<0.3m) + CHARGING | - | 抑制 (不响应) | - |
+| SENSOR_SOUND (>70dB) | NORMAL | ALERT → L2 | <30ms |
+| SENSOR_VISION (人体) | NORMAL | 转发 L1-C | <50ms |
+
+**安全约束不可绕过**: L1-A 反射控制器独立于 L2 运行。即使 L2 推理引擎正在执行导航任务，L1-A 仍能在 <50ms 内中断导航并触发紧急停止。
+
+## 9.5.5 L1-C 四层级联视觉
+
+```
+输入帧 (640×480)
+    │
+    ├─ Layer 1: YOLOv10-Nano → 人体检测 (~6ms/帧)
+    │   └─ 无人体 → 仅记录，不产生事件 (静默注意)
+    │
+    ├─ Layer 2: ROI 裁剪 + MediaPipe Pose → 33 个关键点
+    │   └─ 姿态估计用于下层动作推理
+    │
+    ├─ Layer 3: MobileNetV4-TSM → 动作分类
+    │   └─ 16 帧滑动窗口，时序特征提取
+    │
+    └─ Layer 4: MediaPipe Hands → 手势识别
+        └─ 挥手 / 指向 / 注视 → 生成 INTERACTION 事件
+```
+
+**算力节省**: 无人场景仅运行 Layer 1 (~6ms)，有人场景展开全流水线 (~30ms)。相比始终运行全流水线节省 ~70% 算力。
+
+## 9.5.6 L3 导航专家
+
+导航专家作为 L3 专家技能池成员，由 L2 通过 FC 工具调用:
+
+**A* 路径规划**: 栅格地图 + 八向搜索 + 动态障碍物更新
+
+**DWA 动态窗口避障**:
+
+| 参数类别 | 参数 | 值 |
+|----------|------|-----|
+| 运动学 | 最大线速度 / 角速度 | 1.0 m/s / 1.0 rad/s |
+| 运动学 | 线加速度 / 角加速度 | 0.5 m/s² / 1.0 rad/s² |
+| 安全 | 安全距离 / 停止距离 | 0.5m / 0.3m |
+| 采样 | 速度空间采样 | 10(线) × 20(角) |
+| 预测 | 轨迹预测 | 2.0s, 步长 0.1s |
+| 评估权重 | 朝向/距离/速度 | 0.3 / 0.5 / 0.2 |
+
+**导航-安全协同**: L3 导航输出速度指令 → L1-A 安全约束检查 → L0 执行器执行。L1-A 可随时覆盖 L3 的指令。
+
+## 9.5.7 OpenClaw Bridge
+
+OpenClaw Bridge 是祖龙与实体机器人之间的事件桥接层:
+
+```
+祖龙 EventBus ←→ EventBusClient ←→ 适配器/监听器 ←→ 机器人硬件
+                   (ZeroMQ/HTTP)
+```
+
+**组件**:
+
+| 组件 | 方向 | 功能 |
+|------|------|------|
+| `MicAdapter` | 机器人→祖龙 | 音频采集 → USER_SPEECH 事件 |
+| `VisionReporter` | 机器人→祖龙 | 视觉检测 → SENSOR_VISION 事件 |
+| `ExecuteListener` | 祖龙→机器人 | TASK_EXECUTE → 机器人动作指令 |
+| `SpeakListener` | 祖龙→机器人 | ACTION_SPEAK → 语音播报 |
+| `WebAdapter` | 双向 | HTTP API + Web UI 交互 |
+
+**设计原则**: Bridge 不加载模型，不做决策，仅做事件格式转换。所有智能逻辑保留在祖龙主系统中。
+
+---
+
 # 第 10 章：MCP 协议支持
 
 ## 10.1 MCP Server 定义
