@@ -357,11 +357,16 @@ class IDEToolRegistry:
         """根据意图返回过滤后的合并工具定义
 
         Args:
-            intent: "complex" 返回全部工具; "resume" 排除 task_create_plan/task_add_node
+            intent: "chat" 返回空列表; "complex" 返回全部工具; "resume" 排除 task_create_plan/task_add_node
 
         Returns:
             过滤后的 OpenAI FC tool schema 列表
         """
+        # CHAT意图：简单对话，不需要工具
+        if intent == "chat":
+            logger.info(f"[IDEToolRegistry] 意图 {intent} 工具定义: 内部=0, 远程=0, 总计=0")
+            return []
+        
         extra_exclude = _RESUME_EXCLUDED_INTERNAL_TOOLS if intent == "resume" else None
         internal = self._get_filtered_internal_tools(extra_exclude=extra_exclude)
         remote = list(_IDE_TOOL_SCHEMAS)
