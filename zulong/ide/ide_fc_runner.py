@@ -242,6 +242,9 @@ class IDEFCRunner:
         self._bfs_min_interval: int = 3  # 最小间隔轮次
         # WS层IDESession引用（由 ide_server._run_fc_loop 注入）
         self.ide_session = None
+        # L1-B 意图分类器（与Web端统一）
+        self._intent_filter = None
+        self._init_intent_filter()
 
     def _notify_session_linked(self, task_graph_id: str) -> None:
         """通知监控客户端: 会话已关联到任务图谱"""
@@ -870,6 +873,27 @@ class IDEFCRunner:
         except Exception as e:
             logger.warning(f"[IDEFCRunner] SemanticDriftDetector 创建失败: {e}")
 
+    def _init_intent_filter(self) -> None:
+        """初始化L1-B意图分类器（与Web端统一使用ALBERT模型）"""
+        try:
+            from zulong.l1b.intent_filter import IntentFilter
+            # 从配置获取intent_config
+            try:
+                from zulong.core.config_manager import get_config
+                config = get_config()
+                intent_config = config.get("l1b", {}).get("intent_filter", {})
+            except Exception:
+                intent_config = {}
+            
+            self._intent_filter = IntentFilter(config=intent_config)
+            if self._intent_filter._albert_enabled:
+                logger.info("[IDEFCRunner] L1-B IntentFilter 已启用（ALBERT 15类）")
+            else:
+                logger.info("[IDEFCRunner] L1-B IntentFilter 已启用（关键词匹配）")
+        except Exception as e:
+            logger.warning(f"[IDEFCRunner] IntentFilter 初始化失败: {e}")
+            self._intent_filter = None
+
     def _init_dialogue_adapter(self) -> None:
         """创建 DialogueAdapter 实例（复用或新建）"""
         try:
@@ -1071,14 +1095,11 @@ class IDEFCRunner:
         return state
 
     def _detect_ide_intent(self, user_input: str) -> tuple:
-        """IDE 意图检测启发式（轻量，无需 LLM 调用）
+        """IDE 意图检测（优先使用L1-B IntentFilter，与Web端统一）
 
-        规则：
-        0. Session 上下文：如果上一次 FC 处于 waiting_remote 且有活跃 TG → RESUME
-        1. 存在活跃 TaskGraph 且有未完成节点 → RESUME
-        2. 用户输入包含恢复关键词 → RESUME
-        3. 简单问候/闲聊 → CHAT（直接文本回复，不调用工具）
-        4. 其余 → COMPLEX（IDE 模式默认）
+        流程：
+        1. 优先使用L1-B IntentFilter（ALBERT模型）
+        2. 回退到启发式规则（RESUME/CHAT/COMPLEX）
 
         Returns:
             (intent: str, has_active_task_graph: bool)
@@ -1141,20 +1162,41 @@ class IDEFCRunner:
             except Exception as e:
                 logger.debug(f"[IDEFCRunner] 备份加载尝试失败: {e}")
 
-        # 规则 3: 简单问候/闲聊 → CHAT（避免加载工具导致LLM返回空回复）
+        # 规则 3: 使用L1-B IntentFilter进行意图分类（与Web端统一）
+        if self._intent_filter:
+            try:
+                intent_result = self._intent_filter.analyze(user_input)
+                predicted_intent = intent_result.get("intent", "UNKNOWN").lower()
+                confidence = intent_result.get("confidence", 0.0)
+                
+                # L1-B的15类意图映射到IDE的3类意图
+                if predicted_intent == "chat":
+                    logger.info(f"[IDEFCRunner] 意图检测: CHAT（L1-B ALBERT，置信度={confidence:.2f}）")
+                    return "chat", has_active_tg
+                elif predicted_intent in ("task_code", "task_analysis", "task_write", 
+                                          "task_execute", "task_search", "task_read"):
+                    logger.info(f"[IDEFCRunner] 意图检测: COMPLEX（L1-B ALBERT={predicted_intent}，置信度={confidence:.2f}）")
+                    return "complex", has_active_tg
+                # 其他意图默认为COMPLEX
+                elif confidence >= 0.6:
+                    logger.info(f"[IDEFCRunner] 意图检测: COMPLEX（L1-B ALBERT={predicted_intent}，置信度={confidence:.2f}）")
+                    return "complex", has_active_tg
+            except Exception as e:
+                logger.debug(f"[IDEFCRunner] IntentFilter分析失败: {e}")
+
+        # 规则 4: 回退到启发式 - 简单问候/闲聊 → CHAT
         _chat_patterns = (
             "你好", "您好", "hello", "hi", "hey",
             "早上好", "下午好", "晚上好", "good morning", "good afternoon",
             "怎么样", "how are you", "最近好吗",
             "谢谢", "感谢", "thanks", "thank you",
         )
-        # 短文本（<20字符）且匹配问候模式 → CHAT
         if len(stripped) < 20 and any(p in stripped for p in _chat_patterns):
-            logger.info("[IDEFCRunner] 意图检测: CHAT（简单问候）")
+            logger.info("[IDEFCRunner] 意图检测: CHAT（启发式：简单问候）")
             return "chat", has_active_tg
 
         # 默认: COMPLEX
-        logger.info("[IDEFCRunner] 意图检测: COMPLEX")
+        logger.info("[IDEFCRunner] 意图检测: COMPLEX（默认）")
         return "complex", has_active_tg
 
     def _try_activate_from_reference(self, user_input: str) -> Optional[str]:
