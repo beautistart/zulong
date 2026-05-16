@@ -2028,6 +2028,7 @@ class IDEFCRunner:
             
             # 返回完整内容供后续处理
             rc = full_content
+            tc = None  # 初始化tc，避免UnboundLocalError
             
         except concurrent.futures.TimeoutError:
             future.cancel()
