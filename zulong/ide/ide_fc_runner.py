@@ -2092,6 +2092,17 @@ class IDEFCRunner:
             if sent_count > 0:
                 logger.info(f"🌊 [FC] 流式推送完成：共 {sent_count} 个句子，总长度 {len(full_content)}")
             
+            # 🔥 立即发送 task_complete，确保前端收到（避免WS提前断开）
+            # 仅在无工具调用时发送（有工具调用时由FC循环结束后发送）
+            try:
+                loop = asyncio.get_running_loop()
+                # 等待短暂时间确保 display_text 被前端消费
+                await asyncio.sleep(0.1)
+                await send_callback("task_complete", {"result": full_content})
+                logger.info(f"✅ [FC] task_complete 已发送: {len(full_content)} chars")
+            except Exception as e:
+                logger.warning(f"[FC] task_complete 发送失败: {e}")
+            
             # 返回完整内容供后续处理
             rc = full_content
             tc = None  # 初始化tc，避免UnboundLocalError
