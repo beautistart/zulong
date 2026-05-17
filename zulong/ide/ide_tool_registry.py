@@ -364,14 +364,15 @@ class IDEToolRegistry:
         Returns:
             过滤后的 OpenAI FC tool schema 列表
         """
-        # CHAT意图：简单对话，仅加载基础工具（记忆相关）
+        # CHAT意图：简单对话，仅加载基础工具（记忆相关 + 网络搜索）
         if intent == "chat":
-            # CHAT基础工具：记忆检索/读取/保存/发现相关
+            # CHAT基础工具：记忆检索/读取/保存/发现相关 + 网络搜索
             _CHAT_BASE_TOOLS = {
                 "recall_memory",      # 记忆检索
                 "read_memory_node",   # 读取记忆节点
                 "save_memory_note",   # 保存记忆
                 "discover_related",   # 发现相关内容
+                "web_search",         # 网络搜索
             }
             internal = self._get_filtered_internal_tools(
                 extra_include=_CHAT_BASE_TOOLS)
