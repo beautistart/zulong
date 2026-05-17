@@ -2096,9 +2096,9 @@ class IDEFCRunner:
             # 仅在无工具调用时发送（有工具调用时由FC循环结束后发送）
             try:
                 loop = asyncio.get_running_loop()
-                # 等待短暂时间确保 display_text 被前端消费
-                await asyncio.sleep(0.1)
-                await send_callback("task_complete", {"result": full_content})
+                # 等待短暂时间确保 display_text 被前端消费（同步等待）
+                time.sleep(0.1)
+                loop.create_task(send_callback("task_complete", {"result": full_content}))
                 logger.info(f"✅ [FC] task_complete 已发送: {len(full_content)} chars")
             except Exception as e:
                 logger.warning(f"[FC] task_complete 发送失败: {e}")
