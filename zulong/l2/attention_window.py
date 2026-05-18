@@ -19,6 +19,19 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Any, Set
 
+# ── LLM自主注意力选择模块导入 ──
+from .attention_types import (
+    PressureMetrics, DecisionRequest, DecisionResponse,
+    SwitchRecord, OscillationState, TriggerType,
+    PressureTrend, OscillationLevel,
+)
+from .attention_config import AttentionConfig
+from .pressure_detector import PressureDetector
+from .attention_mode_selector import AttentionModeSelector
+from .mode_switch_controller import (
+    ModeSwitchController, CooldownManager, OscillationDetector
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -144,6 +157,40 @@ class AttentionWindowManager:
             f"[AttentionWindow] 初始化: context={context_window_size}, "
             f"reserved={reserved_tokens}, budget={self.budget}"
         )
+
+        # ── LLM自主注意力选择组件初始化 ──
+        self._llm_config: Optional[AttentionConfig] = None
+        self._pressure_detector: Optional[PressureDetector] = None
+        self._mode_selector: Optional[AttentionModeSelector] = None
+        self._cooldown_manager: Optional[CooldownManager] = None
+        self._oscillation_detector: Optional[OscillationDetector] = None
+        self._mode_controller: Optional[ModeSwitchController] = None
+        self._llm_client: Optional[Any] = None
+        self._last_llm_selection_time: Optional[float] = None
+
+        try:
+            _cfg = AttentionConfig.load_from_yaml()
+            _cfg.validate()
+
+            if _cfg.enabled:
+                self._llm_config = _cfg
+                self._pressure_detector = PressureDetector(self, self._llm_config)
+                self._mode_selector = AttentionModeSelector(self._llm_config)
+                self._cooldown_manager = CooldownManager(self._llm_config)
+                self._oscillation_detector = OscillationDetector(self._llm_config)
+                self._mode_controller = ModeSwitchController(
+                    self._llm_config,
+                    self._cooldown_manager,
+                    self._oscillation_detector,
+                )
+                logger.info(
+                    f"[AttentionWindow] LLM自主注意力选择已启用: "
+                    f"pressure_threshold={self._llm_config.pressure_threshold_high}"
+                )
+            else:
+                logger.info("[AttentionWindow] LLM自主注意力选择已禁用")
+        except Exception as e:
+            logger.warning(f"[AttentionWindow] LLM注意力选择初始化失败(非致命): {e}")
 
     # ── 消息注册 ──
 
@@ -407,6 +454,18 @@ class AttentionWindowManager:
         Returns:
             经过窗口过滤的消息列表（保持时间顺序）
         """
+        # ── LLM自主注意力选择检查 ──
+        if self._should_try_llm_selection():
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(self._try_llm_mode_selection_async())
+                else:
+                    loop.run_until_complete(self._try_llm_mode_selection_async())
+            except Exception as e:
+                logger.warning(f"[AttentionWindow] LLM注意力选择执行失败: {e}")
+
         if not self.envelopes:
             return []
 
@@ -951,6 +1010,211 @@ class AttentionWindowManager:
             "usage_ratio": self.usage_ratio,
             "current_node_id": self._current_node_id,
             "context_window_size": self.context_window_size,
+        }
+
+    # ── LLM自主注意力选择辅助方法 ──
+
+    def set_llm_client(self, llm_client: Any) -> None:
+        """设置LLM客户端实例，启用LLM自主注意力选择
+
+        Args:
+            llm_client: LLM客户端实例（需支持chat或generate方法）
+        """
+        if self._llm_config and self._llm_config.enabled:
+            self._llm_client = llm_client
+            if self._mode_selector:
+                self._mode_selector.set_llm_client(llm_client)
+            logger.info("[AttentionWindow] LLM客户端已设置，LLM自主注意力选择已就绪")
+
+    def _should_try_llm_selection(self) -> bool:
+        """检查是否应尝试LLM自主选择
+
+        条件：
+        1. 功能已启用且配置有效
+        2. LLM客户端已设置
+        3. 不在冷却期内
+
+        Returns:
+            是否应尝试
+        """
+        if not self._llm_config or not self._llm_config.enabled:
+            return False
+        if not self._llm_client:
+            return False
+        if not self._mode_controller:
+            return False
+        cooldown_result = self._mode_controller.can_switch()
+        if not cooldown_result.is_allowed:
+            return False
+        return True
+
+    async def _try_llm_mode_selection_async(self) -> None:
+        """异步执行LLM自主注意力模式选择
+
+        完整流程：
+        1. 计算当前压力指标
+        2. 检查是否超过阈值
+        3. 构建决策请求（含任务上下文）
+        4. 调用LLM决策
+        5. 应用决策结果（含震荡检测和冷却管理）
+        """
+        if not self._pressure_detector or not self._mode_selector or not self._mode_controller:
+            return
+
+        try:
+            # 1. 计算压力
+            metrics = self._pressure_detector.calculate_pressure()
+
+            # 2. 检查阈值
+            threshold_result = self._pressure_detector.check_threshold(metrics)
+            if not threshold_result.should_trigger:
+                logger.debug(
+                    f"[AttentionWindow] 压力未超阈值: "
+                    f"pressure={metrics.current_pressure:.3f}, "
+                    f"threshold={threshold_result.message}"
+                )
+                return
+
+            logger.info(
+                f"[AttentionWindow] 触发LLM注意力选择: "
+                f"pressure={metrics.current_pressure:.3f}, "
+                f"trend={metrics.pressure_trend.value}, "
+                f"trigger={threshold_result.trigger_type}"
+            )
+
+            # 3. 构建决策请求
+            task_context = self._get_task_context_summary()
+            current_mode = self.mode.name
+            switch_history = self._mode_controller.get_switch_history(5)
+
+            request = self._mode_selector.build_decision_request(
+                pressure_metrics=metrics,
+                current_mode=current_mode,
+                task_context=task_context,
+                switch_history=switch_history,
+            )
+
+            # 4. 调用LLM决策
+            decision = await self._mode_selector.call_llm_decision(request)
+
+            logger.info(
+                f"[AttentionWindow] LLM决策结果: mode={decision.mode}, "
+                f"confidence={decision.confidence:.2f}, "
+                f"fallback={decision.is_fallback}, "
+                f"reason={decision.reason[:60]}"
+            )
+
+            # 5. 应用决策
+            if decision.mode != current_mode:
+                result = self._mode_controller.apply_llm_decision(
+                    current_mode=current_mode,
+                    decision=decision,
+                    pressure_value=metrics.current_pressure,
+                )
+
+                if result.switched:
+                    try:
+                        new_mode = AttentionMode[decision.mode]
+                        old_mode = self.mode
+                        self.mode = new_mode
+                        self._last_llm_selection_time = __import__('time').time()
+                        logger.info(
+                            f"[AttentionWindow] LLM自主切换: "
+                            f"{old_mode.value} → {new_mode.value} "
+                            f"(confidence={decision.confidence:.2f})"
+                        )
+                        self._publish_mode_change(
+                            old_mode, new_mode,
+                            f"llm_autonomous:{decision.reason[:30]}"
+                        )
+                        # 聚焦切换时注入节点知识
+                        if new_mode in (AttentionMode.FOCUS, AttentionMode.SINGLE_CHAIN):
+                            self._inject_node_knowledge(self._current_node_id)
+                    except KeyError:
+                        logger.error(
+                            f"[AttentionWindow] LLM返回无效模式名: {decision.mode}"
+                        )
+            else:
+                logger.info(
+                    f"[AttentionWindow] LLM选择保持当前模式: {current_mode} "
+                    f"(confidence={decision.confidence:.2f})"
+                )
+
+        except Exception as e:
+            logger.error(f"[AttentionWindow] LLM注意力选择流程异常: {e}")
+
+    def _get_task_context_summary(self) -> str:
+        """获取任务上下文摘要（供LLM决策参考）
+
+        收集任务图状态、消息统计、近期工具调用等信息，
+        帮助LLM做出更准确的注意力模式选择。
+
+        Returns:
+            任务上下文摘要文本（≤500字符）
+        """
+        summary_parts = []
+
+        if self.task_graph:
+            try:
+                node_count = (
+                    self.task_graph.node_count
+                    if hasattr(self.task_graph, 'node_count')
+                    else len(self.task_graph._nodes)
+                    if hasattr(self.task_graph, '_nodes')
+                    else 0
+                )
+                summary_parts.append(f"任务图节点数: {node_count}")
+                if self._current_node_id:
+                    summary_parts.append(f"当前节点: {self._current_node_id}")
+            except Exception:
+                pass
+
+        message_count = len(self.envelopes)
+        total_tokens = sum(e.tokens for e in self.envelopes)
+        summary_parts.append(f"消息数量: {message_count}")
+        summary_parts.append(f"总tokens: {total_tokens}")
+
+        # 近期工具调用
+        recent_tools = []
+        for env in self.envelopes[-5:]:
+            if env.tool_name:
+                recent_tools.append(env.tool_name)
+        if recent_tools:
+            summary_parts.append(f"近期工具: {', '.join(recent_tools)}")
+
+        summary = " | ".join(summary_parts)
+        return summary[:500]
+
+    def get_llm_selection_stats(self) -> Dict[str, Any]:
+        """获取LLM注意力选择的统计信息
+
+        Returns:
+            统计信息字典（含启用状态、当前模式、切换次数等）
+        """
+        if not self._llm_config:
+            return {"enabled": False}
+
+        history = self._mode_controller.get_switch_history(10) if self._mode_controller else []
+        llm_switches = [
+            r for r in history
+            if hasattr(r, 'trigger_type') and r.trigger_type == TriggerType.LLM_AUTONOMOUS
+        ]
+        fallback_switches = [
+            r for r in history
+            if hasattr(r, 'trigger_type') and r.trigger_type == TriggerType.FALLBACK
+        ]
+
+        return {
+            "enabled": self._llm_config.enabled,
+            "current_mode": self.mode.name,
+            "total_switches": len(history),
+            "llm_autonomous_switches": len(llm_switches),
+            "fallback_switches": len(fallback_switches),
+            "cooldown_seconds": (
+                self._cooldown_manager.get_current_cooldown_seconds()
+                if self._cooldown_manager else 0
+            ),
+            "switch_history": [r.to_dict() for r in history[-5:]],
         }
 
     # ── 序列化/反序列化（IDE 跨请求 Session 持久化）──

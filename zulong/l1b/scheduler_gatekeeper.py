@@ -27,7 +27,8 @@ class Gatekeeper:
         self._cooldown_time = 2.0
         
         # 空闲挂起配置：未完成任务超过此时间（秒）无新指令则自动挂起
-        self._idle_suspend_timeout = 300  # 5 分钟
+        # IDE模式需要更长超时（前端执行命令可能耗时数分钟）
+        self._idle_suspend_timeout = 900  # 15 分钟（从300秒延长）
         self._idle_check_timer = None
         self._idle_check_lock = threading.Lock()
         

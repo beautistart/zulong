@@ -35,6 +35,7 @@ class StateManager:
             self._context = {}
             self._lock = threading.Lock()
             self._last_activity_time = 0.0
+            self._fc_loop_running = False
             self._initialized = True
             import time
             self.touch_activity()
@@ -195,6 +196,30 @@ class StateManager:
             if self._last_activity_time == 0.0:
                 self._last_activity_time = time.time()
             return (time.time() - self._last_activity_time) >= threshold
+    
+    def is_fc_loop_running(self) -> bool:
+        """判断FC循环是否正在运行
+        
+        用于节点审查循环判断是否应该暂停提交审查任务。
+        当FC循环运行时，禁止节点审查提交以避免竞争LLM资源。
+        
+        Returns:
+            bool: True表示FC循环正在运行，False表示已停止
+        """
+        with self._lock:
+            return self._fc_loop_running
+    
+    def set_fc_loop_running(self, running: bool):
+        """设置FC循环运行状态
+        
+        Args:
+            running: True表示FC循环启动，False表示停止
+        """
+        with self._lock:
+            old_state = self._fc_loop_running
+            self._fc_loop_running = running
+            if old_state != running:
+                logger.info(f"FC loop running state changed: {old_state} -> {running}")
 
 
 # 全局状态管理器实例

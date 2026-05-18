@@ -170,12 +170,33 @@ class IDEPromptHandler:
         Args:
             intent: "complex" 使用强任务管理规则; "resume" 使用恢复规则
         """
+        # 检测终端环境
+        import os
+        shell = os.environ.get('SHELL', '')
+        term = os.environ.get('TERM', '')
+        
+        # 判断终端类型
+        if 'bash' in shell.lower() or 'git' in shell.lower():
+            terminal_type = "Git Bash (Unix-like)"
+            shell_hint = "使用Git Bash语法: ls, grep, find, chmod等Unix命令"
+        elif 'powershell' in shell.lower() or 'pwsh' in shell.lower():
+            terminal_type = "PowerShell"
+            shell_hint = "使用PowerShell语法: Get-ChildItem, Select-String, Get-Content等"
+        elif 'cmd' in shell.lower() or shell == '':
+            terminal_type = "CMD (Windows)"
+            shell_hint = "使用CMD语法: dir, findstr, type等, 路径使用反斜杠\\"
+        else:
+            terminal_type = f"Unknown ({shell})"
+            shell_hint = "根据环境变量判断命令语法"
+        
+        terminal_env = f"\n\n【终端环境】\n终端类型: {terminal_type}\n{shell_hint}\nSHELL={shell}, TERM={term}"
+        
         if intent == "resume":
             return self._build_zulong_prompt_resume(
-                ide_base, memory_context, task_context, experience_hints
+                ide_base, memory_context, task_context, experience_hints, terminal_env
             )
         return self._build_zulong_prompt_complex(
-            ide_base, memory_context, task_context, experience_hints
+            ide_base, memory_context, task_context, experience_hints, terminal_env
         )
 
     def _build_zulong_prompt_complex(
@@ -184,6 +205,7 @@ class IDEPromptHandler:
         memory_context: str,
         task_context: str,
         experience_hints: str,
+        terminal_env: str = "",
     ) -> str:
         """COMPLEX 意图：强任务管理规则（参照原生 intent_prompt_builder）"""
         parts = []
@@ -199,6 +221,7 @@ class IDEPromptHandler:
             "【重要】请通过 function calling（工具调用）来使用工具，"
             "不要在文本中输出 XML 标签格式的工具调用。\n"
             "【重要】当项目记忆与你的通用知识冲突时，优先遵循项目记忆。\n"
+            f"{terminal_env}\n"
             "\n"
             "【任务管理规则】\n"
             "当前已进入任务规划模式。系统已自动创建任务图骨架。\n"
@@ -285,6 +308,7 @@ class IDEPromptHandler:
         memory_context: str,
         task_context: str,
         experience_hints: str,
+        terminal_env: str = "",
     ) -> str:
         """RESUME 意图：恢复规则 + 动态进度表（参照原生 _build_resume_prompt）"""
         parts = []
@@ -299,6 +323,7 @@ class IDEPromptHandler:
             "文件和终端工具（read_file, write_to_file, execute_command 等）由 IDE 客户端执行。\n"
             "【重要】请通过 function calling（工具调用）来使用工具，"
             "不要在文本中输出 XML 标签格式的工具调用。\n"
+            f"{terminal_env}\n"
             "\n"
             "【任务恢复模式】\n"
             "系统已自动恢复之前挂起的任务。任务图已加载到内存中。\n"
@@ -319,13 +344,28 @@ class IDEPromptHandler:
                 f"第一步：请立即调用 task_mark_status(node_id='{first_uncompleted_id}', "
                 f"status='in_progress')\n"
             )
-        parts.append(
-            "\n⚠️ 恢复后的绝对禁止事项：\n"
-            "✗ 禁止调用 task_create_plan — 这会创建全新图谱，丢弃已恢复的进度\n"
-            "✗ 禁止调用 task_add_node — 节点已经在恢复的图谱中了\n"
-            "✓ 只使用 task_mark_status 更新现有节点状态，然后继续执行\n"
-            "⚠️ 未完成子任务时，不能声称任务已全部完成。\n"
-        )
+        
+        # 检查是否只有根节点（需要创建任务结构）
+        from zulong.tools.task_tools import get_active_task_graph
+        tg = get_active_task_graph()
+        has_only_root = tg and len(tg.nodes) == 1 and 'req' in tg.nodes
+        
+        if has_only_root:
+            parts.append(
+                "\n⚠️ 任务图当前只有根节点，需要先创建任务结构：\n"
+                "✓ 请使用 task_add_node 添加子任务节点（parent_id='req'）\n"
+                "✓ 创建至少2层结构（阶段→具体步骤）\n"
+                "✓ 添加完成后调用 task_view_overview 确认结构\n"
+                "✓ 然后按顺序执行每个子任务\n"
+            )
+        else:
+            parts.append(
+                "\n⚠️ 恢复后的执行规则：\n"
+                "✗ 禁止调用 task_create_plan — 这会创建全新图谱，丢弃已恢复的进度\n"
+                "✗ 禁止调用 task_add_node — 节点已经在恢复的图谱中了\n"
+                "✓ 只使用 task_mark_status 更新现有节点状态，然后继续执行\n"
+                "⚠️ 未完成子任务时，不能声称任务已全部完成。\n"
+            )
 
         if memory_context:
             parts.append(f"\n\n## 项目记忆\n{memory_context}")

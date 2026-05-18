@@ -417,3 +417,26 @@ workspace:
   auto_open_vscode: true
   root: D:/AI/workspace
   vscode_command: code
+
+# LLM自主注意力模式选择配置
+attention_selection:
+  # 功能开关
+  enabled: true
+  
+  # 压力阈值配置
+  pressure_threshold_high: 0.9      # 高压阈值 (推荐0.8-1.0)
+  pressure_threshold_medium: 0.75   # 中压阈值 (推荐0.6-0.8)
+  
+  # 冷却时间配置
+  cooldown_base_seconds: 30.0       # 基础冷却时间(秒)
+  
+  # Fallback配置
+  fallback_mode: "FOCUS"            # Fallback默认模式
+  
+  # 性能配置
+  decision_timeout_ms: 500          # LLM决策超时(毫秒)
+  
+  # 震荡检测配置
+  oscillation_detection_window: 10  # 震荡检测窗口大小
+  max_switch_history: 50            # 最大切换历史记录数
+  min_confidence_threshold: 0.3     # 最低置信度阈值

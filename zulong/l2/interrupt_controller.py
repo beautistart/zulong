@@ -97,6 +97,12 @@ class InterruptController:
         time.sleep(0.1)  # 快速处理
         state_manager.set_l2_status(L2Status.IDLE)
         
+        # 清除中断标志（确保后续任务能正常执行）
+        if self._inference_engine and hasattr(self._inference_engine, '_interrupt_flag'):
+            if self._inference_engine._interrupt_flag:
+                logger.info("[InterruptController] 清除中断标志（reflex）")
+                self._inference_engine._interrupt_flag = False
+        
         # 检查任务栈，恢复被中断的任务
         task_stack = task_state_manager.get_task_stack()
         if task_stack:
@@ -118,6 +124,12 @@ class InterruptController:
         logger.info("Processing interrupt...")
         time.sleep(1)
         state_manager.set_l2_status(L2Status.IDLE)
+        
+        # 清除中断标志（确保后续任务能正常执行）
+        if self._inference_engine and hasattr(self._inference_engine, '_interrupt_flag'):
+            if self._inference_engine._interrupt_flag:
+                logger.info("[InterruptController] 清除中断标志")
+                self._inference_engine._interrupt_flag = False
         
         # 检查任务栈
         task_stack = task_state_manager.get_task_stack()

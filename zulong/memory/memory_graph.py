@@ -1708,6 +1708,14 @@ class MemoryGraph:
             if not is_idle:
                 continue
 
+            # 检查 FC 循环是否正在运行，若运行则禁止节点审查提交
+            try:
+                if state_manager.is_fc_loop_running():
+                    logger.debug("[MemoryGraph] FC循环运行中，跳过节点审查提交")
+                    continue
+            except Exception:
+                pass
+
             # 检查 L2-PRIME 是否空闲，避免审查任务与用户请求竞争 LLM 资源
             try:
                 from zulong.core.types import L2Status
@@ -1925,6 +1933,15 @@ class MemoryGraph:
                         _IMPORTANCE_ORDER.get(self.get_importance(tgt) or Importance.NORMAL, 1),
                     ),
                 })
+
+        # 检查 FC 循环是否正在运行，若运行则禁止提交审查
+        try:
+            from zulong.core.state_manager import state_manager
+            if state_manager.is_fc_loop_running():
+                logger.debug("[MemoryGraph] FC循环运行中，跳过边审查提交")
+                return
+        except Exception:
+            pass
 
         try:
             from .llm_memory_reviewer import get_llm_memory_reviewer

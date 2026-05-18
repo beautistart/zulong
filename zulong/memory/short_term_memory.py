@@ -549,26 +549,37 @@ class ShortTermMemory:
         num_to_delete = len(memory_scores) - target_size
         if num_to_delete > 0:
             # 🔥 TSD v2.5: 提交 LLM 审查（异步，不阻塞）
+            # 检查 FC 循环是否正在运行，若运行则禁止提交审查
+            fc_running = False
             try:
-                from zulong.memory.llm_memory_reviewer import get_llm_memory_reviewer
-                reviewer = get_llm_memory_reviewer()
-                
-                # 收集待淘汰的记忆内容
-                evict_candidates = []
-                for turn_id, score in memory_scores[:num_to_delete]:
-                    mem = await self.get_turn_by_id(turn_id, include_context=False)
-                    if mem:
-                        evict_candidates.append(mem)
-                
-                if evict_candidates:
-                    usage_ratio = len(self._turn_index) / max(self.hard_limit, 1)
-                    await reviewer.review_before_evict(
-                        memories=evict_candidates,
-                        usage_ratio=usage_ratio,
-                        target_free=num_to_delete,
-                    )
-            except Exception as e:
-                logger.debug(f"[ShortTermMemory] LLM 审查提交失败(非阻塞): {e}")
+                from zulong.core.state_manager import state_manager
+                fc_running = state_manager.is_fc_loop_running()
+                if fc_running:
+                    logger.debug("[ShortTermMemory] FC循环运行中，跳过淘汰前审查提交")
+            except Exception:
+                pass
+            
+            if not fc_running:
+                try:
+                    from zulong.memory.llm_memory_reviewer import get_llm_memory_reviewer
+                    reviewer = get_llm_memory_reviewer()
+                    
+                    # 收集待淘汰的记忆内容
+                    evict_candidates = []
+                    for turn_id, score in memory_scores[:num_to_delete]:
+                        mem = await self.get_turn_by_id(turn_id, include_context=False)
+                        if mem:
+                            evict_candidates.append(mem)
+                    
+                    if evict_candidates:
+                        usage_ratio = len(self._turn_index) / max(self.hard_limit, 1)
+                        await reviewer.review_before_evict(
+                            memories=evict_candidates,
+                            usage_ratio=usage_ratio,
+                            target_free=num_to_delete,
+                        )
+                except Exception as e:
+                    logger.debug(f"[ShortTermMemory] LLM 审查提交失败(非阻塞): {e}")
             
             # 先执行淘汰（不等待 LLM 审查结果，审查结果异步回调处理）
             to_delete = [turn_id for turn_id, score in memory_scores[:num_to_delete]]

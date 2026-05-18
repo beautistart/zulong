@@ -234,8 +234,7 @@ async def _handle_user_cancel(session: IDESession, _payload: Dict) -> None:
     session.cancel_event.set()
     # 同步设置 engine._interrupt_flag，确保所有取消检查路径都生效
     try:
-        from zulong.l2.inference_engine import get_inference_engine
-        engine = get_inference_engine()
+        engine = _get_engine()
         if engine:
             engine._interrupt_flag = True
             logger.info("[ZulongIDE] user_cancel: engine._interrupt_flag 已设置")

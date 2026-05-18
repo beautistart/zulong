@@ -44,27 +44,10 @@ def _broadcast_sync(event_type: str, payload: dict) -> None:
             asyncio.run_coroutine_threadsafe(
                 broadcast_monitor_event(event_type, payload), loop
             )
-    except (RuntimeError, AttributeError, ImportError) as e:
-        logger.debug(f"[IDEFCRunner] 广播失败(预期异常): {e}")
-    except Exception as e:
-        logger.warning(f"[IDEFCRunner] 广播失败(未预期异常): {type(e).__name__}: {e}")
+    except Exception:
+        pass
 
 logger = logging.getLogger(__name__)
-
-
-def _safe_truncate(text: str, max_len: int = 200) -> str:
-    """安全截断字符串，避免多字节字符截断导致乱码"""
-    if len(text) <= max_len:
-        return text
-    # 尝试在字符边界截断
-    try:
-        truncated = text[:max_len]
-        # 验证截断后是否为有效UTF-8
-        truncated.encode('utf-8').decode('utf-8')
-        return truncated + "..."
-    except UnicodeDecodeError:
-        # 回退到安全截断
-        return text.encode('utf-8')[:max_len].decode('utf-8', errors='ignore') + "..."
 
 
 class ThreadPoolManager:
@@ -323,13 +306,6 @@ class IDEFCRunner:
         state = await loop.run_in_executor(None, self._init_state, messages)
         self.session.fc_state = state
 
-        # 设置 FC 循环运行状态为 True（禁止节点审查提交）
-        try:
-            from zulong.core.state_manager import state_manager
-            state_manager.set_fc_loop_running(True)
-        except Exception:
-            pass
-
         # Web 监控: FC 循环启动
         from zulong.ide.ide_server import broadcast_monitor_event
         try:
@@ -528,14 +504,6 @@ class IDEFCRunner:
 
                 if verdict == "done":
                     state.phase = "done"
-                    
-                    # 清除 FC 循环运行状态（允许节点审查提交）
-                    try:
-                        from zulong.core.state_manager import state_manager
-                        state_manager.set_fc_loop_running(False)
-                    except Exception:
-                        pass
-                    
                     # 立即通知前端任务完成（在后处理之前，防止 WS 断开导致丢失）
                     _done_text = state.last_response_content or ""
                     
@@ -590,12 +558,6 @@ class IDEFCRunner:
                 # "continue" → 继续循环
 
             except asyncio.CancelledError:
-                # 清除 FC 循环运行状态
-                try:
-                    from zulong.core.state_manager import state_manager
-                    state_manager.set_fc_loop_running(False)
-                except Exception:
-                    pass
                 return await loop.run_in_executor(
                     None, self._finalize, state, "cancelled")
             except Exception as loop_err:
@@ -604,12 +566,6 @@ class IDEFCRunner:
                     f"{loop_err}", exc_info=True)
                 state.loop_error_count += 1
                 if state.loop_error_count >= 3:
-                    # 清除 FC 循环运行状态
-                    try:
-                        from zulong.core.state_manager import state_manager
-                        state_manager.set_fc_loop_running(False)
-                    except Exception:
-                        pass
                     return await loop.run_in_executor(
                         None, self._finalize, state, "loop_error")
                 continue
@@ -741,20 +697,16 @@ class IDEFCRunner:
                         tool_name=rej_tc["function"]["name"])
 
             if valid_remote:
-                # 设置 pending 状态（累积而非覆盖，支持跨轮次）
+                # 设置 pending 状态（_inject_tool_results 会验证）
                 state.pending_remote_calls = valid_remote
-                new_call_ids = [tc["id"] for tc in valid_remote]
-                
-                # 累积到pending_call_turns（而非覆盖pending_call_ids）
-                for call_id in new_call_ids:
-                    state.pending_call_turns[call_id] = fc
-                state.pending_call_ids = list(state.pending_call_turns.keys())
+                state.pending_call_ids = [
+                    tc["id"] for tc in valid_remote]
 
                 # 通过 WebSocket 推送 tool_request
                 tool_names = [
                     tc["function"]["name"] for tc in valid_remote]
                 logger.info(
-                    f"[IDEFCRunner] async 远程工具推送: {tool_names}, call_ids={new_call_ids}")
+                    f"[IDEFCRunner] async 远程工具推送: {tool_names}")
 
                 await send_callback("tool_request", {
                     "tool_calls": valid_remote,
@@ -942,54 +894,6 @@ class IDEFCRunner:
             logger.warning(f"[IDEFCRunner] IntentFilter 初始化失败: {e}")
             self._intent_filter = None
 
-    def _send_message_safe(self, send_callback, msg_type: str, data: dict) -> bool:
-        """线程安全的消息发送（修复no running event loop问题）
-        
-        三层容错机制：
-        1. 优先使用全局主事件循环（_main_event_loop）
-        2. 回退到当前线程的事件循环
-        3. 异常时记录日志并返回False
-        
-        Args:
-            send_callback: 异步发送回调函数
-            msg_type: 消息类型（display_text/task_complete等）
-            data: 消息数据
-            
-        Returns:
-            发送是否成功
-        """
-        try:
-            # 第一层：优先使用全局主事件循环（解决线程池工作线程问题）
-            from zulong.ide.ide_server import _main_event_loop
-            
-            if _main_event_loop is not None and _main_event_loop.is_running():
-                # 使用线程安全调度
-                future = asyncio.run_coroutine_threadsafe(
-                    send_callback(msg_type, data),
-                    _main_event_loop
-                )
-                # 等待发送完成（带超时，避免阻塞）
-                future.result(timeout=2.0)
-                logger.debug(f"✅ [FC] {msg_type} 已发送（主循环）")
-                return True
-            
-            # 第二层：回退到当前线程的事件循环（向后兼容）
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(send_callback(msg_type, data))
-                logger.debug(f"✅ [FC] {msg_type} 已发送（当前循环）")
-                return True
-            except RuntimeError:
-                pass
-            
-            # 第三层：降级处理
-            logger.warning(f"⚠️ [FC] {msg_type} 发送跳过：无可用事件循环")
-            return False
-            
-        except Exception as e:
-            logger.warning(f"⚠️ [FC] {msg_type} 发送失败: {e}")
-            return False
-
     def _init_dialogue_adapter(self) -> None:
         """创建 DialogueAdapter 实例（复用或新建）"""
         try:
@@ -1105,12 +1009,6 @@ class IDEFCRunner:
             logger.debug(f"[IDEFCRunner] session磁盘持久化跳过: {e}")
 
     def _init_state(self, messages: List[Dict]) -> IDEFCState:
-        # 清除残留的中断标志（防止恢复任务时立即中断）
-        if hasattr(self, 'engine') and self.engine:
-            if getattr(self.engine, '_interrupt_flag', False):
-                logger.info("[IDEFCRunner] 清除残留的中断标志")
-                self.engine._interrupt_flag = False
-        
         from zulong.models.container import LLM_MODEL_ID
         user_input = ""
         for msg in reversed(messages):
@@ -1423,12 +1321,6 @@ class IDEFCRunner:
                     f"[IDEFCRunner] 拒绝未知 call_id: {call_id}, "
                     f"valid={list(valid_ids)[:5]}")
                 continue
-            
-            # 从白名单移除，防止重复注入
-            valid_ids.discard(call_id)
-            # 同时从pending_call_turns移除
-            if hasattr(state, 'pending_call_turns'):
-                state.pending_call_turns.pop(call_id, None)
 
             func_info = call_id_to_func.get(call_id, {})
             tool_name = func_info.get("name", "ide_remote")
@@ -1464,10 +1356,8 @@ class IDEFCRunner:
             state.tool_results_buffer.append(
                 {"tool_name": tool_name, "result": content[:500]})
 
-        # 仅在所有pending结果都已处理后清空
-        # pending_call_turns 通过 discard 机制自动管理，无需手动清空
         state.pending_remote_calls = []
-        state.pending_call_ids = list(state.pending_call_turns.keys()) if hasattr(state, 'pending_call_turns') else []
+        state.pending_call_ids = []
         # 推送 TaskGraph 更新到 web 仪表盘（远程工具结果返回后）
         try:
             self.engine._publish_task_graph_event(
@@ -1796,22 +1686,9 @@ class IDEFCRunner:
             logger.debug(f"[IDEFCRunner] _index_and_anchor_file({file_path}) 异常: {e}")
 
     def _run_loop(self, state: IDEFCState) -> IDEFCResult:
-        # 设置 FC 循环运行状态为 True（禁止节点审查提交）
-        try:
-            from zulong.core.state_manager import state_manager
-            state_manager.set_fc_loop_running(True)
-        except Exception:
-            pass
-        
         while True:
             tr = self._check(state)
             if tr:
-                # 清除 FC 循环运行状态
-                try:
-                    from zulong.core.state_manager import state_manager
-                    state_manager.set_fc_loop_running(False)
-                except Exception:
-                    pass
                 return self._finalize(state, tr)
             try:
                 # FC 请求间隔：防止 API 被打满（跳过第一轮）
@@ -1822,12 +1699,6 @@ class IDEFCRunner:
                 if tc_data is None and resp_content is None:
                     if state.api_timeout_count >= 2:
                         self._publish_fc_progress(state, "api_error", "连续API错误终止")
-                        # 清除 FC 循环运行状态
-                        try:
-                            from zulong.core.state_manager import state_manager
-                            state_manager.set_fc_loop_running(False)
-                        except Exception:
-                            pass
                         return self._finalize(state, "api_error")
                     time.sleep(2)  # API 错误后短暂退避
                     continue
@@ -1838,20 +1709,11 @@ class IDEFCRunner:
                     remote = self._exec_tools(state, tc_data, resp_content)
                     if remote:
                         self._publish_fc_progress(state, "pause_for_remote", f"{len(remote)} remote tools")
-                        # 注意：暂停不清除状态，恢复后会继续运行
                         return self._pause_for_remote(state, remote)
                     continue
                 verdict = self._eval_response(state, resp_content or "")
                 if verdict == "done":
                     state.phase = "done"
-                    
-                    # 清除 FC 循环运行状态（允许节点审查提交）
-                    try:
-                        from zulong.core.state_manager import state_manager
-                        state_manager.set_fc_loop_running(False)
-                    except Exception:
-                        pass
-                    
                     self._auto_complete_task(state)
                     self._finalize_dialogue_round(state, status="completed")
                     self._auto_save_session_memory(state)
@@ -1868,12 +1730,6 @@ class IDEFCRunner:
                 state.loop_error_count += 1
                 if state.loop_error_count >= 3:
                     logger.error("[IDEFCRunner] 连续 3 次循环异常，终止 FC")
-                    # 清除 FC 循环运行状态
-                    try:
-                        from zulong.core.state_manager import state_manager
-                        state_manager.set_fc_loop_running(False)
-                    except Exception:
-                        pass
                     return self._finalize(state, "loop_error")
                 continue
 
@@ -2177,97 +2033,79 @@ class IDEFCRunner:
             full_content = ""
             sentence_buffer = ""
             sent_count = 0
-            tool_calls_chunks = []  # 累积工具调用片段
             
             for chunk in stream_response:
-                if chunk.choices:
-                    choice = chunk.choices[0]
-                    # 累积文本内容
-                    if choice.delta.content:
-                        token = choice.delta.content
-                        full_content += token
-                        sentence_buffer += token
-                        
-                        # 检测句子边界（句号、问号、感叹号、换行）
-                        if any(token.endswith(p) for p in ['。', '！', '？', '\n']):
-                            # 清洗并推送当前句子
-                            from zulong.utils.text_cleaner import clean_text_for_tts
-                            cleaned = clean_text_for_tts(sentence_buffer)
-                            if cleaned:
-                                # 异步推送（使用安全发送方法）
-                                cb = getattr(self, '_ide_send_callback', None)
-                                if cb:
-                                    self._send_message_safe(cb, "display_text", {
-                                        "text": cleaned,
-                                        "turn": state.fc_turn,
-                                        "streaming": True,
-                                        "sentence_index": sent_count
-                                    })
-                                sent_count += 1
-                                sentence_buffer = ""  # 清空缓冲区
+                if chunk.choices and chunk.choices[0].delta.content:
+                    token = chunk.choices[0].delta.content
+                    full_content += token
+                    sentence_buffer += token
                     
-                    # 累积工具调用片段
-                    if hasattr(choice.delta, 'tool_calls') and choice.delta.tool_calls:
-                        tool_calls_chunks.extend(choice.delta.tool_calls)
+                    # 检测句子边界（句号、问号、感叹号、换行）
+                    if any(token.endswith(p) for p in ['。', '！', '？', '\n']):
+                        # 清洗并推送当前句子
+                        from zulong.utils.text_cleaner import clean_text_for_tts
+                        cleaned = clean_text_for_tts(sentence_buffer)
+                        if cleaned:
+                            # 异步推送
+                            try:
+                                loop = asyncio.get_running_loop()
+                                loop.create_task(send_callback("display_text", {
+                                    "text": cleaned,
+                                    "turn": state.fc_turn,
+                                    "streaming": True,
+                                    "sentence_index": sent_count
+                                }))
+                            except Exception:
+                                pass
+                            sent_count += 1
+                            sentence_buffer = ""  # 清空缓冲区
             
             # 处理剩余的文本
             if sentence_buffer.strip():
                 from zulong.utils.text_cleaner import clean_text_for_tts
                 cleaned = clean_text_for_tts(sentence_buffer)
                 if cleaned:
-                    cb = getattr(self, '_ide_send_callback', None)
-                    if cb:
-                        self._send_message_safe(cb, "display_text", {
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(send_callback("display_text", {
                             "text": cleaned,
                             "turn": state.fc_turn,
                             "streaming": True,
                             "sentence_index": sent_count
-                        })
+                        }))
+                    except Exception:
+                        pass
                     sent_count += 1
             
             # 推送完成标记
-            cb = getattr(self, '_ide_send_callback', None)
-            if cb:
-                self._send_message_safe(cb, "display_text", {
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(send_callback("display_text", {
                     "text": "",
                     "turn": state.fc_turn,
                     "streaming": False,
                     "complete": True
-                })
+                }))
+            except Exception:
+                pass
             
             if sent_count > 0:
                 logger.info(f"🌊 [FC] 流式推送完成：共 {sent_count} 个句子，总长度 {len(full_content)}")
             
-            # 组装流式工具调用片段
-            tc = None
-            if tool_calls_chunks:
-                # 按 index 分组并累积
-                tc_map = {}  # {index: {id, type, function: {name, arguments}}}
-                for tc_chunk in tool_calls_chunks:
-                    idx = getattr(tc_chunk, 'index', 0)
-                    if idx not in tc_map:
-                        tc_map[idx] = {
-                            'id': '',
-                            'type': 'function',
-                            'function': {'name': '', 'arguments': ''}
-                        }
-                    if hasattr(tc_chunk, 'id') and tc_chunk.id:
-                        tc_map[idx]['id'] = tc_chunk.id
-                    if hasattr(tc_chunk, 'function'):
-                        if hasattr(tc_chunk.function, 'name') and tc_chunk.function.name:
-                            tc_map[idx]['function']['name'] = tc_chunk.function.name
-                        if hasattr(tc_chunk.function, 'arguments') and tc_chunk.function.arguments:
-                            tc_map[idx]['function']['arguments'] += tc_chunk.function.arguments
-                
-                tc = list(tc_map.values())
-                if tc:
-                    logger.info(f"[IDEFCRunner] Turn {fc}: {len(tc)} 工具调用 (流式)")
-                    for t in tc:
-                        logger.info(f"[IDEFCRunner]   FC tool: {t['function']['name']} args={_safe_truncate(t['function']['arguments'])}")
+            # 🔥 立即发送 task_complete，确保前端收到（避免WS提前断开）
+            # 仅在无工具调用时发送（有工具调用时由FC循环结束后发送）
+            try:
+                loop = asyncio.get_running_loop()
+                # 等待短暂时间确保 display_text 被前端消费（同步等待）
+                time.sleep(0.1)
+                loop.create_task(send_callback("task_complete", {"result": full_content}))
+                logger.info(f"✅ [FC] task_complete 已发送: {len(full_content)} chars")
+            except Exception as e:
+                logger.warning(f"[FC] task_complete 发送失败: {e}")
             
             # 返回完整内容供后续处理
-            # 注意：task_complete在run_loop_async中统一发送，避免重复
             rc = full_content
+            tc = None  # 初始化tc，避免UnboundLocalError
             
         except concurrent.futures.TimeoutError:
             future.cancel()
@@ -2291,81 +2129,62 @@ class IDEFCRunner:
                     full_content = ""
                     sentence_buffer = ""
                     sent_count = 0
-                    retry_tool_calls = []  # 累积工具调用片段
                     
                     for chunk in retry_stream:
-                        if chunk.choices:
-                            choice = chunk.choices[0]
-                            if choice.delta.content:
-                                token = choice.delta.content
-                                full_content += token
-                                sentence_buffer += token
-                                
-                                if any(token.endswith(p) for p in ['。', '！', '？', '\n']):
-                                    from zulong.utils.text_cleaner import clean_text_for_tts
-                                    cleaned = clean_text_for_tts(sentence_buffer)
-                                    if cleaned:
-                                        cb = getattr(self, '_ide_send_callback', None)
-                                        if cb:
-                                            self._send_message_safe(cb, "display_text", {
-                                                "text": cleaned,
-                                                "turn": state.fc_turn,
-                                                "streaming": True,
-                                                "sentence_index": sent_count
-                                            })
-                                        sent_count += 1
-                                        sentence_buffer = ""
+                        if chunk.choices and chunk.choices[0].delta.content:
+                            token = chunk.choices[0].delta.content
+                            full_content += token
+                            sentence_buffer += token
                             
-                            # 累积工具调用片段
-                            if hasattr(choice.delta, 'tool_calls') and choice.delta.tool_calls:
-                                retry_tool_calls.extend(choice.delta.tool_calls)
+                            if any(token.endswith(p) for p in ['。', '！', '？', '\n']):
+                                from zulong.utils.text_cleaner import clean_text_for_tts
+                                cleaned = clean_text_for_tts(sentence_buffer)
+                                if cleaned:
+                                    try:
+                                        loop = asyncio.get_running_loop()
+                                        loop.create_task(send_callback("display_text", {
+                                            "text": cleaned,
+                                            "turn": state.fc_turn,
+                                            "streaming": True,
+                                            "sentence_index": sent_count
+                                        }))
+                                    except Exception:
+                                        pass
+                                    sent_count += 1
+                                    sentence_buffer = ""
                     
                     if sentence_buffer.strip():
                         from zulong.utils.text_cleaner import clean_text_for_tts
                         cleaned = clean_text_for_tts(sentence_buffer)
                         if cleaned:
-                            cb = getattr(self, '_ide_send_callback', None)
-                            if cb:
-                                self._send_message_safe(cb, "display_text", {
+                            try:
+                                loop = asyncio.get_running_loop()
+                                loop.create_task(send_callback("display_text", {
                                     "text": cleaned,
                                     "turn": state.fc_turn,
                                     "streaming": True,
                                     "sentence_index": sent_count
-                                })
+                                }))
+                            except Exception:
+                                pass
                             sent_count += 1
                     
                     state.api_timeout_count = 0
                     rc = full_content
                     
-                    # 组装流式工具调用片段
+                    # 检查是否有工具调用
                     tc = None
-                    if retry_tool_calls:
-                        tc_map = {}
-                        for tc_chunk in retry_tool_calls:
-                            idx = getattr(tc_chunk, 'index', 0)
-                            if idx not in tc_map:
-                                tc_map[idx] = {
-                                    'id': '',
-                                    'type': 'function',
-                                    'function': {'name': '', 'arguments': ''}
-                                }
-                            if hasattr(tc_chunk, 'id') and tc_chunk.id:
-                                tc_map[idx]['id'] = tc_chunk.id
-                            if hasattr(tc_chunk, 'function'):
-                                if hasattr(tc_chunk.function, 'name') and tc_chunk.function.name:
-                                    tc_map[idx]['function']['name'] = tc_chunk.function.name
-                                if hasattr(tc_chunk.function, 'arguments') and tc_chunk.function.arguments:
-                                    tc_map[idx]['function']['arguments'] += tc_chunk.function.arguments
-                        
-                        tc = list(tc_map.values())
-                        if tc:
-                            logger.info(f"[IDEFCRunner] Turn {fc}: {len(tc)} 工具调用 (429重试成功)")
+                    if hasattr(retry_stream, 'choices') and retry_stream.choices:
+                        m = retry_stream.choices[0].message
+                        if m.tool_calls:
+                            logger.info(f"[IDEFCRunner] Turn {fc}: {len(m.tool_calls)} 工具调用 (429重试成功)")
+                            tc = [{"id": t.id, "type": "function",
+                                   "function": {"name": t.function.name, "arguments": t.function.arguments}}
+                                  for t in m.tool_calls]
                             for t in tc:
-                                logger.info(f"[IDEFCRunner]   FC tool: {t['function']['name']} args={_safe_truncate(t['function']['arguments'])}")
+                                logger.info(f"[IDEFCRunner]   FC tool: {t['function']['name']} args={t['function']['arguments'][:200]}")
                         else:
                             logger.info(f"[IDEFCRunner] Turn {fc}: 文本回复 len={len(rc)} (429重试成功)")
-                    else:
-                        logger.info(f"[IDEFCRunner] Turn {fc}: 文本回复 len={len(rc)} (429重试成功)")
                     return tc, rc
                 except Exception as retry_err:
                     logger.warning(f"[IDEFCRunner] Turn {fc} 429重试仍失败: {retry_err}")
@@ -2401,7 +2220,7 @@ class IDEFCRunner:
         if xml_tc:
             logger.info(f"[IDEFCRunner] Turn {fc}: {len(xml_tc)} 工具调用 (XML 回退解析)")
             for xt in xml_tc:
-                logger.info(f"[IDEFCRunner]   XML tool: {xt['function']['name']} args={_safe_truncate(xt['function']['arguments'])}")
+                logger.info(f"[IDEFCRunner]   XML tool: {xt['function']['name']} args={xt['function']['arguments'][:200]}")
             tc = xml_tc
             # 从内容中移除 XML 工具标签，保留前置文本
             rc = self._strip_xml_tool_tags(rc)

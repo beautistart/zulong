@@ -42,6 +42,7 @@ class IDEFCState:
     # IDE 扩展字段
     pending_remote_calls: List[Dict] = field(default_factory=list)
     pending_call_ids: List[str] = field(default_factory=list)
+    pending_call_turns: Dict[str, int] = field(default_factory=dict)  # call_id -> turn 映射，支持跨轮次
     phase: str = "idle"  # "idle" | "running" | "waiting_remote" | "done"
     last_response_content: Optional[str] = None
     vllm_model_id: str = ""
