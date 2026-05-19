@@ -87,6 +87,8 @@ zulong/workspace/
 
 # ===== 子模块和外部项目 =====
 openclaw/
+openclaw_bridge/
+emos_research/
 TSD/
 
 # ===== Unity游戏开发文件 (无关项目) =====
@@ -117,3 +119,7 @@ VOICE_INTEGRATION_SUMMARY.md
 COMMERCIAL_LICENSE.md
 LICENSE_AGPL_RAW.txt
 docs-local-backup/
+项目代码打包.txt
+项目目录结构.txt
+vibe_images/
+新建文件夹/
