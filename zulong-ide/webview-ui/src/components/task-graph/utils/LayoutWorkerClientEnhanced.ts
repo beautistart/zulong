@@ -329,7 +329,7 @@ export class LayoutWorkerClient {
 	 * 等待下一帧
 	 */
 	private nextFrame(): Promise<void> {
-		return new Promise(resolve => requestAnimationFrame(resolve))
+		return new Promise(resolve => requestAnimationFrame(() => resolve()))
 	}
 
 	/**

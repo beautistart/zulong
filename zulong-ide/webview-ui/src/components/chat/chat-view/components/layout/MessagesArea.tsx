@@ -115,11 +115,12 @@ export const MessagesArea: React.FC<MessagesAreaProps> = ({
 			return true
 		}
 
-		// User-requested behavior:
-		// if the last visible row is not actively partial, always show Thinking in the footer.
-		// (some rows like checkpoint_created don't set `partial`, and should be treated as non-partial)
-		if (lastVisibleMessage.partial !== true) {
-			return true
+		// 🔥 修复：partial状态判断
+		// - partial=true: 正在流式传输，不显示思考中（流式内容已渲染）
+		// - partial=false: 流式传输完成，不显示思考中（任务完成）
+		// - partial=undefined: 非流式消息，继续后续判断
+		if (lastVisibleMessage.partial === true) {
+			return false
 		}
 
 		if (!lastMsg) {

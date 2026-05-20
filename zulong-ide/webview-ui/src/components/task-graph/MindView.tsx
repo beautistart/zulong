@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef } from "react"
-import { useGraphStore } from "../store/useGraphStore"
-import { NODE_STATUS_COLORS } from "../types"
+import { useGraphStore } from "./store/useGraphStore"
+import { NODE_STATUS_COLORS } from "./types"
 
 interface MindViewProps {
 	width?: number

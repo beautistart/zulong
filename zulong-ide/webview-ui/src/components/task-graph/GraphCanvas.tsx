@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react"
-import { useGraphStore } from "../store/useGraphStore"
-import { ViewportManager } from "../utils/viewport-manager"
-import { LayoutWorkerClient } from "../utils/layout-worker-client"
-import { SkeletonRenderer } from "../engine/skeleton-renderer"
-import { InteractionController } from "../interaction/interaction-controller"
-import { selectRenderMode, isPointLineMode } from "../engine/render-engine"
-import type { NodeAttribute, ViewportState, Position } from "../types"
+import { useGraphStore } from "./store/useGraphStore"
+import { ViewportManager } from "./utils/viewport-manager"
+import { LayoutWorkerClient } from "./utils/layout-worker-client"
+import { SkeletonRenderer } from "./engine/skeleton-renderer"
+import { InteractionController } from "./interaction/interaction-controller"
+import { selectRenderMode, isPointLineMode } from "./engine/render-engine"
+import type { NodeAttribute, ViewportState, Position } from "./types"
 
 interface GraphCanvasProps {
 	width?: number

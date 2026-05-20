@@ -41,9 +41,47 @@ export class ZulongHandler implements ApiHandler {
 	private transport: ZulongWebSocket | null = null
 	private abortController: AbortController | null = null
 	private dynamicModelInfo: ModelInfo = { ...ZULONG_MODEL_INFO }
+	private connectionPromise: Promise<string> | null = null
 
 	constructor(options: ZulongHandlerOptions) {
 		this.options = options
+		// 🔥 长连接模式：在构造函数中初始化WebSocket
+		const serverUrl = options.zulongServerUrl || "ws://127.0.0.1:8090"
+		this.transport = new ZulongWebSocket(serverUrl)
+		Logger.info(`[ZulongHandler] WebSocket initialized (long connection mode), serverUrl=${serverUrl}`)
+	}
+
+	/**
+	 * 确保WebSocket已连接，支持自动重连
+	 */
+	private async ensureConnected(): Promise<string> {
+		if (!this.transport) {
+			const serverUrl = this.options.zulongServerUrl || "ws://127.0.0.1:8090"
+			this.transport = new ZulongWebSocket(serverUrl)
+		}
+
+		if (this.transport.isConnected) {
+			return this.transport.currentSessionId
+		}
+
+		// 复用正在进行的连接尝试
+		if (this.connectionPromise) {
+			return this.connectionPromise
+		}
+
+		Logger.info(`[ZulongHandler] Connecting to backend...`)
+		this.connectionPromise = this.transport.connect()
+		
+		try {
+			const sessionId = await this.connectionPromise
+			Logger.info(`[ZulongHandler] Connected to backend, sessionId=${sessionId?.slice(0, 12)}`)
+			return sessionId
+		} catch (err) {
+			Logger.error(`[ZulongHandler] Connection failed: ${err}`)
+			throw err
+		} finally {
+			this.connectionPromise = null
+		}
 	}
 
 	getModel(): ApiHandlerModel {
@@ -64,10 +102,9 @@ export class ZulongHandler implements ApiHandler {
 		tools?: ZulongTool[],
 		_useResponseApi?: boolean,
 	): ApiStream {
-		const serverUrl = this.options.zulongServerUrl || "ws://127.0.0.1:8090"
 		this.abortController = new AbortController()
 
-		Logger.info(`[ZulongHandler] createMessage() starting, serverUrl=${serverUrl}`)
+		Logger.info(`[ZulongHandler] createMessage() starting (reusing connection)`)
 
 		// Extract task text from the last user message
 		let taskText = ""
@@ -108,18 +145,21 @@ export class ZulongHandler implements ApiHandler {
 		const cwdMatch = systemPrompt.match(/Current Working Directory[:\s]+([^\n]+)/i)
 		const cwd = cwdMatch?.[1]?.trim() || "."
 
-		// Connect to backend
-		this.transport = new ZulongWebSocket(serverUrl)
-
+		// 🔥 长连接模式：复用现有连接，不创建新的WebSocket
 		try {
-			await this.transport.connect()
-			Logger.info("[ZulongHandler] Connected to backend")
+			await this.ensureConnected()
+			Logger.info("[ZulongHandler] Connection ready for task")
+
+			if (!this.transport) {
+				throw new Error("Transport not initialized")
+			}
 
 			this.transport.on("audio_transcript", (text: string, isFinal: boolean) => {
 				Logger.info(`[ZulongHandler] ← audio_transcript: "${text}" (is_final=${isFinal})`)
 			})
 		} catch (err) {
 			Logger.error(`[ZulongHandler] Connection failed: ${err}`)
+			const serverUrl = this.options.zulongServerUrl || "ws://127.0.0.1:8090"
 			yield {
 				type: "text" as const,
 				text: `[Zulong] WebSocket connection failed: ${err}\nPlease ensure the Zulong IDE Server is running at ${serverUrl}`,
@@ -141,10 +181,17 @@ export class ZulongHandler implements ApiHandler {
 		}
 
 		// Register WS event listeners
-		this.transport.on("display_text", (text: string) => {
-			if (text) {
-				Logger.info(`[ZulongHandler] \u2190 display_text (${text.length} chars)`)
+		this.transport.on("display_text", (text: string, turn?: number, payload?: any) => {
+			Logger.info(`[ZulongHandler] ← display_text: text=${text.length} chars, turn=${turn}, payload keys=${payload ? Object.keys(payload).join(",") : "none"}`)
+			// 🔥 修复：忽略task_result字段，避免重复显示
+			// task_result是完成标记中的完整文本，不应再次显示
+			if (text && !payload?.task_result) {
 				pushChunk({ type: "text" as const, text })
+			}
+			// 🔥 修复：检查payload中的task_complete信息
+			if (payload && payload.complete && payload.task_status === "completed") {
+				Logger.info(`[ZulongHandler] ← display_text包含task_complete, 发送done chunk`)
+				pushChunk({ type: "done" as const })
 			}
 		})
 
@@ -187,6 +234,13 @@ export class ZulongHandler implements ApiHandler {
 			pushChunk({ type: "error", error })
 		})
 
+		// 🎯 P3改进：任务进度汇报（仅记录日志，不显示给用户）
+		this.transport.on("task_progress", (progress: { phase: string; message: string; current_turn?: number; max_turns?: number }) => {
+			Logger.info(`[ZulongHandler] \u2190 task_progress: phase=${progress.phase}, message=${progress.message}`)
+			// 🔥 修复：不将内部调试信息推送给用户
+			// pushChunk({ type: "text", text: `\n[${progress.phase}] ${progress.message}` })
+		})
+
 		// P2-15: 监听FC循环状态更新（进度展示）
 		this.transport.on("status_update", (payload: { turn?: number; phase?: string }) => {
 			Logger.info(`[ZulongHandler] \u2190 status_update: turn=${payload.turn} phase=${payload.phase}`)
@@ -207,7 +261,10 @@ export class ZulongHandler implements ApiHandler {
 
 		this.transport.on("disconnected", (code: number, reason: string) => {
 			Logger.warn(`[ZulongHandler] \u2190 disconnected: code=${code} reason=${reason}`)
-			// WS 意外断开时，通知 generator 退出，避免永久 hang
+			// 🔥 P0修复：WS断开时推送text+done（而非error+done），确保generator走正常完成路径
+			// 正常done路径会触发finalizeApiReqMsg()设置partial=false，从而重置前端"思考中"状态
+			// 之前用error chunk会导致generator提前break，done永远不会被处理，partial残留为true
+			pushChunk({ type: "text" as const, text: `\n[Zulong] WebSocket连接已断开 (code=${code}): ${reason}` })
 			pushChunk({ type: "done" })
 		})
 
@@ -295,9 +352,8 @@ export class ZulongHandler implements ApiHandler {
 				yield chunk as ApiStreamChunk
 			}
 		} finally {
-			Logger.info("[ZulongHandler] Session ended, transport disposed")
-			this.transport.dispose()
-			this.transport = null
+			// 🔥 长连接模式：不断开WebSocket，保持连接复用
+			Logger.info("[ZulongHandler] Task completed, WebSocket kept alive for next task")
 		}
 	}
 
@@ -312,6 +368,15 @@ export class ZulongHandler implements ApiHandler {
 		} else {
 			Logger.error(`[ZulongHandler] Cannot send tool result - transport not connected! call_id=${callId}, tool=${toolName}`)
 		}
+	}
+
+	/**
+	 * 显式关闭WebSocket连接（IDE关闭时调用）
+	 */
+	dispose(): void {
+		Logger.info("[ZulongHandler] Explicit dispose called, closing WebSocket")
+		this.transport?.dispose()
+		this.transport = null
 	}
 
 	/**

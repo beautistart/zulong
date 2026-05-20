@@ -1790,6 +1790,29 @@ class Gatekeeper:
             if elapsed >= self._idle_suspend_timeout:
                 active = task_state_manager.get_active_task()
                 if active:
+                    # 🔥 修复：检查 FC 循环是否仍在运行，已完成/停止的任务不应被挂起
+                    try:
+                        from zulong.core.state_manager import state_manager
+                        if not state_manager.is_fc_loop_running():
+                            logger.info(
+                                f"[ZULONG] 任务 {active} FC 循环已停止，"
+                                f"跳过空闲超时挂起（任务可能已完成）")
+                            return
+                    except Exception:
+                        pass
+
+                    # 🔥 修复：检查任务归档文件是否存在（双重保险）
+                    try:
+                        import os as _os
+                        _archive_file = _os.path.join(
+                            "./data/completed_tasks", f"{active}.json")
+                        if _os.path.exists(_archive_file):
+                            logger.info(
+                                f"[ZULONG] 任务 {active} 已归档完成，跳过空闲超时挂起")
+                            return
+                    except Exception:
+                        pass
+
                     logger.info(
                         f"[ZULONG] 任务 {active} 空闲超时 ({elapsed:.0f}s >= {self._idle_suspend_timeout}s)，自动挂起。"
                     )

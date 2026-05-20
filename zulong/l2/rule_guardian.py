@@ -54,10 +54,11 @@ class RuleGuardian:
 
         if not has_completion_claim:
             # ── 新增：检测"绕过节点执行"行为 ──
-            # 模型生成了充实的内容但未调用 task_mark_status，
-            # 此时任务图有全部未完成的叶节点 → 说明模型在绕过节点执行。
-            # 第一次给一次重定向机会，让模型尝试正确使用工具。
             block, reason = self._check_node_bypass(response_text, task_graph)
+            if block:
+                return block, reason
+            # ── 新增：短文本+未完成节点协同检测 ──
+            block, reason = self._check_short_text_incomplete(response_text, task_graph)
             if block:
                 return block, reason
             return False, ""
@@ -174,6 +175,65 @@ class RuleGuardian:
 
         except Exception as e:
             logger.debug(f"[RuleGuardian] 节点绕过检查异常: {e}")
+            return False, ""
+
+    def _check_short_text_incomplete(
+        self, response_text: str, task_graph
+    ) -> Tuple[bool, str]:
+        """短文本+未完成节点协同检测
+
+        触发条件（全部满足）：
+        - 回复长度 20-80 字符（短文本进度汇报）
+        - 包含进度汇报动词（现在/创建/编写/实现等）
+        - 任务图 >= 30% 叶节点未完成
+
+        Returns:
+            (should_block, reason)
+        """
+        text_len = len(response_text.strip())
+        if not (20 <= text_len <= 80):
+            return False, ""
+
+        _PROGRESS_VERBS = (
+            "现在", "正在", "接下来", "开始", "创建", "生成", "编写", "实现",
+            "完成", "添加", "修改", "构建", "开发", "设计", "执行", "处理",
+            "将", "会", "要", "首先", "然后", "最后", "接着",
+        )
+        if not any(v in response_text for v in _PROGRESS_VERBS):
+            return False, ""
+
+        try:
+            leaf_nodes = task_graph.get_leaf_nodes()
+            if not leaf_nodes:
+                return False, ""
+            user_leaves = [n for n in leaf_nodes if not n.id.startswith("crg_")]
+            if not user_leaves:
+                return False, ""
+            total = len(user_leaves)
+            uncompleted = [
+                n for n in user_leaves
+                if n.status not in ("completed", "skipped")
+            ]
+            if len(uncompleted) < total * 0.3:
+                return False, ""
+
+            current = next(
+                (n for n in uncompleted if n.status == "in_progress"),
+                uncompleted[0],
+            )
+            reason = (
+                f"短文本进度汇报({text_len}字符)但仍有 "
+                f"{len(uncompleted)}/{total} 个子任务未完成。"
+                f"当前应执行: {current.id}({current.label})。"
+                f"请继续调用工具执行任务，不要提前结束。"
+            )
+            logger.info(
+                f"[RuleGuardian] 短文本+未完成节点拦截: "
+                f"len={text_len}, uncompleted={len(uncompleted)}/{total}"
+            )
+            return True, reason
+        except Exception as e:
+            logger.debug(f"[RuleGuardian] 短文本+未完成检查异常: {e}")
             return False, ""
 
     @staticmethod

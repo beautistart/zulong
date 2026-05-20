@@ -1,3 +1,13 @@
+attention_selection:
+  cooldown_base_seconds: 30.0
+  decision_timeout_ms: 500
+  enabled: true
+  fallback_mode: FOCUS
+  max_switch_history: 50
+  min_confidence_threshold: 0.3
+  oscillation_detection_window: 10
+  pressure_threshold_high: 0.9
+  pressure_threshold_medium: 0.75
 audio:
   asr:
     backend: sensevoice
@@ -37,7 +47,7 @@ environments:
         enabled: false
   production:
     llm:
-      backend: siliconflow
+      backend: ollama
     monitoring:
       performance:
         enabled: true
@@ -107,15 +117,6 @@ intent_classification:
     model_path: ./models/albert-tiny-chinese
   backend: albert
   enabled: true
-voice_intent_classification:
-  enabled: true
-  backend: albert
-  albert:
-    model_path: ./models/albert-tiny-chinese
-    device: cpu
-    max_length: 128
-    confidence_threshold: 0.6
-    head_weights_path: voice_intent_head.pt
 l2_inference:
   backup_model: qwen3.5:cloud
   circuit_breaker:
@@ -213,7 +214,7 @@ launcher:
   host: 127.0.0.1
   port: 8090
 llm:
-  backend: siliconflow
+  backend: ollama
   llamaccp:
     api_key: EMPTY
     backend: llamaccp
@@ -232,8 +233,8 @@ llm:
     backend: ollama
     backup_model_id: qwen3.5:4b
     base_url: http://localhost:11434/v1
-    model_id: qwen3.5:9b
-    num_ctx: 131072
+    model_id: deepseek-v4-pro:cloud
+    num_ctx: 1048576
     num_predict: 1024
   openai:
     api_key: ${OPENAI_API_KEY}
@@ -400,6 +401,15 @@ vision:
     device: cuda
     iou_threshold: 0.45
     model_path: models/yolov10n.pt
+voice_intent_classification:
+  albert:
+    confidence_threshold: 0.6
+    device: cpu
+    head_weights_path: voice_intent_head.pt
+    max_length: 128
+    model_path: ./models/albert-tiny-chinese
+  backend: albert
+  enabled: true
 web:
   api:
     cors_enabled: true
@@ -417,26 +427,3 @@ workspace:
   auto_open_vscode: true
   root: D:/AI/workspace
   vscode_command: code
-
-# LLM自主注意力模式选择配置
-attention_selection:
-  # 功能开关
-  enabled: true
-  
-  # 压力阈值配置
-  pressure_threshold_high: 0.9      # 高压阈值 (推荐0.8-1.0)
-  pressure_threshold_medium: 0.75   # 中压阈值 (推荐0.6-0.8)
-  
-  # 冷却时间配置
-  cooldown_base_seconds: 30.0       # 基础冷却时间(秒)
-  
-  # Fallback配置
-  fallback_mode: "FOCUS"            # Fallback默认模式
-  
-  # 性能配置
-  decision_timeout_ms: 500          # LLM决策超时(毫秒)
-  
-  # 震荡检测配置
-  oscillation_detection_window: 10  # 震荡检测窗口大小
-  max_switch_history: 50            # 最大切换历史记录数
-  min_confidence_threshold: 0.3     # 最低置信度阈值

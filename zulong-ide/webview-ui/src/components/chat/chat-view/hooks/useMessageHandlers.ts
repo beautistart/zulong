@@ -101,12 +101,27 @@ export function useMessageHandlers(messages: ZulongMessage[], chatState: ChatSta
 					const lastMessage = messages[messages.length - 1]
 					const isTaskRunning =
 						lastMessage.partial === true || (lastMessage.type === "say" && lastMessage.say === "api_req_started")
-
+				
 					if (isTaskRunning) {
 						// Task is running - send message as interruption/feedback
 						await TaskServiceClient.askResponse(
 							AskResponseRequest.create({
 								responseType: "messageResponse",
+								text: messageToSend,
+								images,
+								files,
+							}),
+						)
+						messageSent = true
+					} else {
+						// 🔥 修复：任务已完成（非活跃状态），启动新任务
+						// Zulong provider 在一次 createMessage 调用中完成整个 FC 循环，
+						// didEndLoop 始终为 true，initiateTaskLoop 会在首次请求后退出。
+						// 退出后没有 ask() 等待用户输入，zulongAsk 为 undefined。
+						// 此时用户输入新消息应通过 newTask 启动新的任务会话。
+						console.log("[ChatView] handleSendMessage - Task completed, starting new task")
+						await TaskServiceClient.newTask(
+							NewTaskRequest.create({
 								text: messageToSend,
 								images,
 								files,

@@ -306,5 +306,12 @@ export function getButtonConfig(message: ZulongMessage | undefined, _mode: Mode 
 		return BUTTON_CONFIGS.command_output
 	}
 
-	return BUTTON_CONFIGS.partial
+	// 🔥 修复：任务完成后不应显示"取消"按钮
+	// 检查消息是否为流式传输中
+	if (message.partial === true) {
+		return BUTTON_CONFIGS.partial // 流式中：显示"取消"
+	}
+
+	// 非流式消息（partial=false/undefined）：返回default配置（不显示按钮）
+	return BUTTON_CONFIGS.default
 }

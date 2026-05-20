@@ -1,5 +1,5 @@
-import { useGraphStore } from "../store/useGraphStore"
-import { NODE_TYPE_ICONS, NODE_STATUS_COLORS } from "../types"
+import { useGraphStore } from "./store/useGraphStore"
+import { NODE_TYPE_ICONS, NODE_STATUS_COLORS } from "./types"
 
 export default function NodeDetailPanel() {
 	const selectedNodeId = useGraphStore((s) => s.selectedNodeId)

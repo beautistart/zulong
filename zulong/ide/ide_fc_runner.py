@@ -143,6 +143,16 @@ _FILLER_PATTERNS = [
     "但我需要", "不过我需要", "还需要进一步", "需要更多信息",
 ]
 
+_PROGRESS_VERB_PATTERNS = (
+    "现在", "正在", "接下来", "开始", "创建", "生成", "编写", "实现",
+    "完成", "添加", "修改", "构建", "开发", "设计", "部署", "运行",
+    "执行", "处理", "分析", "准备", "优化", "更新", "调整", "修复",
+    "将", "会", "要", "需要", "首先", "然后", "最后", "接着",
+)
+
+# UncompletedGuard 未完成节点拦截阈值（从0.5降至0.3，覆盖更多未完成场景）
+_UNCOMPLETED_THRESHOLD = 0.3
+
 # 工具结果缓冲区最大条目数（防止无限增长）
 _TOOL_RESULTS_BUFFER_MAX = 100
 
@@ -152,10 +162,17 @@ _JSON_DENSITY_THRESHOLD = 0.12
 
 def _is_filler_content(text: str) -> bool:
     stripped = text.strip()
-    if len(stripped) < 50:
+    if not stripped:
+        return True
+    if len(stripped) < 6:
+        return True
+    if len(stripped) < 80:
+        if stripped.rstrip().endswith(("？", "?")):
+            return False
+        if any(v in stripped for v in _PROGRESS_VERB_PATTERNS):
+            return False
         return True
     pattern_count = sum(1 for p in _FILLER_PATTERNS if p in stripped)
-    # 长文本中少量关键词不应被判为 filler
     if len(stripped) > 300:
         return pattern_count >= 3
     return pattern_count >= 2
@@ -341,6 +358,15 @@ class IDEFCRunner:
             })
         except Exception:
             pass
+        
+        # 🎯 P0改进：任务进度汇报 - 任务启动
+        await send_callback("task_progress", {
+            "phase": "started",
+            "message": f"开始执行任务: {(state.user_input_text or '')[:50]}",
+            "current_turn": 0,
+            "max_turns": self._max_fc_turns,
+            "timestamp": time.time()
+        })
 
         while True:
             # 检查取消
@@ -360,6 +386,12 @@ class IDEFCRunner:
                 await send_callback("status_update", {
                     "turn": state.fc_turn, "phase": "calling_model",
                     "progress": _progress_snapshot})
+                
+                # 🔥 修复：持续发送reasoning心跳，保持"思考中"状态稳定
+                reasoning_msg = f"正在调用模型进行推理... (Turn {state.fc_turn}/{self._max_fc_turns})"
+                await send_callback("display_reasoning", {
+                    "reasoning": reasoning_msg
+                })
 
                 # Web 监控: 调用模型（保护性包裹）
                 try:
@@ -393,6 +425,10 @@ class IDEFCRunner:
                             await send_callback("status_update", {
                                 "turn": state.fc_turn, "phase": "waiting_model",
                                 "progress": self._get_progress_snapshot()})
+                            # 🔥 修复：持续发送reasoning心跳，保持"思考中"状态稳定
+                            await send_callback("display_reasoning", {
+                                "reasoning": f"模型推理中... (Turn {state.fc_turn}/{self._max_fc_turns})"
+                            })
                         except Exception:
                             pass
                         continue  # 继续等待，下次循环检查 cancel_event
@@ -425,6 +461,17 @@ class IDEFCRunner:
                         })
                     except Exception:
                         pass
+                    
+                    # 🎯 P0改进：任务进度汇报 - 工具执行中
+                    await send_callback("task_progress", {
+                        "phase": "executing",
+                        "message": f"执行工具: {', '.join(tool_names)}",
+                        "current_turn": state.fc_turn,
+                        "max_turns": self._max_fc_turns,
+                        "tools": tool_names,
+                        "timestamp": time.time()
+                    })
+                    
                     # CB 模式工具调用计数：防止死循环
                     if state.cb_force_no_tools:
                         state.cb_tool_streak += 1
@@ -451,58 +498,30 @@ class IDEFCRunner:
 
                 # 纯文本回复 → 先评估，再决定是否推送给前端
                 # 避免安全网返回 "continue" 时重复显示 filler 内容
+                final_text = state.last_response_content or resp_content
                 verdict = await loop.run_in_executor(
                     None, self._eval_response, state, resp_content or "")
 
-                # 只有最终确认 "done" 时才推送 display_text
-                # cb_force 时不推送，下一轮强制无工具回复后再推送
-                final_text = state.last_response_content or resp_content
-                
-                # 🎯 优化3: 流式推送清洗后的文本到前端（按句子边界逐句推送）
-                if final_text:
-                    from zulong.utils.text_cleaner import clean_text_streaming
-                    
-                    # 流式清洗并逐句推送
-                    sent_count = 0
-                    for cleaned_sentence in clean_text_streaming(final_text):
-                        # 推送单个句子
-                        await send_callback("display_text", {
-                            "text": cleaned_sentence, 
-                            "turn": state.fc_turn,
-                            "streaming": True,  # 标记为流式推送
-                            "sentence_index": sent_count
-                        })
-                        
-                        # 兜底：直接通过WS发送display_text，防止队列消费者退出
-                        try:
-                            ws_direct = getattr(self.session, 'ws', None)
-                            if ws_direct:
-                                await ws_direct.send_json({
-                                    "type": "display_text",
-                                    "session_id": self.session.session_id,
-                                    "payload": {
-                                        "text": cleaned_sentence, 
-                                        "turn": state.fc_turn,
-                                        "streaming": True,
-                                        "sentence_index": sent_count
-                                    },
-                                })
-                        except Exception:
-                            pass
-                        
-                        sent_count += 1
-                        logger.debug(f"✨ [FC] 流式推送句子 #{sent_count}: {cleaned_sentence[:50]}...")
-                    
-                    if sent_count > 0:
-                        logger.info(f"✨ [FC] 前端流式推送完成：共 {sent_count} 个句子")
-                    
-                    # 推送完成标记
-                    await send_callback("display_text", {
+                # 🔥 修复：流式推理已在 _call_model 中实时推送，此处不再重复推送
+                # 只发送完成标记即可
+                if verdict == "done":
+                    # 发送包含task_status的完成标记（无text字段，避免重复）
+                    complete_msg = {
                         "text": "", 
                         "turn": state.fc_turn,
-                        "streaming": False,  # 流式推送结束
-                        "complete": True
-                    })
+                        "streaming": False,
+                        "complete": True,
+                        "task_status": "completed"
+                    }
+                    logger.info(f"[IDEFCRunner] 发送display_text完成标记（流式已完成，仅发送完成信号）")
+                    await send_callback("display_text", complete_msg)
+                    
+                elif verdict == "continue":
+                    # continue时不推送，避免中间状态重复显示
+                    logger.info(f"[FC] Turn {state.fc_turn} verdict=continue, skip display_text push (len={len(final_text or '')})")
+                    # 保存内容供下一轮使用
+                    if final_text:
+                        state.last_response_content = final_text
                 
                 if verdict == "done" and final_text:
                     # Web 监控: 模型文本回复（保护性包裹）
@@ -529,6 +548,15 @@ class IDEFCRunner:
                 if verdict == "done":
                     state.phase = "done"
                     
+                    # 🎯 P0改进：任务进度汇报 - 任务完成
+                    await send_callback("task_progress", {
+                        "phase": "completed",
+                        "message": f"任务完成 (共{state.fc_turn}轮推理)",
+                        "current_turn": state.fc_turn,
+                        "max_turns": self._max_fc_turns,
+                        "timestamp": time.time()
+                    })
+                    
                     # 清除 FC 循环运行状态（允许节点审查提交）
                     try:
                         from zulong.core.state_manager import state_manager
@@ -544,18 +572,10 @@ class IDEFCRunner:
                         from zulong.utils.text_cleaner import clean_text_for_tts
                         _done_text = clean_text_for_tts(_done_text)
                     
-                    await send_callback("task_complete", {"result": _done_text})
-                    # 兜底：直接通过WS发送，防止outbound_queue消费者已退出
-                    try:
-                        ws_direct = getattr(self.session, 'ws', None)
-                        if ws_direct:
-                            await ws_direct.send_json({
-                                "type": "task_complete",
-                                "session_id": self.session.session_id,
-                                "payload": {"result": _done_text},
-                            })
-                    except Exception:
-                        pass
+                    # 🔥 修复：不在FC循环内发送task_complete，由ide_server统一发送
+                    # 避免重复发送导致前端状态混乱
+                    # await send_callback("task_complete", {"result": _done_text})
+                    
                     # Web 前端: 广播 task_complete 到 /ws 客户端
                     try:
                         await broadcast_monitor_event("TASK_COMPLETE", {
@@ -574,6 +594,26 @@ class IDEFCRunner:
                         })
                     except Exception:
                         pass
+                    # 🔥 修复：提取 submit_final_answer 内容，确保后处理和 ide_server 能读到完整答案
+                    _final_answer = self._extract_final_answer(state)
+                    if _final_answer:
+                        state.final_answer = _final_answer
+                        logger.info(
+                            f"[IDEFCRunner] 提取 submit_final_answer: "
+                            f"len={len(_final_answer)}")
+                    else:
+                        state.final_answer = None
+
+                    # 将 FC 统计写入 TaskGraph 元数据，供 TaskArchive 使用
+                    try:
+                        from zulong.tools.task_tools import get_active_task_graph
+                        _tg = get_active_task_graph()
+                        if _tg and hasattr(_tg, "metadata"):
+                            _tg.metadata["total_turns"] = state.fc_turn
+                            _tg.metadata["duration"] = time.time() - getattr(_tg, "created_at", time.time())
+                    except Exception:
+                        pass
+
                     # 后处理（耗时操作，客户端已收到完成通知）
                     await loop.run_in_executor(
                         None, self._auto_complete_task, state)
@@ -582,9 +622,19 @@ class IDEFCRunner:
                         None, self._auto_save_session_memory, state)
                     self._save_runner_state()
                     self.session.fc_state = state
+
+                    # 🔥 修复：FC 完成后重新归档，补全 final_answer/duration/turns
+                    try:
+                        from zulong.tools.task_tools import get_active_task_graph, _auto_archive_completed
+                        _tg = get_active_task_graph()
+                        if _tg:
+                            _auto_archive_completed(_tg)
+                    except Exception:
+                        pass
+
                     return IDEFCResult(
                         phase="done",
-                        text_response=state.last_response_content)
+                        text_response=state.final_answer or state.last_response_content)
                 elif verdict == "cb_force":
                     state.cb_force_no_tools = True
                 # "continue" → 继续循环
@@ -927,9 +977,8 @@ class IDEFCRunner:
             from zulong.l1b.intent_filter import IntentFilter
             # 从配置获取intent_config
             try:
-                from zulong.core.config_manager import get_config
-                config = get_config()
-                intent_config = config.get("l1b", {}).get("intent_filter", {})
+                from zulong.config.config_manager import get_config
+                intent_config = get_config("intent_classification", {})
             except Exception:
                 intent_config = {}
             
@@ -1852,12 +1901,37 @@ class IDEFCRunner:
                     except Exception:
                         pass
                     
+                    # 🔥 修复：提取 submit_final_answer 内容
+                    _final_answer = self._extract_final_answer(state)
+                    if _final_answer:
+                        state.final_answer = _final_answer
+
+                    # 将 FC 统计写入 TaskGraph 元数据
+                    try:
+                        from zulong.tools.task_tools import get_active_task_graph
+                        _tg = get_active_task_graph()
+                        if _tg and hasattr(_tg, "metadata"):
+                            _tg.metadata["total_turns"] = state.fc_turn
+                            _tg.metadata["duration"] = time.time() - getattr(_tg, "created_at", time.time())
+                    except Exception:
+                        pass
+
                     self._auto_complete_task(state)
                     self._finalize_dialogue_round(state, status="completed")
                     self._auto_save_session_memory(state)
                     self._save_runner_state()
                     self.session.fc_state = state
-                    return IDEFCResult(phase="done", text_response=state.last_response_content)
+
+                    # 🔥 修复：FC 完成后重新归档，补全 final_answer/duration/turns
+                    try:
+                        from zulong.tools.task_tools import get_active_task_graph, _auto_archive_completed
+                        _tg = get_active_task_graph()
+                        if _tg:
+                            _auto_archive_completed(_tg)
+                    except Exception:
+                        pass
+
+                    return IDEFCResult(phase="done", text_response=state.final_answer or state.last_response_content)
                 elif verdict == "cb_force":
                     state.cb_force_no_tools = True
                 # verdict == "continue" → 继续循环
@@ -1892,6 +1966,44 @@ class IDEFCRunner:
             return "interrupted"
         if fc % self._warning_interval == 0:
             logger.info(f"[IDEFCRunner] 进度: {fc}/{self._hard_limit}")
+        
+        # 🔥 P1修复：重复工具调用死循环检测（增强版：检查参数）
+        if len(state.messages) >= 6 and fc > 5:
+            last_tool_calls = []
+            for msg in reversed(state.messages[-6:]):
+                tool_calls = msg.get("tool_calls", [])
+                if tool_calls and len(tool_calls) > 0:
+                    # 记录工具名称和参数
+                    tc = tool_calls[0]["function"]
+                    last_tool_calls.append({
+                        "name": tc["name"],
+                        "args": tc.get("arguments", "")
+                    })
+            
+            # 连续3轮相同工具且相同参数 → 真正的死循环
+            if len(last_tool_calls) >= 3:
+                tool_names = [tc["name"] for tc in last_tool_calls]
+                tool_args = [tc["args"] for tc in last_tool_calls]
+                
+                # 检查：工具名称相同 AND 参数也相同
+                if len(set(tool_names)) == 1 and len(set(tool_args)) == 1:
+                    logger.warning(
+                        f"[IDEFCRunner] 检测到死循环: "
+                        f"连续{len(last_tool_calls)}轮调用 {tool_names[0]} 且参数相同"
+                    )
+                    # 强制收敛：注入系统消息
+                    state.cb_force_no_tools = True
+                    cm = {
+                        "role": "user",
+                        "content": (
+                            f"[系统警告] 检测到重复工具调用循环（{tool_names[0]}），"
+                            f"请立即基于已有信息生成最终回复，不允许再调用工具。"
+                        ),
+                    }
+                    state.messages.append(cm)
+                    if self._attn_window:
+                        self._attn_window.register_message(cm, turn=fc)
+        
         # 周期性进度广播（每 _progress_report_interval 轮，独立于 hard_limit）
         # 仅推送到 Web 仪表盘，不注入消息、不影响 FC 循环控制流
         if (fc > 1
@@ -2102,16 +2214,43 @@ class IDEFCRunner:
 
         停滞条件：最近 N 次报告中 completed_count 和 total_nodes 都没有增长
         （即既没完成节点、也没创建新节点 → 真正的死循环）
+        
+        🔥 P1修复：增强检测逻辑
+        - completed_count增加 → 有进展
+        - in_progress_count变化 → 有变化
+        - 消息长度增加 → 有新信息
         """
         reports = state.progress_reports
         n = self._max_reports_before_force_stop
         if len(reports) < n:
             return False
         recent = reports[-n:]
+        
+        # 检查1：completed_count是否增加
         completed_counts = [r.get("completed_count", 0) for r in recent]
+        if completed_counts[-1] > completed_counts[0]:
+            return False  # 有进展
+        
+        # 检查2：total_nodes是否增加（新节点创建）
         total_counts = [r.get("total_nodes", 0) for r in recent]
-        # 只有完成数和总节点数都没变化才算停滞
-        return len(set(completed_counts)) == 1 and len(set(total_counts)) == 1
+        if total_counts[-1] > total_counts[0]:
+            return False  # 有新节点
+        
+        # 检查3：in_progress_count是否变化（节点状态流转）
+        wip_counts = [r.get("in_progress_count", 0) for r in recent]
+        if len(set(wip_counts)) > 1:
+            return False  # 有状态变化
+        
+        # 检查4：消息长度是否增加（有新信息注入）
+        if hasattr(state, 'last_report_msg_count'):
+            if len(state.messages) > state.last_report_msg_count:
+                state.last_report_msg_count = len(state.messages)
+                return False  # 有新消息
+        else:
+            state.last_report_msg_count = len(state.messages)
+        
+        # 所有指标都无变化 → 停滞
+        return True
 
     def _call_model(self, state: IDEFCState) -> Tuple[Optional[List[Dict]], Optional[str]]:
         """LLM API 调用。返回 (tool_calls, content)。都为 None 表示超时。"""
@@ -2179,6 +2318,10 @@ class IDEFCRunner:
             sent_count = 0
             tool_calls_chunks = []  # 累积工具调用片段
             
+            stream_start_time = time.time()
+            last_heartbeat = stream_start_time
+            heartbeat_interval = 10.0  # 每10秒输出一次心跳日志
+            
             for chunk in stream_response:
                 if chunk.choices:
                     choice = chunk.choices[0]
@@ -2209,6 +2352,13 @@ class IDEFCRunner:
                     # 累积工具调用片段
                     if hasattr(choice.delta, 'tool_calls') and choice.delta.tool_calls:
                         tool_calls_chunks.extend(choice.delta.tool_calls)
+                
+                # 心跳日志：防止长时间无输出时看起来像卡死
+                now = time.time()
+                if now - last_heartbeat >= heartbeat_interval:
+                    elapsed = int(now - stream_start_time)
+                    logger.info(f"💓 [FC] 等待模型流式响应中... 已等待 {elapsed}s, 已接收 {len(full_content)} 字符")
+                    last_heartbeat = now
             
             # 处理剩余的文本
             if sentence_buffer.strip():
@@ -2416,6 +2566,32 @@ class IDEFCRunner:
                 logger.info(f"[IDEFCRunner] Turn {fc} 文本预览: {snippet}")
         
         return tc, rc
+
+    @staticmethod
+    @staticmethod
+    def _extract_final_answer(state: IDEFCState) -> Optional[str]:
+        """从消息历史中提取 submit_final_answer 的 answer 内容。
+
+        如果 FC 循环中调用了 submit_final_answer，从最近的 assistant
+        tool_call 消息中提取 answer 参数作为最终回答内容。
+        返回 None 表示未调用 submit_final_answer。
+        """
+        for msg in reversed(state.messages):
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            for tc in (msg.get("tool_calls") or []):
+                fn = tc.get("function", {}).get("name", "")
+                if fn == "submit_final_answer":
+                    import json as _json
+                    try:
+                        args_str = tc.get("function", {}).get("arguments", "{}")
+                        args = _json.loads(args_str) if isinstance(args_str, str) else args_str
+                        answer = args.get("answer", "")
+                        if answer:
+                            return answer
+                    except Exception:
+                        pass
+        return None
 
     @staticmethod
     def _get_cb_retained_tools(tool_definitions: List[Dict]) -> List[Dict]:
@@ -2780,6 +2956,11 @@ class IDEFCRunner:
         resp = response_content
         is_resume = state.is_resume
 
+        logger.info(
+            f"[IDEFCRunner][EvalChain] turn={fc} resp_len={len(resp.strip()) if resp else 0} "
+            f"cb_force={state.cb_force_no_tools} null_count={state.null_response_count}"
+        )
+
         if state.cb_force_no_tools:
             if not resp or len(resp.strip()) < 10:
                 resp = self._get_cb_fallback(state)
@@ -2803,10 +2984,12 @@ class IDEFCRunner:
                             f"[IDEFCRunner][CB] 仍有 {len(unc_cb)}/{len(user_leaves)} "
                             f"用户任务未完成，恢复工具调用继续执行"
                         )
+                        logger.info(f"[IDEFCRunner][EvalChain] turn={fc} path=cb_continue")
                         return "continue"
             except Exception:
                 pass
             logger.info(f"[IDEFCRunner][CB] 强制回复, len={len(resp)}")
+            logger.info(f"[IDEFCRunner][EvalChain] turn={fc} path=cb_force_done")
             return "done"
 
         # 安全网 0: 语义漂移检测
@@ -3009,8 +3192,8 @@ class IDEFCRunner:
                         if req_node and req_node.status not in ("completed", "skipped"):
                             uncompleted_uc = [req_node]
                             total_uc = 1
-                    # 超过半数用户任务节点未完成 → 继续执行
-                    if len(uncompleted_uc) > 0 and total_uc > 0 and len(uncompleted_uc) >= total_uc * 0.5:
+                    # 超过阈值比例用户任务节点未完成 → 继续执行
+                    if len(uncompleted_uc) > 0 and total_uc > 0 and len(uncompleted_uc) >= total_uc * _UNCOMPLETED_THRESHOLD:
                         current_uc = next(
                             (n for n in uncompleted_uc if n.status == "in_progress"),
                             uncompleted_uc[0],
@@ -3040,6 +3223,55 @@ class IDEFCRunner:
                         return "cb_force" if state.null_response_count >= 4 else "continue"
             except Exception as e:
                 logger.warning(f"[IDEFCRunner][UncompletedGuard] {e}")
+
+        # 安全网 6.5: 响应提前中断检测
+        # LLM返回短文本进度汇报但function_call未生成时，不应判定为done
+        # 条件：短文本(<80字符) + 非filler(含进度动词) + 有未完成节点(>=30%)
+        if (resp and 6 <= len(resp.strip()) < 80
+                and not _is_filler_content(resp)
+                and state.null_response_count < 3):
+            try:
+                from zulong.tools.task_tools import get_active_task_graph as _gtg_ri
+                tg_ri = _gtg_ri()
+                if tg_ri:
+                    leaves_ri = tg_ri.get_leaf_nodes()
+                    user_leaves_ri = [n for n in leaves_ri if not n.id.startswith("crg_")]
+                    total_ri = len(user_leaves_ri)
+                    uncompleted_ri = [n for n in user_leaves_ri
+                                      if n.status not in ("completed", "skipped")]
+                    if (total_ri > 0
+                            and len(uncompleted_ri) > 0
+                            and len(uncompleted_ri) >= total_ri * 0.3):
+                        current_ri = next(
+                            (n for n in uncompleted_ri if n.status == "in_progress"),
+                            uncompleted_ri[0],
+                        )
+                        nudge_ri = {
+                            "role": "user",
+                            "content": (
+                                f"[响应提前中断] 你的回复仅{len(resp.strip())}字符，"
+                                f"疑似function_call未生成。"
+                                f"仍有 {len(uncompleted_ri)}/{total_ri} 个子任务未完成。"
+                                f"当前应执行: {current_ri.id}({current_ri.label})。"
+                                f"请继续调用工具执行任务。"
+                            ),
+                        }
+                        msgs.append({"role": "assistant", "content": resp})
+                        msgs.append(nudge_ri)
+                        if self._attn_window:
+                            self._attn_window.register_message(
+                                {"role": "assistant", "content": resp}, turn=fc)
+                            self._attn_window.register_message(nudge_ri, turn=fc)
+                        state.null_response_count += 1
+                        logger.info(
+                            f"[IDEFCRunner][ResponseIntegrity] turn={fc} "
+                            f"resp_len={len(resp.strip())} "
+                            f"uncompleted={len(uncompleted_ri)}/{total_ri} "
+                            f"疑似响应提前中断(function_call未生成)"
+                        )
+                        return "cb_force" if state.null_response_count >= 4 else "continue"
+            except Exception as e:
+                logger.warning(f"[IDEFCRunner][ResponseIntegrity] {e}")
 
         # 安全网 7: 首轮无效回复拦截
         # 当 COMPLEX 意图首轮模型未调用工具，直接返回短回复/问候语时，
@@ -3078,6 +3310,7 @@ class IDEFCRunner:
                 return "continue"
 
         state.last_response_content = resp
+        logger.info(f"[IDEFCRunner][EvalChain] turn={fc} path=default_done")
         return "done"
 
     def _pause_for_remote(self, state: IDEFCState, remote_calls: List[Dict]) -> IDEFCResult:
@@ -3671,10 +3904,11 @@ class IDEFCRunner:
             logger.warning(f"[IDEFCRunner] 自动创建任务计划失败（不影响FC循环）: {e}")
 
     def _auto_complete_task(self, state: IDEFCState) -> None:
-        """FC 正常完成时自动标记任务节点为已完成
+        """FC 正常完成时自动标记任务节点
 
-        包括 in_progress 和 pending 状态的用户任务叶节点
-        （排除 CRG 自动注入的 crg_ 节点，它们已由后台线程标记为 completed）
+        in_progress → completed（当前正在做的确实结束了）
+        pending → skipped（从未执行，标记为跳过而非虚假完成）
+        排除 CRG 自动注入的 crg_ 节点，它们已由后台线程标记为 completed
         """
         try:
             from zulong.tools.task_tools import get_active_task_graph, _save_active_backup
@@ -3683,23 +3917,34 @@ class IDEFCRunner:
                 return
             response = state.last_response_content or ""
             leaves = tg.get_leaf_nodes()
-            marked = 0
+            completed_count = 0
+            skipped_count = 0
             for leaf in leaves:
-                # 跳过 CRG 自动注入节点
                 if leaf.id.startswith("crg_"):
                     continue
-                if leaf.status in ("in_progress", "pending"):
+                if leaf.status == "in_progress":
                     tg.update_node_status(
                         leaf.id, "completed",
                         result=response[:500] if response else "(IDE 会话已完成)",
                     )
-                    marked += 1
-            if marked > 0:
+                    completed_count += 1
+                elif leaf.status == "pending":
+                    tg.update_node_status(
+                        leaf.id, "skipped",
+                        result="(FC循环终止，任务未执行)",
+                    )
+                    skipped_count += 1
+            total = completed_count + skipped_count
+            if total > 0:
                 try:
                     _save_active_backup()
                 except Exception:
                     pass
-                logger.info(f"[IDEFCRunner] 自动标记 {marked} 个任务节点为已完成")
+                logger.info(
+                    f"[IDEFCRunner] 自动标记任务完成: "
+                    f"{completed_count} 个in_progress→completed, "
+                    f"{skipped_count} 个pending→skipped"
+                )
         except Exception as e:
             logger.debug(f"[IDEFCRunner] 自动标记任务完成失败: {e}")
 
@@ -3728,7 +3973,8 @@ class IDEFCRunner:
         """FC 会话结束后自动保存记忆节点（包含任务摘要和工具使用记录）"""
         try:
             user_input = state.user_input_text
-            response = state.last_response_content
+            # 🔥 修复：优先使用 submit_final_answer 的完整内容，确保记忆持久化包含完整答案
+            response = getattr(state, "final_answer", None) or state.last_response_content
             if not user_input or len(user_input.strip()) < 10:
                 return
 

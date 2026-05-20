@@ -1,5 +1,6 @@
-import { useGraphStore } from "../store/useGraphStore"
-import type { SearchResult } from "../types"
+import { useState, useCallback } from "react"
+import { useGraphStore } from "./store/useGraphStore"
+import type { SearchResult } from "./types"
 
 interface SearchBoxProps {
 	onResult: (result: SearchResult) => void

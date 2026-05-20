@@ -296,10 +296,17 @@ export class ZulongWebSocket extends EventEmitter {
 				this.emit("tool_request", msg.payload as ZulongToolRequest)
 				break
 			case "display_text":
-				this.emit("display_text", msg.payload.text || "", msg.payload.turn)
+				// 🔥 修复：传递完整payload，包含task_result和task_status
+				Logger.info(`[ZulongWS] display_text payload: ${JSON.stringify(msg.payload).substring(0, 200)}`)
+				this.emit("display_text", msg.payload.text || "", msg.payload.turn, msg.payload)
 				break
 			case "display_reasoning":
 				this.emit("display_reasoning", msg.payload.reasoning || "")
+				break
+			case "task_progress":
+				// 🎯 P3改进：任务进度汇报
+				Logger.info(`[ZulongWS] task_progress: phase=${msg.payload.phase}, message=${msg.payload.message}`)
+				this.emit("task_progress", msg.payload)
 				break
 			case "task_complete":
 				this.emit("task_complete", msg.payload.result || "")

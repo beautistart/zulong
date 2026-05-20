@@ -1,4 +1,4 @@
-import { useGraphStore } from "../store/useGraphStore"
+import { useGraphStore } from "./store/useGraphStore"
 
 export default function ProgressIndicator() {
 	const nodes = useGraphStore((s) => s.nodes)

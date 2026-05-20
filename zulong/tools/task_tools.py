@@ -205,9 +205,9 @@ def _auto_archive_completed(tg):
         archive = CompletedTaskArchive(
             task_id=graph_id,
             description=description,
-            final_answer="",
-            duration=0,
-            total_turns=0,
+            final_answer=(root.result or "") if root else "",
+            duration=(time.time() - getattr(tg, "created_at", time.time())) if hasattr(tg, "created_at") else 0,
+            total_turns=tg.metadata.get("total_turns", 0) if hasattr(tg, "metadata") else 0,
             completion_status="completed",
             task_graph_snapshot=tg.serialize(),
             workspace_dir=_active_workspace_dir or "",

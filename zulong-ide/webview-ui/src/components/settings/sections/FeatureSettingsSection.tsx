@@ -312,7 +312,7 @@ const FeatureSettingsSection = ({ renderSectionHeader }: FeatureSettingsSectionP
 											min={1}
 											onChange={handleFocusChainIntervalChange}
 											step={1}
-											value={focusChainSettings?.remindZulongInterval || 6}
+											value={focusChainSettings?.remindClineInterval || 6}
 											valueWidth="w-6"
 										/>
 									)}

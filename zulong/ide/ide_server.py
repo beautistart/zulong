@@ -26,6 +26,44 @@ import uvicorn
 
 logger = logging.getLogger(__name__)
 
+
+# ── 待发送消息缓存（断线重连恢复）──────────────────────────
+
+class PendingMessageCache:
+    """WebSocket断线后缓存待发送消息，重连后恢复"""
+    _cache: Dict[str, list] = {}  # session_id → [{"msg": dict, "timestamp": float}, ...]
+    _ttl = 300  # 5分钟过期
+    
+    @classmethod
+    def cache(cls, session_id: str, msg: Dict[str, Any]) -> None:
+        """缓存消息"""
+        if session_id not in cls._cache:
+            cls._cache[session_id] = []
+        cls._cache[session_id].append({
+            "msg": msg,
+            "timestamp": time.time(),
+        })
+        # 限制缓存大小
+        if len(cls._cache[session_id]) > 10:
+            cls._cache[session_id] = cls._cache[session_id][-10:]
+        logger.debug(f"[PendingMessageCache] 缓存消息: session={session_id[:12]}, type={msg.get('type')}")
+    
+    @classmethod
+    def pop(cls, session_id: str) -> list:
+        """取出并清除缓存消息（过滤过期）"""
+        msgs = cls._cache.get(session_id, [])
+        now = time.time()
+        valid = [m["msg"] for m in msgs if now - m["timestamp"] < cls._ttl]
+        cls._cache[session_id] = []
+        if valid:
+            logger.info(f"[PendingMessageCache] 恢复 {len(valid)} 条消息: session={session_id[:12]}")
+        return valid
+    
+    @classmethod
+    def clear(cls, session_id: str) -> None:
+        """清除缓存"""
+        cls._cache.pop(session_id, None)
+
 # ── 模块级日志持久化 ──────────────────────────────────
 _LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "logs")
 os.makedirs(_LOG_DIR, exist_ok=True)
@@ -616,16 +654,6 @@ async def _run_fc_loop(
             await session.send_msg(_msg_type, _msg_payload)
         except Exception:
             pass
-        # 兜底：直接通过WS发送，防止队列消费者已退出导致消息丢失
-        try:
-            await session.ws.send_json({
-                "type": _msg_type,
-                "session_id": session.session_id,
-                "payload": _msg_payload,
-            })
-            logger.info(f"[ZulongIDE] 兜底WS直发成功: type={_msg_type}, session={session.session_id[:12]}")
-        except Exception as e:
-            logger.warning(f"[ZulongIDE] 兜底WS直发失败: type={_msg_type}, error={e}")
 
         # Web 监控: IDE 会话结束
         await broadcast_monitor_event("IDE_SESSION_END", {
@@ -833,6 +861,16 @@ async def websocket_endpoint(ws: WebSocket):
         },
     }
     await ws.send_json(ack)
+    
+    # 恢复缓存消息（断线重连场景）
+    pending_msgs = PendingMessageCache.pop(session_id)
+    for pending_msg in pending_msgs:
+        try:
+            await ws.send_json(pending_msg)
+            logger.info(f"[ZulongIDE] 恢复缓存消息: type={pending_msg.get('type')}")
+        except Exception as e:
+            logger.warning(f"[ZulongIDE] 恢复消息失败: {e}")
+            break
 
     # 启动出站消息发送协程
     sender_task = asyncio.create_task(_outbound_sender(session))
@@ -862,6 +900,26 @@ async def websocket_endpoint(ws: WebSocket):
 
     except WebSocketDisconnect:
         logger.info(f"[ZulongIDE] WebSocket 断开: session={session_id[:12]}")
+        # 🔥 关键修复：WS断开时，强制等待FC任务完成并发送task_complete
+        if session.fc_task and not session.fc_task.done():
+            logger.info(f"[ZulongIDE] 等待FC任务完成（最多5秒）...")
+            try:
+                await asyncio.wait_for(session.fc_task, timeout=5.0)
+                logger.info(f"[ZulongIDE] FC任务已完成")
+            except asyncio.TimeoutError:
+                logger.warning(f"[ZulongIDE] FC任务超时，强制发送task_complete")
+                # 超时后强制发送task_complete，确保前端不卡死
+                try:
+                    await session.ws.send_json({
+                        "type": "task_complete",
+                        "session_id": session_id,
+                        "payload": {"result": "[任务超时终止]"},
+                    })
+                    logger.info(f"[ZulongIDE] 已发送超时task_complete")
+                except Exception as e:
+                    logger.warning(f"[ZulongIDE] 发送超时task_complete失败: {e}")
+            except asyncio.CancelledError:
+                logger.info(f"[ZulongIDE] FC任务被取消")
     except Exception as e:
         logger.error(f"[ZulongIDE] WebSocket 异常: {e}", exc_info=True)
     finally:
@@ -869,11 +927,7 @@ async def websocket_endpoint(ws: WebSocket):
         sender_task.cancel()
         if session.fc_task and not session.fc_task.done():
             session.cancel_event.set()
-            # 给FC任务一个短窗口完成收尾（如发送task_complete），而非立即取消
-            try:
-                await asyncio.wait_for(session.fc_task, timeout=3.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                session.fc_task.cancel()
+            session.fc_task.cancel()
         _sessions.pop(session_id, None)
         logger.info(f"[ZulongIDE] 会话清理完成: session={session_id[:12]}")
 
