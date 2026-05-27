@@ -261,7 +261,7 @@ llm:
     schedule_policy: lpm
     tp_size: 1
   siliconflow:
-    api_key: sk-fmylzckwftjrirdovmqygassifruqckzjsqzpbmyjrbqivcy
+    api_key: ${SILICONFLOW_API_KEY}
     backend: siliconflow
     base_url: https://api.siliconflow.cn/v1
     model_id: deepseek-ai/DeepSeek-V4-Flash
