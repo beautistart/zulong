@@ -11,7 +11,7 @@ attention_selection:
 audio:
   asr:
     backend: sensevoice
-    device: cuda
+    device: auto
     language: zh
     model_path: ./models/OpenASR/sensevoice-small-onnx
   microphone:
@@ -27,7 +27,7 @@ audio:
     sample_rate: 44100
   tts:
     backend: kokoro
-    device: cuda
+    device: auto
     model_path: ./models/hexgrad/Kokoro-82M
     sample_rate: 24000
     speed: 1.0
@@ -121,19 +121,22 @@ l2_inference:
   backup_model: qwen3.5:cloud
   circuit_breaker:
     bfs_min_interval: 3
-    content_overlap_threshold: 0.8
-    context_red_ratio: 0.9
+    # 信号2: 模式循环
+    pattern_window: 10
+    pattern_yellow_count: 8
+    pattern_red_count: 10
+    query_similarity_threshold: 0.85
+    # 信号4: 上下文窗口压力
     context_window_size: 131072
     context_yellow_ratio: 0.75
+    context_red_ratio: 0.9
+    # 信号6: 无进度空转
+    no_progress_red: 8
+    no_progress_yellow: 5
+    # 通用
     enabled: true
-    info_gain_window: 3
-    max_yellow_before_red: 2
-    pattern_red_count: 7
-    pattern_window: 6
-    pattern_yellow_count: 5
-    query_similarity_threshold: 0.7
-    repetition_window: 3
     safety_hard_cap: 100
+    max_yellow_before_red: 4
     time_red_seconds: 120
     time_yellow_seconds: 60
   core_model: qwen3.5:cloud
@@ -253,7 +256,7 @@ llm:
     backend: sglang
     base_url: http://localhost:30000/v1
     mem_fraction_static: 0.8
-    model_id: /mnt/d/AI/project/zulong_beta4/models/Qwen/Qwen3___5-0.8B-AWQ
+    model_id: /mnt/d/AI/project/zulong_beta5/models/Qwen/Qwen3___5-0.8B-AWQ
     schedule_conservativeness: 1.0
     schedule_policy: lpm
     tp_size: 1
@@ -266,7 +269,7 @@ llm:
   transformer:
     backend: transformer
     cpu_offload: false
-    device: cuda
+    device: auto
     dtype: float16
     max_length: 4096
     max_memory: 0.8
@@ -283,7 +286,7 @@ llm:
     max_model_len: 4096
     max_num_batched_tokens: 2048
     max_num_seqs: 256
-    model_id: /mnt/d/AI/project/zulong_beta4/models/Qwen/Qwen3___5-0.8B-AWQ
+    model_id: /mnt/d/AI/project/zulong_beta5/models/Qwen/Qwen3___5-0.8B-AWQ
     tensor_parallel_size: 1
     tool_call_parser: qwen3_xml
 memory:
@@ -305,8 +308,9 @@ memory:
     enabled: true
     map_size_gb: 10
     max_active_shards: 3
+    max_nodes_per_shard: 150000
     shard_strategy: month
-    use_sharding: false
+    use_sharding: true
   rag:
     data_dir: ./data/rag
     embedding_dim: 512
@@ -320,6 +324,11 @@ memory:
     persistence_enabled: true
     persistence_path: ./data/short_term_memory
     ttl: 3600
+  event_persistence:
+    enabled: true
+    db_path: ./data/events.db
+    retention_days: 30
+    batch_size: 100
 monitoring:
   debug:
     backup_count: 5
@@ -398,7 +407,7 @@ vision:
     pose_tracking: true
   yolo:
     confidence_threshold: 0.25
-    device: cuda
+    device: auto
     iou_threshold: 0.45
     model_path: models/yolov10n.pt
 voice_intent_classification:

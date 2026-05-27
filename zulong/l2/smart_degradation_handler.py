@@ -13,6 +13,8 @@ class TimeoutPhase(Enum):
     BACKUP_TIMEOUT = "BACKUP_TIMEOUT"
     BACKUP_UNAVAILABLE = "BACKUP_UNAVAILABLE"
     CORE_BACKUP_SAME_MODEL = "CORE_BACKUP_SAME_MODEL"
+    CIRCUIT_BREAKER_TRIPPED = "CIRCUIT_BREAKER_TRIPPED"  # 非超时: CircuitBreaker 触发 RED 提前终止
+    ORCHESTRATOR_NO_OUTPUT = "ORCHESTRATOR_NO_OUTPUT"  # 非超时: 编排器/FC 完成但未生成有效回复
 
 
 class InputIntent(Enum):
@@ -37,35 +39,13 @@ GREETING_MARKERS = ["你好", "您好", "hello", "hi", "嗨", "早上好", "下�
 FAREWELL_MARKERS = ["谢谢", "再见", "拜拜", "bye", "感谢"]
 QUESTION_MARKERS = ["？", "?", "吗", "什么", "怎么", "为什么", "哪里", "哪个", "如何", "能不能", "可以"]
 
-DEGRADATION_TEMPLATES: Dict[TimeoutPhase, Dict[InputIntent, str]] = {
-    TimeoutPhase.CORE_TIMEOUT: {
-        InputIntent.DELETE: "抱歉，当前处理能力受限，无法立即执行删除操作。请稍后重试。",
-        InputIntent.GREETING: "你好！我目前响应较慢，请稍后再试。",
-        InputIntent.FAREWELL: "不客气，有需要随时找我！",
-        InputIntent.QUESTION: "抱歉，模型响应超时，我暂时无法回答这个问题。请稍后再试。",
-        InputIntent.GENERIC: "抱歉，模型响应超时，请稍后再试。",
-    },
-    TimeoutPhase.BACKUP_TIMEOUT: {
-        InputIntent.DELETE: "抱歉，当前所有模型响应缓慢，无法执行删除操作。请稍后重试。",
-        InputIntent.GREETING: "你好！系统当前负载较高，请稍后再试。",
-        InputIntent.FAREWELL: "不客气，有需要随时找我！",
-        InputIntent.QUESTION: "抱歉，所有模型均响应超时，暂时无法回答。请稍后再试。",
-        InputIntent.GENERIC: "抱歉，我当前响应较慢，请稍后再试。",
-    },
-    TimeoutPhase.BACKUP_UNAVAILABLE: {
-        InputIntent.DELETE: "抱歉，备用模型不可用，无法执行删除操作。请稍后重试。",
-        InputIntent.GREETING: "你好！备用模型暂不可用，请稍后再试。",
-        InputIntent.FAREWELL: "不客气！",
-        InputIntent.QUESTION: "抱歉，备用模型不可用，暂时无法回答。请稍后再试。",
-        InputIntent.GENERIC: "抱歉，备用模型不可用，请稍后再试。",
-    },
-    TimeoutPhase.CORE_BACKUP_SAME_MODEL: {
-        InputIntent.DELETE: "抱歉，模型响应超时，无法执行删除操作。请稍后重试。",
-        InputIntent.GREETING: "你好！模型响应较慢，请稍后再试。",
-        InputIntent.FAREWELL: "不客气！",
-        InputIntent.QUESTION: "抱歉，模型响应超时，暂时无法回答。请稍后再试。",
-        InputIntent.GENERIC: "抱歉，模型响应超时，请稍后再试。",
-    },
+DEGRADATION_REASONS: Dict[TimeoutPhase, str] = {
+    TimeoutPhase.CORE_TIMEOUT: "主模型响应超时",
+    TimeoutPhase.BACKUP_TIMEOUT: "主模型和备用模型都响应超时",
+    TimeoutPhase.BACKUP_UNAVAILABLE: "主模型不可用，备用模型也未配置或不可用",
+    TimeoutPhase.CORE_BACKUP_SAME_MODEL: "主模型响应超时，备用模型与主模型相同，无法继续降级",
+    TimeoutPhase.CIRCUIT_BREAKER_TRIPPED: "安全防护触发：检测到重复调用或无效循环，已提前终止",
+    TimeoutPhase.ORCHESTRATOR_NO_OUTPUT: "推理流程已完成，但模型未生成有效回复（可能因 API 返回空或编排器提前终止）",
 }
 
 BACKUP_SUFFIX = "（当前使用备用模型，回复质量可能降低）"
@@ -94,10 +74,13 @@ class SmartDegradationHandler:
         except Exception:
             degradation_id = str(int(time.time()))
         intent = self.classify_intent(context.user_input)
-        templates = DEGRADATION_TEMPLATES.get(context.timeout_phase, DEGRADATION_TEMPLATES[TimeoutPhase.CORE_TIMEOUT])
-        base_msg = templates.get(intent, templates[InputIntent.GENERIC])
-        if context.elapsed_seconds > 0 and intent not in (InputIntent.GREETING, InputIntent.FAREWELL):
-            base_msg = base_msg.rstrip("。") + f"（已等待{int(context.elapsed_seconds)}秒）"
+        reason = DEGRADATION_REASONS.get(
+            context.timeout_phase,
+            DEGRADATION_REASONS[TimeoutPhase.CORE_TIMEOUT],
+        )
+        base_msg = f"系统当前出问题了，{reason}，因此无法正常回复。"
+        if context.elapsed_seconds > 0:
+            base_msg = base_msg.rstrip("。") + f"（已等待{int(context.elapsed_seconds)}秒）。"
         self._last_degradation_id = degradation_id
         self._last_intent = intent
         return base_msg

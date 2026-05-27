@@ -141,6 +141,8 @@ class PropertyStore:
         self.decoder = msgspec.msgpack.Decoder()
         
         self._db_path = db_path
+        self._map_size = map_size_gb
+        self._max_readers = max_readers
         self._stats = {
             "node_count": 0,
             "edge_count": 0,
@@ -253,6 +255,17 @@ class PropertyStore:
                             yield NodeProperties.from_dict(prop_dict)
                         except Exception as e:
                             logger.error(f"节点反序列化失败: {e}")
+
+    def iter_nodes(self) -> Iterator[NodeProperties]:
+        """遍历所有节点属性。"""
+        with self.env.begin() as txn:
+            cursor = txn.cursor(db=self.node_db)
+            for _, data in cursor:
+                try:
+                    prop_dict = self.decoder.decode(data)
+                    yield NodeProperties.from_dict(prop_dict)
+                except Exception as e:
+                    logger.error(f"节点反序列化失败: {e}")
                             
     def get_edge(self, src_id: str, dst_id: str) -> Optional[EdgeProperties]:
         """读取边属性"""
@@ -307,6 +320,17 @@ class PropertyStore:
                         logger.error(f"边反序列化失败 {edge_key}: {e}")
                         
         return result
+
+    def iter_edges(self) -> Iterator[EdgeProperties]:
+        """遍历所有边属性。"""
+        with self.env.begin() as txn:
+            cursor = txn.cursor(db=self.edge_db)
+            for _, data in cursor:
+                try:
+                    prop_dict = self.decoder.decode(data)
+                    yield EdgeProperties.from_dict(prop_dict)
+                except Exception as e:
+                    logger.error(f"边反序列化失败: {e}")
         
     def delete_edge(self, src_id: str, dst_id: str, sync: bool = False) -> bool:
         """删除边"""
@@ -390,9 +414,47 @@ class PropertyStore:
         self.env.sync()
         
     def compact(self):
-        """压缩数据库（减少文件大小）"""
+        """压缩数据库（减少文件大小）
+        
+        使用 LMDB 原生 env.copy(compact=True) 生成压缩副本，
+        然后替换原文件并重新打开环境。
+        """
+        import tempfile, shutil
         logger.info(f"开始压缩LMDB数据库: {self._db_path}")
         
+        compact_dir = tempfile.mkdtemp(prefix="lmdb_compact_")
+        try:
+            # LMDB copy with compact=True 在compact_dir下生成压缩后的文件
+            self.env.copy(compact_dir, compact=True)
+            self.env.close()
+            
+            # 用压缩后的文件替换原文件
+            for fname in os.listdir(compact_dir):
+                src = os.path.join(compact_dir, fname)
+                dst = os.path.join(self._db_path, fname)
+                shutil.copy2(src, dst)
+            
+            logger.info(f"LMDB压缩完成: {self._db_path}")
+        finally:
+            shutil.rmtree(compact_dir, ignore_errors=True)
+            # 重新打开数据库环境
+            self._reopen_env()
+
+    def _reopen_env(self):
+        """重新打开LMDB环境（compact 或外部关闭后复用）"""
+        map_size = self._map_size * 1024**3
+        self.env = lmdb.open(
+            self._db_path,
+            map_size,
+            max_dbs=4,
+            max_readers=self._max_readers,
+        )
+        self.node_db = self.env.open_db(b"nodes")
+        self.edge_db = self.env.open_db(b"edges")
+        self.node_type_index = self.env.open_db(b"node_type_idx")
+        self.metadata_db = self.env.open_db(b"metadata")
+        logger.debug(f"LMDB环境已重新打开: {self._db_path}")
+
     def close(self):
         """关闭数据库"""
         self.env.sync()

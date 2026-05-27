@@ -208,7 +208,7 @@ def test_direct_client():
     
     print("✓ 环境检查通过")
     
-    output_path = r"d:\AI\project\zulong_beta4\tests\output_cosyvoice_direct_client.wav"
+    output_path = r"d:\AI\project\zulong_beta5\tests\output_cosyvoice_direct_client.wav"
     
     print("\n测试语音合成...")
     success = client.synthesize(

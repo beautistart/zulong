@@ -26,7 +26,7 @@ from zulong.l2.attention_window import (
 )
 from zulong.l2.circuit_breaker import ToolCallCircuitBreaker, CircuitBreakerState
 from zulong.l2.rule_guardian import RuleGuardian
-from zulong.l2.unified_fc_runner import run_fc_loop
+from zulong.l2.fc_runner import run_fc_loop
 from zulong.l2.timeout_calibrator import TimeoutCalibrator
 from zulong.l2.model_health_tracker import ModelHealthTracker, ModelHealthStatus
 from zulong.l2.timeout_event_logger import TimeoutEventLogger
@@ -68,6 +68,7 @@ except ImportError:
 
 # 线程安全的 request_id 追踪（替代 self._current_request_id 避免竞态）
 _current_request_id_var = contextvars.ContextVar('current_request_id', default=None)
+_current_session_id_var = contextvars.ContextVar('current_session_id', default=None)
 
 
 class InferenceEngine:
@@ -197,6 +198,7 @@ class InferenceEngine:
             # 超时上下文（供降级处理器使用）
             self._last_timeout_phase: Optional[TimeoutPhase] = None
             self._last_timeout_elapsed: float = 0.0
+            self._response_is_fallback: bool = False  # 标记当前 response 是否来自降级路径
             
             # FC 循环请求间隔（防止 API 被打满）
             self._fc_request_interval = float(_l2_config.get('request_interval', 1.0))
@@ -398,7 +400,7 @@ class InferenceEngine:
 
         当用户引用了某个节点（如 @[xxx#tg:tg_1777012532/req]），
         解析其中的 graph_id，如果与当前活跃图不同，则切换到对应任务图。
-        必须在 _classify_intent() 之前调用，否则 _handle_resume 会盲目复用旧图。
+        必须在统一提示词构建前调用，否则后续任务图策略会误用旧图。
         """
         _ref_nodes = getattr(self, '_referenced_nodes', [])
         if not _ref_nodes:
@@ -498,278 +500,81 @@ class InferenceEngine:
         except Exception as e:
             logger.error(f"[GraphSwitch] 切换失败: {e}", exc_info=True)
 
-    def _classify_intent(self, user_input: str):
-        """两阶段 FC 意图分类 — Round 1
-        
-        使用极简提示词 + start_session 工具 + tool_choice=required
-        强制模型输出意图分类，然后执行对应的骨架操作。
-        
-        Args:
-            user_input: 用户输入文本
-            
-        Returns:
-            Tuple[IntentType, dict]: (意图类型, scaffold 操作返回的数据)
-        """
-        import json
-        import concurrent.futures
-        from zulong.l2.intent_prompt_builder import (
-            IntentType, build_round1_system_prompt, get_round1_tools
-        )
-        from zulong.tools.session_tool import StartSessionTool
-        from zulong.tools.base import ToolRequest
-        
-        # 如果没有远程模型客户端，跳过 Round 1，默认 CHAT
-        if not self.vllm_client:
-            logger.info("[Intent] vllm_client 不可用，跳过 Round 1，默认 CHAT")
-            return IntentType.CHAT, {}
-        
-        try:
-            # ── MemoryGraph: 检索相关历史经验注入意图分类 ──
-            _history_hint = ""
-            try:
-                _mg_intent = self._get_memory_graph_safe()
-                logger.info(f"[Intent] MemoryGraph 历史检索前置检查: mg={'有' if _mg_intent else '无'}")
-                if _mg_intent:
-                    import asyncio
-                    _loop = asyncio.new_event_loop()
-                    try:
-                        _ctx_results = _loop.run_until_complete(
-                            _mg_intent.retrieve_context(str(user_input), top_k=3)
-                        )
-                    finally:
-                        _loop.close()
-                    if _ctx_results:
-                        _parts = []
-                        for _cr in _ctx_results[:3]:
-                            _lbl = _cr.get("label", "")
-                            _cnt = (_cr.get("content", "") or "")[:150]
-                            if _lbl:
-                                _parts.append(f"- {_lbl}: {_cnt}")
-                        if _parts:
-                            _history_hint = "\n\n相关历史经验:\n" + "\n".join(_parts)
-            except Exception as _ctx_err:
-                logger.info(f"[Intent] MemoryGraph 检索跳过: {_ctx_err}")
-
-            # 构建 Round 1 消息
-            _user_content = str(user_input) + _history_hint
-            round1_messages = [
-                {"role": "system", "content": build_round1_system_prompt()},
-                {"role": "user", "content": _user_content},
-            ]
-            
-            round1_tools = get_round1_tools()
-            
-            # 调用 LLM API（强制调用 start_session）
-            api_kwargs = {
-                "model": LLM_MODEL_ID,
-                "messages": round1_messages,
-                "tools": round1_tools,
-                "tool_choice": {"type": "function", "function": {"name": "start_session"}},
-                "max_tokens": 256,
-                "temperature": 0.1,
-                "stream": False,
-                **self._get_llm_extra_kwargs(),
-            }
-            
-            def _call(kwargs=api_kwargs):
-                return self.vllm_client.chat.completions.create(**kwargs)
-            
-            api_response = None
-            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            future = executor.submit(_call)
-            try:
-                api_response = future.result(timeout=15)
-            except Exception as core_err:
-                logger.warning(f"[Intent] Round 1 CORE 模型失败: {core_err}")
-                # 尝试备用模型进行意图分类
-                if self.backup_client and LLM_MODEL_ID_BACKUP:
-                    logger.info(f"[Intent] 尝试使用备用模型 {LLM_MODEL_ID_BACKUP} 进行意图分类")
-                    backup_kwargs = {
-                        "model": LLM_MODEL_ID_BACKUP,
-                        "messages": round1_messages,
-                        "tools": round1_tools,
-                        "tool_choice": {"type": "function", "function": {"name": "start_session"}},
-                        "max_tokens": 256,
-                        "temperature": 0.1,
-                        "stream": False,
-                        **self._get_llm_extra_kwargs(),
-                    }
-                    try:
-                        api_response = self.backup_client.chat.completions.create(**backup_kwargs)
-                        logger.info(f"[Intent] 备用模型意图分类成功")
-                    except Exception as backup_err:
-                        logger.warning(f"[Intent] 备用模型也失败: {backup_err}，默认 CHAT")
-                        return IntentType.CHAT, {}
-                else:
-                    logger.warning("[Intent] 无可用备用模型，默认 CHAT")
-                    return IntentType.CHAT, {}
-            finally:
-                executor.shutdown(wait=False)
-            
-            # 解析 tool_call
-            msg = api_response.choices[0].message
-            if not msg.tool_calls:
-                logger.warning("[Intent] Round 1 未返回 tool_call，尝试启发式分类")
-                # 启发式回退：当 4B 模型未遵循 tool_choice=required 时
-                _heuristic = self._heuristic_intent_classify(user_input)
-                logger.info(f"[Intent] 启发式分类结果: {_heuristic}")
-                # 启发式分类也需要执行骨架操作（创建/挂起任务图等）
-                _heuristic_intent_str = _heuristic.value  # "chat" / "complex" / "resume"
-                if _heuristic_intent_str != "chat":
-                    from zulong.tools.session_tool import StartSessionTool
-                    from zulong.tools.base import ToolRequest as _TR
-                    _h_session = StartSessionTool()
-                    _h_request = _TR(
-                        tool_name="start_session",
-                        action="execute",
-                        parameters={
-                            "intent": _heuristic_intent_str,
-                            "reason": "启发式分类回退",
-                            "task_description": user_input[:100],
-                            "user_input": user_input,
-                        },
-                    )
-                    _h_result = _h_session.execute(_h_request)
-                    _h_scaffold = _h_result.data if _h_result.success and _h_result.data else {}
-                    logger.info(f"[Intent] 启发式路径已执行骨架操作: {_h_scaffold.get('message', '')}")
-                    # 检测 RESUME 降级
-                    if _h_scaffold.get("fallback"):
-                        logger.info(f"[Intent] 启发式 RESUME 降级为 CHAT: {_h_scaffold.get('message', '')}")
-                        return IntentType.CHAT, _h_scaffold
-                    return _heuristic, _h_scaffold
-                return _heuristic, {}
-            
-            tc = msg.tool_calls[0]
-            args = json.loads(tc.function.arguments)
-            intent_str = args.get("intent", "chat")
-            reason = args.get("reason", "")
-            task_description = args.get("task_description", "")
-            
-            logger.info(f"[Intent] Round 1 分类结果: intent={intent_str}, reason={reason}, task_desc={task_description}")
-            
-            # 映射为 IntentType
-            intent_map = {"chat": IntentType.CHAT, "complex": IntentType.COMPLEX, "resume": IntentType.RESUME}
-            intent_type = intent_map.get(intent_str, IntentType.CHAT)
-            
-            # 执行 StartSessionTool 骨架操作
-            session_tool = StartSessionTool()
-            tool_request = ToolRequest(
-                tool_name="start_session",
-                action="execute",
-                parameters={
-                    "intent": intent_str,
-                    "reason": reason,
-                    "task_description": task_description,
-                    "user_input": user_input,  # Rule B: 传递原始用户输入
-                },
-            )
-            result = session_tool.execute(tool_request)
-            scaffold_data = result.data if result.success and result.data else {}
-            
-            # 检测 RESUME 降级：如果未找到挂起任务，降级为 CHAT
-            if scaffold_data.get("fallback"):
-                logger.info(f"[Intent] RESUME 降级为 CHAT: {scaffold_data.get('message', '')}")
-                intent_type = IntentType.CHAT
-            
-            # 如果 StartSessionTool 返回的 intent 与模型分类不同（如 RESUME 降级）
-            actual_intent = scaffold_data.get("intent", intent_str)
-            if actual_intent != intent_str:
-                intent_type = intent_map.get(actual_intent, intent_type)
-            
-            return intent_type, scaffold_data
-            
-        except Exception as e:
-            logger.warning(f"[Intent] Round 1 分类失败: {e}，尝试启发式分类", exc_info=True)
-            _heuristic = self._heuristic_intent_classify(user_input)
-            return _heuristic, {}
-    
-    @staticmethod
-    def _heuristic_intent_classify(user_input: str):
-        """启发式意图分类 — LLM 回退方案
-        
-        当 LLM Round 1 未返回有效 tool_call 时，
-        使用关键词匹配进行基础分类。
-        """
-        from zulong.l2.intent_prompt_builder import IntentType
-        
-        text = user_input.strip()
-        
-        # RESUME 信号
-        resume_signals = ["继续", "接着做", "恢复", "上次那个", "接着", "继续做", "回到"]
-        for s in resume_signals:
-            if s in text:
-                return IntentType.RESUME
-        
-        # CHAT 优先信号 — 记忆/记录类请求（save_memory_note 即可处理）
-        memory_signals = ["记住", "记下", "记录", "保存", "备忘", "帮我记", "存一下"]
-        for s in memory_signals:
-            if s in text:
-                return IntentType.CHAT
-        
-        # COMPLEX 信号：多部分请求（含连接词 + 动作动词）
-        complex_verbs = ["分析", "对比", "列出", "设计", "开发", "编写", "写一篇",
-                         "做一个", "帮我做", "帮我写", "帮我设计", "创建", "搭建",
-                         "实现", "规划", "制定", "总结", "归纳"]
-        multi_signals = ["同时", "另外", "以及", "还要", "此外", "再加上"]
-        
-        has_verb = any(v in text for v in complex_verbs)
-        has_multi = any(m in text for m in multi_signals)
-        
-        # 有任务动词 + 多部分信号 → COMPLEX
-        if has_verb and has_multi:
-            return IntentType.COMPLEX
-        
-        # 有强任务动词（帮我做/写/设计/开发/创建/搭建/实现）→ COMPLEX
-        strong_verbs = ["帮我做", "帮我写", "帮我设计", "帮我开发", "帮我创建",
-                        "帮我搭建", "帮我实现", "帮我规划", "帮我制定"]
-        if any(v in text for v in strong_verbs):
-            return IntentType.COMPLEX
-        
-        # 输入较长且包含任务动词（动词须在前 40 字符内，表示指令而非内容描述）
-        if len(text) > 80 and has_verb:
-            first_verb_pos = min(
-                (text.find(v) for v in complex_verbs if v in text), default=999
-            )
-            if first_verb_pos < 40:
-                return IntentType.COMPLEX
-        
-        return IntentType.CHAT
-    
-    def _collect_tool_definitions_for_intent(self, intent_type) -> List[Dict[str, Any]]:
-        """根据意图类型收集过滤后的工具定义
-        
-        CHAT: 仅对话相关工具（8个）
-        COMPLEX: 全部工具（不过滤）
-        RESUME: 仅任务恢复相关工具（6个，物理排除 task_create_plan 和 task_add_node）
-        
-        Args:
-            intent_type: IntentType 枚举值
-            
-        Returns:
-            List[Dict]: 过滤后的 OpenAI FC 工具定义列表
-        """
-        from zulong.l2.intent_prompt_builder import get_round2_tool_names
-        
-        allowed_names = get_round2_tool_names(intent_type)
-        
-        # None 表示不过滤（COMPLEX 场景使用全部工具）
-        if allowed_names is None:
-            return self._collect_tool_definitions()
-        
+    def _collect_named_tool_definitions(self, names: set) -> List[Dict[str, Any]]:
+        """Collect schemas for a small explicit tool allowlist."""
         tool_definitions = []
-        for name, tool in self.tool_engine.registry.tools.items():
-            if not tool.enabled:
-                continue
-            if name not in allowed_names:
+        for name in names:
+            tool = self.tool_engine.registry.tools.get(name)
+            if not tool or not tool.enabled:
                 continue
             try:
-                schema = tool.get_function_schema()
-                tool_definitions.append(schema)
+                tool_definitions.append(tool.get_function_schema())
             except Exception as e:
                 logger.warning(f"[FC] 工具 {name} 的 schema 获取失败: {e}")
-        
-        logger.info(f"[FC] 为 {intent_type.value} 场景收集到 {len(tool_definitions)} 个工具定义 (过滤自 {len(allowed_names)} 个允许)")
+        logger.info("[FC] 显式工具集 %s → %d 个定义", sorted(names), len(tool_definitions))
         return tool_definitions
+
+    def _collect_tool_definitions_for_bundle(
+        self,
+        tool_bundle: Optional[List[str]],
+    ) -> List[Dict[str, Any]]:
+        """Collect tool schemas from L1-B predicted concrete tool names.
+
+        This is the new primary tool-injection path.
+        """
+        names = set(tool_bundle or [])
+        if not names:
+            return []
+        names.add("request_tool_supplement")
+        tools = self._collect_named_tool_definitions(names)
+        if tools:
+            logger.info("[ToolBundle] L1-B 工具包注入 %d 个工具: %s", len(tools), sorted(names))
+            return tools
+        logger.warning("[ToolBundle] 工具包为空或不可用，回退为无工具直接回复")
+        return []
+
+    @staticmethod
+    def _inject_tool_bundle_context(messages: List[Dict[str, Any]], prediction: Optional[Dict[str, Any]]) -> None:
+        if not prediction:
+            return
+        context_bundle = prediction.get("context_bundle") or {}
+        predicted_tools = prediction.get("predicted_tools") or []
+        policy = prediction.get("task_graph_policy") or "none"
+        if (
+            context_bundle.get("turn_shape") == "simple_social"
+            and not predicted_tools
+            and policy in ("", "none", None)
+        ):
+            return
+        try:
+            from zulong.tools.tool_bag import summarize_tool_bundle
+            summary = summarize_tool_bundle(prediction)
+        except Exception:
+            names = prediction.get("predicted_tools", [])
+            summary = (
+                "【L1-B 工具预判】\n"
+                f"- 建议工具: {', '.join(names) if names else '无'}\n"
+                "- 如果工具不够，请调用 request_tool_supplement。"
+            )
+        msg = {"role": "system", "content": summary}
+        if len(messages) >= 2:
+            messages.insert(-1, msg)
+        else:
+            messages.append(msg)
+
+    def _requires_realtime_search(self, user_input: str) -> bool:
+        """Detect chat-shaped questions that cannot be answered from static memory."""
+        text = (user_input or "").strip().lower()
+        if not text:
+            return False
+        realtime_terms = (
+            "天气", "气温", "降雨", "下雨", "空气质量", "台风",
+            "今天", "明天", "后天", "现在", "当前", "实时", "最新",
+            "新闻", "热搜", "股价", "汇率", "油价", "票房",
+            "航班", "火车", "高铁", "路况", "限行",
+            "weather", "forecast", "latest", "today", "tomorrow",
+        )
+        return any(term in text for term in realtime_terms)
     
     def _execute_tool_call(self, tool_call) -> str:
         """执行单个 FC 工具调用并返回结果文本
@@ -846,6 +651,7 @@ class InferenceEngine:
         fc_turn: int = 0,
         tool_name: str = "",
         tool_result: str = "",
+        tool_call_id: str = "",
     ) -> None:
         """发布任务图谱更新事件到前端
         
@@ -881,11 +687,14 @@ class InferenceEngine:
                     "serialize_error": str(serialize_err),
                 }
 
+            progress = self._task_graph_progress(tg)
             event_data = {
                 "graph": graph_data,
                 "turn": fc_turn,
                 "tool": tool_name,
+                "tool_call_id": tool_call_id,
                 "tool_count": len(tg._nodes),
+                "progress": progress,
             }
 
             # 添加额外上下文
@@ -893,6 +702,14 @@ class InferenceEngine:
                 event_data["duration"] = 0  # 由调用方填充
             if tool_result:
                 event_data["tool_result"] = tool_result[:500]
+            event_data["interaction"] = self._build_pipeline_interaction(
+                pipeline_type=pipeline_type,
+                fc_turn=fc_turn,
+                tool_name=tool_name,
+                tool_result=tool_result,
+                tool_call_id=tool_call_id,
+                progress=progress,
+            )
 
             step_type = f"pipeline.{pipeline_type}"
             self._send_thinking_step(step_type, event_data)
@@ -904,6 +721,103 @@ class InferenceEngine:
         except Exception as e:
             import traceback
             logger.warning(f"[图谱推送] {pipeline_type} 失败: {e}\n{traceback.format_exc()}")
+
+    def _task_graph_progress(self, tg) -> Dict[str, Any]:
+        """Return compact TaskGraph progress for TSD frontend cards."""
+        nodes = list(getattr(tg, "_nodes", {}).values())
+        total = len(nodes)
+        done = sum(1 for n in nodes if getattr(n, "status", "") in ("completed", "skipped"))
+        running = sum(1 for n in nodes if getattr(n, "status", "") == "in_progress")
+        blocked = sum(1 for n in nodes if getattr(n, "status", "") in ("blocked", "needs_adjust"))
+        percent = int(round((done / total) * 100)) if total else 0
+        return {
+            "total": total,
+            "completed": done,
+            "running": running,
+            "blocked": blocked,
+            "percent": percent,
+        }
+
+    def _tool_description_for_frontend(self, tool_name: str) -> str:
+        if not tool_name:
+            return ""
+        try:
+            tool = self.tool_engine.registry.tools.get(tool_name)
+            desc = (getattr(tool, "description", "") or "").strip() if tool else ""
+            return desc[:160]
+        except Exception:
+            return ""
+
+    def _build_pipeline_interaction(
+        self,
+        *,
+        pipeline_type: str,
+        fc_turn: int,
+        tool_name: str,
+        tool_result: str,
+        tool_call_id: str,
+        progress: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build the TSD v2.7 interaction payload rendered by the Web UI."""
+        percent = progress.get("percent", 0)
+        if pipeline_type == "pipeline_start":
+            return {
+                "pair_id": f"pipeline-start-{fc_turn}",
+                "kind": "plan",
+                "status": "running",
+                "title": "任务已启动",
+                "detail": "L2 已收到 L1-B 打包的工具、上下文和记忆信息，开始规划与执行。",
+                "progress": percent,
+                "next_step": "等待模型选择是否调用工具",
+            }
+        if pipeline_type == "agent_tool_call":
+            preview = (tool_result or "").strip()
+            if len(preview) > 260:
+                preview = preview[:260] + "..."
+            failed = '"error"' in preview[:80].lower() or "失败" in preview[:80] or "error" in preview[:80].lower()
+            return {
+                "pair_id": tool_call_id or f"tool-{fc_turn}-{tool_name or 'unknown'}",
+                "kind": "observation" if tool_result else "action",
+                "status": "running" if not tool_result else ("failed" if failed else "succeeded"),
+                "title": f"工具调用: {tool_name or '未知工具'}",
+                "detail": (
+                    self._tool_description_for_frontend(tool_name)
+                    or "执行 L2 真实返回的 tool_call，并把结果回填到任务图。"
+                ),
+                "tool_name": tool_name,
+                "progress": percent,
+                "next_step": "根据工具结果继续推理",
+                "result_preview": preview,
+            }
+        if pipeline_type == "agent_done":
+            return {
+                "pair_id": f"pipeline-done-{fc_turn}",
+                "kind": "summary",
+                "status": "succeeded",
+                "title": "任务执行结束",
+                "detail": (
+                    f"工具循环已结束，共 {fc_turn} 轮；"
+                    f"任务图完成 {progress.get('completed', 0)}/{progress.get('total', 0)} 个节点。"
+                ),
+                "progress": percent,
+            }
+        if pipeline_type == "agent_error":
+            return {
+                "pair_id": f"pipeline-error-{fc_turn}",
+                "kind": "summary",
+                "status": "failed",
+                "title": "任务执行异常",
+                "detail": tool_result or "工具循环报告异常。",
+                "progress": percent,
+            }
+        return {
+            "pair_id": f"pipeline-{pipeline_type}-{fc_turn}",
+            "kind": "progress",
+            "status": "running",
+            "title": "任务进度更新",
+            "detail": pipeline_type,
+            "progress": percent,
+        }
     
     def _task_graph_to_frontend(self, tg) -> Dict:
         """将 TaskGraph 转换为前端 addTaskGraph() 兼容格式
@@ -1043,9 +957,14 @@ class InferenceEngine:
         Returns:
             降级回复文本
         """
-        timeout_phase = self._last_timeout_phase or TimeoutPhase.CORE_TIMEOUT
+        timeout_phase = self._last_timeout_phase or TimeoutPhase.ORCHESTRATOR_NO_OUTPUT
         elapsed = self._last_timeout_elapsed
-        model_id = "CORE" if timeout_phase == TimeoutPhase.CORE_TIMEOUT else "BACKUP"
+        # 非超时阶段 (ORCHESTRATOR_NO_OUTPUT / CIRCUIT_BREAKER_TRIPPED) 的 model_id 应为 CORE
+        if timeout_phase in (TimeoutPhase.CORE_TIMEOUT, TimeoutPhase.ORCHESTRATOR_NO_OUTPUT,
+                             TimeoutPhase.CIRCUIT_BREAKER_TRIPPED):
+            model_id = "CORE"
+        else:
+            model_id = "BACKUP"
         request_id = _current_request_id_var.get()
         
         context = DegradationContext(
@@ -1060,6 +979,122 @@ class InferenceEngine:
         self._degradation_handler.generate_diagnostic_log(context)
         
         return response
+
+    def _call_l2_once(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        tool_definitions: Optional[List[Dict[str, Any]]] = None,
+        vllm_model_id: Optional[str] = None,
+        response_max_tokens: int = 1024,
+        force_first_tool: bool = False,
+        forced_first_tool_name: str = "",
+        user_input: str = "",
+    ) -> Dict[str, Any]:
+        """单次 L2 模型决策。
+
+        该方法只负责一次模型推理：模型可能直接返回自然语言，也可能
+        返回 tool_calls。只有出现真实 tool_calls 时，调用方才进入
+        FC 工具执行循环。
+        """
+        import concurrent.futures
+
+        model_id = vllm_model_id or LLM_MODEL_ID
+        api_kwargs: Dict[str, Any] = {
+            "model": model_id,
+            "messages": (
+                self._attn_window.apply_window()
+                if getattr(self, "_attn_window", None) else messages
+            ),
+            "max_tokens": response_max_tokens,
+            "temperature": 0.3,
+            "top_p": 0.85,
+            "stream": False,
+            **self._get_llm_extra_kwargs(),
+        }
+
+        if tool_definitions:
+            api_kwargs["tools"] = tool_definitions
+            if forced_first_tool_name:
+                api_kwargs["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": forced_first_tool_name},
+                }
+            elif force_first_tool:
+                api_kwargs["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": "task_view_overview"},
+                }
+            else:
+                api_kwargs["tool_choice"] = "auto"
+
+        def call_core(kwargs=api_kwargs):
+            return self.vllm_client.chat.completions.create(**kwargs)
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            future = executor.submit(call_core)
+            api_response = future.result(timeout=self._core_timeout)
+        except concurrent.futures.TimeoutError:
+            self._last_timeout_phase = TimeoutPhase.CORE_TIMEOUT
+            self._last_timeout_elapsed = self._core_timeout
+            self._health_tracker.record_timeout("CORE")
+            logger.error(
+                "🚨 [L2] CORE 单次推理超时 (>%s秒)，尝试备用模型",
+                self._core_timeout,
+            )
+            backup_text = asyncio.run(
+                self._generate_with_backup(messages, user_input)
+            )
+            return {
+                "response_content": backup_text,
+                "tool_calls_data": None,
+                "fallback_used": True,
+            }
+        except Exception as api_err:
+            logger.error("🚨 [L2] CORE 单次推理失败: %s", api_err)
+            backup_text = asyncio.run(
+                self._generate_with_backup(messages, user_input)
+            )
+            return {
+                "response_content": backup_text,
+                "tool_calls_data": None,
+                "fallback_used": True,
+            }
+        finally:
+            executor.shutdown(wait=False)
+
+        msg = api_response.choices[0].message
+        response_content = msg.content or ""
+        tool_calls_data = None
+        if getattr(msg, "tool_calls", None):
+            tool_calls_data = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in msg.tool_calls
+            ]
+            logger.info(
+                "[L2] 单次决策返回工具调用: %s",
+                [tc["function"]["name"] for tc in tool_calls_data],
+            )
+        else:
+            logger.info(
+                "[L2] 单次决策直接回复，长度 %d",
+                len(response_content),
+            )
+
+        self._health_tracker.record_success("CORE")
+        return {
+            "response_content": response_content,
+            "tool_calls_data": tool_calls_data,
+            "fallback_used": False,
+        }
 
     async def _generate_with_backup(self, messages: List[Dict[str, str]], user_input: str = "") -> str:
         """使用备用模型（L2 BACKUP）生成响应
@@ -1194,6 +1229,15 @@ class InferenceEngine:
         vision_ready = event.payload.get("vision_ready", False)
         suspended_task = event.payload.get("suspended_task", None)
         
+        # 🔥 提取 request_id 用于响应关联（前端需要 request_id 匹配置信）
+        request_id = event.payload.get("request_id")
+        if request_id:
+            _current_request_id_var.set(request_id)
+        session_id = event.payload.get("session_id") or event.payload.get("conversation_id")
+        if session_id:
+            _current_session_id_var.set(session_id)
+            self._current_session_id = session_id
+        
         # 缓存 GK 传来的节点信息，供 _update_memory() 复用
         self._current_dialogue_round_id = event.payload.get("dialogue_round_id", None)
         
@@ -1248,19 +1292,21 @@ class InferenceEngine:
             voice_mode = "AUTO_TTS"
         logger.info(f"🎙️ [L2] Voice Mode: {voice_mode}")
         
-        # 🎯 提取 L1-B 预分类意图（如果存在则跳过 Round 1）
-        pre_classified_intent = event.payload.get("pre_classified_intent")
-        if pre_classified_intent:
-            logger.info(f"🎯 [L2] 使用 L1-B 预分类意图: {pre_classified_intent} (跳过 Round 1)")
-        else:
-            logger.debug("[L2] 无预分类意图，将执行 Round 1 分类")
-        
+        # 🎯 L1-B 工具预判（核心路由机制）
         # 🎯 提取 L1-B 预检索的记忆上下文（如果存在则跳过重复检索）
         pre_retrieved_memory = event.payload.get("pre_retrieved_memory")
         if pre_retrieved_memory:
             logger.info(f"🧠 [L2] 使用 L1-B 预检索记忆上下文 ({len(pre_retrieved_memory)} 字符)")
         else:
             logger.debug("[L2] 无预检索记忆，将执行 MemoryGraph 检索")
+
+        tool_prediction = event.payload.get("tool_prediction") or {}
+        tool_bundle = event.payload.get("tool_bundle") or tool_prediction.get("predicted_tools") or []
+        task_graph_policy = event.payload.get("task_graph_policy") or tool_prediction.get("task_graph_policy")
+        if tool_bundle:
+            logger.info("[L2] 使用 L1-B 工具预判: tools=%s, policy=%s", tool_bundle, task_graph_policy)
+        else:
+            logger.debug("[L2] 无 L1-B 工具预判，将使用兼容工具收集")
         
         # 提取用户引用的节点（前端右键引用 → WebSocket → EventBus）
         self._referenced_nodes = event.payload.get("referenced_nodes", [])
@@ -1295,7 +1341,16 @@ class InferenceEngine:
         else:
             threading.Thread(
                 target=self._process_with_memory,
-                args=(text, event.priority, voice_mode, pre_classified_intent, pre_retrieved_memory),
+                args=(
+                    text,
+                    event.priority,
+                    voice_mode,
+                    pre_retrieved_memory,
+                    request_id,
+                    tool_prediction,
+                    tool_bundle,
+                    task_graph_policy,
+                ),
                 daemon=True,
                 name="L2-FC-Worker"
             ).start()
@@ -1405,7 +1460,8 @@ class InferenceEngine:
             'text': response,
             'session_id': session_id,
             'analysis_type': 'review',
-            'deep_analysis': deep_analysis
+            'deep_analysis': deep_analysis,
+            'request_id': _current_request_id_var.get()
         }
         
         # 如果期望 JSON，尝试解析
@@ -1429,16 +1485,22 @@ class InferenceEngine:
         event_bus.publish(output_event)
         logger.info(f"🧠 [复盘] 已发布 L2_OUTPUT 事件，session_id={session_id}")
     
-    def _process_with_memory(self, user_input: str, priority: EventPriority, voice_mode: str = "TEXT_ONLY", 
-                            pre_classified_intent: str = None, pre_retrieved_memory: str = None):
+    def _process_with_memory(self, user_input: str, priority: EventPriority, voice_mode: str = "TEXT_ONLY",
+                            pre_retrieved_memory: str = None,
+                            request_id: str = None, tool_prediction: Optional[Dict[str, Any]] = None,
+                            tool_bundle: Optional[List[str]] = None,
+                            task_graph_policy: Optional[str] = None):
         """带记忆的推理流程（非 Orchestrator 模式）
         
         Args:
             user_input: 用户输入
             priority: 优先级
             voice_mode: 语音模式 ("TEXT_ONLY", "AUTO_TTS", "FORCED_TTS")
-            pre_classified_intent: L1-B 预分类的意图 ("chat"/"complex"/"resume")，如果提供则跳过 Round 1
             pre_retrieved_memory: L1-B 预检索的记忆上下文，如果提供则跳过重复检索
+            request_id: 请求 ID（用于前端响应关联）
+            tool_prediction: L1-B 工具预判结果
+            tool_bundle: L1-B 建议注入 L2 的工具名
+            task_graph_policy: L1-B 建议的任务图策略
         """
         import time
         
@@ -1494,97 +1556,67 @@ class InferenceEngine:
         logger.debug("[TRACE] set BUSY, entering try block")
         
         try:
-            logger.debug("[TRACE] calling _retrieve_from_rag...")
-            rag_context = self._retrieve_from_rag(user_input)
-            logger.debug(f"[TRACE] RAG done, has_context={bool(rag_context)}")
-            
-            if rag_context:
-                logger.info(f"📚 [RAG 调试] 检索到的上下文:\n{rag_context[:500]}...")
-            else:
-                logger.warning("⚠️ [RAG 调试] 未检索到任何 RAG 上下文")
-            
-            # ── 引用节点任务图切换（必须在意图分类之前） ──
+            # ── 引用节点任务图切换（先于提示词构建） ──
             self._referenced_graph_lost = None  # 重置标记
             self._switch_graph_for_referenced_nodes()
             
-            # ── 两阶段 FC 意图分类（Round 1: 分类 + 骨架操作） ──
-            logger.debug("[TRACE] checking for pre-classified intent...")
-            
-            if pre_classified_intent:
-                # L1-B 已经做了意图分类，直接使用
-                logger.info(f"🎯 [Intent] 使用 L1-B 预分类结果: {pre_classified_intent} (跳过 Round 1)")
-                from zulong.l2.intent_prompt_builder import IntentType
-                intent_type = IntentType(pre_classified_intent)
-                scaffold_data = {"intent": pre_classified_intent, "from_l1b": True}
+            # ── TSD v2.7: 统一执行主链，由 L1-B 工具预判驱动 ──
+            tool_bundle = list(tool_bundle or [])
+            context_bundle = (tool_prediction or {}).get("context_bundle") or {}
+            has_predicted_tools = bool(tool_bundle)
+            has_task_graph_hint = task_graph_policy in {
+                "inspect", "reuse", "inspect_or_create", "create", "extend", "continue"
+            }
+            is_simple_social = context_bundle.get("turn_shape") == "simple_social"
+            skip_rag_for_direct_reply = (
+                is_simple_social
+                and not has_predicted_tools
+                and not has_task_graph_hint
+            )
+
+            rag_context = None
+            if skip_rag_for_direct_reply:
+                logger.info("⚡ [UnifiedFlow] simple_social 命中轻量推理路径，跳过 RAG 预检索")
             else:
-                # 没有预分类，执行 Round 1 分类（兼容旧流程）
-                logger.debug("[TRACE] calling _classify_intent...")
-                intent_type, scaffold_data = self._classify_intent(user_input)
-                logger.debug(f"[TRACE] intent done: {intent_type.value}")
-            
-            logger.info(f"🎯 [Intent] 最终分类结果: {intent_type.value}, scaffold: {scaffold_data}")
-            
-            # ── 活跃任务图意图升级 ──────────────────────────────
-            # 当用户回答模型的追问时（如"5月1日出发，15天"），Round1 会分类
-            # 为 CHAT（无 RESUME/COMPLEX 关键词）。但此时内存中仍有活跃任务图
-            # 且有未完成节点 → 应升级为 COMPLEX，确保：
-            #   1. 任务工具（task_mark_status 等）被注入
-            #   2. 任务管理 prompt 被构建
-            #   3. 模型能感知并继续执行任务图
-            if intent_type.value == "chat":
-                # 社交/问候类短消息不触发活跃任务图升级
-                # "你好"、"谢谢" 等不应导致模型去执行任务图
-                _stripped_input = user_input.strip().rstrip("。！？~～.!?")
-                _is_trivial = (
-                    len(_stripped_input) <= 5
-                    and not any(c.isdigit() for c in _stripped_input)
-                )
-                if not _is_trivial:
-                    try:
-                        from zulong.tools.task_tools import get_active_task_graph as _get_tg_upgrade
-                        _upgrade_tg = _get_tg_upgrade()
-                        if _upgrade_tg is not None:
-                            _upgrade_leaves = _upgrade_tg.get_leaf_nodes()
-                            _upgrade_uncompleted = [
-                                n for n in _upgrade_leaves
-                                if n.status not in ("completed", "skipped")
-                            ]
-                            if _upgrade_uncompleted:
-                                from zulong.l2.intent_prompt_builder import IntentType as _IT
-                                intent_type = _IT.COMPLEX
-                                scaffold_data = {
-                                    "intent": "complex",
-                                    "already_exists": True,
-                                    "graph_id": getattr(_upgrade_tg, 'id', ''),
-                                    "title": _upgrade_tg.title,
-                                    "upgraded_from": "chat",
-                                    "message": (
-                                        f"检测到活跃任务图「{_upgrade_tg.title}」"
-                                        f"有 {len(_upgrade_uncompleted)} 个未完成节点，"
-                                        f"自动升级为 COMPLEX 意图。"
-                                    ),
-                                }
-                                logger.info(
-                                    f"[Intent] CHAT → COMPLEX 升级: "
-                                    f"活跃任务图 {getattr(_upgrade_tg, 'id', '?')} "
-                                    f"有 {len(_upgrade_uncompleted)}/{len(_upgrade_leaves)} "
-                                    f"个未完成节点"
-                                )
-                    except Exception as _upgrade_err:
-                        logger.debug(f"[Intent] 活跃任务图升级检查失败: {_upgrade_err}")
+                logger.debug("[TRACE] calling _retrieve_from_rag...")
+                rag_context = self._retrieve_from_rag(user_input)
+                logger.debug(f"[TRACE] RAG done, has_context={bool(rag_context)}")
+                
+                if rag_context:
+                    logger.info(f"📚 [RAG 调试] 检索到的上下文:\n{rag_context[:500]}...")
                 else:
-                    logger.debug(
-                        f"[Intent] 跳过 CHAT→COMPLEX 升级: "
-                        f"输入 '{user_input}' 为社交短消息"
-                    )
-            # ── END 活跃任务图意图升级 ────────────────────────────
+                    logger.warning("⚠️ [RAG 调试] 未检索到任何 RAG 上下文")
+
+            execution_mode = "reply_only"
+            if has_predicted_tools or has_task_graph_hint:
+                execution_mode = "tool_augmented"
+            if is_simple_social and not has_predicted_tools:
+                execution_mode = "reply_only"
+
+            scaffold_data = {
+                "tools": tool_bundle,
+                "from_l1b": True,
+                "policy": task_graph_policy,
+                "context_bundle": context_bundle,
+                "execution_mode": execution_mode,
+            }
+            logger.info(
+                "🎯 [UnifiedFlow] mode=%s tools=%s policy=%s context=%s",
+                execution_mode,
+                tool_bundle,
+                task_graph_policy,
+                context_bundle,
+            )
+
+            # TSD v2.7: 不再因为“系统里碰巧有活跃任务图”就把普通对话抬成复杂任务。
+            # 是否进入工具增强路径，只由 L1-B 的工具预判 / task_graph_policy /
+            # 用户显式引用节点这三类主干信号决定。
             
-            # ── COMPLEX → CHAT 降级（已完成任务的后续提问） ──────────
+            # ── 工具增强 → 直接回答降级（已完成任务的后续提问） ──────────
             # 当活跃任务图的所有叶子节点已完成，且用户输入较短时，
-            # 将 COMPLEX 降级为 CHAT，避免为后续提问创建新任务图。
+            # 改为直接回答，避免为后续提问创建新任务图。
             # 🔥 [Fix-7B] 仅对短问句降级（如"怎么运行"），不对新任务降级
-            # 新任务的 scaffold_data 中不会有 already_exists（已被 Fix-7A 处理）
-            if intent_type.value == "complex":
+            if execution_mode == "tool_augmented":
                 try:
                     from zulong.tools.task_tools import get_active_task_graph as _get_tg_downgrade
                     _downgrade_tg = _get_tg_downgrade()
@@ -1603,29 +1635,29 @@ class InferenceEngine:
                                            "创建", "搭建", "实现", "生成", "构建")
                             )
                             if len(_stripped) <= 15 and not _has_task_verb:
-                                from zulong.l2.intent_prompt_builder import IntentType as _IT_dg
-                                intent_type = _IT_dg.CHAT
+                                execution_mode = "reply_only"
+                                tool_bundle = []
+                                task_graph_policy = "none"
                                 scaffold_data = {
-                                    "intent": "chat",
-                                    "downgraded_from": "complex",
+                                    "downgraded_to": "reply_only",
                                     "completed_task_title": _downgrade_tg.title,
                                     "message": (
                                         f"检测到已完成任务「{_downgrade_tg.title}」"
-                                        f"的后续提问，降级为 CHAT"
+                                        f"的后续提问，改为直接回答"
                                     ),
                                 }
                                 logger.info(
-                                    f"[Intent] COMPLEX → CHAT 降级: "
+                                    f"[UnifiedFlow] 工具增强 → 直接回答: "
                                     f"已完成任务后续提问 '{_stripped}'"
                                 )
                 except Exception as _dg_err:
-                    logger.debug(f"[Intent] COMPLEX→CHAT 降级检查失败: {_dg_err}")
-            # ── END COMPLEX → CHAT 降级 ────────────────────────────
+                    logger.debug(f"[UnifiedFlow] 直接回答降级检查失败: {_dg_err}")
+            # ── END 工具增强 → 直接回答降级 ────────────────────────────
 
             # ── 🔥 [Fix-8] 新任务清除旧图谱 ──────────────────────────
-            # 当判定为 COMPLEX（新任务）且旧图谱已全部完成时，清除旧图谱，
+            # 当 L1-B 预判需要任务图扩展/创建且旧图谱已全部完成时，清除旧图谱，
             # 让模型调用 task_create_plan 创建全新的任务图谱。
-            if intent_type.value == "complex":
+            if execution_mode == "tool_augmented":
                 try:
                     from zulong.tools.task_tools import (
                         get_active_task_graph as _get_tg_clear,
@@ -1666,41 +1698,58 @@ class InferenceEngine:
                     logger.debug(f"[Fix-8] 清除旧图谱失败: {_clear_err}")
             # ── END 新任务清除旧图谱 ───────────────────────────────
 
-            # 图丢失处理：用户引用了一个找不到的任务图，RESUME 降级为 CHAT
-            # 此时应强制走 COMPLEX 路径，让模型重新创建任务计划
+            # 图丢失处理：用户引用了一个找不到的任务图。
+            # 此时强制启用工具增强路径，让模型重新创建任务计划。
             _lost_graph_id = getattr(self, '_referenced_graph_lost', None)
-            if _lost_graph_id and intent_type.value == "chat" and scaffold_data.get("fallback"):
-                from zulong.l2.intent_prompt_builder import IntentType
-                intent_type = IntentType.COMPLEX
+            if _lost_graph_id and execution_mode == "reply_only":
+                execution_mode = "tool_augmented"
+                task_graph_policy = "inspect_or_create"
+                tool_bundle = list(dict.fromkeys((tool_bundle or []) + ["task_create_plan", "task_add_node"]))
                 scaffold_data = {
-                    "intent": "complex",
                     "graph_lost": True,
                     "lost_graph_id": _lost_graph_id,
                     "message": f"用户引用的任务图 {_lost_graph_id} 数据已丢失，需要重新创建任务计划。",
                 }
-                logger.info(f"[GraphLost] 检测到图丢失，CHAT → COMPLEX 覆盖 (graph_id={_lost_graph_id})")
+                logger.info(f"[GraphLost] 检测到图丢失，启用工具增强路径 (graph_id={_lost_graph_id})")
             
-            # 如果 Round 1 判定为 RESUME 且成功恢复了任务图，标记恢复状态
-            if intent_type.value == "resume" and scaffold_data.get("has_task_graph"):
+            # 如果任务图策略要求继续已有图，标记恢复状态
+            if task_graph_policy in {"reuse", "inspect", "continue"}:
                 self._is_resume_task = True
-                # RESUME 流程需要逐节点处理，提升 CB 时间和步数预算
+                # 继续已有任务需要逐节点处理，提升 CB 时间和步数预算
                 if hasattr(self, '_circuit_breaker'):
                     self._circuit_breaker.escalate_for_resume()
 
-            # COMPLEX 流程也提前升级 CB（不依赖 task_create_plan 工具调用）
-            if intent_type.value == "complex" and scaffold_data.get("graph_id"):
+            # 工具增强流程提前升级 CB（不依赖 task_create_plan 工具调用）
+            if execution_mode == "tool_augmented" and scaffold_data.get("graph_id"):
                 if hasattr(self, '_circuit_breaker'):
                     self._circuit_breaker.escalate_for_planning()
             
-            # ── Round 2: 构建场景化提示词 ──
-            from zulong.l2.intent_prompt_builder import build_round2_system_prompt
+            # ── 构建统一主链提示词 ──
+            from zulong.l2.intent_prompt_builder import build_unified_system_prompt
+            runtime_context = {
+                "os_name": "Windows" if os.name == "nt" else os.name,
+                "shell": os.environ.get("SHELL") or "PowerShell",
+                "workspace_root": "",
+                "preferred_commands": ["Get-ChildItem", "Select-String", "Get-Content", "rg", "python", "npm", "git"],
+            }
+            try:
+                from zulong.tools.task_tools import get_active_workspace_dir
+                runtime_context["workspace_root"] = get_active_workspace_dir() or os.getcwd()
+            except Exception:
+                runtime_context["workspace_root"] = os.getcwd()
             
-            messages = build_round2_system_prompt(
-                intent_type, user_input, rag_context, visual_context,
+            messages = build_unified_system_prompt(
+                user_input, rag_context, visual_context,
                 scaffold_data, rag_manager=self.rag_manager,
                 voice_mode=voice_mode,
                 pre_retrieved_memory=pre_retrieved_memory,
+                runtime_context=runtime_context,
+                tool_prediction=tool_prediction,
+                tool_bundle=tool_bundle,
+                task_graph_policy=task_graph_policy,
             )
+
+            self._inject_tool_bundle_context(messages, tool_prediction)
             
             # 注入用户引用的节点（前端右键引用的节点地址，供模型定位）
             _ref_nodes = getattr(self, '_referenced_nodes', [])
@@ -1726,10 +1775,20 @@ class InferenceEngine:
                 user_input=user_input,
                 voice_mode=voice_mode,
                 has_visual=visual_context is not None,
+                tool_prediction=tool_prediction or {},
+                tool_bundle=tool_bundle or [],
+                task_graph_policy=task_graph_policy or "",
+                workspace_root=runtime_context.get("workspace_root"),
+                os_name=runtime_context.get("os_name"),
+                shell=runtime_context.get("shell"),
+                preferred_commands=runtime_context.get("preferred_commands"),
             )
             
-            # ── Round 2: 收集场景过滤后的工具定义 ──
-            tool_definitions = self._collect_tool_definitions_for_intent(intent_type)
+            # ── 按 L1-B 工具包收集工具定义 ──
+            tool_definitions = self._collect_tool_definitions_for_bundle(
+                tool_bundle or [],
+            )
+            forced_first_tool_name = ""
             
             logger.info(f"🧠 开始推理：'{user_input[:50]}...' " if len(user_input) > 50 else f"🧠 开始推理：'{user_input}'")
             
@@ -1738,9 +1797,9 @@ class InferenceEngine:
             
             # 根据 l2_model 类型选择推理路径
             if isinstance(self.l2_model, dict) and self.vllm_client is not None:
-                # ====== 远程模型：FC 自主循环 ======
-                # 模型完全自主决定：直接回复 or 调用工具 or 多轮工具链
-                logger.info(f"🚀 [FC] 远程 API 模式，工具数: {len(tool_definitions)}")
+                # ====== 远程模型：L2 单次决策 + 按需工具循环 ======
+                # 工具清单只代表可用范围；只有模型真实返回 tool_call 才进入工具循环。
+                logger.info(f"🚀 [L2] 远程 API 单次决策，候选工具数: {len(tool_definitions)}")
                 vllm_model_id = LLM_MODEL_ID
                 
                 # 初始化 FC 循环变量
@@ -1793,10 +1852,11 @@ class InferenceEngine:
                 except Exception:
                     pass
                 
-                # RESUME 场景：第一轮强制调用 task_view_overview
+                # 统一主链：只有显式任务图复用/检查场景才强制先看概览
                 _force_first_tool = (
-                    intent_type.value == "resume"
+                    task_graph_policy in {"reuse", "inspect"}
                     and _task_graph is not None
+                    and "task_view_overview" in (tool_bundle or [])
                 )
                 
                 # Circuit Breaker: 重置状态（每次推理会话独立）
@@ -1820,93 +1880,45 @@ class InferenceEngine:
                 # 保存 messages 引用供 Rule C 自动挂起使用
                 self._last_fc_messages = messages
                 
-                # 编排器路由：COMPLEX/RESUME + 编排器开关 → 走编排器
-                # ✅ 选择执行引擎：LangGraph Orchestrator / 传统 Orchestrator / FC Loop
-                _use_orchestrator = False
-                _use_langgraph = False
-                try:
-                    from zulong.config.config_manager import get_l2_inference_config as _get_l2_cfg
-                    _orch_cfg = _get_l2_cfg().get("orchestrator", {})
-                    _use_orchestrator = (
-                        _orch_cfg.get("enabled", False)
-                        and intent_type.value in ("complex", "resume")
+                # 统一主链：先做一次 L2 模型决策。L1-B 给出工具包只代表
+                # “可用工具范围”，不等于进入工具循环；只有模型真实返回
+                # tool_calls 时，才启动 FC 工具执行闭环。
+                decision = self._call_l2_once(
+                    messages,
+                    tool_definitions=tool_definitions,
+                    vllm_model_id=vllm_model_id,
+                    response_max_tokens=4096 if tool_definitions else 1024,
+                    force_first_tool=_force_first_tool,
+                    forced_first_tool_name=forced_first_tool_name,
+                    user_input=user_input,
+                )
+                initial_tool_calls = decision.get("tool_calls_data") or []
+                response = decision.get("response_content") or ""
+                if decision.get("fallback_used"):
+                    self._response_is_fallback = True
+
+                if not initial_tool_calls:
+                    fc_turn = 0
+                    logger.info(
+                        "[L2] 本轮未发生工具调用，跳过 FC 工具循环"
                     )
-                    # ✅ v2.0 新增：检查是否启用 LangGraph
-                    _use_langgraph = (
-                        _use_orchestrator
-                        and _orch_cfg.get("use_langgraph", False)
-                    )
-                except Exception:
-                    pass
-                
-                if _use_orchestrator:
-                    if _use_langgraph:
-                        # ✅ 使用 LangGraph StateGraph 编排器（v2.0）
-                        logger.info("[L2] ✅ 使用 LangGraph Orchestrator")
-                        try:
-                            from zulong.l2.orchestrator_graph import OrchestratorWithLangGraph
-                            
-                            # 创建或复用编排器实例
-                            if not hasattr(self, '_orchestrator_langgraph'):
-                                self._orchestrator_langgraph = OrchestratorWithLangGraph(self)
-                            
-                            orchestrator = self._orchestrator_langgraph
-                            
-                            # 异步运行编排器
-                            import asyncio
-                            loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(loop)
-                            try:
-                                response, fc_turn, thread_id = loop.run_until_complete(
-                                    orchestrator.run(
-                                        user_input=user_input,
-                                        messages=messages,
-                                        tool_definitions=tool_definitions,
-                                        vllm_model_id=vllm_model_id,
-                                        is_resume=(intent_type.value == "resume"),
-                                    )
-                                )
-                            finally:
-                                loop.close()
-                            
-                            logger.info(f"[L2] LangGraph Orchestrator 完成: thread_id={thread_id}")
-                            
-                        except Exception as e:
-                            logger.error(f"[L2] LangGraph Orchestrator 失败: {e}", exc_info=True)
-                            logger.warning("[L2] 降级为传统 Orchestrator")
-                            # 降级为传统模式
-                            from zulong.l2.orchestrator_graph import run_orchestrator
-                            response, fc_turn = run_orchestrator(
-                                engine=self,
-                                messages=messages,
-                                tool_definitions=tool_definitions,
-                                vllm_model_id=vllm_model_id,
-                                user_input=user_input,
-                                is_resume=(intent_type.value == "resume"),
-                            )
-                    else:
-                        # 使用传统状态机编排器
-                        logger.info("[L2] 使用传统 Orchestrator")
-                        from zulong.l2.orchestrator_graph import run_orchestrator
-                        response, fc_turn = run_orchestrator(
-                            engine=self,
-                            messages=messages,
-                            tool_definitions=tool_definitions,
-                            vllm_model_id=vllm_model_id,
-                            user_input=user_input,
-                            is_resume=(intent_type.value == "resume"),
-                        )
                 else:
-                    # 使用原生 FC 循环
+                    logger.info(
+                        "[L2] 本轮发生 %d 个工具调用，进入 FC 工具循环",
+                        len(initial_tool_calls),
+                    )
                     response, fc_turn = run_fc_loop(
                         engine=self,
                         messages=messages,
                         tool_definitions=tool_definitions,
                         vllm_model_id=vllm_model_id,
-                        force_first_tool=_force_first_tool,
+                        force_first_tool=False,
+                        forced_first_tool_name="",
                         user_input=user_input,
-                        is_resume=(intent_type.value == "resume"),
-                        intent_max_tokens=4096 if intent_type.value in ("complex", "resume") else 1024,
+                        is_resume=(task_graph_policy in {"reuse", "inspect", "continue"}),
+                        response_max_tokens=4096,
+                        initial_tool_calls_data=initial_tool_calls,
+                        initial_response_content=response,
                     )
                 self._fc_turn_count = fc_turn  # 供 Rule C 自动挂起记录
                 
@@ -1960,11 +1972,19 @@ class InferenceEngine:
                     return
                 
                 if not response:  # None 或空字符串都需要降级处理
+                    # 🔥 标记：后续 response 来自降级路径，非模型原始输出
+                    self._response_is_fallback = True
                     # 🔥 优化：根据达到限制的原因选择不同处理方式
                     if fc_turn >= self._hard_limit:
                         logger.warning(f"[FC] 达到硬限制 {self._hard_limit} 步，使用降级回复")
                     else:
                         logger.warning(f"[FC] FC 循环异常终止 (已执行 {fc_turn} 步)")
+
+                    # 🔥 记录真实的 elapsed 和 phase（而非超时路径的默认值）
+                    if self._last_timeout_phase is None:
+                        # 未经过 _generate_with_backup 超时路径，说明编排器/FC 完成了但无输出
+                        self._last_timeout_phase = TimeoutPhase.ORCHESTRATOR_NO_OUTPUT
+                        self._last_timeout_elapsed = time.time() - generate_start
 
                     # 任务全完成但回复为空 → 从 TaskGraph 合成摘要（降级路径保底）
                     if not response:
@@ -1986,7 +2006,7 @@ class InferenceEngine:
                         except Exception:
                             pass
 
-                    # RESUME 场景专用降级：利用任务图信息生成有意义的提示
+                    # 继续已有任务图时的降级：利用任务图信息生成有意义的提示
                     if getattr(self, '_is_resume_task', False):
                         try:
                             from zulong.tools.task_tools import get_active_task_graph as _get_tg_fb
@@ -2004,14 +2024,14 @@ class InferenceEngine:
                                     _fb_next = _fb_uncompleted[0]
                                     response += f"\n下一步需要执行：{_fb_next.label}（{_fb_next.desc or ''}）。"
                                 response += "\n由于模型响应超时，请稍后再说「继续」来推进任务。"
-                                logger.info(f"[FC][RESUME] 使用任务图信息生成降级回复")
+                                logger.info(f"[FC][ContinueTaskGraph] 使用任务图信息生成降级回复")
                         except Exception:
                             pass
 
                     if not response:
                         response = self._get_fallback_response(user_input)
                 
-                logger.info(f"[FC] 循环完成，共 {fc_turn} 轮")
+                logger.info(f"[L2] 工具循环完成，共 {fc_turn} 轮")
                 
                 # Phase B3: 正常完成，清理 InterruptHandler 生成状态
                 try:
@@ -2101,7 +2121,10 @@ class InferenceEngine:
                     logger.info(f"📝 已提取</think>后的回复 (共{len(parts)}个</think>标签)")
             
             raw_response = response
-            logger.info(f"🔍 [DEBUG] 模型原始输出 (Raw Output): {raw_response[:500]}...")
+            if getattr(self, '_response_is_fallback', False):
+                logger.info(f"🔍 [DEBUG] 降级回复 (Fallback Response): {raw_response[:500]}...")
+            else:
+                logger.info(f"🔍 [DEBUG] 模型原始输出 (Raw Output): {raw_response[:500]}...")
             logger.info(f"🔍 [DEBUG] 原始回复长度：{len(raw_response)} 字符")
             
             from zulong.utils.text_cleaner import clean_text_for_tts
@@ -2136,10 +2159,16 @@ class InferenceEngine:
                 source="InferenceEngine",
                 payload={
                     "text": response,
+                    "display_text": response,
+                    "raw_text": raw_response,
+                    "speech_text": cleaned_response,
                     "input_text": user_input,
                     "has_rag_context": rag_context is not None,
                     "history_length": len(self._recent_turns_cache),
                     "visual_context": None,
+                    "session_id": _current_session_id_var.get() or getattr(self, '_current_session_id', ""),
+                    "conversation_id": _current_session_id_var.get() or getattr(self, '_current_session_id', ""),
+                    "request_id": request_id,
                     "timestamp": time.time()
                 }
             )
@@ -2249,8 +2278,8 @@ class InferenceEngine:
                 # 不清空活跃任务图引用：
                 # 1. 数据已安全持久化到磁盘（suspended_tasks + graph_backups 双保险）
                 # 2. 如果下一条消息是同一任务的后续操作，可以直接访问活跃图
-                # 3. 如果是全新任务（COMPLEX），StartSessionTool 的防重复机制会处理
-                # 4. 如果是简单聊天（CHAT），不会触及任务图
+                # 3. 后续是否新建/复用任务图由 L1-B 工具预判和 L2 工具调用共同决定
+                # 4. 普通对话不会触及任务图
                 logger.info(
                     f"[Rule C] 已持久化未完成任务图: '{description}' "
                     f"({len(uncompleted)}/{len(leaf_nodes)} 未完成), task_id={task_id} "
@@ -2362,9 +2391,6 @@ class InferenceEngine:
             original_input = snapshot.metadata.get("user_input", snapshot.task_name)
             logger.info(f"[L2] 恢复上下文: {len(messages)} 条消息, 原始输入: '{original_input[:50]}'")
             
-            # 4. 运行 FC 循环
-            from zulong.l2.unified_fc_runner import run_fc_loop
-            
             with self._lock:
                 self._interrupt_flag = False
             
@@ -2388,15 +2414,32 @@ class InferenceEngine:
             vllm_model_id = LLM_MODEL_ID
             
             self._last_fc_messages = messages
-            response, fc_turn = run_fc_loop(
-                engine=self,
-                messages=messages,
+            decision = self._call_l2_once(
+                messages,
                 tool_definitions=tool_definitions,
                 vllm_model_id=vllm_model_id,
-                force_first_tool=None,
+                response_max_tokens=4096,
                 user_input=original_input,
-                is_resume=True,
             )
+            initial_tool_calls = decision.get("tool_calls_data") or []
+            response = decision.get("response_content") or ""
+            if initial_tool_calls:
+                from zulong.l2.fc_runner import run_fc_loop
+                response, fc_turn = run_fc_loop(
+                    engine=self,
+                    messages=messages,
+                    tool_definitions=tool_definitions,
+                    vllm_model_id=vllm_model_id,
+                    force_first_tool=False,
+                    user_input=original_input,
+                    is_resume=True,
+                    response_max_tokens=4096,
+                    initial_tool_calls_data=initial_tool_calls,
+                    initial_response_content=response,
+                )
+            else:
+                logger.info("[L2][RESUME] 单次决策未调用工具，跳过 FC 工具循环")
+                fc_turn = 0
             self._fc_turn_count = fc_turn
             
             # 中断检查
@@ -2427,8 +2470,12 @@ class InferenceEngine:
                     source="InferenceEngine/Resume",
                     payload={
                         "text": response,
+                        "display_text": response,
                         "input_text": original_input,
                         "resumed_task": True,
+                        "session_id": _current_session_id_var.get() or getattr(self, '_current_session_id', ""),
+                        "conversation_id": _current_session_id_var.get() or getattr(self, '_current_session_id', ""),
+                        "request_id": _current_request_id_var.get(),
                         "timestamp": time.time()
                     }
                 )
@@ -3708,7 +3755,7 @@ class InferenceEngine:
         except Exception as e:
             logger.error(f"生成简短回复失败：{e}")
             return "抱歉，我暂时无法回答。"
-        
+
         video_path = event.payload.get("video_path")
         duration = event.payload.get("duration")
         frame_count = event.payload.get("frame_count")

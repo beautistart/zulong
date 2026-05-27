@@ -40,14 +40,8 @@ evals/
 buf.yaml
 .clinerules/
 
-# Ignore all webview-ui files except the build directory (https://github.com/microsoft/vscode-webview-ui-toolkit-samples/blob/main/frameworks/hello-world-react-cra/.vscodeignore)
-webview-ui/src/**
-webview-ui/public/**
-webview-ui/index.html
-webview-ui/README.md
-webview-ui/package.json
-webview-ui/package-lock.json
-webview-ui/node_modules/**
+# VS Code 插件生产包只保留后台桥，不再携带 Webview 产物。
+webview-ui/**
 **/.gitignore
 
 # Ignore docs

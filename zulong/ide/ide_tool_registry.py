@@ -27,6 +27,16 @@ IDE_REMOTE_TOOLS = {
     "browser_action",
     "ask_followup_question",
     "attempt_completion",
+    # ===== VS Code 完整控制工具 (TSD v2.7 扩充) =====
+    "vscode_run_command",
+    "get_diagnostics",
+    "ask_user_input",
+    "ask_user_select_file",
+    "vscode_manage_extension",
+    "open_settings",
+    "open_problems",
+    # ===== 修复已有缺失 =====
+    "create_directory",
 }
 
 # 祖龙内部工具中与 IDE 远程工具功能重叠的（IDE 模式下禁用）
@@ -36,8 +46,8 @@ _ZULONG_TOOLS_DISABLED_IN_IDE_MODE = {
     "exec_read_file",
 }
 
-# RESUME 场景物理排除的内部工具（防止 LLM 重新创建/扩展已恢复的任务图）
-_RESUME_EXCLUDED_INTERNAL_TOOLS = {
+# 继续已有任务图时物理排除的内部工具（防止 LLM 重新创建/扩展已恢复的任务图）
+_CONTINUE_GRAPH_EXCLUDED_INTERNAL_TOOLS = {
     "task_create_plan",
     "task_add_node",
 }
@@ -130,7 +140,7 @@ _IDE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "文件路径（相对于工作目录）"},
+                    "path": {"type": "string", "description": "文件绝对路径"},
                     "start_line": {"type": "integer", "description": "起始行号（可选）"},
                     "end_line": {"type": "integer", "description": "结束行号（可选）"},
                 },
@@ -146,7 +156,7 @@ _IDE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "文件路径"},
+                    "path": {"type": "string", "description": "文件绝对路径"},
                     "content": {"type": "string", "description": "文件完整内容"},
                 },
                 "required": ["path", "content"],
@@ -161,7 +171,7 @@ _IDE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "文件路径"},
+                    "path": {"type": "string", "description": "文件绝对路径"},
                     "diff": {"type": "string", "description": "SEARCH/REPLACE 格式的替换块"},
                 },
                 "required": ["path", "diff"],
@@ -176,7 +186,7 @@ _IDE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "要删除的文件路径（相对于工作目录）"},
+                    "path": {"type": "string", "description": "要删除的文件绝对路径"},
                 },
                 "required": ["path"],
             },
@@ -208,7 +218,7 @@ _IDE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "搜索目录路径"},
+                    "path": {"type": "string", "description": "搜索目录绝对路径"},
                     "regex": {"type": "string", "description": "正则表达式模式"},
                     "file_pattern": {"type": "string", "description": "文件名 glob 模式（可选）"},
                 },
@@ -224,7 +234,7 @@ _IDE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "目录路径"},
+                    "path": {"type": "string", "description": "目录绝对路径"},
                     "recursive": {
                         "type": "boolean",
                         "description": "是否递归列出（默认 false）",
@@ -299,6 +309,123 @@ _IDE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
             },
         },
     },
+    # ===== VS Code 完整控制工具 (TSD v2.7 扩充) =====
+    {
+        "type": "function",
+        "function": {
+            "name": "vscode_run_command",
+            "description": "执行 VS Code 内置或扩展命令。可用于格式化代码、重构、运行测试、Git 操作、打开面板等。部分高风险命令需要用户审批。常用命令: editor.action.formatDocument, editor.action.organizeImports, workbench.action.tasks.build, git.stage 等。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "VS Code 命令 ID"},
+                    "args": {"type": "array", "items": {"type": "string"}, "description": "命令参数（可选）"},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_diagnostics",
+            "description": "获取工作区文件的 linter/编译器诊断信息（Error/Warning/Info/Hint）。修改代码后用于检查是否引入错误。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件绝对路径（可选，不传则返回所有文件）"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_user_input",
+            "description": "弹出 VS Code 输入框向用户询问信息。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "提示文字"},
+                    "placeholder": {"type": "string", "description": "占位文字（可选）"},
+                    "default_value": {"type": "string", "description": "默认值（可选）"},
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_user_select_file",
+            "description": "弹出系统文件/文件夹选择对话框，让用户选择路径。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "对话框标题"},
+                    "type": {"type": "string", "enum": ["file", "folder"], "description": "选择文件还是文件夹"},
+                },
+                "required": ["title", "type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "vscode_manage_extension",
+            "description": "管理 VS Code 扩展（安装/卸载/启用/禁用/查询列表）。高风险操作需要用户审批。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["install", "uninstall", "enable", "disable", "list"], "description": "操作类型"},
+                    "extension_id": {"type": "string", "description": "扩展 ID（install/uninstall/enable/disable 时必填）"},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_settings",
+            "description": "打开 VS Code 设置面板。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "enum": ["user", "workspace"], "description": "用户设置或工作区设置"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_problems",
+            "description": "打开 VS Code 问题面板，展示诊断结果。",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    # ===== 修复已有缺失 =====
+    {
+        "type": "function",
+        "function": {
+            "name": "create_directory",
+            "description": "创建工作目录。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "目录绝对路径"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
 ]
 
 
@@ -351,45 +478,27 @@ class IDEToolRegistry:
         logger.warning(f"[IDEToolRegistry] 未找到远程工具: {tool_name}")
         return False
 
-    def get_combined_tool_definitions_for_intent(
-        self, intent: str = "complex"
+    def get_combined_tool_definitions_for_policy(
+        self, task_graph_policy: str = "none"
     ) -> List[Dict[str, Any]]:
-        """根据意图返回过滤后的合并工具定义
-
-        Args:
-            intent: "chat" 返回基础工具（记忆/上下文）;
-                   "complex" 返回全部工具;
-                   "resume" 排除 task_create_plan/task_add_node
-
-        Returns:
-            过滤后的 OpenAI FC tool schema 列表
-        """
-        # CHAT意图：简单对话，仅加载基础工具（记忆相关 + 网络搜索）
-        if intent == "chat":
-            # CHAT基础工具：记忆检索/读取/保存/发现相关 + 网络搜索
-            _CHAT_BASE_TOOLS = {
-                "recall_memory",      # 记忆检索
-                "read_memory_node",   # 读取记忆节点
-                "save_memory_note",   # 保存记忆
-                "discover_related",   # 发现相关内容
-                "web_search",         # 网络搜索
-            }
-            internal = self._get_filtered_internal_tools(
-                extra_include=_CHAT_BASE_TOOLS)
-            # CHAT不加载远程IDE工具
-            logger.info(
-                f"[IDEToolRegistry] 意图 {intent} 工具定义: "
-                f"内部={len(internal)}, 远程=0, 总计={len(internal)}"
-            )
-            return internal
-        
-        extra_exclude = _RESUME_EXCLUDED_INTERNAL_TOOLS if intent == "resume" else None
-        internal = self._get_filtered_internal_tools(extra_exclude=extra_exclude)
+        """按 L1-B 任务图策略返回工具定义。"""
+        task_graph_policy = (task_graph_policy or "none").lower()
+        extra_exclude = (
+            _CONTINUE_GRAPH_EXCLUDED_INTERNAL_TOOLS
+            if task_graph_policy in {"reuse", "inspect", "continue"}
+            else None
+        )
+        internal = self._get_filtered_internal_tools(
+            extra_exclude=extra_exclude,
+        )
         remote = list(_IDE_TOOL_SCHEMAS)
         combined = internal + remote
         logger.info(
-            f"[IDEToolRegistry] 意图 {intent} 工具定义: "
-            f"内部={len(internal)}, 远程={len(remote)}, 总计={len(combined)}"
+            "[IDEToolRegistry] 策略工具定义: policy=%s, 内部=%s, 远程=%s, 总计=%s",
+            task_graph_policy,
+            len(internal),
+            len(remote),
+            len(combined),
         )
         return combined
 
@@ -400,8 +509,8 @@ class IDEToolRegistry:
         """获取过滤后的祖龙内部工具 schema
 
         IDE 模式下禁用与远程工具功能重叠的执行工具。
-        extra_exclude 用于 RESUME 场景排除 task_create_plan/task_add_node。
-        extra_include 用于 CHAT 场景仅加载指定工具。
+        extra_exclude 用于继续已有任务图时排除 task_create_plan/task_add_node。
+        extra_include 用于显式工具白名单。
         """
         if not self.tool_engine:
             return []
@@ -410,19 +519,19 @@ class IDEToolRegistry:
         for name, tool in self.tool_engine.registry.tools.items():
             if not tool.enabled:
                 continue
-            # CHAT模式：仅加载extra_include中的工具
+            # 显式白名单：仅加载 extra_include 中的工具
             if extra_include is not None:
                 if name not in extra_include:
                     continue
             else:
-                # 非CHAT模式的正常过滤
+                # 正常过滤
                 if name in _ZULONG_TOOLS_DISABLED_IN_IDE_MODE:
                     logger.debug(f"[IDEToolRegistry] 跳过 IDE 模式禁用工具: {name}")
                     continue
                 if name in IDE_REMOTE_TOOLS:
                     continue
                 if extra_exclude and name in extra_exclude:
-                    logger.info(f"[IDEToolRegistry] RESUME 排除工具: {name}")
+                    logger.info(f"[IDEToolRegistry] 继续任务图策略排除工具: {name}")
                     continue
 
             # 使用缓存获取schema
@@ -438,7 +547,7 @@ class IDEToolRegistry:
             except Exception as e:
                 logger.warning(f"[IDEToolRegistry] 工具 {name} schema 获取失败: {e}")
 
-        # CHAT模式不加载CRUD工具
+        # 显式白名单模式不加载 CRUD 工具
         if extra_include is None:
             # 追加 TaskGraph CRUD 工具 schema
             try:

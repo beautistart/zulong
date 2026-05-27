@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
+from zulong.utils.device import resolve_device
+
 
 @dataclass
 class KVPoolConfig:
@@ -149,7 +151,7 @@ class HardwareAwareKVPool:
         self.max_blocks = self.config.max_blocks
         
         self.is_unified_memory = self._detect_unified_memory()
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = resolve_device("auto", prefer_gpu=True)
         
         if self.is_unified_memory:
             logger.info("[HardwareAwareKVPool] 检测到统一内存架构 (APU)，启用 Zero-Copy 模式")
@@ -169,7 +171,10 @@ class HardwareAwareKVPool:
             True 如果是 APU 统一内存架构，False 如果是独立显卡
         """
         if not torch.cuda.is_available():
-            logger.warning("[HardwareAwareKVPool] CUDA 不可用，将使用 CPU")
+            if resolve_device("auto", prefer_gpu=True) == "mps":
+                logger.info("[HardwareAwareKVPool] 检测到 Apple Silicon 统一内存架构")
+                return True
+            logger.warning("[HardwareAwareKVPool] GPU 不可用，将使用 CPU")
             return False
         
         try:

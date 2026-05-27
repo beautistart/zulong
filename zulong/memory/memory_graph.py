@@ -6,12 +6,12 @@
 # 通过加权 BFS 扩散激活实现跨类型上下文发现与图注意力。
 #
 # 核心能力:
-# - 异构节点/边类型图 (NetworkX DiGraph)
+# - 异构节点/边类型图
 # - BFS 扩散激活算法 (从任意种子节点追溯全局关联)
 # - 赫布学习 (共激活增强边权)
 # - 突触修剪 (艾宾浩斯衰减 + 弱连接移除)
 # - 语义边自动发现 (FAISS 侧车索引)
-# - JSON 持久化 (跨会话保留图结构)
+# - 运行态使用分片 Hybrid 持久化；本文件的 NetworkX 类仅作兼容实现
 
 import logging
 import json
@@ -23,6 +23,7 @@ import asyncio
 import threading
 import atexit
 from collections import deque
+from queue import Empty, Queue
 from typing import Dict, Any, List, Optional, Tuple, Set
 from dataclasses import dataclass, field
 from enum import Enum
@@ -530,6 +531,17 @@ class MemoryGraph:
         # 变更追踪 (增量 delta 推送到前端)
         self._pending_changes: List[Dict[str, Any]] = []
 
+        # 自动 embedding / 语义边发现队列。
+        # 节点进入 MemoryGraph 时必须实时触发语义处理，但向量模型和邻居发现
+        # 不能阻塞主会话线程，所以这里用后台工作线程串行处理。
+        self._embedding_queue = Queue()
+        self._embedding_queued: Set[str] = set()
+        self._embedding_queue_lock = threading.Lock()
+        self._embedding_worker_stop = threading.Event()
+        self._embedding_worker_thread: Optional[threading.Thread] = None
+        self._summary_queue = Queue()
+        self._summary_queued: Set[str] = set()
+
         # 异步修剪控制
         self._running = False
         self._prune_task: Optional[asyncio.Task] = None
@@ -577,6 +589,8 @@ class MemoryGraph:
 
         # P2-3: atexit 安全网 — 进程退出时强制刷盘防抖窗口内未保存的变更
         atexit.register(self._atexit_flush)
+
+        self._start_embedding_worker()
 
         # P1-5: 启动异步修剪循环（尝试在现有事件循环中调度）
         self._try_start_prune_loop()
@@ -1869,6 +1883,13 @@ class MemoryGraph:
             self._idle_review_task.cancel()
         logger.info("[MemoryGraph] 修剪循环已停止")
 
+    def stop_background_workers(self):
+        """停止 MemoryGraph 后台工作线程。"""
+        self._embedding_worker_stop.set()
+        if self._embedding_worker_thread and self._embedding_worker_thread.is_alive():
+            self._embedding_worker_thread.join(timeout=1.0)
+        logger.info("[MemoryGraph] embedding 后台线程已停止")
+
     # ============================================================
     # LLM 剪枝守卫
     # ============================================================
@@ -2025,24 +2046,100 @@ class MemoryGraph:
 
         提取节点文本内容 → EmbeddingModelManager → set_embedding →
         discover_semantic_neighbors（自动创建 SEMANTIC 边）。
-        同步执行，失败静默降级。
+        实时入队，后台线程处理，失败静默降级。
         """
+        # MemoryGraph 是唯一长期存储，任何对话节点都要进入语义处理链路。
+        # 旧的 skip_auto_embedding 只作为历史兼容字段，不再跳过。
         if np is None:
             return
 
         # 提取有意义的文本内容
-        text = (
-            node.metadata.get("content")
-            or node.metadata.get("goal")
-            or node.metadata.get("desc")
-            or node.metadata.get("summary")
-            or node.label
-        )
+        text = self._extract_embedding_text(node)
         if not text or len(str(text).strip()) < 10:
             return  # 内容太短，不值得向量化
 
         # 已有 embedding 则跳过
         if node.node_id in self._embeddings:
+            return
+
+        self._enqueue_embedding(node.node_id)
+
+    def _extract_embedding_text(self, node: GraphNode) -> str:
+        text = (
+            node.metadata.get("content")
+            or node.metadata.get("goal")
+            or node.metadata.get("user_text")
+            or node.metadata.get("bot_text")
+            or node.metadata.get("topic_summary")
+            or node.metadata.get("desc")
+            or node.metadata.get("summary")
+            or node.label
+        )
+        return str(text or "")
+
+    def _enqueue_embedding(self, node_id: str) -> None:
+        with self._embedding_queue_lock:
+            if node_id in self._embedding_queued:
+                return
+            self._embedding_queued.add(node_id)
+        self._embedding_queue.put(node_id)
+        self._start_embedding_worker()
+
+    def _enqueue_summary_index(self, node_id: str, summary_text: str) -> None:
+        if not summary_text:
+            return
+        with self._embedding_queue_lock:
+            if node_id in self._summary_queued:
+                return
+            self._summary_queued.add(node_id)
+        self._summary_queue.put((node_id, summary_text))
+        self._start_embedding_worker()
+
+    def _start_embedding_worker(self) -> None:
+        if self._embedding_worker_thread and self._embedding_worker_thread.is_alive():
+            return
+        self._embedding_worker_stop.clear()
+        self._embedding_worker_thread = threading.Thread(
+            target=self._embedding_worker_loop,
+            name="MemoryGraphEmbeddingWorker",
+            daemon=True,
+        )
+        self._embedding_worker_thread.start()
+
+    def _embedding_worker_loop(self) -> None:
+        while not self._embedding_worker_stop.is_set():
+            try:
+                node_id, summary_text = self._summary_queue.get_nowait()
+                try:
+                    self._summary_index.add_summary(node_id, summary_text)
+                finally:
+                    with self._embedding_queue_lock:
+                        self._summary_queued.discard(node_id)
+                    self._summary_queue.task_done()
+                continue
+            except Empty:
+                pass
+            try:
+                node_id = self._embedding_queue.get(timeout=0.5)
+            except Empty:
+                continue
+            try:
+                self._embed_node_now(node_id)
+            finally:
+                with self._embedding_queue_lock:
+                    self._embedding_queued.discard(node_id)
+                self._embedding_queue.task_done()
+
+    def _embed_node_now(self, node_id: str) -> None:
+        if np is None:
+            return
+        node = self.get_node(node_id)
+        if node is None:
+            return
+        if node_id in self._embeddings:
+            return
+        text = self._extract_embedding_text(node)
+        if not text or len(text.strip()) < 10:
             return
 
         try:
@@ -2051,14 +2148,14 @@ class MemoryGraph:
                 return
             vector = emb_mgr.encode_document(str(text)[:512])
             if vector is not None:
-                self.set_embedding(node.node_id, vector)
+                self.set_embedding(node_id, vector)
                 # 有足够多节点后再做语义发现（图太小时无意义）
                 if len(self._embeddings) >= 3:
                     self.discover_semantic_neighbors(
-                        node.node_id, top_k=3, threshold=0.75
+                        node_id, top_k=3, threshold=0.75
                     )
         except Exception as e:
-            logger.debug(f"[MemoryGraph] 自动 embedding 失败 {node.node_id}: {e}")
+            logger.debug(f"[MemoryGraph] 自动 embedding 失败 {node_id}: {e}")
 
     def set_embedding(self, node_id: str, embedding) -> bool:
         """设置节点的 embedding 向量"""
@@ -2135,7 +2232,15 @@ class MemoryGraph:
 
         适配器在 finalize_round() / EpisodeAdapter.sync() 时调用。
         """
-        return self._summary_index.add_summary(node_id, summary_text)
+        if not summary_text:
+            return False
+        # 关键词文本立刻可检索，向量索引后台处理，避免用户会话被 embedding 阻塞。
+        try:
+            self._summary_index._text_index[node_id] = summary_text
+        except Exception:
+            pass
+        self._enqueue_summary_index(node_id, summary_text)
+        return True
 
     def search_summaries(
         self,
@@ -2749,6 +2854,7 @@ class MemoryGraph:
 
     def _atexit_flush(self):
         """P2-3: 进程退出安全网 — 取消挂起的定时器并立即刷盘"""
+        self._embedding_worker_stop.set()
         if self._auto_save_timer is not None:
             self._auto_save_timer.cancel()
             self._auto_save_timer = None
@@ -2760,161 +2866,16 @@ class MemoryGraph:
                 logger.error(f"[MemoryGraph] atexit: 刷盘失败: {e}")
 
     def save(self) -> bool:
-        """保存记忆图谱到磁盘（原子写入：temp + rename，防止崩溃导致数据损坏）"""
-        with self._save_lock:
-            try:
-                filepath = os.path.join(self.persist_path, "memory_graph.json")
-                temp_filepath = filepath + ".tmp"
-                backup_filepath = filepath + ".bak"
-
-                data = {
-                    "version": self._SCHEMA_VERSION,
-                    "nodes": {
-                        nid: node.to_dict() for nid, node in self._nodes.items()
-                    },
-                    "edges": [
-                        {"source": u, "target": v, **d}
-                        for u, v, d in self._graph.edges(data=True)
-                    ],
-                    "embeddings": self._serialize_embeddings(),
-                    "coactivation_counter": {
-                        f"{a}||{b}": count
-                        for (a, b), count in self._coactivation_counter.items()
-                    },
-                    "meta": {
-                        "saved_at": time.time(),
-                        "node_count": len(self._nodes),
-                        "edge_count": self._graph.number_of_edges(),
-                        "stats": self._stats,
-                        "last_focus_context": self._last_focus_context,
-                    },
-                }
-
-                # Step 1: 写入临时文件（P1-1: 添加 fsync 确保数据刷入磁盘）
-                with open(temp_filepath, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
-                    f.flush()
-                    os.fsync(f.fileno())
-
-                # Step 2: 备份当前文件（安全网）
-                if os.path.exists(filepath):
-                    try:
-                        if os.path.exists(backup_filepath):
-                            os.remove(backup_filepath)
-                        os.rename(filepath, backup_filepath)
-                    except OSError:
-                        pass  # 备份失败不阻塞保存
-
-                # Step 3: 原子替换（同卷 rename 在 NTFS/POSIX 上是原子的）
-                os.replace(temp_filepath, filepath)
-
-                # Step 4: 保存 FAISS 摘要侧车索引（独立于 JSON）
-                try:
-                    sidecar_path = os.path.join(self.persist_path, "summary_sidecar")
-                    self._summary_index.save(sidecar_path)
-                except Exception as e:
-                    logger.warning(f"[MemoryGraph] FAISS 侧车索引保存失败: {e}")
-
-                self._dirty = False
-                self._last_save_time = time.time()
-                logger.info(
-                    f"[MemoryGraph] 已保存: {len(self._nodes)} 节点, "
-                    f"{self._graph.number_of_edges()} 边"
-                )
-                return True
-            except Exception as e:
-                logger.error(f"[MemoryGraph] 保存失败: {e}")
-                return False
+        """旧 NetworkX 单 JSON 持久化已废弃。"""
+        logger.warning("[MemoryGraph] NetworkX 单 JSON 保存已废弃，运行态应使用分片 Hybrid 后端")
+        self._dirty = False
+        return False
 
     _SCHEMA_VERSION = "1.0"
 
     def _load(self) -> bool:
-        """从磁盘加载记忆图谱（支持 .bak 崩溃恢复）"""
-        filepath = os.path.join(self.persist_path, "memory_graph.json")
-        backup_filepath = filepath + ".bak"
-
-        # 尝试主文件 -> 备份文件
-        for candidate, label in [(filepath, "主文件"), (backup_filepath, "备份文件")]:
-            if not os.path.exists(candidate):
-                continue
-            try:
-                with open(candidate, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-
-                # 版本号校验
-                file_version = data.get("version", "unknown")
-                if file_version != self._SCHEMA_VERSION:
-                    logger.warning(
-                        f"[MemoryGraph] {label}版本不匹配: 文件={file_version}, "
-                        f"当前={self._SCHEMA_VERSION}，将尝试兼容加载"
-                    )
-
-                # 恢复节点
-                for nid, ndata in data.get("nodes", {}).items():
-                    node = GraphNode.from_dict(ndata)
-                    self._nodes[nid] = node
-                    self._graph.add_node(nid, **node.to_dict())
-
-                # P1-4: 重建地址反向索引
-                self._address_index.clear()
-                for nid, node in self._nodes.items():
-                    self._index_node_address(nid, node.metadata)
-
-                # 恢复边（验证节点存在性，跳过孤儿边）
-                _skipped_edges = 0
-                for edge in data.get("edges", []):
-                    edge_copy = dict(edge)
-                    source = edge_copy.pop("source")
-                    target = edge_copy.pop("target")
-                    if source not in self._nodes or target not in self._nodes:
-                        _skipped_edges += 1
-                        continue
-                    self._graph.add_edge(source, target, **edge_copy)
-                if _skipped_edges:
-                    logger.warning(
-                        f"[MemoryGraph] 跳过 {_skipped_edges} 条孤儿边（引用不存在的节点）"
-                    )
-
-                # 恢复 embeddings
-                self._deserialize_embeddings(data.get("embeddings", {}))
-
-                # 恢复共激活计数器
-                for key, count in data.get("coactivation_counter", {}).items():
-                    parts = key.split("||")
-                    if len(parts) == 2:
-                        self._coactivation_counter[(parts[0], parts[1])] = count
-
-                # 恢复统计
-                meta = data.get("meta", {})
-                self._stats = meta.get("stats", self._stats)
-
-                # 恢复焦点上下文（用于重启后恢复注意力）
-                self._last_focus_context = meta.get("last_focus_context")
-                if self._last_focus_context:
-                    restored_ids = self._last_focus_context.get("active_node_ids", [])
-                    self._active_node_ids = set(restored_ids)
-
-                logger.info(
-                    f"[MemoryGraph] 已加载({label}): "
-                    f"{len(self._nodes)} 节点, {self._graph.number_of_edges()} 边"
-                )
-
-                # 尝试加载 FAISS 摘要侧车索引
-                try:
-                    sidecar_path = os.path.join(self.persist_path, "summary_sidecar")
-                    self._summary_index.load(sidecar_path)
-                except Exception as e:
-                    logger.warning(f"[MemoryGraph] FAISS 侧车索引加载失败(不影响图谱): {e}")
-
-                return True
-            except (json.JSONDecodeError, KeyError, ValueError) as e:
-                logger.warning(f"[MemoryGraph] {label}损坏({e})，尝试备份...")
-                continue
-            except Exception as e:
-                logger.error(f"[MemoryGraph] 加载{label}失败: {e}")
-                continue
-
-        logger.info("[MemoryGraph] 无可用数据，从空图谱开始")
+        """旧 NetworkX 单 JSON 加载已废弃。"""
+        logger.info("[MemoryGraph] 跳过旧单 JSON 加载；运行态由分片 Hybrid 后端负责持久化")
         return False
 
     def _sanitize_association_edges(self):
@@ -3466,6 +3427,110 @@ class MemoryGraph:
             "thought_view": self.get_thought_view_data(),
         }
 
+    def take_snapshot(self) -> Dict[str, Any]:
+        """捕获当前图谱快照，供 get_diff() 比较。
+
+        返回仅包含节点/边引用信息的轻量快照，不深拷贝完整数据。
+
+        Returns:
+            {"node_ids": set, "edges": {(src, dst, weight), ...}}
+        """
+        node_ids = set(self._nodes.keys())
+        edges = set()
+        for src, dst, data in self._graph.edges(data=True):
+            try:
+                weight = float(data.get("weight", 1.0))
+            except (ValueError, TypeError):
+                weight = 1.0
+            edges.add((src, dst, weight))
+        return {"node_ids": node_ids, "edges": edges}
+
+    def get_diff(
+        self,
+        from_snapshot: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """计算从快照到当前状态的增量变化 (TSD 23.6.1-C)。
+
+        与 take_snapshot() 配合使用，在任务开始前拍快照，
+        任务完成后调用此方法获取增量。
+
+        Args:
+            from_snapshot: take_snapshot() 返回的快照
+
+        Returns:
+            {
+                "created": int,        # 新增节点数
+                "strengthened": int,   # 权重增强的边数
+                "pruned": int,         # 被移除的节点数
+                "new_node_ids": list,  # 新增节点 ID 列表
+                "strengthened_edges": list,  # 强化边列表
+                "pruned_node_ids": list,     # 移除节点 ID 列表
+            }
+        """
+        old_node_ids: set = from_snapshot.get("node_ids", set())
+        old_edges: set = from_snapshot.get("edges", set())
+        current_node_ids = set(self._nodes.keys())
+
+        # 新增节点
+        created_ids = current_node_ids - old_node_ids
+        created_count = len(created_ids)
+
+        # 移除节点
+        pruned_ids = old_node_ids - current_node_ids
+        pruned_count = len(pruned_ids)
+
+        # 构建当前边集合
+        current_edges: Dict[tuple, float] = {}
+        for src, dst, data in self._graph.edges(data=True):
+            try:
+                weight = float(data.get("weight", 1.0))
+            except (ValueError, TypeError):
+                weight = 1.0
+            current_edges[(src, dst)] = weight
+
+        # 旧边映射
+        old_edge_map: Dict[tuple, float] = {
+            (s, d): w for s, d, w in old_edges
+        }
+
+        # 强化边：已存在且权重增大的边
+        strengthened_edges = []
+        for key, new_weight in current_edges.items():
+            old_weight = old_edge_map.get(key, 0.0)
+            if new_weight > old_weight + 0.01:
+                strengthened_edges.append({
+                    "source": key[0],
+                    "target": key[1],
+                    "old_weight": round(old_weight, 4),
+                    "new_weight": round(new_weight, 4),
+                })
+
+        # 新增边
+        new_edge_keys = set(current_edges.keys()) - old_edge_map.keys()
+        for key in new_edge_keys:
+            strengthened_edges.append({
+                "source": key[0],
+                "target": key[1],
+                "old_weight": 0.0,
+                "new_weight": round(current_edges[key], 4),
+            })
+
+        strengthened_count = len(strengthened_edges)
+
+        logger.info(
+            "[MemoryGraph] diff: +%d nodes, %d strengthened edges, -%d pruned",
+            created_count, strengthened_count, pruned_count,
+        )
+
+        return {
+            "created": created_count,
+            "strengthened": strengthened_count,
+            "pruned": pruned_count,
+            "new_node_ids": sorted(created_ids),
+            "strengthened_edges": strengthened_edges[:20],  # 上限 20 条
+            "pruned_node_ids": sorted(pruned_ids),
+        }
+
     def get_thought_view_data(self) -> Dict[str, Any]:
         """为思维可视化浮动窗口提供数据：活跃节点 + 1跳邻居 + 连接边"""
         active_ids = set(self._active_node_ids)
@@ -3547,18 +3612,16 @@ class MemoryGraph:
 # 便捷访问函数
 # ============================================================
 
-def get_memory_graph(persist_path: str = None) -> MemoryGraph:
-    """获取 MemoryGraph 单例（P3-23: 优先从配置读取路径）"""
-    if persist_path is None:
-        try:
-            import yaml
-            import os
-            cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    "..", "..", "config", "zulong_config.yaml")
-            if os.path.exists(cfg_path):
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    cfg = yaml.safe_load(f) or {}
-                persist_path = (cfg.get("memory") or {}).get("persist_path") or "./data/memory_graph"
-        except Exception:
-            persist_path = "./data/memory_graph"
-    return MemoryGraph(persist_path=persist_path)
+def get_memory_graph(persist_path: str = None):
+    """获取记忆图谱单例。
+
+    运行态统一返回分片 Hybrid 后端，避免 WebSocket 预请求在 Launcher Full
+    启动前先创建空的 NetworkX JSON 后端。
+    """
+    if MemoryGraph._instance is not None:
+        return MemoryGraph._instance
+    from zulong.memory.memory_graph_factory import create_memory_graph
+
+    graph = create_memory_graph(persist_path=persist_path or "./data/memory_graph")
+    MemoryGraph._instance = graph
+    return graph

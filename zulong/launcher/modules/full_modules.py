@@ -58,7 +58,7 @@ class L1BGatekeeperModule(Module):
     name = "l1b_gatekeeper"
     display_name = "L1-B 调度网关"
     dependencies = ["config"]
-    mode_tags: Set[str] = {"full"}
+    mode_tags: Set[str] = {"core"}
 
     async def start(self) -> None:
         self.progress_message = "正在注册 L1-B 调度网关..."

@@ -183,18 +183,12 @@ class InterruptController:
         # 模拟生成过程
         response = ""
         if "故事" in text:
-            # 模拟长时间生成（分段任务）
-            total_steps = 5
-            for i in range(total_steps):
-                logger.info(f"Generating step {i+1}/{total_steps}...")
-                time.sleep(0.5)
-                
-            # 生成故事响应
-            response = "这是一个火星探险的故事...（故事内容）"
+            logger.warning("InterruptController Mock 故事路径被触发，拒绝生成硬编码会话回复")
+            response = "系统当前出问题了，InterruptController 仍处于 Mock 路径，无法正常回复。"
         else:
             time.sleep(1)
-            # 生成通用响应
-            response = f"我听到了您说：'{text}'。这是一个很好的输入，但我目前的 Mock 模式还只能回答特定关键词（如：你好、故事、状态、睡觉、救命）。"
+            logger.warning("InterruptController Mock 通用路径被触发，拒绝生成硬编码会话回复")
+            response = "系统当前出问题了，InterruptController 仍处于 Mock 路径，无法正常回复。"
         
         # 发布 L2 输出事件
         from zulong.core.event_bus import event_bus

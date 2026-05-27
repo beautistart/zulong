@@ -18,8 +18,7 @@ export { getProviderLabel }
 function isProviderConfigured(providerId: string, config: ApiConfiguration): boolean {
 	switch (providerId) {
 		case "zulong":
-			// Check if user has Zulong API key or Zulong account auth data stored
-			return !!(config.zulongApiKey ?? config["zulong:zulongAccountId"])
+			return true // Zulong always has a default server URL
 		case "anthropic":
 			return !!config.apiKey
 		case "openrouter":
@@ -112,8 +111,6 @@ function isProviderConfigured(providerId: string, config: ApiConfiguration): boo
 			return !!config.claudeCodePath
 		case "oca":
 			return !!config.ocaBaseUrl
-		case "zulong":
-			return true // Zulong always has a default server URL
 		default:
 			return false
 	}

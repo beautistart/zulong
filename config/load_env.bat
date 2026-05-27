@@ -8,6 +8,12 @@ echo ================================================================
 echo   祖龙系统 - 环境变量加载器
 echo ================================================================
 
+REM ====== 项目路径配置（所有模块从此派生）======
+REM ZULONG_HOME: 项目根目录（自动检测脚本所在目录的父目录）
+for %%I in ("%~dp0..") do set "ZULONG_HOME=%%~fI"
+set ZULONG_MODEL_BASE_DIR=%ZULONG_HOME%\models
+set ZULONG_DATA_DIR=%ZULONG_HOME%\data
+
 REM 设置默认环境变量
 set ZULONG_ENV=production
 set ZULONG_LLM_BACKEND=ollama

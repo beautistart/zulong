@@ -16,6 +16,49 @@ from .base import BaseTool, ToolRequest, ToolResult, ToolCategory
 logger = logging.getLogger(__name__)
 
 
+def _iter_code_symbol_nodes(memory_graph, node_type_enum) -> List[tuple]:
+    """兼容单体/分片 MemoryGraph，返回 [(node_id, node_like)]。"""
+    results = []
+    if memory_graph is None:
+        return results
+
+    if hasattr(memory_graph, "_nodes"):
+        expected = getattr(node_type_enum, "value", node_type_enum)
+        for node_id, node in memory_graph._nodes.items():
+            node_type = getattr(node, "node_type", None)
+            node_type_value = getattr(node_type, "value", node_type)
+            if node_type_value == expected:
+                results.append((node_id, node))
+        return results
+
+    get_nodes_by_type = getattr(memory_graph, "get_nodes_by_type", None)
+    if callable(get_nodes_by_type):
+        try:
+            nodes = get_nodes_by_type(getattr(node_type_enum, "value", node_type_enum))
+        except TypeError:
+            nodes = get_nodes_by_type(node_type_enum)
+        for node in nodes or []:
+            node_id = getattr(node, "node_id", None) or getattr(node, "id", None)
+            if node_id:
+                results.append((node_id, node))
+    return results
+
+
+def _node_metadata(node) -> Dict[str, Any]:
+    meta = getattr(node, "metadata", None)
+    return meta if isinstance(meta, dict) else {}
+
+
+def _required_tree_sitter_packages(lang: str) -> List[str]:
+    mapping = {
+        "python": ["tree_sitter", "tree_sitter_python"],
+        "javascript": ["tree_sitter", "tree_sitter_javascript"],
+        "typescript": ["tree_sitter", "tree_sitter_typescript"],
+        "tsx": ["tree_sitter", "tree_sitter_typescript"],
+    }
+    return mapping.get(lang, ["tree_sitter"])
+
+
 class SearchCodeSymbolsTool(BaseTool):
     """搜索代码符号
 
@@ -90,10 +133,8 @@ class SearchCodeSymbolsTool(BaseTool):
             # 搜索匹配节点
             results = []
             query_lower = query.lower()
-            for node_id, node in mg._nodes.items():
-                if node.node_type != NodeType.CODE_SYMBOL:
-                    continue
-                meta = node.metadata or {}
+            for node_id, node in _iter_code_symbol_nodes(mg, NodeType.CODE_SYMBOL):
+                meta = _node_metadata(node)
 
                 # kind 过滤
                 if kind_filter and meta.get("kind") != kind_filter:
@@ -104,10 +145,11 @@ class SearchCodeSymbolsTool(BaseTool):
                     continue
 
                 # 名称匹配（标签 = qualified_name）
-                label_lower = node.label.lower()
+                label = getattr(node, "label", "") or ""
+                label_lower = label.lower()
                 if query_lower in label_lower or query_lower in node_id.lower():
                     results.append({
-                        "name": node.label,
+                        "name": label,
                         "kind": meta.get("kind", ""),
                         "file": meta.get("file_path", ""),
                         "lines": f"{meta.get('start_line', '?')}-{meta.get('end_line', '?')}",
@@ -208,11 +250,10 @@ class GetSymbolContextTool(BaseTool):
             target_id = None
             name_lower = symbol_name.lower()
 
-            for nid, node in mg._nodes.items():
-                if node.node_type != NodeType.CODE_SYMBOL:
-                    continue
-                if node.label.lower() == name_lower:
-                    meta = node.metadata or {}
+            for nid, node in _iter_code_symbol_nodes(mg, NodeType.CODE_SYMBOL):
+                label = getattr(node, "label", "") or ""
+                if label.lower() == name_lower:
+                    meta = _node_metadata(node)
                     if file_filter and file_filter not in meta.get("file_path", ""):
                         continue
                     target_node = node
@@ -373,11 +414,10 @@ class GetImpactAnalysisTool(BaseTool):
             # 查找目标节点
             target_id = None
             name_lower = symbol_name.lower()
-            for nid, node in mg._nodes.items():
-                if node.node_type != NodeType.CODE_SYMBOL:
-                    continue
-                if node.label.lower() == name_lower:
-                    meta = node.metadata or {}
+            for nid, node in _iter_code_symbol_nodes(mg, NodeType.CODE_SYMBOL):
+                label = getattr(node, "label", "") or ""
+                if label.lower() == name_lower:
+                    meta = _node_metadata(node)
                     if file_filter and file_filter not in meta.get("file_path", ""):
                         continue
                     target_id = nid
@@ -562,7 +602,12 @@ class IndexCodeFileTool(BaseTool):
         if not source_content:
             return self._create_result(
                 success=False,
-                error=f"无法获取文件内容: {file_path}（请通过 source_content 参数传入）",
+                error=f"无法获取文件内容: {file_path}（请通过 source_content 参数传入，或先调用 read_file）",
+                data={
+                    "file_path": file_path,
+                    "failure_reason": "missing_source_content",
+                    "recommended_fallback": "read_file",
+                },
                 execution_time=time.time() - start,
                 request_id=request.request_id,
             )
@@ -609,6 +654,13 @@ class IndexCodeFileTool(BaseTool):
             return self._create_result(
                 success=False,
                 error=f"Tree-sitter {lang} 解析器不可用（需安装 tree-sitter 和对应语言包）",
+                data={
+                    "file_path": file_path,
+                    "language": lang,
+                    "failure_reason": "parser_unavailable",
+                    "required_packages": _required_tree_sitter_packages(lang),
+                    "recommended_fallback": "read_file",
+                },
                 execution_time=time.time() - start,
                 request_id=request.request_id,
             )
@@ -636,7 +688,7 @@ class IndexCodeFileTool(BaseTool):
         local_node_ids = {s.node_id for s in result.symbols}
 
         global_sym_index = {}
-        for nid, node in mg._nodes.items():
+        for nid, node in _iter_code_symbol_nodes(mg, NodeType.CODE_SYMBOL):
             if node.node_type == NodeType.CODE_SYMBOL:
                 global_sym_index[node.label] = nid
                 short = node.label.rsplit(".", 1)[-1]
@@ -792,12 +844,13 @@ class IndexProjectTool(BaseTool):
         summary_only = params.get("summary_only", False)
 
         if not root_dir:
-            return self._create_result(
-                success=False,
-                error="缺少 root_dir 参数",
-                execution_time=time.time() - start,
-                request_id=request.request_id,
-            )
+            try:
+                from zulong.tools.task_tools import get_active_workspace_dir
+                root_dir = (get_active_workspace_dir() or "").strip()
+            except Exception:
+                root_dir = ""
+            if not root_dir:
+                root_dir = "."
 
         # 路径解析
         from pathlib import Path

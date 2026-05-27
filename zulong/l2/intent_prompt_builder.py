@@ -1,202 +1,23 @@
 # File: zulong/l2/intent_prompt_builder.py
-# 两阶段 FC 意图分类 — 提示词构建器与工具过滤
+# 统一主链提示词构建器
 #
-# Round 1: 极简分类提示 + start_session 工具 → 模型被强制输出意图标签
-# Round 2: 场景化提示 + 过滤后的工具集 → 模型在受控范围内自由行动
+# 当前 TSD 主链:
+# 用户事件 -> L1-B（工具预判 + 上下文/记忆检索 + 工具包打包）-> L2（推理）
 #
-# 设计原则：固化骨架 + 自由决策
-# - 基础设施操作由代码确定性执行（创建图谱 / 恢复任务 / 过滤工具）
-# - 内容决策由模型自由生成（如何规划 / 执行什么 / 怎么回答）
+# 本模块只消费 L1-B 注入的工具包、任务图策略和上下文信号。
+# L2 据此决定直接回答、调用已有工具，或在工具增强轮次中自主补充工具。
 
-import logging
 import asyncio
-from enum import Enum
+import logging
+import os
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger(__name__)
 
 
-# ──────────────────────────────────────────────────────────
-# 意图枚举
-# ──────────────────────────────────────────────────────────
-
-class IntentType(Enum):
-    """用户意图分类"""
-    CHAT = "chat"          # 日常闲聊、简单问答、知识查询
-    COMPLEX = "complex"    # 多步骤复杂任务（开发、设计、写报告等）
-    RESUME = "resume"      # 恢复/继续之前挂起的任务
-
-
-# ──────────────────────────────────────────────────────────
-# Round 1: 分类阶段
-# ──────────────────────────────────────────────────────────
-
-def build_round1_system_prompt() -> str:
-    """构建 Round 1 分类提示词（~300 token）
-
-    此提示词极度精简，仅包含身份声明和分类指令。
-    不包含任何任务管理规则、模板或示例。
-    当有活跃任务图时，注入上下文帮助 LLM 正确分类。
-
-    Returns:
-        系统提示词文本
-    """
-    now = datetime.now()
-    current_time_str = now.strftime("%Y-%m-%d %H:%M")
-
-    # 检测活跃任务图，为分类器提供上下文
-    active_graph_hint = ""
-    try:
-        from zulong.tools.task_tools import get_active_task_graph
-        tg = get_active_task_graph()
-        if tg is not None:
-            root = tg.get_node("req")
-            title = root.label if root else tg.title
-            leaves = tg.get_leaf_nodes()
-            uncompleted = [n for n in leaves if n.status not in ("completed", "skipped")]
-            if uncompleted:
-                active_graph_hint = (
-                    f"\n⚠️ 重要上下文：当前有一个进行中的任务「{title}」，"
-                    f"还有 {len(uncompleted)} 个未完成的子任务。"
-                    f"如果用户的输入看起来是在回答问题、补充信息、或与该任务相关，"
-                    f"请分类为 complex（而非 chat）。\n"
-                )
-            elif leaves:
-                # 所有叶子节点已完成 → 注入已完成任务上下文
-                active_graph_hint = (
-                    f"\n⚠️ 重要上下文：刚刚完成了一个任务「{title}」。"
-                    f"如果用户的输入是关于这个已完成任务的后续提问"
-                    f"（如怎么运行、怎么部署、怎么使用、查看结果等），"
-                    f"请分类为 chat（不是 complex），因为这不需要创建新任务。\n"
-                )
-    except Exception:
-        pass
-
-    return (
-        "你是祖龙（ZULONG），一个智能助手。\n"
-        f"当前时间：{current_time_str}\n"
-        f"{active_graph_hint}"
-        "\n"
-        "你的任务：分析用户输入的意图，然后调用 start_session 工具进行分类。\n"
-        "\n"
-        "意图分类定义：\n"
-        "- chat: 闲聊、单一问题、打招呼、记住/记录/保存信息。例：\"你好\"、\"请记住小王的信息\"、\"帮我记一下明天开会\"\n"
-        "- complex: 需要多个步骤或产出多个部分的任务。包括但不限于：\n"
-        "  * 开发/编码/设计/写报告/做游戏等创作任务\n"
-        "  * 分析对比、列出多项内容、归纳总结等结构化输出\n"
-        "  * 包含\"同时\"、\"另外\"、\"此外\"等连接词的多部分请求\n"
-        "  * 包含\"帮我做\"、\"帮我写\"、\"帮我设计\"等明确任务动词的请求\n"
-        "  * 用户为正在进行的任务补充信息（如回答出发日期、预算等问题）\n"
-        "- resume: 用户想要继续/恢复/接着做之前暂停或挂起的任务\n"
-        "\n"
-        "分类要点：\n"
-        "- 用户请求\"记住\"、\"记录\"、\"记下\"、\"保存\"某些信息时 → chat（不需要创建任务）\n"
-        "- 包含\"继续\"、\"接着做\"、\"恢复\"、\"上次那个\"等恢复意图时 → resume\n"
-        "- 用户请求中包含2个或以上子任务/子要求时 → complex\n"
-        "- 用户请求需要结构化输出（列表、对比表、多段分析）时 → complex\n"
-        "- 仅在明确是简短闲聊或单一事实查询时 → chat\n"
-        "\n"
-        "⚠️ 语言规则：task_description 必须使用与用户输入相同的语言。"
-        "用户用中文提问，task_description 必须用中文。\n"
-    )
-
-
-def get_round1_tools() -> List[Dict[str, Any]]:
-    """获取 Round 1 的工具定义（仅 start_session）
-
-    返回硬编码的 OpenAI FC 格式 schema，不依赖 ToolRegistry。
-
-    Returns:
-        包含单个工具定义的列表
-    """
-    return [{
-        "type": "function",
-        "function": {
-            "name": "start_session",
-            "description": "对用户输入进行意图分类。必须在每次对话开始时调用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "intent": {
-                        "type": "string",
-                        "enum": ["chat", "complex", "resume"],
-                        "description": "用户意图分类：chat（闲聊/问答）、complex（复杂多步骤任务）、resume（恢复之前的任务）",
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "分类理由的简短说明",
-                    },
-                    "task_description": {
-                        "type": "string",
-                        "description": "对于 complex/resume 意图，提取任务的简短描述（用于创建任务图或匹配挂起任务）。必须使用与用户输入相同的语言。",
-                    },
-                },
-                "required": ["intent", "reason"],
-            },
-        },
-    }]
-
-
-# ──────────────────────────────────────────────────────────
-# Round 2: 执行阶段 — 工具过滤
-# ──────────────────────────────────────────────────────────
-
-# 各场景允许的工具集（COMPLEX 返回 None 表示不过滤）
-_CHAT_TOOLS = {
-    "recall_memory", "read_memory_node", "save_memory_note",
-    "discover_related", "navigate_attention", "search_experience",
-    "web_search", "search_tools",
-    "delete_memory_node", "delete_memory_edge", "set_importance",
-    "list_memory",
-    # 文件操作
-    "exec_write_file", "exec_run_command",
-    # 代码智能
-    "search_code_symbols", "get_symbol_context", "get_impact_analysis",
-    "index_code_file", "index_project", "analyze_module",
-}
-
-_RESUME_TOOLS = {
-    # 任务管理
-    "task_view_overview", "task_mark_status", "task_suspend",
-    "task_list_suspended",
-    # CRUD 补全（让 RESUME 也能查看/修改节点）
-    "task_get_detail", "task_update_node",
-    # 执行类（RESUME 必须能实际执行任务内容）
-    "exec_write_file", "exec_run_command",
-    # 记忆/检索
-    "recall_memory", "read_memory_node", "discover_related",
-    "search_experience",
-    # 注意力导航
-    "navigate_attention",
-}
-# 关键：RESUME 场景物理排除 task_create_plan 和 task_add_node（防止重复创建图）
-
-
-def get_round2_tool_names(intent_type: IntentType) -> Optional[set]:
-    """获取 Round 2 允许的工具名集合
-
-    Args:
-        intent_type: 意图分类结果
-
-    Returns:
-        允许的工具名集合。None 表示不过滤（使用全部工具）。
-    """
-    if intent_type == IntentType.CHAT:
-        return _CHAT_TOOLS.copy()
-    elif intent_type == IntentType.RESUME:
-        return _RESUME_TOOLS.copy()
-    else:
-        # COMPLEX: 使用全部工具
-        return None
-
-
-# ──────────────────────────────────────────────────────────
-# Round 2: 执行阶段 — 场景化提示词构建
-# ──────────────────────────────────────────────────────────
-
 def _build_time_header() -> str:
-    """构建时间和身份头部（所有场景共用）"""
+    """构建时间和身份头部。"""
     now = datetime.now()
     hour = now.hour
     current_time_str = now.strftime("%Y-%m-%d %H:%M")
@@ -223,43 +44,63 @@ def _build_time_header() -> str:
     )
 
 
-def _inject_memory_context(system_parts: list, user_input: str, rag_manager=None,
-                           attn_stats: dict = None, pre_retrieved_memory: str = None):
-    """注入记忆上下文（MemoryGraph 检索 + 思维导航 + 容量感知）
+def _build_environment_header(runtime_context: Optional[Dict[str, Any]] = None) -> str:
+    runtime_context = runtime_context or {}
+    workspace_root = runtime_context.get("workspace_root") or "未提供工作区"
+    shell_name = runtime_context.get("shell") or os.environ.get("SHELL") or "PowerShell"
+    os_name = runtime_context.get("os_name") or ("Windows" if os.name == "nt" else os.name)
+    preferred_commands = runtime_context.get("preferred_commands") or [
+        "Get-ChildItem",
+        "Select-String",
+        "Get-Content",
+        "rg",
+        "python",
+        "npm",
+        "git",
+    ]
+    return (
+        "\n【运行环境】\n"
+        f"- 操作系统: {os_name}\n"
+        f"- Shell: {shell_name}\n"
+        f"- 工作区根目录: {workspace_root}\n"
+        f"- 推荐命令: {', '.join(preferred_commands)}\n"
+        "- 当前环境优先使用 Windows/PowerShell 命令，不要生成 Unix 专属命令（如 `find / -name`、`ls -la`、`pwd && ...`、`2>/dev/null`）。\n"
+        "- 代码阅读/架构分析优先使用代码工具：index_project(root_dir=...)、search_code_symbols(query=...)、zulong_code_query(file_path=...)。\n"
+        "- 如果结构化代码工具因解析器/索引限制失败，优先改用 read_file(file_path=...) 只读读取源码，再继续分析。\n"
+        "- 若需要运行命令，再调用 exec_run_command，且命令必须符合当前 shell。\n"
+    )
 
-    Args:
-        system_parts: 系统提示词片段列表
-        user_input: 用户输入（用于记忆检索）
-        rag_manager: RAGManager 实例
-        attn_stats: AttentionWindowManager.stats 字典（可选）
-        pre_retrieved_memory: L1-B 预检索的记忆上下文（如果提供则跳过重复检索）
-    """
-    # 思维导航注入
+
+def _inject_memory_context(
+    system_parts: list,
+    user_input: str,
+    rag_manager=None,
+    attn_stats: Optional[dict] = None,
+    pre_retrieved_memory: Optional[str] = None,
+) -> None:
+    """注入 MemoryGraph 上下文和注意力状态。"""
     try:
         from zulong.memory.memory_graph import get_memory_graph as _get_mg_nav
+
         _mg_nav = _get_mg_nav()
         if _mg_nav:
             focus_summary = _mg_nav.get_focus_path_summary()
             if focus_summary:
                 system_parts.append(f"\n{focus_summary}\n")
-                logger.debug(f"[思维导航] 已注入焦点路径 ({len(focus_summary)} chars)")
+                logger.debug("[Prompt] 已注入焦点路径 (%d chars)", len(focus_summary))
     except Exception as e:
-        logger.debug(f"[思维导航] 注入跳过: {e}")
+        logger.debug("[Prompt] 焦点路径注入跳过: %s", e)
 
-    # MemoryGraph 记忆检索
-    # 🎯 优化：如果 L1-B 已预检索记忆，则跳过重复检索
     if pre_retrieved_memory:
-        logger.info(f"[MemoryGraph] 使用 L1-B 预检索记忆 ({len(pre_retrieved_memory)} 字符)，跳过重复检索")
-        system_parts.append(
-            "\n【记忆上下文】\n" + pre_retrieved_memory + "\n"
-        )
+        logger.info("[MemoryGraph] 使用 L1-B 预检索记忆 (%d 字符)", len(pre_retrieved_memory))
+        system_parts.append("\n【记忆上下文】\n" + pre_retrieved_memory + "\n")
     else:
-        # 没有预检索记忆，执行 MemoryGraph 检索
         try:
             from zulong.memory.memory_graph import get_memory_graph
+
             _mg = get_memory_graph()
             if _mg:
-                if not getattr(_mg, '_rag_manager', None) and rag_manager:
+                if not getattr(_mg, "_rag_manager", None) and rag_manager:
                     _mg.set_rag_manager(rag_manager)
 
                 def _run_async_bridge(coro):
@@ -269,532 +110,320 @@ def _inject_memory_context(system_parts: list, user_input: str, rag_manager=None
                         loop = None
                     if loop is not None and loop.is_running():
                         import concurrent.futures
+
                         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                             return pool.submit(asyncio.run, coro).result(timeout=30)
-                    else:
-                        return asyncio.run(coro)
+                    return asyncio.run(coro)
 
-                # 动态 top_k + BFS扩散深度：根据上下文窗口和剩余预算动态调整
-                _top_k = 8
-                _context_window_size = 131072
                 _usage_ratio = 0.0
+                _context_window_size = 131072
                 if attn_stats:
-                    _ratio = attn_stats.get("usage_ratio", 0)
-                    _usage_ratio = _ratio
+                    _usage_ratio = attn_stats.get("usage_ratio", 0.0)
                     _context_window_size = attn_stats.get("context_window_size", 131072)
-                if _ratio > 0.8:
-                    _top_k = 3
-                elif _ratio > 0.6:
-                    _top_k = 5
 
-            if hasattr(_mg, 'retrieve_context_dynamic'):
-                mg_results = _run_async_bridge(
-                    _mg.retrieve_context_dynamic(
-                        user_input,
-                        context_window_size=_context_window_size,
-                        usage_ratio=_usage_ratio,
-                        session_id="",
-                    )
-                )
-            else:
-                mg_results = _run_async_bridge(
-                    _mg.retrieve_context(user_input, top_k=_top_k, session_id="")
-                )
-            if mg_results:
-                remaining_ratio = max(0.0, 1.0 - _usage_ratio)
-                _content_limit = max(100, min(500, int(500 * remaining_ratio)))
-                memory_sections = []
-                for r in mg_results:
-                    ntype = r.get("node_type", "")
-                    content = r.get("content", "")
-                    label = r.get("label", "")
-                    if not content:
-                        continue
-                    if ntype == "experience":
-                        continue
-                    elif ntype == "dialogue":
-                        memory_sections.append(f"【历史对话】{content[:_content_limit]}")
-                    elif ntype == "task":
-                        status = r.get("metadata", {}).get("status", "")
-                        memory_sections.append(
-                            f"【相关任务】{label}" + (f"（状态：{status}）" if status else "")
+                if hasattr(_mg, "retrieve_context_dynamic"):
+                    mg_results = _run_async_bridge(
+                        _mg.retrieve_context_dynamic(
+                            user_input,
+                            context_window_size=_context_window_size,
+                            usage_ratio=_usage_ratio,
+                            session_id="",
                         )
-                    elif ntype == "knowledge":
-                        memory_sections.append(f"【知识参考】{content[:_content_limit]}")
-                    elif ntype == "episode":
-                        memory_sections.append(f"【历史摘要】{content[:_content_limit]}")
-                    elif ntype in ("person", "concept"):
-                        memory_sections.append(f"【知识参考】{label}: {content[:_content_limit]}")
-                    else:
-                        memory_sections.append(f"【参考】{content[:_content_limit]}")
-
-                if memory_sections:
-                    system_parts.append(
-                        "\n【记忆上下文】\n" + "\n".join(memory_sections) + "\n"
                     )
-                    logger.info(f"[MemoryGraph] 注入 {len(memory_sections)} 条记忆到上下文")
+                else:
+                    _top_k = 3 if _usage_ratio > 0.8 else 5 if _usage_ratio > 0.6 else 8
+                    mg_results = _run_async_bridge(
+                        _mg.retrieve_context(user_input, top_k=_top_k, session_id="")
+                    )
+
+                if mg_results:
+                    remaining_ratio = max(0.0, 1.0 - _usage_ratio)
+                    content_limit = max(100, min(500, int(500 * remaining_ratio)))
+                    memory_sections = []
+                    for result in mg_results:
+                        node_type = result.get("node_type", "")
+                        content = result.get("content", "")
+                        label = result.get("label", "")
+                        if not content:
+                            continue
+                        if node_type == "experience":
+                            continue
+                        if node_type == "dialogue":
+                            memory_sections.append(f"【历史对话】{content[:content_limit]}")
+                        elif node_type == "task":
+                            status = result.get("metadata", {}).get("status", "")
+                            memory_sections.append(
+                                f"【相关任务】{label}" + (f"（状态：{status}）" if status else "")
+                            )
+                        elif node_type == "knowledge":
+                            memory_sections.append(f"【知识参考】{content[:content_limit]}")
+                        elif node_type == "episode":
+                            memory_sections.append(f"【历史摘要】{content[:content_limit]}")
+                        elif node_type in ("person", "concept"):
+                            memory_sections.append(f"【知识参考】{label}: {content[:content_limit]}")
+                        else:
+                            memory_sections.append(f"【参考】{content[:content_limit]}")
+
+                    if memory_sections:
+                        system_parts.append("\n【记忆上下文】\n" + "\n".join(memory_sections) + "\n")
+                        logger.info("[MemoryGraph] 注入 %d 条记忆到上下文", len(memory_sections))
         except Exception as e:
-            logger.warning(f"[MemoryGraph] 记忆检索失败，降级跳过: {e}")
+            logger.warning("[MemoryGraph] 记忆检索失败，降级跳过: %s", e)
 
-    # 注意力状态 + 容量仪表盘
-    _mem_count = sum(1 for p in system_parts if "【记忆上下文】" in p or "【历史对话】" in p)
-    _has_memory = _mem_count > 0
-    _attn_lines = ["\n【注意力状态】"]
-
-    # 容量仪表盘（当 attn_stats 可用时注入）
+    memory_count = sum(1 for part in system_parts if "【记忆上下文】" in part or "【历史对话】" in part)
+    attn_lines = ["\n【注意力状态】"]
     if attn_stats:
-        _mode = attn_stats.get("mode", "global")
-        _ratio = attn_stats.get("usage_ratio", 0)
-        _remaining = attn_stats.get("remaining_tokens", 0)
-        _budget = attn_stats.get("budget", 0)
-        # 使用比率条 ████░░░░░░
-        _bar_len = 10
-        _filled = int(_ratio * _bar_len)
-        _bar = "\u2588" * _filled + "\u2591" * (_bar_len - _filled)
-        _attn_lines.append(f"容量: [{_bar}] {_ratio:.0%}  剩余≈{_remaining}tok  模式={_mode}")
-        if _ratio >= 0.85:
-            _attn_lines.append("容量紧张，请精简输出，避免冗长工具调用。")
+        mode = attn_stats.get("mode", "global")
+        ratio = attn_stats.get("usage_ratio", 0)
+        remaining = attn_stats.get("remaining_tokens", 0)
+        bar_len = 10
+        filled = int(ratio * bar_len)
+        bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
+        attn_lines.append(f"容量: [{bar}] {ratio:.0%}  剩余≈{remaining}tok  模式={mode}")
+        if ratio >= 0.85:
+            attn_lines.append("容量紧张，请精简输出，避免冗长工具调用。")
     else:
-        _attn_lines.append("容量: 未启用窗口管理")
+        attn_lines.append("容量: 未启用窗口管理")
 
-    if _has_memory:
-        _attn_lines.append(f"已注入 {_mem_count} 段记忆/上下文。")
-        _attn_lines.append("如果这些信息不足以回答用户问题，请主动调用 recall_memory 工具检索更多相关记忆。")
+    if memory_count:
+        attn_lines.append(f"已注入 {memory_count} 段记忆/上下文。")
+        attn_lines.append("请优先基于已注入的记忆/上下文直接回答，不要为了闲聊继续检索。")
     else:
-        _attn_lines.append("当前对话未注入任何记忆上下文。")
-        _attn_lines.append("如果用户的问题涉及历史信息或个人偏好，请主动调用 recall_memory 工具进行检索。")
-    _attn_lines.append("如果需要用户补充信息才能继续，请直接用自然语言向用户提问。\n")
-    system_parts.append("\n".join(_attn_lines))
+        attn_lines.append("当前对话未注入任何记忆上下文。")
+        attn_lines.append("如果信息不足，请直接说明或向用户追问。")
+    attn_lines.append("如果需要用户补充信息才能继续，请直接用自然语言向用户提问。\n")
+    system_parts.append("\n".join(attn_lines))
 
 
-def _build_chat_prompt(user_input: str, rag_context: Optional[str],
-                       visual_context: Optional[str], rag_manager=None,
-                       attn_stats: dict = None, enable_voice_hint: bool = False,
-                       pre_retrieved_memory: str = None) -> list:
-    """构建 CHAT 场景的 messages（~800 token）
-
-    不包含任何任务管理规则。仅保留身份、交流风格、RAG、记忆。
-    """
-    system_parts = [_build_time_header()]
-
-    system_parts.append(
-        "\n【交流风格】\n"
-        "用自然、友好的口语和用户对话，就像朋友聊天一样。\n"
-        "⚠️ 必须使用用户输入的语言回复。用户用中文提问就用中文回答，用英文就用英文回答。\n"
-    )
-
-    # 仅在语音交互模式下注入语音功能提示
-    if enable_voice_hint:
-        system_parts.append(
-            "\n【语音功能】\n"
-            "✅ 你拥有 TTS (Text-To-Speech) 语音合成功能，可以直接用语音回复用户。\n"
-            "当用户要求语音回复或使用语音触发词（如'用语音'、'大声点'、'说给我听'）时，\n"
-            "系统会自动将你的文字回复转换为语音播放给用户。\n"
-            "因此，请正常生成回复内容，不要告诉用户你只能用文字交流。\n"
-            "如果用户明确要求语音回复，你可以在文字回复中包含'好的，我用语音回复你'等自然回应。\n"
-        )
-
-    if visual_context:
-        is_simple_greeting = any(kw in visual_context for kw in ["挥手", "注视", "走近"])
-        if is_simple_greeting:
-            system_parts.append(
-                "\n【回应风格】\n"
-                "用户正在和你互动！请用简短、活泼、口语化的方式回应。\n"
-                "打招呼回复控制在 40 字以内，像真人对话一样自然。\n"
-                f"\n【视觉观察】\n{visual_context}\n"
-            )
-        else:
-            system_parts.append(
-                "\n【回答建议】\n"
-                "1. 直接基于视觉观察回答用户问题\n"
-                "2. 如果视觉信息不足，诚实告知用户\n"
-                "3. 使用自然口语，50-150 字\n"
-                f"\n【视觉观察】\n{visual_context}\n"
-            )
-    else:
-        system_parts.append(
-            "\n【回答建议】\n"
-            "1. 友好、专业地回答用户问题\n"
-            "2. 如果信息不足，诚实告知用户\n"
-            "3. 使用自然流畅的口语，50-150 字\n"
-        )
-
-    if rag_context:
-        system_parts.append(f"\n【参考知识】\n{rag_context}\n")
-
-    # 已完成任务上下文注入：让 CHAT 模式能回答关于已完成任务的后续提问
+def _append_completed_task_context(system_parts: list) -> None:
+    """注入刚完成任务的摘要，供后续追问使用。"""
     try:
         from zulong.tools.task_tools import get_active_task_graph
-        _chat_tg = get_active_task_graph()
-        if _chat_tg is not None:
-            _chat_root = _chat_tg.get_node("req")
-            _chat_title = _chat_root.label if _chat_root else _chat_tg.title
-            _chat_leaves = _chat_tg.get_leaf_nodes()
-            _chat_uncompleted = [
-                n for n in _chat_leaves
-                if n.status not in ("completed", "skipped")
-            ]
-            if not _chat_uncompleted and _chat_leaves:
-                _completed_lines = [
-                    f"\n【已完成任务上下文】\n刚刚完成了任务「{_chat_title}」："
-                ]
-                for _cn in _chat_leaves[:8]:
-                    _r_brief = _cn.result[:100] if _cn.result else ""
-                    _completed_lines.append(
-                        f"- {_cn.label}"
-                        + (f"：{_r_brief}" if _r_brief else "")
-                    )
-                _user_req = _chat_tg.metadata.get("user_requirement", "")
-                if _user_req:
-                    _completed_lines.append(
-                        f"\n用户的原始需求：{_user_req[:200]}"
-                    )
-                _completed_lines.append(
-                    "\n如果用户在询问与这个任务相关的问题，请基于以上信息回答。"
-                )
-                system_parts.append("\n".join(_completed_lines))
+
+        task_graph = get_active_task_graph()
+        if task_graph is None:
+            return
+        root = task_graph.get_node("req")
+        title = root.label if root else task_graph.title
+        leaves = task_graph.get_leaf_nodes()
+        uncompleted = [n for n in leaves if n.status not in ("completed", "skipped")]
+        if uncompleted or not leaves:
+            return
+
+        lines = [f"\n【已完成任务上下文】\n刚刚完成了任务「{title}」："]
+        for node in leaves[:8]:
+            result = node.result[:100] if node.result else ""
+            lines.append(f"- {node.label}" + (f"：{result}" if result else ""))
+        user_requirement = task_graph.metadata.get("user_requirement", "")
+        if user_requirement:
+            lines.append(f"\n用户的原始需求：{user_requirement[:200]}")
+        lines.append("\n如果用户在询问与这个任务相关的问题，请基于以上信息回答。")
+        system_parts.append("\n".join(lines))
     except Exception:
         pass
 
-    _inject_memory_context(system_parts, user_input, rag_manager, attn_stats, pre_retrieved_memory)
+
+def _append_active_task_context(system_parts: list, task_graph_policy: str) -> None:
+    """按 L1-B 任务图策略注入任务图执行提示。"""
+    if task_graph_policy in ("", "none", None):
+        return
+
+    try:
+        from zulong.tools.task_tools import get_active_task_graph
+
+        task_graph = get_active_task_graph()
+    except Exception:
+        task_graph = None
+
+    system_parts.append(
+        "\n【任务图策略】\n"
+        f"- L1-B 建议策略: {task_graph_policy}\n"
+        "- 这是执行策略信号，不是用户意图分类标签。\n"
+        "- 如果需要理解现有任务图，优先调用 task_view_overview。\n"
+        "- 如果需要创建/扩展任务图，先确保确有多步骤工作，再调用 task_* 工具。\n"
+        "- 如果工具包不足，请调用 request_tool_supplement 申请补充工具。\n"
+    )
+
+    if not task_graph:
+        system_parts.append(
+            "\n当前未加载活跃任务图。若用户请求确实需要持续执行，"
+            "请用 task_create_plan 创建任务图，再用 task_add_node 分解工作。\n"
+        )
+        return
+
+    try:
+        root = task_graph.get_node("req")
+        title = root.label if root else task_graph.title
+        leaves = task_graph.get_leaf_nodes()
+        completed = [n for n in leaves if n.status == "completed"]
+        uncompleted = [n for n in leaves if n.status != "completed"]
+        lines = [
+            "\n【当前任务图摘要】",
+            f"任务: {title}",
+            f"进度: {len(completed)}/{len(leaves)} 个工作项已完成。",
+        ]
+        if uncompleted:
+            lines.append("未完成工作项：")
+            for node in uncompleted[:8]:
+                status_text = {
+                    "pending": "待开始",
+                    "not_started": "待开始",
+                    "in_progress": "进行中",
+                    "blocked": "阻塞",
+                }.get(node.status, node.status)
+                lines.append(f"- {node.id}: {node.label} ({status_text})")
+            lines.append("仍有未完成工作项时，不能声称任务已全部完成。")
+        elif leaves:
+            lines.append("所有工作项已完成；如果用户提出新需求，请判断是追问、扩展，还是全新任务。")
+        system_parts.append("\n".join(lines) + "\n")
+    except Exception as exc:
+        logger.debug("[Prompt] 任务图摘要注入失败: %s", exc)
+
+
+def build_unified_system_prompt(
+    user_input: str,
+    rag_context: Optional[str],
+    visual_context: Optional[str],
+    scaffold_data: Optional[Dict[str, Any]] = None,
+    rag_manager=None,
+    attn_stats: Optional[dict] = None,
+    voice_mode: str = "TEXT_ONLY",
+    pre_retrieved_memory: Optional[str] = None,
+    runtime_context: Optional[Dict[str, Any]] = None,
+    tool_prediction: Optional[Dict[str, Any]] = None,
+    tool_bundle: Optional[List[str]] = None,
+    task_graph_policy: Optional[str] = None,
+) -> list:
+    """构建统一主链系统提示词。
+
+    该函数只消费 L1-B 打包结果，不执行或表达会话意图分类。
+    """
+    scaffold_data = scaffold_data or {}
+    tool_prediction = tool_prediction or {}
+    tool_bundle = list(tool_bundle or scaffold_data.get("tools") or [])
+    context_bundle = (
+        scaffold_data.get("context_bundle")
+        or tool_prediction.get("context_bundle")
+        or {}
+    )
+    task_graph_policy = task_graph_policy or scaffold_data.get("policy") or "none"
+    turn_shape = context_bundle.get("turn_shape", "")
+    simple_social = turn_shape == "simple_social" and not tool_bundle and task_graph_policy in ("", "none", None)
+    enable_voice_hint = voice_mode in ("AUTO_TTS", "FORCED_TTS")
+
+    system_parts = [_build_time_header()]
+    if not simple_social:
+        system_parts.append(_build_environment_header(runtime_context))
+
+    if simple_social:
+        system_parts.append(
+            "\n【统一主链】\n"
+            "- 本轮已经由 L1-B 完成工具预判、上下文检索和任务打包。\n"
+            "- L1-B 判定当前轮次无需工具，你只需要进行自然语言推理并生成回复。\n"
+            "- 不要输出内部路由标签或状态标签。\n"
+            "- 主回答必须由模型生成，不能依赖固定回复模板。\n"
+        )
+    else:
+        system_parts.append(
+            "\n【统一主链】\n"
+            "- 本轮已经由 L1-B 完成工具预判、上下文检索和工具包打包。\n"
+            "- 你是 L2 推理层：根据当前消息、上下文和工具包自主决定直接回答、调用工具或请求补充工具。\n"
+            "- 不要输出内部路由标签或状态标签。\n"
+            "- 主回答必须由模型生成，不能依赖固定回复模板。\n"
+        )
+
+    system_parts.append(
+        "\n【交流风格】\n"
+        "用自然、友好的口语和用户对话。\n"
+        "必须使用用户输入的语言回复。用户用中文提问就用中文回答，用英文就用英文回答。\n"
+    )
+
+    if simple_social:
+        system_parts.append(
+            "\n【轻量寒暄约束】\n"
+            "用户只是打招呼或寒暄时，直接自然回应即可。\n"
+            "不要要求用户提供具体任务，不要把寒暄改写成任务需求，不要调用工具。\n"
+            "回复保持简短、自然、有人味。\n"
+        )
+
+    if enable_voice_hint:
+        system_parts.append(
+            "\n【语音功能】\n"
+            "你拥有 TTS 语音合成功能。系统会根据 L1-B 的 voice_mode 将文字回复转换为语音。\n"
+            "如果用户明确要求语音回复，可以自然回应并继续生成正常内容。\n"
+        )
+
+    if tool_bundle:
+        system_parts.append(
+            "\n【L1-B 工具包】\n"
+            f"- 建议工具: {', '.join(tool_bundle)}\n"
+            "- 这些工具只是预判结果，不代表必须全部调用。\n"
+            "- 如果要完成用户请求还缺工具，调用 request_tool_supplement 补充；如果无需工具，直接回答。\n"
+        )
+    elif not simple_social:
+        system_parts.append(
+            "\n【工具使用】\n"
+            "L1-B 未建议具体工具。若当前消息可直接回答，请直接回答；不要为了形式调用工具。\n"
+        )
+
+    if not simple_social:
+        system_parts.append(
+            "\n【执行规则】\n"
+            "1. 普通问答、确认、简短说明可以直接自然语言回复。\n"
+            "2. 需要读取项目代码时，优先使用代码/文件工具，不要先用 shell 穷举目录。\n"
+            "3. 需要多步骤持续执行时，再使用 task_* 工具创建、复用或推进任务图。\n"
+            "4. 运行命令必须符合当前 Windows/PowerShell 环境。\n"
+            "5. 工具调用中的 label、desc、result 等字段必须使用与用户相同的语言。\n"
+            "6. 内容型子任务写入工作目录时，优先使用相对 file_path。\n"
+            "7. 如信息不足，先用已有上下文和工具补齐；确实无法继续时再向用户追问。\n"
+        )
+
+    if not simple_social:
+        _append_active_task_context(system_parts, task_graph_policy or "none")
+        _append_completed_task_context(system_parts)
+
+    if scaffold_data.get("graph_lost"):
+        lost_graph_id = scaffold_data.get("lost_graph_id", "")
+        system_parts.append(
+            "\n【任务图缺失】\n"
+            f"用户引用的任务图 {lost_graph_id} 未能从内存、挂起任务或备份中恢复。\n"
+            "请说明该任务记录不可用，并根据用户当前描述重新建立可执行计划。\n"
+        )
+
+    if visual_context:
+        system_parts.append(f"\n【视觉观察】\n{visual_context}\n")
+
+    if rag_context:
+        system_parts.append(f"\n【参考知识】\n{rag_context}\n")
+
+    if simple_social:
+        system_parts.append(
+            "\n【注意力状态】\n"
+            "轻量寒暄轮次不注入历史记忆，避免旧任务或旧回复污染当前问候。\n"
+        )
+    else:
+        _inject_memory_context(
+            system_parts,
+            user_input,
+            rag_manager=rag_manager,
+            attn_stats=attn_stats,
+            pre_retrieved_memory=pre_retrieved_memory,
+        )
 
     system_parts.append(
         "\n⚠️ 语言要求：必须使用与用户输入相同的语言回复。\n"
-        "\n请开始回答用户的问题："
+        "\n请根据以上上下文开始回答或执行："
     )
     system_prompt = "".join(system_parts)
 
-    logger.info(f"[IntentPrompt] CHAT 系统提示词: {len(system_prompt)} chars")
+    logger.info(
+        "[UnifiedPrompt] 系统提示词: %d chars, tools=%d, policy=%s, turn_shape=%s",
+        len(system_prompt),
+        len(tool_bundle),
+        task_graph_policy,
+        turn_shape or "unknown",
+    )
     return [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": str(user_input)},
     ]
-
-
-def _build_complex_prompt(user_input: str, rag_context: Optional[str],
-                          visual_context: Optional[str], scaffold_data: dict,
-                          rag_manager=None, attn_stats: dict = None,
-                          enable_voice_hint: bool = False,
-                          pre_retrieved_memory: str = None) -> list:
-    """构建 COMPLEX 场景的 messages（~1500 token）
-
-    包含任务创建规则（但不包含恢复规则）。scaffold_data 中包含已创建的任务图信息。
-    """
-    system_parts = [_build_time_header()]
-
-    system_parts.append(
-        "\n【交流风格】\n"
-        "用自然、友好的口语和用户对话，就像朋友聊天一样。\n"
-        "⚠️ 必须使用用户输入的语言回复。用户用中文提问就用中文回答，用英文就用英文回答。\n"
-    )
-
-    # 仅在语音交互模式下注入语音功能提示
-    if enable_voice_hint:
-        system_parts.append(
-            "\n【语音功能】\n"
-            "✅ 你拥有 TTS (Text-To-Speech) 语音合成功能，可以直接用语音回复用户。\n"
-            "当用户要求语音回复或使用语音触发词（如'用语音'、'大声点'、'说给我听'）时，\n"
-            "系统会自动将你的文字回复转换为语音播放给用户。\n"
-            "因此，请正常生成回复内容，不要告诉用户你只能用文字交流。\n"
-            "如果用户明确要求语音回复，你可以在文字回复中包含'好的，我用语音回复你'等自然回应。\n"
-        )
-
-    # 任务管理规则（仅创建部分，不包含恢复规则）
-    system_parts.append(
-        "\n【任务管理规则】\n"
-        "当前已进入任务规划模式。系统已自动创建任务图骨架。\n"
-        "\n"
-        "⚠️ 核心原则：不要反问用户！直接根据已有信息开始规划和执行。\n"
-        "即使信息不完整，也要基于合理假设直接输出完整方案。\n"
-        "\n"
-        "你需要做的：\n"
-        "1. 用 task_add_node 向任务图添加子任务节点（parent_id='req' 挂到根节点下）\n"
-        "   - 每个子节点代表一个独立的工作模块/步骤\n"
-        "   - 先搭建完整大纲再执行，不要边做边加\n"
-        "2. 用 task_view_overview 查看一次任务概览确认结构（只需查看一次）\n"
-        "3. 按顺序逐个执行每个子任务：\n"
-        "   a) 调用 task_mark_status(node_id='节点ID', status='in_progress')\n"
-        "   b) 用 exec_write_file 把该子任务的完整内容写入文件（代码/文档/方案等），或者对于纯分析/决策类子任务直接在 result 中写详细结论\n"
-        "   c) 调用 task_mark_status(node_id='节点ID', status='completed', result='详细结果，不少于50字，包含关键结论或产出文件路径')\n"
-        "   d) 立即开始下一个子任务\n"
-        "\n"
-        "重要规则：\n"
-        "- 不需要调用 task_create_plan（任务图已自动创建）\n"
-        "- 所有子节点必须通过 parent_id 正确挂到父节点下\n"
-        "- task_view_overview 只需要调用一次，不要重复调用\n"
-        "- 每完成一个子任务必须调用 task_mark_status 标记为 completed\n"
-        "- ⚠️ 在还有未完成的子任务时，绝对不能声称任务已全部完成\n"
-        "- ⚠️ 绝对不要向用户反问或要求补充信息，直接基于合理假设开始执行\n"
-        "- ⚠️ 工具调用中的 label、desc、result 等字段必须使用与用户相同的语言\n"
-        "- 内容型子任务（代码/文档/方案）必须调用 exec_write_file 写入工作目录\n"
-    )
-
-    # 信息缺口感知
-    system_parts.append(
-        "\n【信息视角】\n"
-        "执行每个子任务前，检查是否有足够的信息：\n"
-        "- 如果需要前置子任务的结果（如数据、分析、接口定义），先确认该子任务已完成\n"
-        "- 如果信息不完整，基于常见情况和合理假设直接执行，不要向用户追问\n"
-        "- 如果信息充足，直接执行\n"
-    )
-
-    # 注入 scaffold 信息
-    graph_id = scaffold_data.get("graph_id", "")
-    title = scaffold_data.get("title", "")
-    graph_lost = scaffold_data.get("graph_lost", False)
-
-    if graph_lost:
-        # 任务图数据丢失 → 通知模型需要重新创建
-        lost_graph_id = scaffold_data.get("lost_graph_id", "")
-        system_parts.append(
-            f"\n【重要：任务图数据丢失】\n"
-            f"用户引用了之前的任务图（{lost_graph_id}），但该任务图的数据已丢失。\n"
-            f"请先告知用户：之前的任务记录已丢失，需要重新创建任务计划。\n"
-            f"然后根据用户的描述，重新用 task_create_plan 创建任务图，"
-            f"用 task_add_node 添加子任务节点。\n"
-        )
-    elif scaffold_data.get("already_exists") and graph_id:
-        # 任务图已存在（用户在同一任务上追加请求）→ 先查看再修改
-        system_parts.append(
-            f"\n【当前任务图（已有）】\n"
-            f"图谱ID: {graph_id}\n"
-            f"任务: {title}\n"
-            f"这是一个已经存在的任务图，用户正在此基础上提出新的要求。\n"
-            f"请先用 task_view_overview 查看当前任务图的完整状态，\n"
-            f"然后根据用户的新需求：\n"
-            f"- 用 task_add_node 添加新的子任务节点\n"
-            f"- 用 task_mark_status 完成未完成的任务\n"
-            f"- 不需要重新创建任务图\n"
-        )
-    elif scaffold_data.get("old_graph_cleared"):
-        # 🔥 [Fix-8] 旧图谱已清除，需要创建全新图谱
-        cleared_title = scaffold_data.get("cleared_graph_title", "未知任务")
-        system_parts.append(
-            f"\n【重要：需要创建全新任务图】\n"
-            f"之前的任务图「{cleared_title}」已全部完成并已归档。\n"
-            f"这是一个全新的任务请求，请首先调用 task_create_plan 创建新图谱：\n"
-            f"1. 调用 task_create_plan(title='新任务标题') 创建新图谱和根节点\n"
-            f"2. 然后用 task_add_node 添加子任务节点（parent_id='req'）\n"
-            f"3. 用 task_add_dependency 建立依赖关系\n"
-            f"4. 然后按顺序执行每个子任务\n"
-        )
-    elif graph_id:
-        system_parts.append(
-            f"\n【当前任务图】\n"
-            f"图谱ID: {graph_id}\n"
-            f"根节点: req ({title})\n"
-            f"请用 task_add_node 开始添加子任务节点。\n"
-        )
-
-    if visual_context:
-        system_parts.append(f"\n【视觉观察】\n{visual_context}\n")
-
-    if rag_context:
-        system_parts.append(f"\n【参考知识】\n{rag_context}\n")
-
-    _inject_memory_context(system_parts, user_input, rag_manager, attn_stats, pre_retrieved_memory)
-
-    system_parts.append(
-        "\n⚠️ 语言要求：用户的输入是中文还是英文，你的所有输出就必须用同一种语言，"
-        "包括回复正文、task_add_node 的 label 和 desc、task_mark_status 的 result、"
-        "以及 exec_write_file 的内容。绝不可以混用语言。\n"
-        "\n请开始规划和执行用户的任务："
-    )
-    system_prompt = "".join(system_parts)
-
-    logger.info(f"[IntentPrompt] COMPLEX 系统提示词: {len(system_prompt)} chars")
-    return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": str(user_input)},
-    ]
-
-
-def _build_resume_prompt(user_input: str, rag_context: Optional[str],
-                         visual_context: Optional[str], scaffold_data: dict,
-                         rag_manager=None, attn_stats: dict = None,
-                         enable_voice_hint: bool = False,
-                         pre_retrieved_memory: str = None) -> list:
-    """构建 RESUME 场景的 messages（~1000 token）
-
-    包含恢复指令和已恢复的任务信息。物理排除 task_create_plan 和 task_add_node。
-    """
-    system_parts = [_build_time_header()]
-
-    system_parts.append(
-        "\n【交流风格】\n"
-        "用自然、友好的口语和用户对话，就像朋友聊天一样。\n"
-        "⚠️ 必须使用用户输入的语言回复。用户用中文提问就用中文回答，用英文就用英文回答。\n"
-    )
-
-    # 仅在语音交互模式下注入语音功能提示
-    if enable_voice_hint:
-        system_parts.append(
-            "\n【语音功能】\n"
-            "✅ 你拥有 TTS (Text-To-Speech) 语音合成功能，可以直接用语音回复用户。\n"
-            "当用户要求语音回复或使用语音触发词（如'用语音'、'大声点'、'说给我听'）时，\n"
-            "系统会自动将你的文字回复转换为语音播放给用户。\n"
-            "因此，请正常生成回复内容，不要告诉用户你只能用文字交流。\n"
-            "如果用户明确要求语音回复，你可以在文字回复中包含'好的，我用语音回复你'等自然回应。\n"
-        )
-
-    # 任务恢复规则
-    task_desc = scaffold_data.get("description", "")
-    task_id = scaffold_data.get("task_id", "")
-    has_graph = scaffold_data.get("has_task_graph", False)
-    already_active = scaffold_data.get("already_active", False)
-
-    title = scaffold_data.get("title", task_desc)
-    system_parts.append(
-        "\n【任务恢复模式】\n"
-        f"系统已自动恢复之前挂起的任务" + (f"「{title}」" if title else "") + "。\n"
-    )
-
-    if already_active:
-        system_parts.append(
-            "⚠️ 当前内存中已有活跃任务图，不要调用 task_list_suspended 搜索挂起任务。\n"
-            "直接从 task_view_overview 开始查看进度，然后执行未完成的子任务。\n"
-        )
-
-    if has_graph:
-        # 直接注入任务进度表，让模型立刻看到哪些没完成
-        _progress_summary = ""
-        _user_requirement = ""
-        _uncompleted = []
-        try:
-            from zulong.tools.task_tools import get_active_task_graph
-            _tg = get_active_task_graph()
-            if _tg:
-                # 提取用户原始需求（Rule B 在创建时存储的）
-                _user_requirement = getattr(_tg, 'metadata', {}).get("user_requirement", "")
-
-                _leaf_nodes = _tg.get_leaf_nodes()
-                _completed = [n for n in _leaf_nodes if n.status == "completed"]
-                _uncompleted = [n for n in _leaf_nodes if n.status != "completed"]
-                _total = len(_leaf_nodes)
-                _done = len(_completed)
-
-                _progress_lines = [f"进度: {_done}/{_total} 个工作项已完成。"]
-
-                # 已完成的任务（附带结果摘要）
-                if _completed:
-                    _progress_lines.append("✅ 已完成：")
-                    for _n in _completed:
-                        _result_brief = ""
-                        if _n.result:
-                            _result_brief = f" → {_n.result[:80]}"
-                        _progress_lines.append(f"  - {_n.id}: {_n.label}{_result_brief}")
-
-                # 未完成的任务（附带描述信息）
-                if _uncompleted:
-                    _progress_lines.append("❌ 未完成的任务：")
-                    for _n in _uncompleted:
-                        _status_text = {"pending": "待开始", "not_started": "待开始",
-                                        "in_progress": "进行中", "blocked": "阻塞"}.get(_n.status, _n.status)
-                        _desc_brief = ""
-                        if _n.desc:
-                            _desc_brief = f"\n    描述: {_n.desc[:120]}"
-                        _progress_lines.append(f"  - {_n.id}: {_n.label} ({_status_text}){_desc_brief}")
-                    _progress_lines.append("")
-                    _progress_lines.append(f"⚠️ 请从第一个未完成任务 {_uncompleted[0].id}（{_uncompleted[0].label}）开始执行。")
-                else:
-                    _progress_lines.append("✅ 所有工作项已完成。")
-                _progress_summary = "\n".join(_progress_lines)
-        except Exception as _e:
-            logger.warning(f"[RESUME] 获取任务进度失败: {_e}")
-
-        system_parts.append(
-            "任务图已加载到内存中。\n"
-        )
-
-        # 注入用户原始需求（让模型理解任务背景）
-        if _user_requirement:
-            system_parts.append(
-                f"\n【用户原始需求】\n{_user_requirement[:500]}\n"
-            )
-
-        if _progress_summary:
-            system_parts.append(f"\n【当前任务进度】\n{_progress_summary}\n")
-
-        # 精简指令：4B 模型更易遵循短指令
-        _first_uncompleted_id = ""
-        _first_uncompleted_label = ""
-        if _uncompleted:
-            _first_uncompleted_id = _uncompleted[0].id
-            _first_uncompleted_label = _uncompleted[0].label
-
-        system_parts.append(
-            "\n【执行规则】\n"
-            "对每个未完成节点：先调用 task_mark_status(node_id, 'in_progress') 开始，"
-            "完成后调用 task_mark_status(node_id, 'completed', result='结果摘要')。\n"
-        )
-        if _first_uncompleted_id:
-            system_parts.append(
-                f"第一步：请立即调用 task_mark_status(node_id='{_first_uncompleted_id}', status='in_progress')\n"
-            )
-        system_parts.append(
-            "⚠️ 未完成子任务时，不能声称任务已全部完成。\n"
-        )
-    else:
-        system_parts.append(
-            "注意：该任务没有关联的任务图，请根据上下文继续处理。\n"
-        )
-
-    if visual_context:
-        system_parts.append(f"\n【视觉观察】\n{visual_context}\n")
-
-    if rag_context:
-        system_parts.append(f"\n【参考知识】\n{rag_context}\n")
-
-    _inject_memory_context(system_parts, user_input, rag_manager, attn_stats, pre_retrieved_memory)
-
-    system_parts.append(
-        "\n⚠️ 语言要求：必须使用与用户输入相同的语言回复，包括工具调用中的所有字段。\n"
-        "\n请继续执行之前的任务："
-    )
-    system_prompt = "".join(system_parts)
-
-    logger.info(f"[IntentPrompt] RESUME 系统提示词: {len(system_prompt)} chars")
-    return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": str(user_input)},
-    ]
-
-
-def build_round2_system_prompt(intent_type: IntentType, user_input: str,
-                               rag_context: Optional[str],
-                               visual_context: Optional[str],
-                               scaffold_data: dict,
-                               rag_manager=None,
-                               attn_stats: dict = None,
-                               voice_mode: str = "TEXT_ONLY",
-                               pre_retrieved_memory: str = None) -> list:
-    """构建 Round 2 场景化系统提示词
-
-    根据 Round 1 分类结果构建对应场景的 messages 列表。
-
-    Args:
-        intent_type: Round 1 分类结果
-        user_input: 用户原始输入
-        rag_context: RAG 检索到的上下文
-        visual_context: 视觉上下文
-        scaffold_data: Round 1 scaffold 操作的返回数据
-        rag_manager: RAGManager 实例（用于 MemoryGraph 注入）
-        attn_stats: AttentionWindowManager.stats 字典（可选，用于容量仪表盘）
-        voice_mode: 语音模式 (TEXT_ONLY / AUTO_TTS / FORCED_TTS)
-        pre_retrieved_memory: L1-B 预检索的记忆上下文（如果提供则跳过重复检索）
-
-    Returns:
-        构建好的 messages 列表 [{"role": "system", ...}, {"role": "user", ...}]
-    """
-    # 只有在语音交互模式下才注入语音功能提示
-    enable_voice_hint = voice_mode in ("AUTO_TTS", "FORCED_TTS")
-
-    if intent_type == IntentType.CHAT:
-        return _build_chat_prompt(user_input, rag_context, visual_context, rag_manager, attn_stats, enable_voice_hint, pre_retrieved_memory)
-    elif intent_type == IntentType.COMPLEX:
-        return _build_complex_prompt(user_input, rag_context, visual_context, scaffold_data, rag_manager, attn_stats, enable_voice_hint, pre_retrieved_memory)
-    elif intent_type == IntentType.RESUME:
-        return _build_resume_prompt(user_input, rag_context, visual_context, scaffold_data, rag_manager, attn_stats, enable_voice_hint, pre_retrieved_memory)
-    else:
-        logger.warning(f"[IntentPrompt] 未知意图类型 {intent_type}，降级为 CHAT")
-        return _build_chat_prompt(user_input, rag_context, visual_context, rag_manager, attn_stats, enable_voice_hint, pre_retrieved_memory)

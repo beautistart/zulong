@@ -97,9 +97,9 @@ class MiniL2Engine:
             
             if self._interrupt_flag:
                 logger.info(f"[L2_{self.engine_id}] 被中断")
-                return f"[L2_{self.engine_id}] 任务被中断: {input_text[:30]}..."
+                return "系统当前出问题了，模拟 L2 引擎被误用于会话链路，无法正常回复。"
             
-            response = f"[L2_{self.engine_id}] 收到: {input_text[:50]}..."
+            response = "系统当前出问题了，模拟 L2 引擎被误用于会话链路，无法正常回复。"
             return response
         finally:
             self.is_busy = False

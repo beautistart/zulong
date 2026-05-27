@@ -2,16 +2,22 @@
 # 祖龙 (ZULONG) 系统 - L2 (Cortex) 层配置
 # TSD v1.7 规范：L2 运行在 GPU，使用无量化模式加载
 
+import os
 from pathlib import Path
 from typing import Dict, Any
 import torch
+from zulong.utils.device import torch_device
+
+# 项目根目录（优先从环境变量 ZULONG_HOME 获取，否则自动检测）
+_PROJECT_ROOT = Path(os.environ.get("ZULONG_HOME", Path(__file__).resolve().parent.parent.parent))
+_MODEL_BASE = Path(os.environ.get("ZULONG_MODEL_BASE_DIR", str(_PROJECT_ROOT / "models")))
 
 # 模型路径 (INT4 量化模式)
 # ✅ 已更换为 Qwen3.5-2B 模型，平衡性能和显存占用
-L2_CORE_MODEL_PATH = Path(r"d:\AI\project\zulong_beta4\models\Qwen\Qwen3___5-2B")
+L2_CORE_MODEL_PATH = _MODEL_BASE / "Qwen" / "Qwen3___5-2B"
 
-# 设备配置 (L2 运行在 GPU)
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# 设备配置 (Windows/Linux 优先 CUDA，macOS Apple Silicon 优先 MPS)
+DEVICE = torch_device("auto", prefer_gpu=True)
 
 # 模型参数 (Qwen3.5-2B)
 MAX_LENGTH = 2048  # 最大生成长度 (2B 模型支持足够上下文)

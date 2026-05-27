@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Dict, Any
 import torch
+from zulong.utils.device import torch_device
 
 # 🎯 动态获取项目根目录 (基于当前文件位置)
 PROJECT_ROOT = Path(__file__).parent.parent.parent  # zulong/l1a -> zulong -> project_root
@@ -25,8 +26,8 @@ os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
 os.makedirs(VIDEO_BACKTRACK_DIR, exist_ok=True)
 os.makedirs(SHARED_VISION_DIR, exist_ok=True)
 
-# 设备配置 (L1-A 运行在 GPU)
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# 设备配置 (Windows/Linux 优先 CUDA，macOS Apple Silicon 使用 MPS)
+DEVICE = torch_device("auto", prefer_gpu=True)
 
 # 模型参数
 MAX_LENGTH = 512  # 最大生成长度

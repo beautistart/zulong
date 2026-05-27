@@ -115,6 +115,54 @@ export interface ExtensionState {
 	openAiCodexIsAuthenticated?: boolean
 }
 
+export interface InteractionPayload {
+	interaction_id: string
+	pair_id: string
+	kind: "plan" | "action" | "observation" | "progress" | "approval" | "summary" | "user_interject"
+	status:
+		| "pending"
+		| "running"
+		| "awaiting_approval"
+		| "approved"
+		| "rejected"
+		| "succeeded"
+		| "failed"
+		| "blocked"
+		| "cancelled"
+	title: string
+	detail?: string
+	/** L2 的思考: "为什么选择这个工具" */
+	thought?: string
+	/** 启动说明中的规划步骤 (kind=plan) */
+	plan_steps?: string[]
+	tool_name?: string
+	/** 工具参数摘要 */
+	tool_args?: Record<string, any>
+	risk_level?: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"
+	risk_reason?: string
+	confirmation_state?: "pending" | "approved" | "rejected"
+	/** 审批模式: 完全权限/白名单/手动/弹窗 */
+	approval_mode?: "full_auto" | "whitelist" | "manual" | "popup"
+	progress?: number
+	current_step?: number
+	total_steps?: number
+	next_step?: string
+	timestamp?: number
+	/** FC 循环轮次 */
+	turn?: number
+	// ===== 总结卡片 (kind=summary) =====
+	completed_items?: string[]
+	verified_items?: string[]
+	pending_items?: string[]
+	risks_summary?: string
+	/** 本次任务产生的记忆变化 */
+	memory_changes?: {
+		created: number
+		strengthened: number
+		pruned: number
+	}
+}
+
 export interface ZulongMessage {
 	ts: number
 	type: "ask" | "say"
@@ -132,6 +180,7 @@ export interface ZulongMessage {
 	conversationHistoryIndex?: number
 	conversationHistoryDeletedRange?: [number, number] // for when conversation history is truncated for API requests
 	modelInfo?: ZulongMessageModelInfo
+	interaction?: InteractionPayload
 }
 
 export type ZulongAsk =

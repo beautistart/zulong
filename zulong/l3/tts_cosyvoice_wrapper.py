@@ -171,7 +171,7 @@ def test_cosyvoice_wrapper():
     
     wrapper = CosyVoiceWrapper()
     
-    output_path = r"d:\AI\project\zulong_beta4\tests\output_cosyvoice_wrapper.wav"
+    output_path = r"d:\AI\project\zulong_beta5\tests\output_cosyvoice_wrapper.wav"
     
     success = wrapper.synthesize(
         text="你好，我是祖龙机器人。",

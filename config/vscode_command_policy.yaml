@@ -1,0 +1,84 @@
+# VS Code 命令安全策略
+# 用于 vscode_run_command 工具的命令安全分级
+# safe: 免审批直接执行
+# high_risk: 需要用户审批
+# blocked: 硬阻止
+
+vscode_command_policy:
+  safe:
+    # 编辑器操作
+    - "editor.action.formatDocument"
+    - "editor.action.formatSelection"
+    - "editor.action.organizeImports"
+    - "editor.action.goToDefinition"
+    - "editor.action.peekDefinition"
+    - "editor.action.referenceSearch.trigger"
+    - "editor.action.rename"
+    - "editor.action.triggerSuggest"
+    - "editor.action.triggerParameterHints"
+    - "editor.action.commentLine"
+    - "editor.action.blockComment"
+
+    # 任务运行
+    - "workbench.action.tasks.build"
+    - "workbench.action.tasks.test"
+    - "workbench.action.tasks.runTask"
+
+    # 面板操作
+    - "workbench.action.problems.focus"
+    - "workbench.action.output.focus"
+    - "workbench.action.terminal.focus"
+    - "workbench.action.terminal.toggleTerminal"
+
+    # VS Code 内置 Provider
+    - "vscode.executeDocumentSymbolProvider"
+    - "vscode.executeCompletionItemProvider"
+    - "vscode.executeHoverProvider"
+    - "vscode.executeDefinitionProvider"
+    - "vscode.executeImplementationProvider"
+    - "vscode.executeReferenceProvider"
+    - "vscode.executeTypeDefinitionProvider"
+    - "vscode.executeWorkspaceSymbolProvider"
+    - "vscode.executeFormatDocumentProvider"
+    - "vscode.executeFormatRangeProvider"
+    - "vscode.executeCodeLensProvider"
+    - "vscode.executeLinkProvider"
+    - "vscode.previewHtml"
+
+    # Notebook
+    - "notebook.execute"
+    - "notebook.cell.execute"
+
+  high_risk:
+    # Git 操作
+    - "git.stage"
+    - "git.stageAll"
+    - "git.stageSelectedRanges"
+    - "git.unstage"
+    - "git.unstageAll"
+    - "git.unstageSelectedRanges"
+    - "git.commit"
+    - "git.commitAll"
+    - "git.commitStaged"
+    - "git.push"
+    - "git.pull"
+    - "git.clean"
+    - "git.revert"
+    - "git.revertSelectedRanges"
+
+    # 破坏性文件操作
+    - "deleteFile"
+    - "workbench.files.action.deleteFile"
+
+    # 剪切操作
+    - "editor.action.clipboardCutAction"
+
+  blocked:
+    # 窗口/进程破坏
+    - "workbench.action.reloadWindow"
+    - "workbench.action.closeWindow"
+    - "workbench.action.quit"
+
+    # 扩展管理（走 vscode_manage_extension 专门工具）
+    - "workbench.extensions.installExtension"
+    - "workbench.extensions.uninstallExtension"

@@ -506,12 +506,17 @@ class ToolEngine:
             
             # 注册 search_tools 元工具（Tool RAG 入口）
             try:
-                from zulong.tools.search_tools import SearchToolsTool
+                from zulong.tools.search_tools import SearchToolsTool, RequestToolSupplementTool
                 search_tools_tool = SearchToolsTool()
                 if self.register_tool(search_tools_tool):
                     logger.info("[ToolEngine] 已注册 search_tools 元工具")
                 else:
                     logger.debug("[ToolEngine] search_tools 元工具已存在，跳过注册")
+                supplement_tool = RequestToolSupplementTool(self.registry)
+                if self.register_tool(supplement_tool):
+                    logger.info("[ToolEngine] 已注册 request_tool_supplement 工具")
+                else:
+                    logger.debug("[ToolEngine] request_tool_supplement 工具已存在，跳过注册")
             except ImportError:
                 logger.debug("[ToolEngine] search_tools 模块未找到，跳过注册")
             
@@ -525,6 +530,25 @@ class ToolEngine:
                     logger.debug("[ToolEngine] search_experience 工具已存在，跳过注册")
             except ImportError:
                 logger.debug("[ToolEngine] experience_tool 模块未找到，跳过注册")
+
+            # 注册 IDE 后台桥工具（供 L2 主动打开/切换 VS Code 工作区）
+            try:
+                from zulong.tools.ide_bridge_tools import (
+                    IdeOpenWorkspaceTool,
+                    IdeWriteFileTool,
+                )
+                ide_open_workspace_tool = IdeOpenWorkspaceTool()
+                if self.register_tool(ide_open_workspace_tool):
+                    logger.info("[ToolEngine] 已注册 ide_open_workspace 工具")
+                else:
+                    logger.debug("[ToolEngine] ide_open_workspace 工具已存在，跳过注册")
+                ide_write_file_tool = IdeWriteFileTool()
+                if self.register_tool(ide_write_file_tool):
+                    logger.info("[ToolEngine] 已注册 ide_write_file 工具")
+                else:
+                    logger.debug("[ToolEngine] ide_write_file 工具已存在，跳过注册")
+            except ImportError:
+                logger.debug("[ToolEngine] ide_bridge_tools 模块未找到，跳过注册")
             
             # 注册 navigate_attention 工具（思维深度索引 — 注意力导航）
             try:
@@ -641,6 +665,10 @@ class ToolEngine:
                     GetImpactAnalysisTool, IndexCodeFileTool,
                     IndexProjectTool, AnalyzeModuleTool,
                 )
+                from zulong.tools.read_file_tool import ReadFileTool
+                read_file_tool = ReadFileTool()
+                if self.register_tool(read_file_tool):
+                    logger.info(f"[ToolEngine] 已注册 {read_file_tool.name} 工具")
                 for code_tool_cls in (
                     SearchCodeSymbolsTool, GetSymbolContextTool,
                     GetImpactAnalysisTool, IndexCodeFileTool,

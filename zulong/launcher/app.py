@@ -26,6 +26,7 @@ from zulong.launcher.modules.core_modules import (
     ConfigModule,
     SharedMemoryPoolModule,
     MemoryGraphModule,
+    EventStoreModule,
     EventBusWSModule,
     InferenceEngineModule,
 )
@@ -85,6 +86,7 @@ class LauncherApp:
         self.manager.register(ConfigModule())
         self.manager.register(SharedMemoryPoolModule())
         self.manager.register(MemoryGraphModule())
+        self.manager.register(EventStoreModule())
         self.manager.register(EventBusWSModule())
         self.manager.register(InferenceEngineModule())
         self.manager.register(IDEServerModule())
@@ -146,7 +148,8 @@ class LauncherApp:
                 return JSONResponse({"error": f"无效模式: {mode}"}, status_code=400)
 
             self.phase = "launching"
-            asyncio.create_task(self._do_launch(mode))
+            loop = asyncio.get_running_loop()
+            loop.call_later(0.1, lambda: asyncio.create_task(self._do_launch(mode)))
             return {"status": "ok", "mode": mode}
 
         @app.get("/api/status")
@@ -156,6 +159,43 @@ class LauncherApp:
             info["phase"] = self.phase
             info["uptime_seconds"] = round(time.time() - self._start_time, 1)
             return info
+
+        @app.get("/api/tools/bag")
+        async def tool_bag():
+            """返回当前 ToolEngine 注册工具的统一工具袋清单。"""
+            try:
+                from zulong.l2.inference_engine import InferenceEngine
+                from zulong.tools.tool_bag import build_tool_bag
+
+                engine = InferenceEngine()
+                bag = build_tool_bag(engine.tool_engine.registry)
+                return {
+                    "total": len(bag),
+                    "tools": [entry.to_dict() for entry in bag.values()],
+                }
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
+
+        @app.post("/api/tools/predict")
+        async def predict_tools(body: dict):
+            """调试 L1-B 工具预判，不触发 L2 执行。"""
+            try:
+                from zulong.l2.inference_engine import InferenceEngine
+                from zulong.tools.tool_bag import predict_tools_for_turn
+
+                text = (body.get("text") or body.get("message") or "").strip()
+                engine = InferenceEngine()
+                prediction = predict_tools_for_turn(
+                    text,
+                    registry=engine.tool_engine.registry,
+                    intent_result=body.get("intent_result") or None,
+                    referenced_nodes=body.get("referenced_nodes") or None,
+                    has_task_graph=bool(body.get("has_task_graph", False)),
+                    max_prompt_tools=body.get("max_prompt_tools"),
+                )
+                return prediction.to_dict()
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
 
         @app.post("/api/module/{name}/start")
         async def module_start(name: str):

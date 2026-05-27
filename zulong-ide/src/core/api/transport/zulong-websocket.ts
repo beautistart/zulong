@@ -4,13 +4,15 @@
  * Manages a persistent WebSocket connection to the Zulong IDE Server (Python backend).
  * Handles message framing, reconnection, and event dispatching.
  *
- * Protocol (matching zulong_ide_server.py):
- *   Plugin → Backend: session_start / session_resume / tool_result / user_cancel
- *   Backend → Plugin: tool_request / display_text / display_reasoning / task_complete / task_error / status_update / session_ack
+ * Protocol:
+ *   Plugin → Backend: task:start / task:resume / tool:result / task:cancel
+ *   Backend → Plugin: tool:request / text:stream / reasoning / task:complete / task:error / task:progress / task:ack
+ * Legacy IDE message names are still accepted for backward compatibility.
  */
 
 import { EventEmitter } from "events"
 import { Logger } from "@/shared/services/Logger"
+import type { InteractionPayload } from "@/shared/ExtensionMessage"
 
 // ── Message types ────────────────────────────────────
 
@@ -31,6 +33,49 @@ export interface ZulongToolRequest {
 	tool_names: string[]
 }
 
+const LEGACY_TO_UNIFIED: Record<string, string> = {
+	session_start: "task:start",
+	session_resume: "task:resume",
+	user_cancel: "task:cancel",
+	tool_result: "tool:result",
+	session_ack: "task:ack",
+	task_complete: "task:complete",
+	task_error: "task:error",
+	task_progress: "task:progress",
+	status_update: "task:progress",
+	display_text: "text:stream",
+	display_reasoning: "reasoning",
+	tool_request: "tool:request",
+	audio_start: "audio:start",
+	audio_chunk: "audio:chunk",
+	audio_end: "audio:end",
+	audio_transcript: "audio:transcript",
+	audio_start_ack: "audio:transcript",
+	tool_prediction: "tool:prediction",
+	task_plan: "task:plan",
+	task_summary: "task:summary",
+	approval_required: "approval:required",
+	approval_result: "approval:result",
+	attention_update: "attention:update",
+	graph_memory_diff: "graph:memory:diff",
+	interaction_event: "interaction:event",
+}
+
+const INTERACTION_EVENT_TYPES = new Set([
+	"tool_prediction",
+	"task_plan",
+	"task_summary",
+	"approval_required",
+	"approval_result",
+	"attention_update",
+	"graph_memory_diff",
+	"interaction_event",
+])
+
+const UNIFIED_TO_LEGACY: Record<string, string> = Object.fromEntries(
+	Object.entries(LEGACY_TO_UNIFIED).map(([legacy, unified]) => [unified, legacy]),
+)
+
 // ── Transport class ──────────────────────────────────
 
 export class ZulongWebSocket extends EventEmitter {
@@ -38,7 +83,7 @@ export class ZulongWebSocket extends EventEmitter {
 	private serverUrl: string
 	private sessionId: string = ""
 	private reconnectAttempts = 0
-	private maxReconnectAttempts = 5
+	private readonly maxReconnectDelay = 30_000
 	private reconnectDelay = 1000
 	private disposed = false
 	private pendingMessages: Array<Record<string, any>> = []
@@ -55,8 +100,10 @@ export class ZulongWebSocket extends EventEmitter {
 		super()
 		// Normalize URL: ensure ws:// or wss://
 		this.serverUrl = serverUrl.replace(/^http/, "ws")
-		if (!this.serverUrl.endsWith("/ide")) {
-			this.serverUrl = this.serverUrl.replace(/\/$/, "") + "/ide"
+		const parsed = new URL(this.serverUrl.replace(/^ws/, "http"))
+		if (parsed.pathname !== "/" && parsed.pathname !== "/ide") {
+			parsed.pathname = "/"
+			this.serverUrl = parsed.toString().replace(/^http/, "ws")
 		}
 	}
 
@@ -99,6 +146,14 @@ export class ZulongWebSocket extends EventEmitter {
 				this.reconnectAttempts = 0
 				this.missedPongs = 0
 				this.startHeartbeat()
+				// 统一协议握手: 声明客户端类型
+				this.sendRaw({
+					msg_id: this.generateMsgId(),
+					type: "handshake",
+					session_id: "",
+					ts: Date.now() / 1000,
+					payload: { client_type: "ide_plugin", api_version: "2.0" },
+				})
 				this.emit("connected")
 			}
 
@@ -107,23 +162,24 @@ export class ZulongWebSocket extends EventEmitter {
 					const msg: ZulongMessage = JSON.parse(
 						typeof event.data === "string" ? event.data : event.data.toString(),
 					)
-					Logger.info(`[ZulongWS] \u2190 RECV ${msg.type} session=${msg.session_id?.slice(0, 12)} msg_id=${msg.msg_id}`)
-					if (msg.type === "tool_request") {
-						const p = msg.payload as ZulongToolRequest
+					const normalizedMsg = this.normalizeIncoming(msg)
+					Logger.info(`[ZulongWS] \u2190 RECV ${msg.type} normalized=${normalizedMsg.type} session=${msg.session_id?.slice(0, 12)} msg_id=${msg.msg_id}`)
+					if (normalizedMsg.type === "tool_request") {
+						const p = normalizedMsg.payload as ZulongToolRequest
 						Logger.info(`[ZulongWS] \u2190 tool_request: tools=[${p.tool_names?.join(", ")}], call_ids=[${p.call_ids?.join(", ")}]`)
 					}
-					this.handleMessage(msg)
+					this.handleMessage(normalizedMsg)
 
 					// Resolve on session_ack
-					if (msg.type === "session_ack") {
+					if (normalizedMsg.type === "session_ack") {
 						clearTimeout(timeout)
-						this.sessionId = msg.payload?.session_id || msg.session_id
+						this.sessionId = normalizedMsg.payload?.session_id || normalizedMsg.session_id
 						Logger.info(`[ZulongWS] Session established: ${this.sessionId?.slice(0, 12)}`)
-						if (msg.payload?.context_window_size && typeof msg.payload.context_window_size === "number") {
+						if (normalizedMsg.payload?.context_window_size && typeof normalizedMsg.payload.context_window_size === "number") {
 							this.emit("model_info", {
-								contextWindow: msg.payload.context_window_size,
+								contextWindow: normalizedMsg.payload.context_window_size,
 							})
-							Logger.info(`[ZulongWS] Backend context_window_size: ${msg.payload.context_window_size}`)
+							Logger.info(`[ZulongWS] Backend context_window_size: ${normalizedMsg.payload.context_window_size}`)
 						}
 						// Flush pending messages
 						for (const pending of this.pendingMessages) {
@@ -170,7 +226,7 @@ export class ZulongWebSocket extends EventEmitter {
 		if (projectId) {
 			payload.project_id = projectId
 		}
-		this.send("session_start", payload)
+		this.send("task:start", payload)
 	}
 
 	/**
@@ -185,14 +241,14 @@ export class ZulongWebSocket extends EventEmitter {
 		if (graphId) {
 			payload.graph_id = graphId
 		}
-		this.send("session_resume", payload)
+		this.send("task:resume", payload)
 	}
 
 	/**
 	 * Send tool execution result back to the backend.
 	 */
 	sendToolResult(callId: string, toolName: string, result: string, isError: boolean = false): void {
-		this.send("tool_result", {
+		this.send("tool:result", {
 			call_id: callId,
 			tool_name: toolName,
 			result,
@@ -204,7 +260,35 @@ export class ZulongWebSocket extends EventEmitter {
 	 * Send user cancel signal.
 	 */
 	sendCancel(): void {
-		this.send("user_cancel", {})
+		this.send("task:cancel", {})
+	}
+
+	sendIdeContext(payload: Record<string, any>): void {
+		this.send("ide:context", payload)
+	}
+
+	sendIdeFileChanged(payload: Record<string, any>): void {
+		this.send("ide:file_changed", payload)
+	}
+
+	sendIdeTerminalStatus(payload: Record<string, any>): void {
+		this.send("ide:terminal_status", payload)
+	}
+
+	sendIdeApprovalStatus(payload: Record<string, any>): void {
+		this.send("ide:approval_status", payload)
+	}
+
+	sendIdeApprovalResult(payload: Record<string, any>): void {
+		this.send("ide:approval_result", payload)
+	}
+
+	sendIdeDiffStatus(payload: Record<string, any>): void {
+		this.send("ide:diff_status", payload)
+	}
+
+	sendIdeCheckpointStatus(payload: Record<string, any>): void {
+		this.send("ide:checkpoint_status", payload)
 	}
 
 	/**
@@ -213,7 +297,7 @@ export class ZulongWebSocket extends EventEmitter {
 	 * @param format Audio format (webm, mp4, wav)
 	 */
 	sendAudioChunk(audioBase64: string, format: string = "webm"): void {
-		this.send("audio_chunk", {
+		this.send("audio:chunk", {
 			audio: audioBase64,
 			format,
 			sample_rate: 16000,
@@ -224,14 +308,14 @@ export class ZulongWebSocket extends EventEmitter {
 	 * Signal audio stream start.
 	 */
 	sendAudioStart(): void {
-		this.send("audio_start", {})
+		this.send("audio:start", {})
 	}
 
 	/**
 	 * Signal audio stream end.
 	 */
 	sendAudioEnd(): void {
-		this.send("audio_end", {})
+		this.send("audio:end", {})
 	}
 
 	/**
@@ -263,7 +347,7 @@ export class ZulongWebSocket extends EventEmitter {
 			payload,
 		}
 		Logger.info(`[ZulongWS] \u2192 SEND ${type} session=${this.sessionId?.slice(0, 12)}`)
-		if (type === "tool_result") {
+		if (type === "tool:result") {
 			Logger.info(`[ZulongWS] \u2192 tool_result: call_id=${payload.call_id}, tool=${payload.tool_name}, is_error=${payload.is_error}`)
 		}
 		if (this.isConnected) {
@@ -292,6 +376,10 @@ export class ZulongWebSocket extends EventEmitter {
 
 		// Emit typed events that ZulongHandler listens to
 		switch (msg.type) {
+			case "handshake_ack":
+				// 握手确认: 记录服务器版本信息
+				Logger.info(`[ZulongWS] handshake_ack: server_version=${msg.payload?.server_version}`)
+				break
 			case "tool_request":
 				this.emit("tool_request", msg.payload as ZulongToolRequest)
 				break
@@ -323,23 +411,254 @@ export class ZulongWebSocket extends EventEmitter {
 			case "audio_transcript":
 				this.emit("audio_transcript", msg.payload.text || "", msg.payload.is_final || false)
 				break
+			case "ide_open_workspace":
+				this.emit("ide_open_workspace", msg.payload)
+				break
+			case "ide_open_file":
+				this.emit("ide_open_file", msg.payload)
+				break
+			case "ide_open_terminal":
+				this.emit("ide_open_terminal", msg.payload)
+				break
+			case "ide_show_diff":
+				this.emit("ide_show_diff", msg.payload)
+				break
+			case "ide_approval_result":
+				this.emit("ide_approval_result", msg.payload)
+				break
+			case "ide_get_context":
+				this.emit("ide_get_context", msg.payload)
+				break
 			case "system_ready":
 				this.emit("system_ready", msg.payload)
 				break
 			default:
+				if (INTERACTION_EVENT_TYPES.has(msg.type)) {
+					this.emit("interaction", this.toInteractionPayload(msg), msg)
+					break
+				}
 				this.emit("unknown_message", msg)
 		}
 	}
 
-	private attemptReconnect(): void {
-		if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-			Logger.error(`[ZulongWS] Max reconnection attempts (${this.maxReconnectAttempts}) reached`)
-			this.emit("error", new Error("Max reconnection attempts reached"))
-			return
+	private toInteractionPayload(msg: ZulongMessage): InteractionPayload {
+		const payload = msg.payload || {}
+		const existing = payload.interaction
+		const base =
+			existing && typeof existing === "object"
+				? { ...(existing as Partial<InteractionPayload>) }
+				: this.buildFallbackInteraction(msg)
+		const interactionId =
+			base.interaction_id ||
+			payload.interaction_id ||
+			payload.call_id ||
+			payload.msg_id ||
+			msg.msg_id ||
+			`${msg.type}:${Date.now()}`
+		const pairId = base.pair_id || payload.pair_id || payload.call_id || interactionId
+
+		return {
+			...base,
+			interaction_id: String(interactionId),
+			pair_id: String(pairId),
+			kind: this.normalizeInteractionKind(base.kind),
+			status: this.normalizeInteractionStatus(base.status),
+			title: base.title || this.defaultInteractionTitle(msg),
+			detail: base.detail || payload.reason || payload.message || "",
+			timestamp: base.timestamp ?? payload.timestamp ?? msg.ts,
+			turn: base.turn ?? payload.turn,
+		} as InteractionPayload
+	}
+
+	private buildFallbackInteraction(msg: ZulongMessage): Partial<InteractionPayload> {
+		const payload = msg.payload || {}
+		switch (msg.type) {
+			case "tool_prediction":
+				return {
+					kind: "plan",
+					status: "running",
+					title: "已预判可用工具",
+					detail: payload.reason || "已根据当前任务准备工具包。",
+					tool_args: {
+						suggested_tools: payload.suggested_tools || payload.prediction?.suggested_tools || [],
+						confidence: payload.confidence ?? payload.prediction?.confidence,
+					},
+				}
+			case "task_plan":
+				return {
+					kind: "plan",
+					status: "running",
+					title: payload.task ? `任务启动: ${String(payload.task).slice(0, 80)}` : "任务已启动",
+					detail: payload.intent ? `意图: ${payload.intent}` : "正在准备上下文和工具。",
+					tool_args: {
+						suggested_tools: payload.tool_prediction?.suggested_tools || [],
+					},
+				}
+			case "approval_required":
+				return {
+					kind: "approval",
+					status: "awaiting_approval",
+					title: payload.tool_name ? `审批请求: ${payload.tool_name}` : "需要审批",
+					detail: payload.reason || "该操作需要用户确认后继续。",
+					tool_name: payload.tool_name,
+					tool_args: this.parseToolArgs(payload.tool_args),
+					risk_level: payload.risk_level,
+					risk_reason: payload.reason,
+					approval_mode: payload.approval_mode,
+				}
+			case "task_summary":
+				return {
+					kind: "summary",
+					status: "succeeded",
+					title: "任务完成",
+					detail: payload.detail || "",
+					completed_items: payload.completed_items,
+					verified_items: payload.verified_items,
+					pending_items: payload.pending_items,
+					risks_summary: payload.risks_summary,
+					next_step: payload.next_step,
+					memory_changes: payload.memory_changes,
+					progress: 100,
+				}
+			case "graph_memory_diff":
+				return {
+					kind: "observation",
+					status: "succeeded",
+					title: "图记忆已更新",
+					detail: "本轮任务产生了记忆图谱变化。",
+					memory_changes: payload.memory_changes,
+				}
+			case "attention_update":
+				return {
+					kind: "progress",
+					status: "running",
+					title: "注意力状态更新",
+					detail: payload.mode || payload.state || "",
+				}
+			case "approval_result":
+				return {
+					kind: "approval",
+					status: payload.action === "reject" ? "rejected" : "approved",
+					title: "审批结果已记录",
+					detail: payload.action || "",
+				}
+			default:
+				return {
+					kind: "observation",
+					status: "running",
+					title: this.defaultInteractionTitle(msg),
+					detail: payload.message || "",
+				}
 		}
+	}
+
+	private defaultInteractionTitle(msg: ZulongMessage): string {
+		switch (msg.type) {
+			case "tool_prediction":
+				return "工具预判"
+			case "task_plan":
+				return "任务启动"
+			case "task_summary":
+				return "任务总结"
+			case "approval_required":
+				return "审批请求"
+			case "graph_memory_diff":
+				return "图记忆变化"
+			case "attention_update":
+				return "注意力更新"
+			case "approval_result":
+				return "审批结果"
+			case "interaction_event":
+				return "任务事件"
+			default:
+				return "任务事件"
+		}
+	}
+
+	private normalizeInteractionKind(kind: unknown): InteractionPayload["kind"] {
+		switch (kind) {
+			case "plan":
+			case "action":
+			case "observation":
+			case "progress":
+			case "approval":
+			case "summary":
+			case "user_interject":
+				return kind
+			case "state":
+				return "progress"
+			case "user_adjustment":
+				return "user_interject"
+			default:
+				return "observation"
+		}
+	}
+
+	private normalizeInteractionStatus(status: unknown): InteractionPayload["status"] {
+		switch (status) {
+			case "pending":
+			case "running":
+			case "awaiting_approval":
+			case "approved":
+			case "rejected":
+			case "succeeded":
+			case "failed":
+			case "blocked":
+			case "cancelled":
+				return status
+			case "completed":
+			case "complete":
+				return "succeeded"
+			default:
+				return "running"
+		}
+	}
+
+	private parseToolArgs(raw: unknown): Record<string, any> | undefined {
+		if (!raw) {
+			return undefined
+		}
+		if (typeof raw === "object") {
+			return raw as Record<string, any>
+		}
+		if (typeof raw !== "string") {
+			return { value: raw }
+		}
+		try {
+			const parsed = JSON.parse(raw)
+			return parsed && typeof parsed === "object" ? parsed : { value: raw }
+		} catch {
+			return { value: raw }
+		}
+	}
+
+	private normalizeIncoming(msg: ZulongMessage): ZulongMessage {
+		const legacyType = UNIFIED_TO_LEGACY[msg.type] || msg.type
+		const payload = { ...(msg.payload || {}) }
+		if (msg.type === "text:final" && !payload.result && payload.text) {
+			payload.result = payload.text
+		}
+		if (msg.type.startsWith("ide:")) {
+			return {
+				...msg,
+				type: msg.type.replace("ide:", "ide_"),
+				payload,
+			}
+		}
+		return {
+			...msg,
+			type: legacyType,
+			payload,
+		}
+	}
+
+	private attemptReconnect(): void {
 		this.reconnectAttempts++
-		const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1)
-		Logger.warn(`[ZulongWS] Reconnecting... attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} (delay ${delay}ms)`)
+		const delay = Math.min(
+			this.maxReconnectDelay,
+			this.reconnectDelay * Math.pow(2, Math.min(this.reconnectAttempts - 1, 5)),
+		)
+		Logger.warn(`[ZulongWS] Reconnecting... attempt ${this.reconnectAttempts} (delay ${delay}ms)`)
 		setTimeout(() => {
 			if (!this.disposed) {
 				this.emit("reconnecting", this.reconnectAttempts)

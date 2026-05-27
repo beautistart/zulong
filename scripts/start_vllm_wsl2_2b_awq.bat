@@ -34,6 +34,19 @@ echo.
 echo [START] 启动 vLLM Server (L2_CORE, 端口 8000)...
 echo.
 
-wsl bash -c "source ~/vllm-env/bin/activate && export VLLM_USE_MODELSCOPE=true && vllm serve /mnt/d/AI/project/zulong_beta4/models/Qwen/Qwen3___5-0.8B-AWQ --port 8000 --host 0.0.0.0 --gpu-memory-utilization 0.5 --max-model-len 4096 --enable-auto-tool-choice --tool-call-parser qwen3_xml"
+if not defined ZULONG_HOME set "ZULONG_HOME=%~dp0.."
+REM 将 Windows 路径转为 WSL 路径 (D:\path\to\project -> /mnt/d/path/to/project)
+for %%I in ("%ZULONG_HOME%") do set "ZULONG_DRIVE=%%~dI"
+set "ZULONG_DRIVE_LOWER=%ZULONG_DRIVE:~0,1%"
+call :tolower ZULONG_DRIVE_LOWER
+set "ZULONG_WSL=/mnt/%ZULONG_DRIVE_LOWER%%%ZULONG_HOME:~2%"
+set "ZULONG_WSL=%ZULONG_WSL:\=/%"
+
+wsl bash -c "source ~/vllm-env/bin/activate && export VLLM_USE_MODELSCOPE=true && vllm serve %ZULONG_WSL%/models/Qwen/Qwen3___5-0.8B-AWQ --port 8000 --host 0.0.0.0 --gpu-memory-utilization 0.5 --max-model-len 4096 --enable-auto-tool-choice --tool-call-parser qwen3_xml"
+goto :eof
+
+:tolower
+for %%a in ("A=a" "B=b" "C=c" "D=d" "E=e" "F=f" "G=g" "H=h" "I=i" "J=j" "K=k" "L=l" "M=m" "N=n" "O=o" "P=p" "Q=q" "R=r" "S=s" "T=t" "U=u" "V=v" "W=w" "X=x" "Y=y" "Z=z") do call set "%1=%%%1:%%~a%%"
+goto :eof
 
 pause

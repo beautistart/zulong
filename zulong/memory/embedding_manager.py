@@ -14,6 +14,7 @@ import logging
 from typing import Optional, List, Union
 import numpy as np
 from pathlib import Path
+from zulong.utils.device import resolve_device
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ class EmbeddingModelManager:
         return cls._instance
     
     def __init__(self,
-                 model_name: str = "BAAI/bge-small-zh-v1.5",
+                 model_name: str = "models/BAAI/bge-small-zh-v1.5",
                  use_cpu: bool = True,
                  quantize: bool = True,
                  cache_dir: Optional[str] = None):
@@ -87,17 +88,8 @@ class EmbeddingModelManager:
                 device = "cpu"
                 logger.info("[EmbeddingModelManager] 使用 CPU 加载模型（节省显存）")
             else:
-                try:
-                    import torch
-                    if torch.cuda.is_available():
-                        device = "cuda"
-                        logger.info("[EmbeddingModelManager] 使用 GPU 加载模型")
-                    else:
-                        device = "cpu"
-                        logger.warning("[EmbeddingModelManager] CUDA 不可用，使用 CPU")
-                except ImportError:
-                    device = "cpu"
-                    logger.warning("[EmbeddingModelManager] PyTorch 未安装，使用 CPU")
+                device = resolve_device("auto", prefer_gpu=True)
+                logger.info(f"[EmbeddingModelManager] 使用 {device} 加载模型")
             
             # 加载模型
             cache_path = Path(self.cache_dir)
@@ -310,7 +302,7 @@ _embedding_manager_instance = None
 
 
 def get_embedding_manager(
-    model_name: str = "BAAI/bge-small-zh-v1.5",
+    model_name: str = "models/BAAI/bge-small-zh-v1.5",
     use_cpu: bool = True,
     quantize: bool = True,
     cache_dir: Optional[str] = None

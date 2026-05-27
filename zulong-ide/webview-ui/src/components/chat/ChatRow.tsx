@@ -46,6 +46,7 @@ import McpResourceRow from "@/components/mcp/configuration/tabs/installed/server
 import McpToolRow from "@/components/mcp/configuration/tabs/installed/server-row/McpToolRow"
 import { useExtensionState } from "@/context/ExtensionStateContext"
 import { cn } from "@/lib/utils"
+import { PLATFORM_CONFIG } from "@/config/platform.config"
 import { FileServiceClient, UiServiceClient } from "@/services/grpc-client"
 import { findMatchingResourceOrTemplate, getMcpServerDisplayName } from "@/utils/mcp"
 import CodeAccordian, { cleanPathPrefix } from "../common/CodeAccordian"
@@ -65,6 +66,11 @@ import SearchResultsDisplay from "./SearchResultsDisplay"
 import SubagentStatusRow from "./SubagentStatusRow"
 import { ThinkingRow } from "./ThinkingRow"
 import UserMessage from "./UserMessage"
+import ApprovalCard from "./ApprovalCard"
+import { InteractionCard } from "./InteractionCard"
+import StartupCard from "./StartupCard"
+import SummaryCard from "./SummaryCard"
+import { InteractionGroup } from "./InteractionGroup"
 
 const HEADER_CLASSNAMES = "flex items-center gap-2.5 mb-3"
 
@@ -839,6 +845,71 @@ export const ChatRowContent = memo(
 			)
 		}
 
+		// TSD v1.7 §23: interaction 渲染优先级最高，独立于 ask/say 类型
+		if (message.interaction) {
+			const interaction = message.interaction
+			switch (interaction.kind) {
+				case "plan":
+					return (
+						<div className="px-1">
+							<StartupCard interaction={interaction} />
+						</div>
+					)
+				case "approval":
+					return (
+						<div className="px-1">
+							<ApprovalCard
+								interaction={interaction}
+								onApprove={(id: string, addToWhitelist?: string) => {
+									PLATFORM_CONFIG.postMessage({
+										type: "ide_approval_result",
+										text: JSON.stringify({
+											action: "approve",
+											interaction_id: id,
+											add_to_whitelist: addToWhitelist,
+										}),
+									})
+								}}
+								onReject={(id: string) => {
+									PLATFORM_CONFIG.postMessage({
+										type: "ide_approval_result",
+										text: JSON.stringify({
+											action: "reject",
+											interaction_id: id,
+										}),
+									})
+								}}
+							/>
+						</div>
+					)
+				case "summary":
+					return (
+						<div className="px-1">
+							<SummaryCard interaction={interaction} />
+						</div>
+					)
+				case "progress":
+					return (
+						<div className="px-1">
+							<InteractionCard interaction={interaction} />
+						</div>
+					)
+				case "user_interject":
+					return (
+						<div className="px-1 border-l-2 border-orange-400 pl-3 py-1">
+							<div className="text-xs text-description font-medium mb-1">🔄 任务方向已调整</div>
+							<InteractionCard interaction={interaction} />
+						</div>
+					)
+				default:
+					return (
+						<div className="px-1">
+							<InteractionCard interaction={interaction} />
+						</div>
+					)
+			}
+		}
+
 		switch (message.type) {
 			case "say":
 				switch (message.say) {
@@ -1145,8 +1216,9 @@ export const ChatRowContent = memo(
 								</button>
 							</div>
 						)
+					case "task":
 					case "task_progress":
-						return <InvisibleSpacer /> // task_progress messages should be displayed in TaskHeader only, not in chat
+						return <InvisibleSpacer /> // task/task_progress msgs displayed in TaskHeader only
 					default:
 						return (
 							<div>
@@ -1301,6 +1373,7 @@ export const ChatRowContent = memo(
 						)
 					}
 					default:
+						// interaction 已在 switch(message.type) 前统一处理
 						return <InvisibleSpacer />
 				}
 		}

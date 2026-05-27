@@ -418,9 +418,9 @@ class AsyncL1BSchedulerWithSharedPool:
         # TODO: 实现 L2 调用
         logger.info(f"[AsyncL1BSchedulerWithSharedPool] 🧠 发送任务到 L2: {task_id}")
         
-        # 模拟 L2 回复
+        # Mock 路径不得伪装成正常会话回复
         await asyncio.sleep(0.1)  # 模拟推理延迟
-        ai_response = "[L2 回复：这是一个模拟回复]"
+        ai_response = "系统当前出问题了，共享池调度器尚未接入真实 L2，无法正常回复。"
         
         return ai_response
     

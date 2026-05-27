@@ -2,11 +2,13 @@
 # CosyVoice2-0.5B TTS 配置
 # TSD v1.7 规范：TTS 运行在 CPU 上，使用 safetensors 格式
 
+import os
 from pathlib import Path
 from typing import Dict, Any
 
-# 模型路径配置
-MODEL_BASE_DIR = Path(r"d:\AI\project\zulong_beta4\models")
+# 项目根目录（优先从环境变量 ZULONG_HOME 获取，否则自动检测）
+_PROJECT_ROOT = Path(os.environ.get("ZULONG_HOME", Path(__file__).resolve().parent.parent.parent))
+MODEL_BASE_DIR = Path(os.environ.get("ZULONG_MODEL_BASE_DIR", str(_PROJECT_ROOT / "models")))
 COSYVOICE3_PATH = MODEL_BASE_DIR / "CosyVoice3-0.5B" / "FunAudioLLM" / "Fun-CosyVoice3-0___5B-2512"
 TTSFRD_PATH = MODEL_BASE_DIR / "iic" / "CosyVoice-ttsfrd"
 

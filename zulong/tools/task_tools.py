@@ -105,6 +105,64 @@ def _label_similarity(a: str, b: str) -> float:
     return intersection / union if union > 0 else 0.0
 
 
+def _extract_title_core(title: str) -> str:
+    """从任务标题中提取核心主题词。"""
+    s = (title or "").strip()
+    s = re.sub(r"^(帮我|请帮我|请|麻烦|把|将|给我|帮忙)\s*", "", s)
+    s = re.sub(
+        r"(写|做|设计|开发|创建|搭建|实现|生成|构建|完成|编写)(一个|一下)?\s*",
+        "",
+        s,
+    )
+    s = re.sub(r"(出来|一下|吧|呢|了)$", "", s)
+    s = re.sub(r"(简单的|简单|基本的|基本|完整的|完整)", "", s)
+    return s.strip()
+
+
+def _strip_title_stopwords(core: str) -> str:
+    """移除标题中的通用技术停用词，避免无关任务误匹配。"""
+    stopwords = [
+        "数据库表", "数据库", "数据结构",
+        "管理系统", "应用程序", "管理平台",
+        "系统的", "系统", "应用的", "应用",
+        "程序的", "程序", "平台的", "平台",
+        "功能的", "功能", "模块的", "模块",
+        "页面的", "页面", "界面的", "界面",
+        "服务的", "服务", "接口的", "接口",
+        "的", "和", "与", "及",
+    ]
+    s = core
+    for word in stopwords:
+        s = s.replace(word, "")
+    return s.strip()
+
+
+def _titles_related(old_title: str, new_title: str) -> bool:
+    """判断两个任务标题是否属于同一项目/领域的关联任务。"""
+    core_a = _extract_title_core(old_title)
+    core_b = _extract_title_core(new_title)
+    if not core_a or not core_b:
+        return False
+    if core_a in core_b or core_b in core_a:
+        return True
+
+    clean_a = _strip_title_stopwords(core_a)
+    clean_b = _strip_title_stopwords(core_b)
+    if clean_a and clean_b and (clean_a in clean_b or clean_b in clean_a):
+        return True
+
+    a = clean_a if len(clean_a) >= 2 else core_a
+    b = clean_b if len(clean_b) >= 2 else core_b
+    if len(a) < 2 or len(b) < 2:
+        return False
+    bigrams_a = {a[i:i + 2] for i in range(len(a) - 1)}
+    bigrams_b = {b[i:i + 2] for i in range(len(b) - 1)}
+    union = len(bigrams_a | bigrams_b)
+    if union == 0:
+        return False
+    return (len(bigrams_a & bigrams_b) / union) >= 0.3
+
+
 def _extract_ordinal(text: str) -> Optional[int]:
     """从任意字符串中提取序号。
     
@@ -280,6 +338,7 @@ def _create_task_workspace(
     project_mode: bool = False,
     project_name: str = "",
     project_desc: str = "",
+    target_path: str = "",
 ) -> str:
     """为任务创建独立工作目录，返回绝对路径
 
@@ -288,13 +347,16 @@ def _create_task_workspace(
         project_mode: 是否使用项目模式（创建到统一工作空间）
         project_name: 项目名称（project_mode=True 时使用）
         project_desc: 项目描述/任务全文（project_mode=True 时使用）
+        target_path: 可选：用户指定的目标父目录。若提供，项目将创建在该目录下
+                     而非 workspace_root。
 
     Returns:
         工作目录绝对路径
 
     目录结构:
         project_mode=False: ./agent_workspace/{YYYYMMDD}_{HHMMSS}_{graph_id}/
-        project_mode=True:  <workspace_root>/<project_name>/
+        project_mode=True (无 target_path): <workspace_root>/<project_name>/
+        project_mode=True (有 target_path): <target_path>/<project_name>/
     """
     from pathlib import Path
 
@@ -309,6 +371,7 @@ def _create_task_workspace(
                 description=project_desc,
                 task_graph_id=graph_id,
                 source="web",
+                target_path=target_path,
             )
 
             # 自动打开 VS Code（如果配置启用）
@@ -688,7 +751,6 @@ class TaskCreatePlanTool(BaseTool):
                 ]
                 if not _old_uncompleted and _old_leaves:
                     # 旧图已完成：检查新任务是否与旧任务关联
-                    from zulong.tools.session_tool import _titles_related
                     if _titles_related(old_title, title):
                         # 关联任务 → 复用旧图，不创建新图
                         logger.info(
@@ -755,11 +817,13 @@ class TaskCreatePlanTool(BaseTool):
             )
 
             # 创建独立工作目录（使用项目模式）
+            target_path = request.parameters.get("target_path", "")
             workspace_dir = _create_task_workspace(
                 graph_id,
                 project_mode=True,
                 project_name=title,
                 project_desc=title,
+                target_path=target_path,
             )
             tg.metadata["workspace_dir"] = workspace_dir
 
@@ -817,6 +881,10 @@ class TaskCreatePlanTool(BaseTool):
                     "type": "string",
                     "description": "任务标题，描述整体目标",
                 },
+                "target_path": {
+                    "type": "string",
+                    "description": "可选：用户指定的项目父目录绝对路径。如果用户明确说了'在D:/project/创建'，则传入D:/project/。留空则使用默认工作区。",
+                },
             },
             "required": ["title"],
         }
@@ -864,12 +932,36 @@ class TaskAddNodeTool(BaseTool):
 
         tg = get_active_task_graph()
         if tg is None:
-            return self._create_result(
-                success=False,
-                error="当前没有活跃的任务图，请先调用 task_create_plan",
-                execution_time=time.time() - start_time,
-                request_id=request.request_id,
+            # 🔥 [Fix] 自动创建任务图：当没有活跃任务图时，自动创建一个
+            logger.warning("[task_add_node] 无活跃任务图，自动创建默认任务图")
+            auto_title = f"自动任务规划 - {label[:30]}" if len(label) > 30 else f"自动任务规划 - {label}"
+            auto_request = ToolRequest(
+                tool_name="task_create_plan",
+                parameters={"title": auto_title},
+                request_id=f"auto_{request.request_id}",
             )
+            create_tool = TaskCreatePlanTool()
+            create_result = create_tool.execute(auto_request)
+            
+            if not create_result.success:
+                return self._create_result(
+                    success=False,
+                    error=f"自动创建任务图失败: {create_result.error}",
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
+            
+            # 重新获取任务图
+            tg = get_active_task_graph()
+            if tg is None:
+                return self._create_result(
+                    success=False,
+                    error="自动创建任务图后仍无法获取活跃任务图",
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
+            
+            logger.info(f"[task_add_node] 已自动创建任务图: {tg.title} (graph_id={tg.graph_id})")
 
         try:
             # ── 守卫 A: 重复标签检查 ──
@@ -1012,6 +1104,16 @@ class TaskAddNodeTool(BaseTool):
             )
 
             tg.add_h_edge(parent_id, node_id)
+
+            # TSD 23.11 Bug A fix: 父节点有子节点后即为容器"完成"，解除子节点死锁
+            parent = tg.get_node(parent_id)
+            if parent and parent.status == "in_progress":
+                parent.status = "completed"
+                parent.result = f"已拆解为 {len(tg.get_children(parent_id))} 个子任务"
+                logger.info(
+                    f"[task_add_node] 父节点 {parent_id} in_progress→completed"
+                    f"（容器已拆解，{len(tg.get_children(parent_id))}个子任务）"
+                )
 
             logger.info(f"[task_add_node] 添加节点 {node_id} ({node_type}): {label}")
 

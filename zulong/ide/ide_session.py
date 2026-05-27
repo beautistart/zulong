@@ -36,7 +36,7 @@ class IDEFCState:
     resume_automark_count: int = 0
     null_response_count: int = 0
     api_timeout_count: int = 0
-    intent_max_tokens: int = 1024
+    response_max_tokens: int = 1024
     user_input_text: str = ""
 
     # IDE 扩展字段
@@ -47,9 +47,9 @@ class IDEFCState:
     last_response_content: Optional[str] = None
     vllm_model_id: str = ""
 
-    # 意图感知扩展（融合原生 3 层编排）
-    ide_intent: str = "complex"  # "complex" | "resume"（IDE 模式无 CHAT）
-    force_first_tool: bool = False  # RESUME 首轮强制 task_view_overview
+    # L1-B 工具预判扩展
+    task_graph_policy: str = "none"
+    force_first_tool: bool = False  # 继续已有任务图时首轮强制 task_view_overview
     force_graph_id: str = ""  # 确定性恢复: 前端传入的 graph_id，非空时跳过启发式
 
     # 错误恢复计数器
@@ -57,6 +57,9 @@ class IDEFCState:
 
     # CB 模式工具调用连续计数（防止 CB 模式下模型持续调用保留工具导致死循环）
     cb_tool_streak: int = 0
+
+    # 独白计数器：连续纯文本回复（无工具调用）次数，检测模型"叙述而不执行"的退化模式
+    consecutive_text_only_count: int = 0
 
     # 压力 RED: 约束工具列表为仅注意力工具
     pressure_force_attention: bool = False

@@ -2,6 +2,7 @@
 # L3 专家技能池配置 - 通用专家模型管理
 # TSD v1.7 规范：L3 层提供专用领域能力，支持动态加载/卸载
 
+import os
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from enum import Enum
@@ -9,10 +10,11 @@ import torch
 
 
 # ============================================================================
-# 模型路径管理（不硬编码具体模型名称）
+# 模型路径管理（不再硬编码，统一从 ZULONG_HOME 环境变量派生）
 # ============================================================================
 
-MODEL_BASE_DIR = Path(r"d:\AI\project\zulong_beta4\models")
+_PROJECT_ROOT = Path(os.environ.get("ZULONG_HOME", Path(__file__).resolve().parent.parent.parent))
+MODEL_BASE_DIR = Path(os.environ.get("ZULONG_MODEL_BASE_DIR", str(_PROJECT_ROOT / "models")))
 
 
 class ExpertModelType(Enum):

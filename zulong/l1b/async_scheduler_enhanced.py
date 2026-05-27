@@ -291,7 +291,7 @@ class AsyncL1BSchedulerEnhanced:
             
             # 4. 发送到 L2 (此处简化，实际应调用 L2 接口)
             # ai_response = await self._send_to_l2(prompt)
-            ai_response = "[L2 回复]"  # TODO: 实现 L2 调用
+            ai_response = "系统当前出问题了，增强调度器尚未接入真实 L2，无法正常回复。"
             
             # 5. 写入 AI 回复到共享池
             ai_trace = await self.data_ingestion.ingest_text(

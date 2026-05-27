@@ -18,6 +18,7 @@ class HardwareType(Enum):
     NVIDIA_LOW_END = "nvidia_low_end"
     NVIDIA_MID_RANGE = "nvidia_mid_range"
     NVIDIA_HIGH_END = "nvidia_high_end"
+    APPLE_SILICON = "apple_silicon"
     APU = "apu"
     CPU_ONLY = "cpu_only"
 
@@ -59,6 +60,14 @@ MODEL_REGISTRY: Dict[HardwareType, ModelConfig] = {
         block_size=16,
         max_model_len=8192,
     ),
+    HardwareType.APPLE_SILICON: ModelConfig(
+        model_id="Qwen/Qwen2.5-3B-Instruct",
+        model_name="Qwen2.5-3B-Instruct-MPS",
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.7,
+        block_size=16,
+        max_model_len=4096,
+    ),
     HardwareType.APU: ModelConfig(
         model_id="Qwen/Qwen2.5-32B-Instruct",
         model_name="Qwen2.5-32B-Instruct",
@@ -87,8 +96,12 @@ def detect_hardware() -> HardwareType:
     """
     try:
         import torch
+        from zulong.utils.device import is_mps_available
         
         if not torch.cuda.is_available():
+            if is_mps_available():
+                logger.info("[ModelLoader] 检测到 Apple Silicon MPS，使用 macOS GPU 推理")
+                return HardwareType.APPLE_SILICON
             logger.info("[ModelLoader] CUDA 不可用，使用 CPU 模式")
             return HardwareType.CPU_ONLY
         
@@ -236,12 +249,10 @@ def _init_mock_engines(config: ModelConfig) -> Tuple[Any, Any]:
     """
     from zulong.l1b.hotswap_scheduler import MiniL2Engine
     
-    device = "cuda"
     try:
-        import torch
-        if not torch.cuda.is_available():
-            device = "cpu"
-    except:
+        from zulong.utils.device import resolve_device
+        device = resolve_device("auto", prefer_gpu=True)
+    except Exception:
         device = "cpu"
     
     l2_prime = MiniL2Engine(device=device, engine_id="PRIME")
@@ -277,6 +288,8 @@ def get_model_info() -> Dict:
     
     try:
         import torch
+        from zulong.utils.device import accelerator_info
+        info.update(accelerator_info())
         if torch.cuda.is_available():
             free_mem, total_mem = torch.cuda.mem_get_info()
             info["gpu_name"] = torch.cuda.get_device_name(0)

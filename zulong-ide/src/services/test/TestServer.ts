@@ -88,8 +88,9 @@ export async function createTestServer(controller: Controller): Promise<http.Ser
 	Logger.log("[createTestServer] Opening Zulong in sidebar...")
 	vscode.commands.executeCommand(`workbench.view.${ExtensionRegistryInfo.name}-ActivityBar`)
 
-	// Then ensure the webview is focused/loaded
-	vscode.commands.executeCommand(`${ExtensionRegistryInfo.views.Sidebar}.focus`)
+	// VS Code production no longer contributes a sidebar. Keep this historical
+	// focus attempt best-effort for standalone/test hosts that still register it.
+	vscode.commands.executeCommand("zulong.SidebarProvider.focus")
 
 	// Update auto approval settings is available
 	await updateAutoApprovalSettings(controller)

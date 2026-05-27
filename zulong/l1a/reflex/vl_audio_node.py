@@ -28,6 +28,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from zulong.core.types import ZulongEvent, EventType, EventPriority
 from zulong.core.event_bus import event_bus
+from zulong.utils.device import empty_accelerator_cache, torch_device
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,11 @@ class VLAudioNode:
     """
     
     # 模型配置
-    MODEL_PATH = r"d:\AI\project\zulong_beta4\models\Qwen\Qwen3___5-0___8B-Base"  # 使用 Qwen3.5-0.8B-Base 模型 (4bit 量化加载)
+    import os
+    from pathlib import Path
+    _PROJECT_ROOT = Path(os.environ.get("ZULONG_HOME", Path(__file__).resolve().parent.parent.parent))
+    _MODEL_BASE = Path(os.environ.get("ZULONG_MODEL_BASE_DIR", str(_PROJECT_ROOT / "models")))
+    MODEL_PATH = str(_MODEL_BASE / "Qwen" / "Qwen3___5-0___8B-Base")  # 使用 Qwen3.5-0.8B-Base 模型 (4bit 量化加载)
     MAX_LENGTH = 512  # 最大生成长度
     
     def __init__(self):
@@ -63,8 +68,8 @@ class VLAudioNode:
         self.model: Optional[AutoModelForCausalLM] = None
         self.tokenizer: Optional[AutoTokenizer] = None
         self.is_loaded = False
-        # L1-A 运行在 GPU
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # L1-A 优先 GPU；macOS Apple Silicon 自动使用 MPS
+        self.device = torch_device("auto", prefer_gpu=True)
         
         logger.info(f"🧠 VL 音频节点初始化完成（设备：{self.device}）")
     
@@ -118,9 +123,7 @@ class VLAudioNode:
             self.model = None
             self.is_loaded = False
             
-            # 清理 CUDA 缓存
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            empty_accelerator_cache()
             
             logger.info("✅ VL 模型已卸载")
     

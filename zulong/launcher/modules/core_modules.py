@@ -89,36 +89,75 @@ class MemoryGraphModule(Module):
     async def start(self) -> None:
         self.progress_message = "正在初始化记忆图谱..."
         from zulong.memory.memory_graph import MemoryGraph
+        from zulong.memory.memory_graph_factory import create_memory_graph, get_memory_graph_type
+        from zulong.config.config_manager import get_config
 
         if MemoryGraph._instance is not None:
             mg = MemoryGraph._instance
-            logger.info("[MemoryGraphModule] 单例已存在，跳过创建")
-            # 确保适配器已注册（单例可能由 bootstrap 创建但未注册适配器）
-            try:
-                from zulong.memory.graph_adapters import register_all_adapters
-                if not mg._adapters.get("code_graph"):
-                    register_all_adapters(mg)
-                    logger.info("[MemoryGraphModule] 适配器补注册完成")
-            except Exception as e:
-                logger.warning(f"[MemoryGraphModule] 适配器补注册失败: {e}")
+            backend_type = get_memory_graph_type(mg)
+
+            if backend_type == "networkx":
+                raise RuntimeError("MemoryGraph 已禁止使用 NetworkX 单 JSON 后端，请检查启动顺序")
+            logger.info(f"[MemoryGraphModule] 单例已存在，使用 {backend_type} 分片后端")
         else:
-            mg = MemoryGraph(persist_path="./data/memory_graph")
-            try:
-                from zulong.memory.graph_adapters import register_all_adapters
-                register_all_adapters(mg)
-            except Exception as e:
-                logger.warning(f"[MemoryGraphModule] register_all_adapters 失败: {e}")
-            try:
-                mg.sync_all()
-            except Exception as e:
-                logger.warning(f"[MemoryGraphModule] sync_all 失败: {e}")
-            logger.info(f"[MemoryGraphModule] MemoryGraph 初始化完成: {mg.stats['total_nodes']} 节点")
+            mg = create_memory_graph(persist_path="./data/memory_graph")
+            backend_type = get_memory_graph_type(mg)
+            
+            # 设置 MemoryGraph 单例引用，防止后续代码创建第二个后端实例（split-brain）
+            MemoryGraph._instance = mg
+            
+            if backend_type == "networkx":
+                raise RuntimeError("MemoryGraph 工厂返回了已禁用的 NetworkX 单 JSON 后端")
+            stats = mg.get_stats() if hasattr(mg, 'get_stats') else {}
+            node_count = stats.get('total_nodes', stats.get('node_count', 0))
+            logger.info(f"[MemoryGraphModule] {mg.__class__.__name__} 初始化完成 ({backend_type}): {node_count} 节点")
 
         self._context["memory_graph"] = mg
         self.state = ModuleState.RUNNING
 
 
-# ── 4. EventBusWSModule ──────────────────────────────
+# ── 4. EventStoreModule ─────────────────────────────
+
+class EventStoreModule(Module):
+    """事件持久化模块 - 将所有 EventBus 事件异步写入 SQLite
+    
+    功能：
+    - 启动时初始化 SQLite EventStore
+    - 注入 EventBus，所有后续事件自动持久化
+    - 30 天自动清理过期事件
+    """
+    name = "event_store"
+    display_name = "事件持久化"
+    dependencies = ["eventbus_ws"]
+    mode_tags: Set[str] = {"core"}
+
+    async def start(self) -> None:
+        self.progress_message = "正在初始化事件持久化..."
+        try:
+            from zulong.config.config_manager import get_config
+            from zulong.core.event_bus import event_bus
+            from zulong.events import get_event_store
+
+            event_persistence_enabled = get_config('memory.event_persistence.enabled', False)
+            if event_persistence_enabled:
+                db_path = get_config('memory.event_persistence.db_path', './data/events.db')
+                retention_days = get_config('memory.event_persistence.retention_days', 30)
+                batch_size = get_config('memory.event_persistence.batch_size', 100)
+                event_store = get_event_store(
+                    db_path=db_path,
+                    retention_days=retention_days,
+                    batch_size=batch_size,
+                )
+                event_bus.set_event_store(event_store)
+                logger.info(f"✅ [EventStoreModule] EventStore 已启用: {db_path} (retention={retention_days}天, batch={batch_size})")
+            else:
+                logger.info("ℹ️ [EventStoreModule] EventStore 未启用 (event_persistence.enabled=false)")
+        except Exception as e:
+            logger.warning(f"⚠️ [EventStoreModule] EventStore 初始化失败（非致命）: {e}")
+        self.state = ModuleState.RUNNING
+
+
+# ── 5. EventBusWSModule ──────────────────────────────
 
 class EventBusWSModule(Module):
     name = "eventbus_ws"

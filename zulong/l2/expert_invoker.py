@@ -442,9 +442,9 @@ class ExpertInvoker:
                 else:
                     prompt_parts.append(f"{i}. ❌ {result.error}")
         
-        # 3. 基础响应（如果没有 L2 模型，使用规则生成）
+        # 3. 无 L2 模型时不得生成伪正常回复
         if not prompt_parts:
-            response = f"收到查询：{query}"
+            response = "系统当前出问题了，专家调用器没有可用的 L2 生成结果，无法正常回复。"
         else:
             response = "\n".join(prompt_parts)
             response += f"\n\n✅ 已处理您的查询：{query[:50]}..."

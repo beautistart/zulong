@@ -57,7 +57,14 @@ import { ApiConfiguration } from "@shared/api"
 import { findLast, findLastIndex } from "@shared/array"
 import { combineApiRequests } from "@shared/combineApiRequests"
 import { combineCommandSequences } from "@shared/combineCommandSequences"
-import { ZulongApiReqCancelReason, ZulongApiReqInfo, ZulongAsk, ZulongMessage, ZulongSay } from "@shared/ExtensionMessage"
+import {
+	InteractionPayload,
+	ZulongApiReqCancelReason,
+	ZulongApiReqInfo,
+	ZulongAsk,
+	ZulongMessage,
+	ZulongSay,
+} from "@shared/ExtensionMessage"
 import { HistoryItem } from "@shared/HistoryItem"
 import { DEFAULT_LANGUAGE_SETTINGS, getLanguageKey, LanguageDisplay } from "@shared/Languages"
 import { USER_CONTENT_TAGS } from "@shared/messages/constants"
@@ -920,6 +927,31 @@ export class Task {
 			text,
 			images,
 			files,
+			modelInfo,
+		})
+		await this.postStateToWebview()
+		return sayTs
+	}
+
+	async sayInteraction(interaction: InteractionPayload): Promise<number> {
+		if (this.taskState.abort) {
+			throw new Error("Zulong instance aborted")
+		}
+
+		const providerInfo = this.getCurrentProviderInfo()
+		const modelInfo: ZulongMessageModelInfo = {
+			providerId: providerInfo.providerId,
+			modelId: providerInfo.model.id,
+			mode: providerInfo.mode,
+		}
+		const sayTs = Date.now()
+		this.taskState.lastMessageTs = sayTs
+		await this.messageStateHandler.addToZulongMessages({
+			ts: sayTs,
+			type: "say",
+			say: "task_progress",
+			text: interaction.title,
+			interaction,
 			modelInfo,
 		})
 		await this.postStateToWebview()
@@ -2895,6 +2927,11 @@ export class Task {
 					}
 
 					switch (chunk.type) {
+						case "interaction": {
+							await this.sayInteraction(chunk.interaction)
+							didScheduleAnyContent = true
+							break
+						}
 						case "reasoning": {
 							// Process the reasoning delta through the handler
 							// Ensure details is always an array

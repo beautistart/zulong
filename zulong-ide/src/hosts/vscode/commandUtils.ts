@@ -1,7 +1,6 @@
 import * as fs from "fs/promises"
 import * as vscode from "vscode"
 import { sanitizeCellForLLM } from "@/integrations/misc/notebook-utils"
-import { ExtensionRegistryInfo } from "@/registry"
 import { CommandContext } from "@/shared/proto/index.zulong"
 import { Logger } from "@/shared/services/Logger"
 import { Controller } from "../../core/controller"
@@ -100,8 +99,10 @@ export async function getContextForCommand(
 	return { controller, commandContext }
 }
 
-export async function showWebview(preserveEditorFocus: boolean = true): Promise<WebviewProvider> {
-	await vscode.commands.executeCommand(ExtensionRegistryInfo.commands.FocusChatInput, preserveEditorFocus)
-
-	return WebviewProvider.getInstance()
+export async function showWebview(_preserveEditorFocus: boolean = true): Promise<WebviewProvider> {
+	try {
+		return WebviewProvider.getInstance()
+	} catch {
+		throw new Error("Zulong VS Code 面板已移除，请在 Web 端继续交互。")
+	}
 }

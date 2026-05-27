@@ -1,14 +1,16 @@
 """
 IDE 模式 FC 循环运行器
 
+继承自 FCRunner (zulong.l2.fc_runner)，复用通用安全网逻辑。
 使用 Python while 循环替代 LangGraph StateGraph，支持跨 HTTP 请求的暂停/恢复。
-完整复用 fc_graph.py 的所有安全网逻辑。
 
-与 fc_graph.py 的区别：
-1. while 循环替代 StateGraph（跨请求暂停）
+IDE 特有功能：
+1. 流式推送 (display_text 逐句推送到前端)
 2. 工具调用分流：内部工具直接执行，远程工具暂停返回
 3. 状态完全序列化到 IDEFCState
-4. 注意力窗口、RuleGuardian、CircuitBreaker 为 per-runner 实例
+4. 注意力窗口/RuleGuardian/CircuitBreaker per-runner 实例
+5. 参数验证/别名映射
+6. 429 限流重试 + 流式处理
 """
 
 import asyncio
@@ -18,18 +20,76 @@ import json as _json
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
+from zulong.l2.fc_runner import FCRunner
 from zulong.ide.ide_session import IDEFCState, AgentSession
 from zulong.ide.ide_tool_registry import IDEToolRegistry, IDE_REMOTE_TOOLS
 from zulong.ide.ide_format_translator import IDEFormatTranslator
 from zulong.ide.common.error_handler import ErrorHandler, ErrorCode
 from zulong.l2.attention_window import MAX_TOOL_RESULT_CHARS
 from zulong.l2.circuit_breaker import CircuitBreakerState
+from zulong.core.unified_protocol import MessageType
 
 if TYPE_CHECKING:
     from zulong.l2.inference_engine import InferenceEngine
+
+_SHARED_INTENT_FILTER = None
+_SHARED_INTENT_FILTER_LOCK = threading.Lock()
+_EMBEDDING_PREWARM_STARTED = False
+_EMBEDDING_PREWARM_LOCK = threading.Lock()
+
+
+def _get_shared_intent_filter():
+    """进程级复用 L1-B IntentFilter，避免每个 IDE 会话重复初始化模型。"""
+    global _SHARED_INTENT_FILTER
+    if _SHARED_INTENT_FILTER is not None:
+        return _SHARED_INTENT_FILTER
+
+    with _SHARED_INTENT_FILTER_LOCK:
+        if _SHARED_INTENT_FILTER is not None:
+            return _SHARED_INTENT_FILTER
+        try:
+            from zulong.l1b.intent_filter import IntentFilter
+            try:
+                from zulong.config.config_manager import get_config
+                intent_config = get_config("intent_classification", {})
+            except Exception:
+                intent_config = {}
+            _SHARED_INTENT_FILTER = IntentFilter(config=intent_config)
+            return _SHARED_INTENT_FILTER
+        except Exception as e:
+            logger.warning(f"[IDEFCRunner] IntentFilter 初始化失败: {e}")
+            return None
+
+
+def _ensure_embedding_prewarm_async() -> None:
+    """后台预热 Embedding，避免首次 FC 会话同步等待模型加载。"""
+    global _EMBEDDING_PREWARM_STARTED
+    if _EMBEDDING_PREWARM_STARTED:
+        return
+    with _EMBEDDING_PREWARM_LOCK:
+        if _EMBEDDING_PREWARM_STARTED:
+            return
+        _EMBEDDING_PREWARM_STARTED = True
+
+    def _prewarm() -> None:
+        try:
+            from zulong.memory.embedding_manager import get_embedding_manager
+            emb_mgr = get_embedding_manager()
+            if getattr(emb_mgr, "_model", None) is None:
+                logger.info("[IDEFCRunner] 后台预热 Embedding 模型...")
+                emb_mgr.encode("预热")
+                logger.info("[IDEFCRunner] Embedding 模型预热完成")
+        except Exception as e:
+            logger.warning(f"[IDEFCRunner] Embedding 模型预热失败: {e}")
+
+    threading.Thread(
+        target=_prewarm,
+        name="zulong-embedding-prewarm",
+        daemon=True,
+    ).start()
 
 # Web 监控事件广播（延迟导入避免循环依赖：ide_fc_runner ↔ ide_server）
 # 注意：ide_server 在模块顶层导入 ide_fc_runner（用于 FC Runner 实例化），
@@ -137,6 +197,37 @@ class IDEFCResult:
     reason: Optional[str] = None
 
 
+@dataclass
+class ExecutionEvent:
+    """Internal execution event normalized before fan-out.
+
+    It is not a third transport.  send_callback and broadcast_monitor_event are
+    the two outward adapters that consume this single in-runner state source.
+    """
+
+    phase: str
+    message: str
+    turn: int = 0
+    event_type: str = "TASK_PROGRESS"
+    payload: Dict[str, Any] = field(default_factory=dict)
+    interaction: Dict[str, Any] = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
+
+    def callback_payload(self, max_turns: int) -> Dict[str, Any]:
+        data = {
+            "protocol_version": "2.0",
+            "phase": self.phase,
+            "message": self.message,
+            "current_turn": self.turn,
+            "max_turns": max_turns,
+            "timestamp": self.created_at,
+        }
+        data.update(self.payload)
+        if self.interaction:
+            data["interaction"] = self.interaction
+        return data
+
+
 _FILLER_PATTERNS = [
     "我正在思考", "让我继续", "我来继续", "让我想想", "接下来我",
     "我正在处理", "正在分析", "正在执行", "稍等", "我需要",
@@ -236,16 +327,18 @@ class _ToolCallProxy:
         self.function = _FunctionProxy(fd["name"], fd["arguments"])
 
 
-class IDEFCRunner:
+class IDEFCRunner(FCRunner):
     """IDE 模式 FC 循环运行器
 
+    继承 FCRunner，复用通用安全网逻辑 (_detect_duplicate_tool_loop, _detect_progress_stall)。
+    添加 IDE 特有：流式推送、工具分流、暂停/恢复、参数验证。
     per-runner 实例隔离注意力窗口/RuleGuardian/CircuitBreaker，
     避免并发 Session 状态冲突。
     """
 
     def __init__(self, engine: "InferenceEngine", session: AgentSession,
                  tool_registry: IDEToolRegistry):
-        self.engine = engine
+        super().__init__(engine)
         self.session = session
         self.tool_registry = tool_registry
         self.translator = IDEFormatTranslator()
@@ -276,12 +369,19 @@ class IDEFCRunner:
         self._bfs_min_interval: int = 3  # 最小间隔轮次
         # WS层IDESession引用（由 ide_server._run_fc_loop 注入）
         self.ide_session = None
-        # L1-B 意图分类器（与Web端统一）
+        # L1-B 细粒度分类器：只作为工具预判的辅助信号
         self._intent_filter = None
+        self._execution_events: List[ExecutionEvent] = []
+        self._interaction_seq = 0
+        self._tool_interaction_pairs: Dict[str, str] = {}
         self._init_intent_filter()
 
     def _notify_session_linked(self, task_graph_id: str) -> None:
-        """通知监控客户端: 会话已关联到任务图谱"""
+        """通知监控客户端: 会话已关联到任务图谱，同时更新 InteractionStore。
+
+        TSD §23.11: 会话窗口绑定根会话节点，根节点下挂载任务图谱。
+        task_graph_id 持久化到 InteractionStore，确保页面刷新后可恢复。
+        """
         try:
             ide_sess = self.ide_session
             if ide_sess:
@@ -289,9 +389,34 @@ class IDEFCRunner:
             from zulong.ide.ide_server import _broadcast_sync
             _broadcast_sync("IDE_SESSION_LINKED", {
                 "session_id": self.session.session_id,
+                "conversation_id": getattr(ide_sess, "conversation_id", None) if ide_sess else None,
+                "turn_id": getattr(ide_sess, "web_turn_id", None) if ide_sess else None,
+                "workspace_path": getattr(ide_sess, "cwd", None) if ide_sess else None,
                 "task_graph_id": task_graph_id,
                 "project_id": ide_sess.project_id if ide_sess else None,
             })
+            # TSD §23.11.6: 将 task_graph_id 写入 InteractionStore
+            # 确保 conversation 表中持久化 task_graph_id，供页面刷新后恢复
+            if ide_sess:
+                _conv_id = getattr(ide_sess, "conversation_id", None)
+                if _conv_id and task_graph_id:
+                    try:
+                        from zulong.launcher.interaction_store import get_interaction_store
+                        _store = get_interaction_store()
+                        _store.upsert_conversation(
+                            _conv_id,
+                            task_graph_id=task_graph_id,
+                            workspace_path=getattr(ide_sess, "cwd", None),
+                            project_id=getattr(ide_sess, "project_id", None),
+                        )
+                        logger.debug(
+                            f"[IDEFCRunner] InteractionStore 已更新: "
+                            f"conv={_conv_id}, graph={task_graph_id}"
+                        )
+                    except Exception as _ie:
+                        logger.debug(
+                            f"[IDEFCRunner] InteractionStore 更新跳过: {_ie}"
+                        )
         except Exception as e:
             logger.debug(f"[IDEFCRunner] _notify_session_linked 跳过: {e}")
 
@@ -339,6 +464,7 @@ class IDEFCRunner:
         loop = asyncio.get_event_loop()
         state = await loop.run_in_executor(None, self._init_state, messages)
         self.session.fc_state = state
+        from zulong.ide.ide_server import broadcast_monitor_event
 
         # 设置 FC 循环运行状态为 True（禁止节点审查提交）
         try:
@@ -347,26 +473,55 @@ class IDEFCRunner:
         except Exception:
             pass
 
-        # Web 监控: FC 循环启动
-        from zulong.ide.ide_server import broadcast_monitor_event
-        try:
-            await broadcast_monitor_event("FC_START", {
-                "session_id": self.session.session_id,
+        await self._emit_execution_event(
+            send_callback,
+            "started",
+            f"开始处理: {(state.user_input_text or '')[:50]}",
+            event_type="FC_START",
+            payload={
                 "max_turns": self._max_fc_turns,
-                "intent": getattr(state, "ide_intent", ""),
+                "task_graph_policy": getattr(state, "task_graph_policy", "none"),
                 "user_input": (state.user_input_text or "")[:500],
+                "next_step": "我会先判断是否需要记忆、项目上下文或 VS Code 后台桥。",
+                "interaction": {
+                    "kind": "state",
+                    "status": "running",
+                    "title": "已接收任务",
+                    "detail": f"开始处理: {(state.user_input_text or '')[:120]}",
+                    "next_step": "正在准备上下文和执行能力。",
+                },
+            },
+            send_status=True,
+        )
+
+        # ── TSD v2.7: 发射 task:plan 和 tool:prediction 消息 ──
+        try:
+            _tool_pred = getattr(state, "tool_prediction", None)
+            if _tool_pred:
+                await send_callback(MessageType.TOOL_PREDICTION, {
+                    "prediction": _tool_pred,
+                    "suggested_tools": _tool_pred.get("suggested_tools", []),
+                    "tool_bag": _tool_pred.get("tool_bag", []),
+                    "confidence": _tool_pred.get("confidence", 0),
+                    "reason": _tool_pred.get("reason", ""),
+                    "timestamp": time.time(),
+                })
+            await send_callback(MessageType.TASK_PLAN, {
+                "task": (state.user_input_text or "")[:500],
+                "task_graph_policy": getattr(state, "task_graph_policy", "none"),
+                "max_turns": self._max_fc_turns,
+                "tool_prediction": _tool_pred,
+                "interaction": {
+                    "kind": "plan",
+                    "status": "running",
+                    "title": "已接收任务",
+                    "detail": f"开始处理: {(state.user_input_text or '')[:120]}",
+                    "next_step": "正在准备上下文和执行能力。",
+                },
+                "timestamp": time.time(),
             })
-        except Exception:
-            pass
-        
-        # 🎯 P0改进：任务进度汇报 - 任务启动
-        await send_callback("task_progress", {
-            "phase": "started",
-            "message": f"开始执行任务: {(state.user_input_text or '')[:50]}",
-            "current_turn": 0,
-            "max_turns": self._max_fc_turns,
-            "timestamp": time.time()
-        })
+        except Exception as _e:
+            logger.debug(f"[IDEFCRunner] 发射 task:plan/tool:prediction 失败: {_e}")
 
         while True:
             # 检查取消
@@ -381,26 +536,34 @@ class IDEFCRunner:
                     None, self._finalize, state, tr)
 
             try:
-                # 每轮推送含图谱进度的 status_update
+                # 每轮推送含图谱进度的统一状态
                 _progress_snapshot = self._get_progress_snapshot()
-                await send_callback("status_update", {
-                    "turn": state.fc_turn, "phase": "calling_model",
-                    "progress": _progress_snapshot})
+                await self._emit_execution_event(
+                    send_callback,
+                    "calling_model",
+                    f"正在调用模型进行推理... (Turn {state.fc_turn}/{self._max_fc_turns})",
+                    turn=state.fc_turn,
+                    event_type="CALLING_MODEL",
+                    payload={
+                        "progress": _progress_snapshot,
+                        "model": getattr(state, "vllm_model_id", ""),
+                    },
+                    send_progress=False,
+                    send_status=True,
+                )
                 
                 # 🔥 修复：持续发送reasoning心跳，保持"思考中"状态稳定
                 reasoning_msg = f"正在调用模型进行推理... (Turn {state.fc_turn}/{self._max_fc_turns})"
                 await send_callback("display_reasoning", {
                     "reasoning": reasoning_msg
                 })
-
-                # Web 监控: 调用模型（保护性包裹）
-                try:
-                    await broadcast_monitor_event("CALLING_MODEL", {
-                        "turn": state.fc_turn,
-                        "model": getattr(state, "vllm_model_id", ""),
-                    })
-                except Exception:
-                    pass
+                self._emit_execution_event_sync(
+                    "waiting_model",
+                    reasoning_msg,
+                    turn=state.fc_turn,
+                    event_type="TASK_HEARTBEAT",
+                    payload={"reasoning": reasoning_msg},
+                )
 
                 # FC 请求间隔
                 if state.fc_turn > 1 and self._fc_request_interval > 0:
@@ -421,11 +584,18 @@ class IDEFCRunner:
                         break
                     except asyncio.TimeoutError:
                         # 模型调用等待中，推送心跳进度防止前端超时
+                        await self._emit_execution_event(
+                            send_callback,
+                            "waiting_model",
+                            f"模型推理中... (Turn {state.fc_turn}/{self._max_fc_turns})",
+                            turn=state.fc_turn,
+                            event_type="TASK_HEARTBEAT",
+                            payload={"progress": self._get_progress_snapshot()},
+                            send_progress=False,
+                            send_status=True,
+                            monitor=True,
+                        )
                         try:
-                            await send_callback("status_update", {
-                                "turn": state.fc_turn, "phase": "waiting_model",
-                                "progress": self._get_progress_snapshot()})
-                            # 🔥 修复：持续发送reasoning心跳，保持"思考中"状态稳定
                             await send_callback("display_reasoning", {
                                 "reasoning": f"模型推理中... (Turn {state.fc_turn}/{self._max_fc_turns})"
                             })
@@ -451,26 +621,15 @@ class IDEFCRunner:
                     pass
 
                 if tc_data:
-                    # Web 监控: 工具调用（保护性包裹）
                     tool_names = [tc["function"]["name"] for tc in tc_data]
-                    try:
-                        await broadcast_monitor_event("TOOL_CALL", {
-                            "turn": state.fc_turn,
-                            "tools": tool_names,
-                            "count": len(tc_data),
-                        })
-                    except Exception:
-                        pass
-                    
-                    # 🎯 P0改进：任务进度汇报 - 工具执行中
-                    await send_callback("task_progress", {
-                        "phase": "executing",
-                        "message": f"执行工具: {', '.join(tool_names)}",
-                        "current_turn": state.fc_turn,
-                        "max_turns": self._max_fc_turns,
-                        "tools": tool_names,
-                        "timestamp": time.time()
-                    })
+                    await self._emit_execution_event(
+                        send_callback,
+                        "executing",
+                        f"执行工具: {', '.join(tool_names)}",
+                        turn=state.fc_turn,
+                        event_type="TOOL_CALL",
+                        payload={"tools": tool_names, "count": len(tc_data)},
+                    )
                     
                     # CB 模式工具调用计数：防止死循环
                     if state.cb_force_no_tools:
@@ -484,15 +643,15 @@ class IDEFCRunner:
                     if should_continue == "cancelled":
                         return await loop.run_in_executor(
                             None, self._finalize, state, "cancelled")
-                    # Web 监控: 工具执行完毕，轮次完成（保护性包裹）
-                    try:
-                        await broadcast_monitor_event("TURN_COMPLETE", {
-                            "turn": state.fc_turn,
-                            "has_tool_calls": True,
-                            "tool_names": tool_names,
-                        })
-                    except Exception:
-                        pass
+                    await self._emit_execution_event(
+                        send_callback,
+                        "turn_complete",
+                        "本轮工具执行完成，继续判断下一步。",
+                        turn=state.fc_turn,
+                        event_type="TURN_COMPLETE",
+                        payload={"has_tool_calls": True, "tool_names": tool_names},
+                        send_progress=False,
+                    )
                     # 继续循环
                     continue
 
@@ -515,6 +674,16 @@ class IDEFCRunner:
                     }
                     logger.info(f"[IDEFCRunner] 发送display_text完成标记（流式已完成，仅发送完成信号）")
                     await send_callback("display_text", complete_msg)
+                    await self._emit_execution_event(
+                        send_callback,
+                        "text_streamed",
+                        "模型文本回复已流式输出完成。",
+                        turn=state.fc_turn,
+                        event_type="DISPLAY_TEXT",
+                        payload={"complete": True, "text_length": len(final_text or "")},
+                        send_progress=False,
+                        monitor=False,
+                    )
                     
                 elif verdict == "continue":
                     # continue时不推送，避免中间状态重复显示
@@ -524,38 +693,102 @@ class IDEFCRunner:
                         state.last_response_content = final_text
                 
                 if verdict == "done" and final_text:
-                    # Web 监控: 模型文本回复（保护性包裹）
-                    try:
-                        await broadcast_monitor_event("MODEL_RESPONSE", {
-                            "session_id": self.session.session_id,
-                            "turn": state.fc_turn,
+                    await self._emit_execution_event(
+                        send_callback,
+                        "model_response",
+                        "模型已生成最终文本回复。",
+                        turn=state.fc_turn,
+                        event_type="MODEL_RESPONSE",
+                        payload={
                             "text": (final_text or "")[:5000],
                             "text_preview": (final_text or "")[:200],
                             "text_length": len(final_text or ""),
-                        })
-                    except Exception:
-                        pass
-                    # Web 前端: 广播 display_text 到 /ws 客户端
-                    try:
-                        await broadcast_monitor_event("DISPLAY_TEXT", {
-                            "session_id": self.session.session_id,
-                            "turn": state.fc_turn,
-                            "text": (final_text or "")[:10000],
-                        })
-                    except Exception:
-                        pass
+                        },
+                        send_progress=False,
+                        monitor=True,
+                    )
+                    await self._emit_execution_event(
+                        send_callback,
+                        "display_text",
+                        "向 Web 端推送最终文本。",
+                        turn=state.fc_turn,
+                        event_type="DISPLAY_TEXT",
+                        payload={"text": (final_text or "")[:10000]},
+                        send_progress=False,
+                        monitor=True,
+                    )
 
                 if verdict == "done":
                     state.phase = "done"
                     
-                    # 🎯 P0改进：任务进度汇报 - 任务完成
-                    await send_callback("task_progress", {
-                        "phase": "completed",
-                        "message": f"任务完成 (共{state.fc_turn}轮推理)",
-                        "current_turn": state.fc_turn,
-                        "max_turns": self._max_fc_turns,
-                        "timestamp": time.time()
-                    })
+                    await self._emit_execution_event(
+                        send_callback,
+                        "completed",
+                        f"任务完成 (共{state.fc_turn}轮推理)",
+                        turn=state.fc_turn,
+                        event_type="TASK_COMPLETE",
+                        payload={
+                            "summary": {
+                                "completed": ["模型已生成最终回复"],
+                                "verified": [],
+                                "remaining": [],
+                                "risk": "",
+                                "next_step": "等待用户继续补充或提出新调整。",
+                            },
+                            "interaction": {
+                                "kind": "summary",
+                                "status": "succeeded",
+                                "title": "任务完成",
+                                "detail": f"本轮共进行了 {state.fc_turn} 轮推理。",
+                                "progress": 100,
+                                "next_step": "你可以继续提问或插入新的调整。",
+                            },
+                        },
+                    )
+                    
+                    # ── TSD v2.7: 发射 task:summary 和 graph:memory:diff ──
+                    try:
+                        from zulong.memory.memory_graph import get_memory_graph
+                        _mg = get_memory_graph()
+                        _mem_changes = {"created": 0, "strengthened": 0, "pruned": 0}
+                        if _mg:
+                            # 从 ShardedMemoryGraph 获取实际计数
+                            if hasattr(_mg, '_last_activated_edges'):
+                                _mem_changes["strengthened"] = len(_mg._last_activated_edges)
+                                _created = 0
+                                for _sid in _mg.list_all_shards():
+                                    _shard = _mg.get_shard(_sid)
+                                    if _shard:
+                                        try:
+                                            _created += len(_shard.topology)
+                                        except Exception:
+                                            pass
+                                _mem_changes["created"] = _created
+                            elif hasattr(_mg, 'stats'):
+                                _mem_changes["created"] = _mg.stats.get("total_nodes", 0)
+                        await send_callback(MessageType.TASK_SUMMARY, {
+                            "completed_items": ["模型已生成最终回复"],
+                            "verified_items": [],
+                            "pending_items": [],
+                            "risks_summary": "",
+                            "memory_changes": _mem_changes,
+                            "next_step": "等待用户继续补充或提出新调整。",
+                            "interaction": {
+                                "kind": "summary",
+                                "status": "succeeded",
+                                "title": "任务完成",
+                                "detail": f"本轮共进行了 {state.fc_turn} 轮推理。",
+                                "progress": 100,
+                                "memory_changes": _mem_changes,
+                            },
+                            "timestamp": time.time(),
+                        })
+                        await send_callback(MessageType.GRAPH_MEMORY_DIFF, {
+                            "memory_changes": _mem_changes,
+                            "timestamp": time.time(),
+                        })
+                    except Exception as _e:
+                        logger.debug(f"[IDEFCRunner] 发射 task:summary/graph:memory:diff 失败: {_e}")
                     
                     # 清除 FC 循环运行状态（允许节点审查提交）
                     try:
@@ -576,24 +809,33 @@ class IDEFCRunner:
                     # 避免重复发送导致前端状态混乱
                     # await send_callback("task_complete", {"result": _done_text})
                     
-                    # Web 前端: 广播 task_complete 到 /ws 客户端
-                    try:
-                        await broadcast_monitor_event("TASK_COMPLETE", {
-                            "session_id": self.session.session_id,
-                            "total_turns": state.fc_turn,
-                            "result": (_done_text or "")[:10000],
-                        })
-                    except Exception:
-                        pass
-                    # Web 监控: FC 循环完成（保护性包裹）
-                    try:
-                        await broadcast_monitor_event("FC_DONE", {
-                            "session_id": self.session.session_id,
+                    await self._emit_execution_event(
+                        send_callback,
+                        "completed",
+                        "FC 循环完成。",
+                        turn=state.fc_turn,
+                        event_type="FC_DONE",
+                        payload={
                             "total_turns": state.fc_turn,
                             "reason": "done",
-                        })
-                    except Exception:
-                        pass
+                            "summary": {
+                                "completed": ["FC 循环已完成"],
+                                "verified": [],
+                                "remaining": [],
+                                "risk": "",
+                                "next_step": "等待下一轮用户输入。",
+                            },
+                            "interaction": {
+                                "kind": "summary",
+                                "status": "succeeded",
+                                "title": "执行结束",
+                                "detail": "祖龙已完成本轮执行。",
+                                "progress": 100,
+                            },
+                        },
+                        send_progress=False,
+                        monitor=True,
+                    )
                     # 🔥 修复：提取 submit_final_answer 内容，确保后处理和 ide_server 能读到完整答案
                     _final_answer = self._extract_final_answer(state)
                     if _final_answer:
@@ -702,11 +944,56 @@ class IDEFCRunner:
                 if cancel_event.is_set():
                     return await loop.run_in_executor(None, self._finalize, state, "cancelled")
                 tn = td["function"]["name"]
-                await send_callback("status_update", {
-                    "turn": fc, "phase": "exec_internal_tool",
-                    "tool_name": tn})
+                call_id = td.get("id") or self._next_interaction_id("internal_tool")
+                self._tool_interaction_pairs[call_id] = call_id
+                await self._emit_execution_event(
+                    send_callback,
+                    "tool_requested",
+                    f"准备执行内部工具: {tn}",
+                    turn=fc,
+                    event_type="TOOL_CALL",
+                    payload={
+                        "tool_name": tn,
+                        "tool_scope": "internal",
+                        "call_id": call_id,
+                        "pair_id": call_id,
+                        "interaction": {
+                            "pair_id": call_id,
+                            "kind": "action",
+                            "status": "running",
+                            "title": f"准备执行内部工具: {tn}",
+                            "detail": "祖龙将在后端内部执行该工具，并把结果回填给模型。",
+                            "tool_name": tn,
+                        },
+                    },
+                    send_progress=False,
+                    send_status=True,
+                )
                 await loop.run_in_executor(
                     None, self._exec_internal, state, td, fc, grp)
+                await self._emit_execution_event(
+                    send_callback,
+                    "tool_finished",
+                    f"内部工具执行完成: {tn}",
+                    turn=fc,
+                    event_type="IDE_TOOL_EXEC",
+                    payload={
+                        "tool_name": tn,
+                        "tool_scope": "internal",
+                        "call_id": call_id,
+                        "pair_id": call_id,
+                        "interaction": {
+                            "pair_id": call_id,
+                            "kind": "observation",
+                            "status": "succeeded",
+                            "title": f"内部工具执行完成: {tn}",
+                            "detail": "工具结果已写回本轮上下文。",
+                            "tool_name": tn,
+                        },
+                    },
+                    send_progress=False,
+                    send_status=True,
+                )
 
             # CircuitBreaker 评估
             try:
@@ -762,6 +1049,22 @@ class IDEFCRunner:
             # 上下文压力感知（在 CB 评估之后）
             self._apply_pressure_guidance(state, fc)
 
+            # ── TSD v2.7: 发射 graph:memory:diff（内部工具执行后）──
+            await self._emit_memory_diff_async(send_callback, state.fc_turn)
+
+            # ── TSD v2.7: 发射 attention:update ──
+            if self._attn_window:
+                try:
+                    _attn_state = {
+                        "mode": self._attn_window.mode.value if self._attn_window.mode else "global",
+                        "turn": fc,
+                        "focus_node_id": self._attn_window._current_node_id,
+                        "budget_usage": round(self._attn_window.usage_ratio * 100, 1) if hasattr(self._attn_window, "usage_ratio") else 0,
+                    }
+                    await send_callback(MessageType.ATTENTION_UPDATE, _attn_state)
+                except Exception as _e:
+                    logger.debug(f"[IDEFCRunner] 发射 attention:update 失败: {_e}")
+
         # ── 远程工具（WebSocket 推送 + 等待） ──
         if remote:
             valid_remote, rejected = self._validate_and_clean_remote_calls(
@@ -800,35 +1103,87 @@ class IDEFCRunner:
                     state.pending_call_turns[call_id] = fc
                 state.pending_call_ids = list(state.pending_call_turns.keys())
 
+                # ── TSD v2.7: 高风险工具预检与 approval:required 发射 ──
+                for tc in valid_remote:
+                    tool_name = tc["function"]["name"]
+                    risk_level = self._get_tool_risk_level(tool_name, tc.get("function", {}).get("arguments", "{}"))
+                    if risk_level in ("HIGH", "CRITICAL"):
+                        try:
+                            from zulong.config.approval_config import get_approval_whitelist
+                            whitelist = get_approval_whitelist()
+                            if not whitelist.should_auto_approve(tool_name):
+                                await send_callback(MessageType.APPROVAL_REQUIRED, {
+                                    "call_id": tc.get("id", ""),
+                                    "tool_name": tool_name,
+                                    "approval_mode": "popup" if risk_level == "CRITICAL" else "manual",
+                                    "risk_level": risk_level,
+                                    "reason": f"高风险工具 ({risk_level}): {tool_name}",
+                                    "tool_args": tc.get("function", {}).get("arguments", "")[:500],
+                                    "interaction": {
+                                        "pair_id": tc.get("id", ""),
+                                        "kind": "approval",
+                                        "status": "awaiting_approval",
+                                        "title": f"审批请求: {tool_name}",
+                                        "detail": f"工具 {tool_name} 风险等级 {risk_level}，需要审批。",
+                                        "tool_name": tool_name,
+                                        "risk_level": risk_level,
+                                        "approval_mode": "popup" if risk_level == "CRITICAL" else "manual",
+                                    },
+                                    "timestamp": time.time(),
+                                })
+                        except Exception as _e:
+                            logger.debug(f"[IDEFCRunner] 发射高风险 approval:required 失败: {_e}")
+
                 # 通过 WebSocket 推送 tool_request
                 tool_names = [
                     tc["function"]["name"] for tc in valid_remote]
+                group_id = f"tool_group:{self.session.session_id}:{fc}:{int(time.time() * 1000)}"
+                for tc in valid_remote:
+                    self._tool_interaction_pairs[tc.get("id", "")] = tc.get("id", "")
                 logger.info(
                     f"[IDEFCRunner] async 远程工具推送: {tool_names}, call_ids={new_call_ids}")
+
+                await self._emit_execution_event(
+                    send_callback,
+                    "tool_requested",
+                    f"等待 VS Code 后台桥执行: {', '.join(tool_names)}",
+                    turn=fc,
+                    event_type="IDE_TOOL_REQUEST",
+                    payload={
+                        "tools": [
+                            {"name": tc["function"]["name"],
+                             "arguments_preview": tc["function"].get("arguments", "")[:300],
+                             "call_id": tc.get("id", ""),
+                             "pair_id": tc.get("id", "")}
+                            for tc in valid_remote
+                        ],
+                        "call_ids": state.pending_call_ids,
+                        "tool_names": tool_names,
+                        "group_id": group_id,
+                        "parallel": len(valid_remote) > 1,
+                        "completed_count": 0,
+                        "total_count": len(valid_remote),
+                        "interaction": {
+                            "pair_id": group_id,
+                            "kind": "action",
+                            "status": "running",
+                            "title": "准备交给 VS Code 后台桥执行",
+                            "detail": f"将执行 {len(valid_remote)} 个工具: {', '.join(tool_names)}",
+                            "tool_name": ",".join(tool_names),
+                            "progress": 0,
+                            "next_step": "等待 VS Code 返回工具结果。",
+                        },
+                    },
+                    send_progress=True,
+                    send_status=True,
+                )
 
                 await send_callback("tool_request", {
                     "tool_calls": valid_remote,
                     "call_ids": state.pending_call_ids,
                     "tool_names": tool_names,
+                    "group_id": group_id,
                 })
-
-                # Web 监控: 远程工具调用详情（保护性包裹，不影响核心流程）
-                try:
-                    await broadcast_monitor_event("IDE_TOOL_REQUEST", {
-                        "session_id": self.session.session_id,
-                        "turn": fc,
-                        "tools": [
-                            {"name": tc["function"]["name"],
-                             "arguments_preview": tc["function"].get("arguments", "")[:300],
-                             "call_id": tc.get("id", "")}
-                            for tc in valid_remote
-                        ],
-                    })
-                except Exception:
-                    pass
-
-                await send_callback("status_update", {
-                    "turn": fc, "phase": "waiting_tool_result"})
 
                 # 等待所有远程工具结果
                 results = []
@@ -841,8 +1196,54 @@ class IDEFCRunner:
                         results.append(result)
                     except asyncio.TimeoutError:
                         tc = valid_remote[i]
+                        call_id = tc.get("id", "")
+                        await self._emit_execution_event(
+                            send_callback,
+                            "blocked",
+                            f"工具执行超时: {tc['function']['name']}",
+                            turn=fc,
+                            event_type="TASK_BLOCKED",
+                            payload={
+                                "tool_name": tc["function"]["name"],
+                                "call_id": call_id,
+                                "pair_id": call_id,
+                                "timeout_seconds": self._remote_tool_timeout,
+                                "interaction": {
+                                    "pair_id": call_id,
+                                    "kind": "state",
+                                    "status": "blocked",
+                                    "title": f"工具执行超时: {tc['function']['name']}",
+                                    "detail": f"等待 VS Code 后台桥超过 {self._remote_tool_timeout}s。",
+                                    "tool_name": tc["function"]["name"],
+                                    "next_step": "可以重试、取消，或根据当前结果调整任务。",
+                                },
+                            },
+                            send_progress=True,
+                            send_status=True,
+                        )
+                        # ── TSD v2.7: 发射 approval:required ──
+                        try:
+                            await send_callback(MessageType.APPROVAL_REQUIRED, {
+                                "call_id": call_id,
+                                "tool_name": tc["function"]["name"],
+                                "approval_mode": "manual",
+                                "reason": f"工具执行超时: {tc['function']['name']}",
+                                "timeout_seconds": self._remote_tool_timeout,
+                                "interaction": {
+                                    "pair_id": call_id,
+                                    "kind": "state",
+                                    "status": "blocked",
+                                    "title": f"工具执行超时: {tc['function']['name']}",
+                                    "detail": f"等待 VS Code 后台桥超过 {self._remote_tool_timeout}s。",
+                                    "tool_name": tc["function"]["name"],
+                                    "next_step": "可以重试、取消，或根据当前结果调整任务。",
+                                },
+                                "timestamp": time.time(),
+                            })
+                        except Exception as _e:
+                            logger.debug(f"[IDEFCRunner] 发射 approval:required 失败: {_e}")
                         results.append({
-                            "call_id": tc["id"],
+                            "call_id": call_id,
                             "tool_name": tc["function"]["name"],
                             "result": f"[工具执行超时 ({self._remote_tool_timeout}s)]",
                             "is_error": True,
@@ -865,27 +1266,48 @@ class IDEFCRunner:
                 self._inject_tool_results(state, formatted_results)
                 self._maybe_run_bfs(fc, "tool_complete")
 
-                # Web 监控: 远程工具执行结果（保护性包裹）
-                try:
-                    await broadcast_monitor_event("IDE_TOOL_RESULT", {
-                        "session_id": self.session.session_id,
-                        "turn": fc,
+                failed_count = sum(1 for r in results if r.get("is_error", False))
+                succeeded_count = len(results) - failed_count
+                await self._emit_execution_event(
+                    send_callback,
+                    "tool_finished",
+                    f"VS Code 后台桥返回 {len(results)} 个工具结果。",
+                    turn=fc,
+                    event_type="IDE_TOOL_RESULT",
+                    payload={
                         "results": [
                             {"tool_name": r.get("tool_name", ""),
                              "call_id": r.get("call_id", ""),
+                             "pair_id": r.get("call_id", ""),
                              "result_preview": (r.get("result", "") or "")[:500],
                              "is_error": r.get("is_error", False)}
                             for r in results
                         ],
-                    })
-                except Exception:
-                    pass
-
-                await send_callback("status_update", {
-                    "turn": state.fc_turn, "phase": "running"})
+                        "group_id": group_id,
+                        "completed_count": len(results),
+                        "total_count": len(valid_remote),
+                        "failed_count": failed_count,
+                        "succeeded_count": succeeded_count,
+                        "interaction": {
+                            "pair_id": group_id,
+                            "kind": "observation",
+                            "status": "failed" if failed_count else "succeeded",
+                            "title": "VS Code 后台桥返回工具结果",
+                            "detail": f"{succeeded_count} 个成功，{failed_count} 个失败。",
+                            "progress": 100,
+                            "next_step": "祖龙会根据这些结果继续判断下一步。",
+                        },
+                    },
+                    send_progress=False,
+                    send_status=True,
+                )
+                # ── TSD v2.7: 发射 graph:memory:diff（远程工具执行后）──
+                await self._emit_memory_diff_async(send_callback, state.fc_turn)
                 return None  # 继续循环
 
         self._maybe_run_bfs(fc, "tool_complete")
+        # ── TSD v2.7: 发射 graph:memory:diff（内部工具执行后）──
+        await self._emit_memory_diff_async(send_callback, state.fc_turn)
         return None  # 继续循环
 
     def _restore_runner_state(self) -> None:
@@ -957,39 +1379,18 @@ class IDEFCRunner:
             from zulong.memory.semantic_drift_detector import get_semantic_drift_detector
             self._drift_detector = get_semantic_drift_detector()
             logger.info("[IDEFCRunner] SemanticDriftDetector 已创建")
-            
-            # 🔥 预热 Embedding 模型，避免首次对话时加载耗时导致前端超时
-            try:
-                from zulong.memory.embedding_manager import get_embedding_manager
-                emb_mgr = get_embedding_manager()
-                if emb_mgr._model is None:
-                    logger.info("[IDEFCRunner] 预热 Embedding 模型...")
-                    emb_mgr.encode("预热")  # 触发懒加载
-                    logger.info("[IDEFCRunner] Embedding 模型预热完成")
-            except Exception as e:
-                logger.warning(f"[IDEFCRunner] Embedding 模型预热失败: {e}")
+            _ensure_embedding_prewarm_async()
         except Exception as e:
             logger.warning(f"[IDEFCRunner] SemanticDriftDetector 创建失败: {e}")
 
     def _init_intent_filter(self) -> None:
         """初始化L1-B意图分类器（与Web端统一使用ALBERT模型）"""
-        try:
-            from zulong.l1b.intent_filter import IntentFilter
-            # 从配置获取intent_config
-            try:
-                from zulong.config.config_manager import get_config
-                intent_config = get_config("intent_classification", {})
-            except Exception:
-                intent_config = {}
-            
-            self._intent_filter = IntentFilter(config=intent_config)
+        self._intent_filter = _get_shared_intent_filter()
+        if self._intent_filter:
             if self._intent_filter._albert_enabled:
                 logger.info("[IDEFCRunner] L1-B IntentFilter 已启用（ALBERT 15类）")
             else:
                 logger.info("[IDEFCRunner] L1-B IntentFilter 已启用（关键词匹配）")
-        except Exception as e:
-            logger.warning(f"[IDEFCRunner] IntentFilter 初始化失败: {e}")
-            self._intent_filter = None
 
     def _send_message_safe(self, send_callback, msg_type: str, data: dict) -> bool:
         """线程安全的消息发送（修复no running event loop问题）
@@ -1038,6 +1439,402 @@ class IDEFCRunner:
         except Exception as e:
             logger.warning(f"⚠️ [FC] {msg_type} 发送失败: {e}")
             return False
+
+    async def _emit_execution_event(
+        self,
+        send_callback,
+        phase: str,
+        message: str,
+        *,
+        turn: int = 0,
+        event_type: str = "TASK_PROGRESS",
+        payload: Optional[Dict[str, Any]] = None,
+        send_progress: bool = True,
+        send_status: bool = False,
+        monitor: bool = True,
+    ) -> None:
+        """Normalize runner state once, then fan out through existing channels."""
+        payload = payload or {}
+        interaction = self._build_interaction_payload(phase, message, turn, event_type, payload)
+        event = ExecutionEvent(
+            phase=phase,
+            message=message,
+            turn=turn,
+            event_type=event_type,
+            payload=payload,
+            interaction=interaction,
+        )
+        self._execution_events.append(event)
+        self._persist_execution_event(event)
+        cb_payload = event.callback_payload(self._max_fc_turns)
+
+        if send_progress:
+            try:
+                await send_callback("task_progress", cb_payload)
+            except Exception:
+                pass
+        if send_status:
+            try:
+                await send_callback("status_update", {
+                    "protocol_version": "2.0",
+                    "turn": turn,
+                    "phase": phase,
+                    "message": message,
+                    **payload,
+                    "interaction": interaction,
+                })
+            except Exception:
+                pass
+        # ── TSD v2.7: 统一交互事件 emission (Web Dashboard 独立消费) ──
+        if interaction:
+            try:
+                await send_callback(MessageType.INTERACTION_EVENT, {
+                    "protocol_version": "2.0",
+                    "interaction": interaction,
+                    "turn": turn,
+                    "event_type": event_type,
+                    "phase": phase,
+                    "timestamp": time.time(),
+                })
+            except Exception:
+                pass
+        if monitor:
+            try:
+                from zulong.ide.ide_server import broadcast_monitor_event
+                await broadcast_monitor_event(event_type, {
+                    "session_id": self.session.session_id,
+                    "conversation_id": getattr(self.ide_session, "conversation_id", None),
+                    "turn_id": getattr(self.ide_session, "web_turn_id", None),
+                    "workspace_path": getattr(self.ide_session, "cwd", None),
+                    "turn": turn,
+                    "phase": phase,
+                    "message": message,
+                    **payload,
+                    "interaction": interaction,
+                })
+            except Exception:
+                pass
+
+    def _emit_execution_event_sync(
+        self,
+        phase: str,
+        message: str,
+        *,
+        turn: int = 0,
+        event_type: str = "TASK_PROGRESS",
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        payload = payload or {}
+        interaction = self._build_interaction_payload(phase, message, turn, event_type, payload)
+        event = ExecutionEvent(
+            phase=phase,
+            message=message,
+            turn=turn,
+            event_type=event_type,
+            payload=payload,
+            interaction=interaction,
+        )
+        self._execution_events.append(event)
+        self._persist_execution_event(event)
+        _broadcast_sync(event_type, {
+            "session_id": self.session.session_id,
+            "conversation_id": getattr(self.ide_session, "conversation_id", None),
+            "turn_id": getattr(self.ide_session, "web_turn_id", None),
+            "workspace_path": getattr(self.ide_session, "cwd", None),
+            "turn": turn,
+            "phase": phase,
+            "message": message,
+            **payload,
+            "interaction": interaction,
+        })
+
+    async def _emit_memory_diff_async(self, send_callback, turn: int) -> None:
+        """发射 graph:memory:diff 事件，获取 MemoryGraph 自上次快照以来的变化。
+        
+        TSD v1.7 §23.7: 在工具执行后、注意力变更时发射记忆差异。
+        """
+        try:
+            from zulong.memory.memory_graph import get_memory_graph
+            _mg = get_memory_graph()
+            _mem_changes = {"created": 0, "strengthened": 0, "pruned": 0}
+            if _mg:
+                if hasattr(_mg, '_last_activated_edges'):
+                    _mem_changes["strengthened"] = len(_mg._last_activated_edges)
+                    _created = 0
+                    for _sid in _mg.list_all_shards():
+                        _shard = _mg.get_shard(_sid)
+                        if _shard:
+                            try:
+                                _created += len(_shard.topology)
+                            except Exception:
+                                pass
+                    _mem_changes["created"] = _created
+                elif hasattr(_mg, 'stats'):
+                    _mem_changes["created"] = _mg.stats.get("total_nodes", 0)
+            await send_callback(MessageType.GRAPH_MEMORY_DIFF, {
+                "memory_changes": _mem_changes,
+                "turn": turn,
+                "timestamp": time.time(),
+            })
+        except Exception as _e:
+            logger.debug(f"[IDEFCRunner] 发射 graph:memory:diff 失败: {_e}")
+
+    # ── TSD v2.7 §23.4.2: 工具风险等级分类 ──
+    _HIGH_RISK_TOOLS = frozenset({
+        "write_to_file", "replace_in_file", "execute_command",
+        "delete_files", "create_rule", "delete_files_by_pattern",
+        "preview_url", "use_skill", "web_fetch", "web_search",
+        "ask_followup_question", "attempt_completion",
+    })
+    _CRITICAL_RISK_TOOLS = frozenset({
+        "execute_command",  # 命令执行可被 CRITICAL
+        "delete_files",     # 不可逆删除
+    })
+
+    @classmethod
+    def _get_tool_risk_level(cls, tool_name: str, tool_args: str = "{}") -> str:
+        """返回工具的风险等级: LOW / MEDIUM / HIGH / CRITICAL"""
+        import json as _json
+        if tool_name in cls._CRITICAL_RISK_TOOLS:
+            # 进一步判断: execute_command 若含 rm -rf / sudo 等升级为 CRITICAL
+            if tool_name == "execute_command":
+                try:
+                    args = _json.loads(tool_args) if isinstance(tool_args, str) else tool_args
+                    command = args.get("command", "").lower()
+                    dangerous = ("rm -rf", "sudo ", "chmod 777", "mkfs.", "dd if=",
+                                ":(){ :|:& };:", "> /dev/sda", "format ")
+                    if any(d in command for d in dangerous):
+                        return "CRITICAL"
+                except Exception:
+                    pass
+            return "HIGH"
+        if tool_name in cls._HIGH_RISK_TOOLS:
+            return "HIGH"
+        return "LOW"
+
+    def _next_interaction_id(self, prefix: str = "interaction") -> str:
+        self._interaction_seq += 1
+        return f"{prefix}:{self.session.session_id}:{int(time.time() * 1000)}:{self._interaction_seq}"
+
+    def _build_interaction_payload(
+        self,
+        phase: str,
+        message: str,
+        turn: int,
+        event_type: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """OpenHands-style visible interaction semantics layered on old events."""
+        existing = payload.get("interaction")
+        if isinstance(existing, dict):
+            merged = dict(existing)
+            merged.setdefault("interaction_id", self._next_interaction_id(phase))
+            merged.setdefault("pair_id", merged.get("interaction_id"))
+            merged.setdefault("title", message)
+            merged.setdefault("detail", message)
+            merged.setdefault("turn", turn)
+            merged.setdefault("event_type", event_type)
+            return merged
+
+        kind = "state"
+        status = "running"
+        title = message
+        detail = message
+        pair_id = payload.get("pair_id") or payload.get("call_id") or payload.get("group_id")
+        tool_name = payload.get("tool_name")
+        risk_level = payload.get("risk_level", "")
+        confirmation_state = payload.get("confirmation_state", "")
+
+        if phase in {"tool_requested", "executing"}:
+            kind = "action"
+            status = "running"
+            title = self._tool_action_title(payload, message)
+        elif phase == "tool_finished":
+            kind = "observation"
+            status = "failed" if payload.get("is_error") else "succeeded"
+            title = self._tool_observation_title(payload, message)
+        elif phase in {"approval_required", "diff_ready", "checkpoint_created"}:
+            kind = "approval" if phase == "approval_required" else "observation"
+            status = "awaiting_approval" if phase == "approval_required" else payload.get("status", "succeeded")
+            title = payload.get("action_summary") or payload.get("summary") or message
+            risk_level = risk_level or payload.get("risk", "")
+            confirmation_state = confirmation_state or ("awaiting_confirmation" if phase == "approval_required" else "")
+        elif phase in {"waiting_model", "calling_model"}:
+            kind = "state"
+            status = "running"
+            title = "正在推理"
+        elif phase in {"blocked"}:
+            kind = "state"
+            status = "blocked"
+            title = "执行受阻"
+        elif phase in {"completed"}:
+            kind = "summary"
+            status = "succeeded"
+            title = "任务完成"
+        elif phase in {"cancelled", "interrupted"}:
+            kind = "user_adjustment"
+            status = "cancelled"
+            title = "任务已被打断"
+        elif phase in {"error"}:
+            kind = "state"
+            status = "failed"
+            title = "执行出错"
+
+        if not pair_id:
+            pair_id = self._next_interaction_id(phase)
+
+        # 审批模式确定 (TSD 23.4.2)
+        approval_mode = payload.get("approval_mode", "")
+        if phase == "approval_required" and not approval_mode:
+            if risk_level == "CRITICAL":
+                approval_mode = "popup"
+            elif risk_level == "HIGH":
+                approval_mode = "manual"
+            elif risk_level == "MEDIUM":
+                approval_mode = "manual"
+            else:
+                approval_mode = "manual"
+
+        # L2 thought (为什么选择这个工具 — TSD 23.2.4)
+        thought = payload.get("thought", "")
+
+        return {
+            "interaction_id": self._next_interaction_id(phase),
+            "pair_id": str(pair_id),
+            "kind": kind,
+            "status": status,
+            "title": title,
+            "detail": detail,
+            "thought": thought,
+            "tool_name": tool_name or "",
+            "tool_args": payload.get("tool_args", payload.get("args", None)),
+            "risk_level": risk_level,
+            "risk_reason": payload.get("risk_reason", ""),
+            "approval_mode": approval_mode,
+            "confirmation_state": confirmation_state,
+            "progress": payload.get("progress"),
+            "next_step": payload.get("next_step", ""),
+            "turn": turn,
+            "event_type": event_type,
+            "phase": phase,
+            "memory_changes": payload.get("memory_changes") if isinstance(payload.get("memory_changes"), dict) else None,
+        }
+
+    def _tool_action_title(self, payload: Dict[str, Any], fallback: str) -> str:
+        tools = payload.get("tools")
+        if isinstance(tools, list) and tools:
+            names = []
+            for item in tools:
+                if isinstance(item, dict):
+                    names.append(item.get("name") or item.get("tool_name") or "")
+                else:
+                    names.append(str(item))
+            names = [n for n in names if n]
+            if names:
+                return "准备执行工具: " + ", ".join(names[:4])
+        if payload.get("tool_name"):
+            return f"准备执行工具: {payload['tool_name']}"
+        return fallback
+
+    def _tool_observation_title(self, payload: Dict[str, Any], fallback: str) -> str:
+        results = payload.get("results")
+        if isinstance(results, list) and results:
+            failed = sum(1 for item in results if isinstance(item, dict) and item.get("is_error"))
+            if failed:
+                return f"工具返回结果: {len(results) - failed} 成功，{failed} 失败"
+            return f"工具返回结果: {len(results)} 个完成"
+        if payload.get("tool_name"):
+            return f"工具完成: {payload['tool_name']}"
+        return fallback
+
+    def _persist_execution_event(self, event: ExecutionEvent) -> None:
+        """Best-effort event ledger + graph memory sink."""
+        try:
+            from zulong.launcher.interaction_store import get_interaction_store
+            get_interaction_store().append_event(
+                conversation_id=getattr(self.ide_session, "conversation_id", None),
+                turn_id=getattr(self.ide_session, "web_turn_id", None),
+                event_type=event.phase,
+                role="system",
+                source="ide_fc_runner",
+                text=event.message,
+                payload={
+                    "event_type": event.event_type,
+                    "phase": event.phase,
+                    "turn": event.turn,
+                    "session_id": self.session.session_id,
+                    **event.payload,
+                    "interaction": event.interaction,
+                },
+                workspace_path=getattr(self.ide_session, "cwd", None),
+                project_id=getattr(self.ide_session, "project_id", None),
+                task_graph_id=getattr(self.ide_session, "task_graph_id", None),
+            )
+        except Exception as exc:
+            logger.debug(f"[IDEFCRunner] InteractionStore 事件记录跳过: {exc}")
+
+        if event.phase in {
+            "started",
+            "tool_requested",
+            "tool_finished",
+            "diff_ready",
+            "approval_required",
+            "checkpoint_created",
+            "blocked",
+            "completed",
+            "cancelled",
+            "error",
+        }:
+            self._persist_event_to_memory(event)
+
+    def _persist_event_to_memory(self, event: ExecutionEvent) -> None:
+        try:
+            from zulong.memory.memory_graph import (
+                get_memory_graph, GraphNode, NodeType, Importance, EdgeType,
+            )
+            mg = get_memory_graph()
+            if not mg:
+                return
+            now = time.time()
+            node_id = f"exec:{self.session.session_id}:{event.created_at:.6f}:{event.phase}"
+            node = GraphNode(
+                node_id=node_id,
+                node_type=NodeType.EPISODE,
+                label=f"{event.phase}: {event.message[:80]}",
+                activation=0.6,
+                created_at=now,
+                last_accessed=now,
+                access_count=1,
+                backend_ref=f"ide_session:{self.session.session_id}",
+                metadata={
+                    "event_phase": event.phase,
+                    "event_type": event.event_type,
+                    "message": event.message,
+                    "turn": event.turn,
+                    "conversation_id": getattr(self.ide_session, "conversation_id", None),
+                    "turn_id": getattr(self.ide_session, "web_turn_id", None),
+                    "workspace_path": getattr(self.ide_session, "cwd", None),
+                    "payload": event.payload,
+                    "interaction": event.interaction,
+                    "source": "ide_fc_runner",
+                },
+            )
+            mg.add_node(node)
+            mg.set_importance(
+                node_id,
+                Importance.IMPORTANT if event.phase in {"completed", "blocked", "checkpoint_created"} else Importance.NORMAL,
+            )
+            try:
+                mg.index_summary(node_id, f"{event.phase} {event.message} {_json.dumps(event.payload, ensure_ascii=False)[:500]}")
+            except Exception:
+                pass
+            if self._current_round_id:
+                try:
+                    mg.add_edge(self._current_round_id, node_id, EdgeType.TEMPORAL, weight=0.4)
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.debug(f"[IDEFCRunner] MemoryGraph 事件记录跳过: {exc}")
 
     def _init_dialogue_adapter(self) -> None:
         """创建 DialogueAdapter 实例（复用或新建）"""
@@ -1176,14 +1973,16 @@ class IDEFCRunner:
                     )
                 break
 
-        # ── Layer 1: 意图检测 ──────────────────────────────────
+        # ── Layer 1: IDE 任务图策略，仅用于工具边界和任务图复用 ──
         _force_gid = getattr(self, 'force_graph_id', '') or ''
+        task_graph_policy = "inspect_or_create"
+        has_active_tg = False
         if _force_gid:
             # 确定性恢复: graph_id 已由 ide_server 加载，跳过启发式
             from zulong.tools.task_tools import get_active_task_graph
             _tg = get_active_task_graph()
             if _tg and getattr(_tg, 'id', '') == _force_gid:
-                intent = "resume"
+                task_graph_policy = "reuse"
                 has_active_tg = True
                 self.session.active_task_graph_id = _force_gid
                 self._notify_session_linked(_force_gid)
@@ -1193,35 +1992,55 @@ class IDEFCRunner:
                 # 活跃图加载失败(不应发生), 降级到启发式
                 logger.warning(
                     f"[IDEFCRunner] 确定性恢复降级: 活跃图不匹配 {_force_gid}")
-                intent, has_active_tg = self._detect_ide_intent(user_input)
+                task_graph_policy, has_active_tg = self._detect_task_graph_policy(user_input)
         else:
-            intent, has_active_tg = self._detect_ide_intent(user_input)
+            task_graph_policy, has_active_tg = self._detect_task_graph_policy(user_input)
 
-        # 非确定性路径下，恢复模式关联活跃图到 session
-        if not _force_gid and intent == "resume" and has_active_tg:
+        # 非确定性路径下，继续已有任务图时关联活跃图到 session
+        if not _force_gid and task_graph_policy in {"reuse", "inspect", "continue"} and has_active_tg:
             from zulong.tools.task_tools import get_active_task_graph
             _tg = get_active_task_graph()
             if _tg and hasattr(_tg, 'id') and not self.session.active_task_graph_id:
                 self.session.active_task_graph_id = getattr(_tg, 'id', None)
                 self._notify_session_linked(self.session.active_task_graph_id)
                 logger.info(
-                    f"[IDEFCRunner] 恢复模式：关联活跃图 "
+                    f"[IDEFCRunner] 继续任务图策略：关联活跃图 "
                     f"{self.session.active_task_graph_id} 到新 session")
 
-        # ── Layer 2: 根据意图获取过滤后的工具定义 ─────────────
-        tool_defs = self.tool_registry.get_combined_tool_definitions_for_intent(intent)
+        # ── Layer 2: 根据任务图策略获取工具定义 ───────────
+        tool_defs = self.tool_registry.get_combined_tool_definitions_for_policy(task_graph_policy)
 
-        # RESUME 首轮强制 task_view_overview
-        force_first = (intent == "resume" and has_active_tg)
+        # 继续已有任务图时首轮强制 task_view_overview
+        force_first = (task_graph_policy in {"reuse", "inspect", "continue"} and has_active_tg)
 
         state = IDEFCState(
             messages=list(messages), fc_turn=0, tool_definitions=tool_defs,
             user_input_text=user_input, vllm_model_id=LLM_MODEL_ID or "",
-            phase="running", intent_max_tokens=8192,
-            is_resume=(intent == "resume"),
-            ide_intent=intent,
+            phase="running", response_max_tokens=8192,
+            is_resume=(task_graph_policy in {"reuse", "inspect", "continue"}),
+            task_graph_policy=task_graph_policy,
             force_first_tool=force_first,
         )
+        # ── TSD v2.7: L1BToolPredictor 工具预判接入 ──
+        try:
+            from zulong.l1b.tool_predictor import L1BToolPredictor
+            _predictor = L1BToolPredictor()
+            _conv_history = [
+                m for m in messages
+                if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+            ]
+            state.tool_prediction = _predictor.predict_tools(
+                user_input, _conv_history
+            )
+            logger.debug(
+                f"[IDEFCRunner] L1BToolPredictor: "
+                f"turn_shape={state.tool_prediction.get('context_bundle', {}).get('turn_shape')}, "
+                f"policy={state.tool_prediction.get('task_graph_policy')}, "
+                f"suggested={state.tool_prediction.get('suggested_tools')[:5]}"
+            )
+        except Exception as _e:
+            logger.debug(f"[IDEFCRunner] L1BToolPredictor 失败: {_e}")
+            state.tool_prediction = None
         from zulong.l2.attention_window import AttentionWindowManager
         from zulong.tools.task_tools import get_active_task_graph
         from zulong.memory.memory_graph import get_memory_graph
@@ -1240,115 +2059,56 @@ class IDEFCRunner:
         self._auto_create_task_plan(state)
         self._init_dialogue_tracking(state)
         logger.info(
-            f"[IDEFCRunner] 意图={intent}, force_first_tool={force_first}, "
-            f"tools={len(tool_defs)}, has_active_tg={has_active_tg}"
+            f"[IDEFCRunner] task_graph_policy={task_graph_policy}, "
+            f"force_first_tool={force_first}, tools={len(tool_defs)}, "
+            f"has_active_tg={has_active_tg}"
         )
         return state
 
-    def _detect_ide_intent(self, user_input: str) -> tuple:
-        """IDE 意图检测（优先使用L1-B IntentFilter，与Web端统一）
-
-        流程：
-        1. 优先使用L1-B IntentFilter（ALBERT模型）
-        2. 回退到启发式规则（RESUME/CHAT/COMPLEX）
-
-        Returns:
-            (intent: str, has_active_task_graph: bool)
-        """
+    def _detect_task_graph_policy(self, user_input: str) -> tuple:
+        """根据引用、活跃任务图和 L1-B 细粒度信号预判任务图策略。"""
         has_active_tg = False
-        has_uncompleted = False
-
         try:
             from zulong.tools.task_tools import get_active_task_graph
             tg = get_active_task_graph()
             if tg is not None:
                 has_active_tg = True
-                leaves = tg.get_leaf_nodes()
-                uncompleted = [n for n in leaves if n.status not in ("completed", "skipped")]
-                has_uncompleted = bool(uncompleted)
         except Exception:
             pass
 
-        # 规则 0: Session 上下文 — 上一次 FC 正在等待 IDE 工具结果
-        if (self.session.fc_state
-                and self.session.fc_state.phase == "waiting_remote"
-                and has_active_tg):
-            logger.info("[IDEFCRunner] 意图检测: RESUME（session 处于 waiting_remote）")
-            return "resume", has_active_tg
-
-        # 规则 1: 有活跃任务图且有未完成节点 → RESUME
-        if has_active_tg and has_uncompleted:
-            logger.info("[IDEFCRunner] 意图检测: RESUME（活跃任务图有未完成节点）")
-            return "resume", has_active_tg
-
-        # 规则 1.5: 用户引用了任务节点 @[label#address] → 从 MemoryGraph 重建并 RESUME
         ref_graph_id = self._try_activate_from_reference(user_input)
         if ref_graph_id:
-            logger.info(
-                f"[IDEFCRunner] 意图检测: RESUME（节点引用触发重建 graph={ref_graph_id}）")
-            return "resume", True
+            return "reuse", True
 
-        # 规则 2: 恢复关键词
-        _resume_keywords = (
-            "继续", "接着做", "接着", "恢复", "上次", "之前的任务",
-            "resume", "continue", "pick up",
-        )
-        stripped = (user_input or "").strip().lower()
-        if any(kw in stripped for kw in _resume_keywords):
+        if any(
+            kw in (user_input or "").strip().lower()
+            for kw in ("继续", "接着做", "接着", "恢复", "上次", "之前的任务",
+                       "resume", "continue", "pick up")
+        ):
             if has_active_tg:
-                logger.info("[IDEFCRunner] 意图检测: RESUME（关键词 + 活跃任务图）")
-                return "resume", has_active_tg
-            # 无活跃 TG 但有恢复关键词 → 尝试从磁盘备份加载最近图谱（含已完成的）
-            try:
-                from zulong.tools.task_tools import (
-                    load_latest_backup, set_active_task_graph
-                )
-                backup_tg, backup_gid = load_latest_backup()
-                if backup_tg and backup_gid:
-                    set_active_task_graph(backup_tg, backup_gid)
-                    logger.info(
-                        f"[IDEFCRunner] 意图检测: RESUME"
-                        f"（关键词触发从备份恢复 graph={backup_gid}）")
-                    return "resume", True
-            except Exception as e:
-                logger.debug(f"[IDEFCRunner] 备份加载尝试失败: {e}")
+                return "reuse", has_active_tg
+            else:
+                try:
+                    from zulong.tools.task_tools import (
+                        load_latest_backup, set_active_task_graph
+                    )
+                    backup_tg, backup_gid = load_latest_backup()
+                    if backup_tg and backup_gid:
+                        set_active_task_graph(backup_tg, backup_gid)
+                        return "reuse", True
+                except Exception as e:
+                    logger.debug(f"[IDEFCRunner] 备份加载尝试失败: {e}")
 
-        # 规则 3: 使用L1-B IntentFilter进行意图分类（与Web端统一）
         if self._intent_filter:
             try:
                 intent_result = self._intent_filter.analyze(user_input)
-                predicted_intent = intent_result.get("intent", "UNKNOWN").lower()
-                confidence = intent_result.get("confidence", 0.0)
-                
-                # L1-B的15类意图映射到IDE的3类意图
-                if predicted_intent == "chat":
-                    logger.info(f"[IDEFCRunner] 意图检测: CHAT（L1-B ALBERT，置信度={confidence:.2f}）")
-                    return "chat", has_active_tg
-                elif predicted_intent in ("task_code", "task_analysis", "task_write", 
-                                          "task_execute", "task_search", "task_read"):
-                    logger.info(f"[IDEFCRunner] 意图检测: COMPLEX（L1-B ALBERT={predicted_intent}，置信度={confidence:.2f}）")
-                    return "complex", has_active_tg
-                # 其他意图默认为COMPLEX
-                elif confidence >= 0.6:
-                    logger.info(f"[IDEFCRunner] 意图检测: COMPLEX（L1-B ALBERT={predicted_intent}，置信度={confidence:.2f}）")
-                    return "complex", has_active_tg
+                predicted = (intent_result.get("intent", "UNKNOWN") or "").lower()
+                if predicted in ("task_code", "task_analysis", "task_write", "task_execute", "task_search", "task_read"):
+                    return "inspect_or_create", has_active_tg
             except Exception as e:
-                logger.debug(f"[IDEFCRunner] IntentFilter分析失败: {e}")
+                logger.debug(f"[IDEFCRunner] IntentFilter 检查失败: {e}")
 
-        # 规则 4: 回退到启发式 - 简单问候/闲聊 → CHAT
-        _chat_patterns = (
-            "你好", "您好", "hello", "hi", "hey",
-            "早上好", "下午好", "晚上好", "good morning", "good afternoon",
-            "怎么样", "how are you", "最近好吗",
-            "谢谢", "感谢", "thanks", "thank you",
-        )
-        if len(stripped) < 20 and any(p in stripped for p in _chat_patterns):
-            logger.info("[IDEFCRunner] 意图检测: CHAT（启发式：简单问候）")
-            return "chat", has_active_tg
-
-        # 默认: COMPLEX
-        logger.info("[IDEFCRunner] 意图检测: COMPLEX（默认）")
-        return "complex", has_active_tg
+        return "inspect_or_create", has_active_tg
 
     def _try_activate_from_reference(self, user_input: str) -> Optional[str]:
         """尝试从用户输入中的 @[label#address] 引用激活历史 TaskGraph
@@ -1883,6 +2643,8 @@ class IDEFCRunner:
                 # 成功获得模型响应，重置连续错误计数
                 state.loop_error_count = 0
                 if tc_data:
+                    # 模型调用了工具 → 重置独白计数器
+                    state.consecutive_text_only_count = 0
                     self._publish_fc_progress(state, "exec_tools", f"{len(tc_data)} tool calls")
                     remote = self._exec_tools(state, tc_data, resp_content)
                     if remote:
@@ -1890,6 +2652,8 @@ class IDEFCRunner:
                         # 注意：暂停不清除状态，恢复后会继续运行
                         return self._pause_for_remote(state, remote)
                     continue
+                # 模型纯文本回复（无工具调用）→ 递增独白计数器
+                state.consecutive_text_only_count += 1
                 verdict = self._eval_response(state, resp_content or "")
                 if verdict == "done":
                     state.phase = "done"
@@ -1967,42 +2731,8 @@ class IDEFCRunner:
         if fc % self._warning_interval == 0:
             logger.info(f"[IDEFCRunner] 进度: {fc}/{self._hard_limit}")
         
-        # 🔥 P1修复：重复工具调用死循环检测（增强版：检查参数）
-        if len(state.messages) >= 6 and fc > 5:
-            last_tool_calls = []
-            for msg in reversed(state.messages[-6:]):
-                tool_calls = msg.get("tool_calls", [])
-                if tool_calls and len(tool_calls) > 0:
-                    # 记录工具名称和参数
-                    tc = tool_calls[0]["function"]
-                    last_tool_calls.append({
-                        "name": tc["name"],
-                        "args": tc.get("arguments", "")
-                    })
-            
-            # 连续3轮相同工具且相同参数 → 真正的死循环
-            if len(last_tool_calls) >= 3:
-                tool_names = [tc["name"] for tc in last_tool_calls]
-                tool_args = [tc["args"] for tc in last_tool_calls]
-                
-                # 检查：工具名称相同 AND 参数也相同
-                if len(set(tool_names)) == 1 and len(set(tool_args)) == 1:
-                    logger.warning(
-                        f"[IDEFCRunner] 检测到死循环: "
-                        f"连续{len(last_tool_calls)}轮调用 {tool_names[0]} 且参数相同"
-                    )
-                    # 强制收敛：注入系统消息
-                    state.cb_force_no_tools = True
-                    cm = {
-                        "role": "user",
-                        "content": (
-                            f"[系统警告] 检测到重复工具调用循环（{tool_names[0]}），"
-                            f"请立即基于已有信息生成最终回复，不允许再调用工具。"
-                        ),
-                    }
-                    state.messages.append(cm)
-                    if self._attn_window:
-                        self._attn_window.register_message(cm, turn=fc)
+        # 重复工具调用死循环检测（从 FCRunner 继承并适配 IDEFCState）
+        self._detect_duplicate_tool_loop_ide(state)
         
         # 周期性进度广播（每 _progress_report_interval 轮，独立于 hard_limit）
         # 仅推送到 Web 仪表盘，不注入消息、不影响 FC 循环控制流
@@ -2071,6 +2801,47 @@ class IDEFCRunner:
                 self._attn_window.register_message(
                     renewal_msg, turn=fc, group_id=gid, pinned=True)
         return ""
+
+    def _detect_duplicate_tool_loop_ide(self, state: IDEFCState) -> None:
+        """重复工具调用死循环检测（IDEFCState 适配版）
+
+        检查最近几轮中是否连续调用相同的工具且参数相同。
+        如果检测到死循环，注入 CB 强制收敛信号。
+        """
+        fc = state.fc_turn
+        if len(state.messages) < 6 or fc <= 5:
+            return
+
+        last_tool_calls = []
+        for msg in reversed(state.messages[-6:]):
+            tool_calls = msg.get("tool_calls", [])
+            if tool_calls and len(tool_calls) > 0:
+                tc = tool_calls[0]["function"]
+                last_tool_calls.append({
+                    "name": tc["name"],
+                    "args": tc.get("arguments", ""),
+                })
+
+        if len(last_tool_calls) >= self._DUPLICATE_TOOL_CHECK_TURNS:
+            tool_names = [tc["name"] for tc in last_tool_calls]
+            tool_args = [tc["args"] for tc in last_tool_calls]
+
+            if len(set(tool_names)) == 1 and len(set(tool_args)) == 1:
+                logger.warning(
+                    f"[IDEFCRunner] 检测到死循环: "
+                    f"连续{len(last_tool_calls)}轮调用 {tool_names[0]} 且参数相同"
+                )
+                state.cb_force_no_tools = True
+                cm = {
+                    "role": "user",
+                    "content": (
+                        f"[系统警告] 检测到重复工具调用循环（{tool_names[0]}），"
+                        f"请立即基于已有信息生成最终回复，不允许再调用工具。"
+                    ),
+                }
+                state.messages.append(cm)
+                if self._attn_window:
+                    self._attn_window.register_message(cm, turn=fc)
 
     def _build_progress_hint(self, state: IDEFCState) -> str:
         """构建进度提示，注入到 LLM 上下文（中性通报，不催促结束）"""
@@ -2254,6 +3025,7 @@ class IDEFCRunner:
 
     def _call_model(self, state: IDEFCState) -> Tuple[Optional[List[Dict]], Optional[str]]:
         """LLM API 调用。返回 (tool_calls, content)。都为 None 表示超时。"""
+        call_start = time.perf_counter()
         fc = state.fc_turn
         msgs = self._attn_window.apply_window() if self._attn_window else state.messages
         extra_kw = self.engine._get_llm_extra_kwargs()
@@ -2263,7 +3035,7 @@ class IDEFCRunner:
         extra_kw["extra_body"] = eb
         kw: Dict[str, Any] = {
             "model": state.vllm_model_id, "messages": msgs,
-            "max_tokens": state.intent_max_tokens, "temperature": 0.3,
+            "max_tokens": state.response_max_tokens, "temperature": 0.3,
             "top_p": 0.85, "stream": True, **extra_kw,  # 启用流式模式
         }
         if state.cb_force_no_tools:
@@ -2299,11 +3071,11 @@ class IDEFCRunner:
                     kw["tool_choice"] = "auto"
         elif state.tool_definitions:
             kw["tools"] = state.tool_definitions
-            # ── Layer 3: force_first_tool (RESUME 首轮强制 task_view_overview) ──
+            # ── Layer 3: 继续已有任务图时首轮强制 task_view_overview ──
             if state.force_first_tool and fc == 1:
                 kw["tool_choice"] = {"type": "function", "function": {"name": "task_view_overview"}}
                 state.force_first_tool = False  # 只强制一次
-                logger.info("[IDEFCRunner] RESUME 首轮强制 task_view_overview")
+                logger.info("[IDEFCRunner] 继续任务图策略首轮强制 task_view_overview")
             else:
                 kw["tool_choice"] = "auto"
         future = self._model_executor.submit(
@@ -2311,6 +3083,10 @@ class IDEFCRunner:
         try:
             # 流式响应处理
             stream_response = future.result(timeout=self._fc_loop_timeout)
+            logger.info(
+                f"[IDEFCRunner] LLM流连接建立: turn={state.fc_turn}, "
+                f"{(time.perf_counter() - call_start) * 1000:.1f}ms"
+            )
             
             # 累积 token 并实时推送清洗后的文本
             full_content = ""
@@ -2319,8 +3095,14 @@ class IDEFCRunner:
             tool_calls_chunks = []  # 累积工具调用片段
             
             stream_start_time = time.time()
+            stream_start_perf = time.perf_counter()
             last_heartbeat = stream_start_time
             heartbeat_interval = 10.0  # 每10秒输出一次心跳日志
+            first_token_logged = False
+            last_flush_perf = stream_start_perf
+            first_phase_flush_chars = 24
+            first_phase_flush_seconds = 1.5
+            first_phase_flush_interval = 0.12
             
             for chunk in stream_response:
                 if chunk.choices:
@@ -2328,11 +3110,27 @@ class IDEFCRunner:
                     # 累积文本内容
                     if choice.delta.content:
                         token = choice.delta.content
+                        now_perf = time.perf_counter()
+                        if not first_token_logged:
+                            first_token_logged = True
+                            logger.info(
+                                f"[IDEFCRunner] LLM首token: turn={state.fc_turn}, "
+                                f"{(now_perf - call_start) * 1000:.1f}ms"
+                            )
                         full_content += token
                         sentence_buffer += token
                         
+                        in_first_phase = (
+                            sent_count == 0
+                            and now_perf - stream_start_perf <= first_phase_flush_seconds
+                        )
+                        should_flush_fast = (
+                            in_first_phase
+                            and len(sentence_buffer) >= first_phase_flush_chars
+                            and now_perf - last_flush_perf >= first_phase_flush_interval
+                        )
                         # 检测句子边界（句号、问号、感叹号、换行）
-                        if any(token.endswith(p) for p in ['。', '！', '？', '\n']):
+                        if should_flush_fast or any(token.endswith(p) for p in ['。', '！', '？', '\n']):
                             # 清洗并推送当前句子
                             from zulong.utils.text_cleaner import clean_text_for_tts
                             cleaned = clean_text_for_tts(sentence_buffer)
@@ -2348,6 +3146,7 @@ class IDEFCRunner:
                                     })
                                 sent_count += 1
                                 sentence_buffer = ""  # 清空缓冲区
+                                last_flush_perf = now_perf
                     
                     # 累积工具调用片段
                     if hasattr(choice.delta, 'tool_calls') and choice.delta.tool_calls:
@@ -2531,7 +3330,7 @@ class IDEFCRunner:
                 if self.engine.backup_client and LLM_MODEL_ID_BACKUP:
                     br = self.engine.backup_client.chat.completions.create(
                         model=LLM_MODEL_ID_BACKUP, messages=state.messages,
-                        max_tokens=state.intent_max_tokens, temperature=0.3,
+                        max_tokens=state.response_max_tokens, temperature=0.3,
                         stream=False, **self.engine._get_llm_extra_kwargs())
                     c = br.choices[0].message.content or ""
                     state.last_response_content = c
@@ -2775,6 +3574,38 @@ class IDEFCRunner:
             mark_node = ta.get("node_id") or ""
             if new_status and mark_node:
                 self._attn_window.auto_navigate_on_status_change(mark_node, new_status)
+        # 🔥 任务完成验证：代码生成节点标记完成时，检查是否真正写入了文件
+        if tn == "task_mark_status" and (ta.get("new_status") or ta.get("status")) == "completed":
+            mark_node_id = ta.get("node_id")
+            if mark_node_id:
+                try:
+                    task_graph = self._get_current_task_graph()
+                    if task_graph:
+                        node = task_graph.get_node(mark_node_id)
+                        if node:
+                            label_lower = (node.label or "").lower()
+                            desc_lower = (node.desc or "").lower()
+                            # 判断是否为代码生成类节点
+                            _code_gen_kw = ("写", "编写", "创建", "生成", "代码", "code", "write",
+                                            "create", "文件", "file", "html", "css", "js", "实现",
+                                            "开发", "构建", "build", "页面", "page", "组件", "component")
+                            is_code_gen = any(kw in label_lower or kw in desc_lower
+                                              for kw in _code_gen_kw)
+                            if is_code_gen:
+                                # 检查最近的工具调用中是否有 write_to_file/replace_in_file
+                                recent_tools = [r.get("tool_name", "") for r in state.tool_results_buffer[-10:]]
+                                has_write = any(t in ("write_to_file", "replace_in_file")
+                                                for t in recent_tools)
+                                if not has_write:
+                                    warn = (
+                                        f"\n\n⚠️ [任务完成验证] 该节点({node.label})属于代码生成任务，"
+                                        f"但未检测到 write_to_file/replace_in_file 工具调用。"
+                                        f"请确认文件已正确创建。如需创建文件，请调用: "
+                                        f"write_to_file(path='文件路径', content='文件内容')"
+                                    )
+                                    rt = rt + warn
+                except Exception as val_err:
+                    logger.debug(f"[IDEFCRunner] 任务完成验证异常: {val_err}")
         # 注意力工具执行完毕后，恢复正常工具列表
         if tn in ("navigate_attention", "adjust_attention_mode"):
             if state.pressure_force_attention:
@@ -2799,14 +3630,17 @@ class IDEFCRunner:
         self.engine._publish_task_graph_event("agent_tool_call", fc, tn, rt)
         # 记录子对话到 MemoryGraph
         self._record_sub_dialogue(state, tool_name=tn, result=rt)
-        # Web 监控: 内部工具执行
-        _broadcast_sync("IDE_TOOL_EXEC", {
-            "session_id": self.session.session_id,
-            "turn": fc,
-            "tool_name": tn,
-            "arguments_preview": _json.dumps(ta, ensure_ascii=False)[:300],
-            "result_preview": (rt or "")[:500],
-        })
+        self._emit_execution_event_sync(
+            "tool_finished",
+            f"内部工具执行完成: {tn}",
+            turn=fc,
+            event_type="IDE_TOOL_EXEC",
+            payload={
+                "tool_name": tn,
+                "arguments_preview": _json.dumps(ta, ensure_ascii=False)[:300],
+                "result_preview": (rt or "")[:500],
+            },
+        )
 
     # 参数默认值：LLM 省略某些参数时自动填充
     # 典型场景：list_files() 不传 path; execute_command() 不传 requires_approval
@@ -3056,6 +3890,74 @@ class IDEFCRunner:
             except Exception as drift_err:
                 logger.warning(f"[IDEFCRunner][DriftDetector] 检测异常: {drift_err}")
 
+        # 安全网 0.5: 独白检测 (OpenHands-style monologue detection)
+        # 检测模型连续纯文本回复而不调用工具的退化模式
+        # 当连续3次以上纯文本 + 有未完成任务时，注入强纠正提示
+        if (state.consecutive_text_only_count >= 3
+                and resp and len(resp.strip()) >= 6):
+            try:
+                from zulong.tools.task_tools import get_active_task_graph as _gtg_mono
+                tg_mono = _gtg_mono()
+                if tg_mono:
+                    leaves_mono = tg_mono.get_leaf_nodes()
+                    user_leaves_mono = [n for n in leaves_mono if not n.id.startswith("crg_")]
+                    uncompleted_mono = [n for n in user_leaves_mono
+                                        if n.status not in ("completed", "skipped")]
+                    if not user_leaves_mono:
+                        req_node = tg_mono.get_node("req")
+                        if req_node and req_node.status not in ("completed", "skipped"):
+                            uncompleted_mono = [req_node]
+                    if uncompleted_mono:
+                        current_mono = next(
+                            (n for n in uncompleted_mono if n.status == "in_progress"),
+                            uncompleted_mono[0],
+                        )
+                        # 🔥 强纠正提示：明确告诉模型用哪个工具、什么参数
+                        # 优先级：1. write_to_file（代码生成节点） 2. read_file（分析节点） 3. execute_command（命令节点）
+                        label_lower = (current_mono.label or "").lower()
+                        tool_hint = ""
+                        if any(kw in label_lower for kw in ("写", "编写", "创建", "生成", "代码", "code", "write", "create", "文件", "file", "html", "css", "js", "实现", "开发")):
+                            tool_hint = (
+                                f'请立即调用 write_to_file 创建文件。\n'
+                                f'示例: write_to_file(path="文件路径", content="文件内容")'
+                            )
+                        elif any(kw in label_lower for kw in ("分析", "分析", "检查", "review", "查看", "阅读", "读", "read")):
+                            tool_hint = "请调用 read_file 或 index_code_file 分析代码。"
+                        elif any(kw in label_lower for kw in ("运行", "执行", "测试", "运行", "test", "run", "命令", "command")):
+                            tool_hint = "请调用 execute_command 运行命令。"
+                        else:
+                            tool_hint = (
+                                "请调用合适的工具（write_to_file/read_file/execute_command）"
+                                "来执行任务。不要只口头叙述！"
+                            )
+                        nudge_mono = {
+                            "role": "user",
+                            "content": (
+                                f"[独白检测] 你已经连续 {state.consecutive_text_only_count} 次"
+                                f"只输出文本而没有调用任何工具！\n"
+                                f"当前应执行: {current_mono.id}({current_mono.label})。\n"
+                                f"还有 {len(uncompleted_mono)} 个任务未完成。\n"
+                                f"{tool_hint}\n"
+                                f"⚠️ 仅在文本中说「开始编写」而不调用工具，等于什么都没做。"
+                            ),
+                        }
+                        msgs.append({"role": "assistant", "content": resp})
+                        msgs.append(nudge_mono)
+                        if self._attn_window:
+                            self._attn_window.register_message(
+                                {"role": "assistant", "content": resp}, turn=fc)
+                            self._attn_window.register_message(nudge_mono, turn=fc)
+                        state.null_response_count += 1
+                        mono_count = state.consecutive_text_only_count
+                        state.consecutive_text_only_count = 0  # 重置，避免重复nudge
+                        logger.warning(
+                            f"[IDEFCRunner][Monologue] turn={fc} "
+                            f"连续{mono_count}次纯文本，"
+                            f"未完成={len(uncompleted_mono)}, 当前={current_mono.id}")
+                        return "cb_force" if state.null_response_count >= 4 else "continue"
+            except Exception as e:
+                logger.warning(f"[IDEFCRunner][Monologue] {e}")
+
         # 安全网 1: RuleGuardian
         blocked = False
         if self._rule_guardian:
@@ -3098,7 +4000,7 @@ class IDEFCRunner:
         except Exception as e:
             logger.warning(f"[IDEFCRunner][InfoGap] {e}")
 
-        # 安全网 3: AutoMark RESUME
+        # 安全网 3: 继续任务图 AutoMark
         if (is_resume and len(resp) > 100 and state.resume_automark_count < 5
                 and not resp.rstrip().endswith(("?", "\uff1f")) and not _is_filler_content(resp)):
             try:
@@ -3210,7 +4112,8 @@ class IDEFCRunner:
                             "content": (
                                 f"[任务未完成] 仍有 {len(uncompleted_uc)}/{total_uc} 个子任务未完成。"
                                 f"当前应执行: {current_uc.id}({current_uc.label})。"
-                                f"请继续调用工具执行任务，不要提前生成最终总结。"
+                                f"请调用工具执行任务，不要只输出文本叙述。"
+                                f"\n⚠️ 口头说「开始编写」「我将创建」而不调用工具 = 什么都没做！"
                             ),
                         }
                         msgs.append({"role": "assistant", "content": resp})
@@ -3246,6 +4149,15 @@ class IDEFCRunner:
                             (n for n in uncompleted_ri if n.status == "in_progress"),
                             uncompleted_ri[0],
                         )
+                        # 🔥 根据当前节点类型提供具体工具引导
+                        label_ri = (current_ri.label or "").lower()
+                        tool_ri_hint = ""
+                        if any(kw in label_ri for kw in ("写", "编写", "创建", "生成", "代码", "code", "write", "create", "文件", "file", "html", "css", "js", "实现", "开发", "页面")):
+                            tool_ri_hint = "\n请调用: write_to_file(path='文件路径', content='文件完整内容')"
+                        elif any(kw in label_ri for kw in ("运行", "执行", "测试", "test", "run", "命令")):
+                            tool_ri_hint = "\n请调用: execute_command(command='命令')"
+                        elif any(kw in label_ri for kw in ("查看", "分析", "阅读", "检查", "read", "review")):
+                            tool_ri_hint = "\n请调用: read_file(path='文件路径')"
                         nudge_ri = {
                             "role": "user",
                             "content": (
@@ -3253,7 +4165,8 @@ class IDEFCRunner:
                                 f"疑似function_call未生成。"
                                 f"仍有 {len(uncompleted_ri)}/{total_ri} 个子任务未完成。"
                                 f"当前应执行: {current_ri.id}({current_ri.label})。"
-                                f"请继续调用工具执行任务。"
+                                f"{tool_ri_hint}"
+                                f"\n⚠️ 只说「开始编写」而不调用工具 = 什么都没做！"
                             ),
                         }
                         msgs.append({"role": "assistant", "content": resp})
@@ -3274,10 +4187,10 @@ class IDEFCRunner:
                 logger.warning(f"[IDEFCRunner][ResponseIntegrity] {e}")
 
         # 安全网 7: 首轮无效回复拦截
-        # 当 COMPLEX 意图首轮模型未调用工具，直接返回短回复/问候语时，
+        # 当工具增强策略首轮模型未调用工具，直接返回短回复/问候语时，
         # 注入纠正提示让模型重新聚焦任务并使用工具
         if (_is_filler_content(resp) and fc <= 1
-                and getattr(state, "ide_intent", "") == "complex"
+                and getattr(state, "task_graph_policy", "") in {"inspect_or_create", "create", "extend"}
                 and state.null_response_count < 3):
             _GREETING_PATTERNS = (
                 "你好", "您好", "有什么我可以帮", "有什么可以帮",
@@ -3365,10 +4278,32 @@ class IDEFCRunner:
         except Exception:
             pass
         # Web 监控: FC 终止（同步上下文 fire-and-forget）
+        phase = "completed" if reason == "done" else ("cancelled" if reason in {"cancelled", "interrupted"} else "blocked")
+        interaction = self._build_interaction_payload(
+            phase,
+            f"FC终止: {reason}",
+            state.fc_turn,
+            "FC_DONE",
+            {
+                "total_turns": state.fc_turn,
+                "reason": reason,
+                "summary": {
+                    "completed": ["已保存当前执行状态"],
+                    "verified": [],
+                    "remaining": [] if reason == "done" else ["存在未完成步骤，已标记为可继续/可调整"],
+                    "risk": "" if reason == "done" else f"本轮以 {reason} 结束，后续需要基于当前上下文继续。",
+                    "next_step": "等待用户继续输入。",
+                },
+            },
+        )
         _broadcast_sync("FC_DONE", {
+            "protocol_version": "2.0",
             "session_id": self.session.session_id,
             "total_turns": state.fc_turn,
             "reason": reason,
+            "phase": phase,
+            "message": f"FC终止: {reason}",
+            "interaction": interaction,
         })
         return IDEFCResult(phase="done", text_response=resp, reason=reason)
 
@@ -3402,7 +4337,11 @@ class IDEFCRunner:
                       and "error" not in r.get("result", "").lower()[:50]
                       and not r.get("result", "").lstrip().startswith(("{", "["))]
             if useful:
-                return "根据已收集的信息：\n" + "\n".join(useful[:3])
+                return (
+                    "系统当前出问题了，IDE FC 循环触发保护后没有生成有效回复，"
+                    "因此无法正常回复。\n已收集到的工具信息如下，仅供排查：\n"
+                    + "\n".join(useful[:3])
+                )
         try:
             from zulong.tools.task_tools import get_active_task_graph as _gtg_fb
             _tg = _gtg_fb()
@@ -3410,7 +4349,11 @@ class IDEFCRunner:
                 lv = _tg.get_leaf_nodes()
                 cp = [n for n in lv if n.status == "completed"]
                 uc = [n for n in lv if n.status not in ("completed", "skipped")]
-                fb = f"任务「{_tg.title}」进度：{len(cp)}/{len(lv)} 完成。"
+                fb = (
+                    "系统当前出问题了，IDE FC 循环触发保护后没有生成有效回复，"
+                    "因此无法正常回复。\n"
+                    f"当前任务「{_tg.title}」进度：{len(cp)}/{len(lv)} 完成。"
+                )
                 if uc:
                     fb += f"\n下一步：{uc[0].label}。"
                 return fb
@@ -3778,11 +4721,15 @@ class IDEFCRunner:
 
         智能判断是否需要创建新任务图：
         - 如果本 session 已有关联的 TG → 复用
-        - 如果是 RESUME 意图 → 复用已完成的旧图（用户想修订/扩展）
-        - 如果全局 TG 所有叶节点都已完成 且 不是 RESUME → 创建新 TG
+        - 如果任务图策略是 reuse/inspect/continue → 复用已完成的旧图（用户想修订/扩展）
+        - 如果全局 TG 所有叶节点都已完成 且策略不是复用 → 创建新 TG
         - 如果全局 TG 仍有未完成节点 → 不覆盖（其他会话可能在用）
         """
         try:
+            if getattr(state, "task_graph_policy", "none") == "none":
+                logger.debug("[IDEFCRunner] 任务图策略为 none，跳过自动任务图")
+                return
+
             from zulong.tools.task_tools import get_active_task_graph, set_active_task_graph
             existing_tg = get_active_task_graph()
 
@@ -3812,14 +4759,14 @@ class IDEFCRunner:
                         f"[IDEFCRunner] 已有活跃任务图（{len(uncompleted)} 未完成），复用")
                     return
 
-                # RESUME 意图 → 复用旧图
+                # 继续已有任务图策略 → 复用旧图
                 if state.is_resume:
                     logger.info(
-                        f"[IDEFCRunner] RESUME 意图：复用旧图"
+                        f"[IDEFCRunner] 继续任务图策略：复用旧图"
                         f"（graph_id={getattr(existing_tg, 'id', '?')}）")
                     return
 
-                # 所有节点已完成 + 非 RESUME → 允许创建新 TG
+                # 所有节点已完成 + 非复用策略 → 允许创建新 TG
                 logger.info("[IDEFCRunner] 旧任务图已全部完成，创建新任务图")
 
             # ── 阶段2: 创建新TaskGraph（受 user_input 长度限制） ──
@@ -3959,7 +4906,7 @@ class IDEFCRunner:
                 "phase": state.phase,
                 "stage": stage,
                 "detail": detail,
-                "intent": getattr(state, "ide_intent", ""),
+                "task_graph_policy": getattr(state, "task_graph_policy", "none"),
                 "cb_force": state.cb_force_no_tools,
                 "max_turns": self._max_fc_turns,
                 "timestamp": time.time(),

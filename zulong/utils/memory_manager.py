@@ -23,6 +23,7 @@ import logging
 import time
 import psutil
 import torch
+from zulong.utils.device import empty_accelerator_cache, is_mps_available
 from typing import Dict, Any, List, Optional, Callable, TypeVar, Generic
 from dataclasses import dataclass, field
 from collections import OrderedDict
@@ -316,6 +317,14 @@ class MemoryManager:
             stats.gpu_allocated_gb = torch.cuda.memory_allocated(0) / (1024**3)
             stats.gpu_reserved_gb = torch.cuda.memory_reserved(0) / (1024**3)
             stats.gpu_percent = stats.gpu_allocated_gb / stats.gpu_total_gb * 100
+        elif is_mps_available():
+            try:
+                stats.gpu_allocated_gb = torch.mps.current_allocated_memory() / (1024**3)
+                stats.gpu_reserved_gb = stats.gpu_allocated_gb
+                stats.gpu_total_gb = psutil.virtual_memory().total / (1024**3)
+                stats.gpu_percent = stats.gpu_allocated_gb / stats.gpu_total_gb * 100 if stats.gpu_total_gb else 0.0
+            except Exception:
+                pass
         
         # 模型内存
         for name, loader in self.lazy_loaders.items():
@@ -388,8 +397,7 @@ class MemoryManager:
         # 垃圾回收
         import gc
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        empty_accelerator_cache()
         
         logger.info("[MemoryManager] 优化完成")
     

@@ -319,7 +319,7 @@ def test_gradio_client():
     
     print("✓ 服务器已运行")
     
-    output_path = r"d:\AI\project\zulong_beta4\tests\output_cosyvoice_gradio.wav"
+    output_path = r"d:\AI\project\zulong_beta5\tests\output_cosyvoice_gradio.wav"
     
     print("\n测试 3s 极速复刻模式（CosyVoice2-0.5B 无预训练音色）...")
     
