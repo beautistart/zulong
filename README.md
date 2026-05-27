@@ -114,7 +114,7 @@
 
 ### 3. 🎯 交互式任务编排 (v2.0 新特性)
 
-借鉴 Claude Code、Devin、Cursor 的设计理念，支持：
+借鉴 codex、OpenHands 的设计理念，支持：
 
 - **权限分级审批**：操作自动分类为安全/需确认/危险级别，对应自动执行/弹窗确认/强制拒绝
 - **进度实时跟踪**：任务卡片系统 (Approval/Interaction/Startup/Summary) 提供完整的任务生命周期可视化
