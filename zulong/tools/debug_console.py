@@ -488,8 +488,11 @@ class DebugConsole:
 
             # 保存命令
             if args and 'save' in args:
-                mg.save()
-                safe_print(f"\n  >> MemoryGraph 已保存到 {mg._persist_path}")
+                if hasattr(mg, "save_all"):
+                    mg.save_all()
+                    safe_print("\n  >> MemoryGraph 分片已保存")
+                else:
+                    safe_print("\n  >> 当前 MemoryGraph 后端不支持运行态保存")
 
             safe_print("=" * 56)
         except Exception as e:

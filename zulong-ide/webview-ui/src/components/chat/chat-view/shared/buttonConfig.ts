@@ -205,6 +205,26 @@ export const BUTTON_CONFIGS: Record<string, ButtonConfig> = {
 		primaryAction: undefined,
 		secondaryAction: "cancel",
 	},
+
+	// ===== v2.7 新增: 中途插话 (TSD 23.7.2) =====
+	// 任务执行中, 用户有输入 → "发送调整"
+	task_interject: {
+		sendingDisabled: false,
+		enableButtons: true,
+		primaryText: "发送调整",
+		secondaryText: "取消任务",
+		primaryAction: "proceed",
+		secondaryAction: "cancel",
+	},
+	// 等待审批中, 用户有补充输入 → "发送补充"
+	awaiting_approval_with_input: {
+		sendingDisabled: false,
+		enableButtons: true,
+		primaryText: "发送补充",
+		secondaryText: "取消",
+		primaryAction: "proceed",
+		secondaryAction: "cancel",
+	},
 }
 
 const errorTypes = ["api_req_failed", "mistake_limit_reached"]

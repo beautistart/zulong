@@ -19,7 +19,7 @@
 对应 TSD v2.4 第 14.1 节：内存内语义缓存（In-Memory Semantic Cache）
 
 文档参考:
-- d:\AI\project\zulong_beta4\资料\临时记忆的动态量化与筛选完整问答.txt
+- 资料/临时记忆的动态量化与筛选完整问答.txt
 """
 
 import asyncio

@@ -113,6 +113,8 @@ let ws = null;
 let selectedMode = null;
 let launching = false;
 let pollTimer = null;
+let progressWsOpened = false;
+let redirected = false;
 
 function selectMode(mode) {
   selectedMode = mode;
@@ -124,6 +126,8 @@ function doLaunch(mode) {
   event.stopPropagation();
   if (launching) return;
   launching = true;
+  progressWsOpened = false;
+  redirected = false;
 
   // Switch to progress phase
   document.getElementById('phase-select').style.display = 'none';
@@ -134,13 +138,25 @@ function doLaunch(mode) {
   // Connect progress WebSocket
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(protocol + '//' + location.host + '/ws/progress');
+  ws.onopen = function() {
+    progressWsOpened = true;
+    addLog('进度通道已连接');
+  };
   ws.onmessage = function(ev) {
     const msg = JSON.parse(ev.data);
     handleProgressMsg(msg);
   };
-  ws.onerror = function() { addLog('WebSocket 连接失败'); };
+  ws.onerror = function() {
+    if (!progressWsOpened) {
+      addLog('进度通道暂不可用，正在使用轮询确认启动状态...');
+    }
+  };
   ws.onclose = function() {
-    addLog('进度连接已断开，切换到轮询模式...');
+    if (!redirected && !progressWsOpened) {
+      addLog('进度连接未建立，已切换到轮询模式...');
+    } else if (!redirected) {
+      addLog('进度通道已关闭，继续轮询确认状态...');
+    }
     startStatusPolling();
   };
 
@@ -165,17 +181,35 @@ function startStatusPolling() {
         clearInterval(pollTimer);
         pollTimer = null;
         doRedirect();
+      } else if (d.phase === 'launching') {
+        updateFromStatusSnapshot(d);
+      } else if (d.phase === 'selecting' && launching) {
+        addLog('启动未完成，仍在等待后端状态...');
       }
     }).catch(function() {});
   }, 2000);
 }
 
 function doRedirect() {
+  if (redirected) return;
+  redirected = true;
   if (ws) { try { ws.close(); } catch(e) {} }
   document.getElementById('phase-progress').style.display = 'none';
   document.getElementById('phase-complete').style.display = 'block';
   // 带时间戳参数避免缓存
   setTimeout(function() { window.location.href = '/?t=' + Date.now(); }, 1500);
+}
+
+function updateFromStatusSnapshot(d) {
+  if (d.modules) renderModules(d.modules);
+  const modules = d.modules ? Object.values(d.modules) : [];
+  if (!modules.length) return;
+  const done = modules.filter(function(m) { return m.state === 'running' || m.state === 'stopped'; }).length;
+  const percent = Math.max(1, Math.min(99, Math.round(done / modules.length * 100)));
+  document.getElementById('progress-bar').style.width = percent + '%';
+  document.getElementById('progress-percent').textContent = percent + '%';
+  const current = modules.find(function(m) { return m.state === 'starting'; });
+  if (current && current.message) addLog(current.message);
 }
 
 function handleProgressMsg(msg) {

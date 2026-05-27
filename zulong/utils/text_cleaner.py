@@ -76,8 +76,8 @@ def clean_text_for_tts(text: str) -> str:
                             print(f"[TextCleaner] Extracted normal content: {result[:50]}...")
                             return result
             
-            # 策略 B: 没有正常句子，返回兜底回复
-            return "我刚才有点走神，请再说一遍您的问题好吗？"
+            # 策略 B: 没有正常句子，返回明确的异常兜底
+            return "系统当前出问题了，模型输出异常，无法正常回复。"
     
     # ========== 步骤 1: 移除思维链 <think>...</think> ==========
     think_pattern = r'<think>.*?</think>'

@@ -32,6 +32,7 @@ from zulong.l1a.l1a_config import PROJECT_ROOT, MODEL_ROOT, SHARED_VISION_DIR, V
 from zulong.models.container import ModelContainer
 from zulong.models.config import ModelID
 from zulong.ide.video_logger import logger
+from zulong.utils.device import empty_accelerator_cache, torch_device
 
 
 class VisionNode:
@@ -68,8 +69,8 @@ class VisionNode:
         self.vl_model = None  # InternVL2_5-1B 多模态模型
         self.processor: Optional[AutoProcessor] = None
         self.is_loaded = False
-        # L1-A 运行在 GPU
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # L1-A 优先 GPU；macOS Apple Silicon 自动使用 MPS
+        self.device = torch_device("auto", prefer_gpu=True)
         
         # 👁️ 视觉短期记忆管理器 (环形缓冲区)
         self.short_term_memory = VisionShortTermMemory(
@@ -132,8 +133,7 @@ class VisionNode:
             self.model = None
             self.is_loaded = False
             
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            empty_accelerator_cache()
             
             logger.info("✅ 视觉模型已卸载")
     

@@ -318,7 +318,7 @@ def test_client():
     
     print("✓ 服务已运行")
     
-    output_path = r"d:\AI\project\zulong_beta4\tests\output_cosyvoice_server.wav"
+    output_path = r"d:\AI\project\zulong_beta5\tests\output_cosyvoice_server.wav"
     
     print("\n测试语音合成...")
     result = client.synthesize(

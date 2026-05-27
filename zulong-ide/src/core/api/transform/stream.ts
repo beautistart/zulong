@@ -1,5 +1,13 @@
+import type { InteractionPayload } from "@shared/ExtensionMessage"
+
 export type ApiStream = AsyncGenerator<ApiStreamChunk> & { id?: string }
-export type ApiStreamChunk = ApiStreamTextChunk | ApiStreamThinkingChunk | ApiStreamUsageChunk | ApiStreamToolCallsChunk | ApiStreamStatusUpdateChunk
+export type ApiStreamChunk =
+	| ApiStreamTextChunk
+	| ApiStreamThinkingChunk
+	| ApiStreamUsageChunk
+	| ApiStreamToolCallsChunk
+	| ApiStreamStatusUpdateChunk
+	| ApiStreamInteractionChunk
 
 export interface ApiStreamTextChunk {
 	type: "text"
@@ -78,6 +86,13 @@ export interface ApiStreamStatusUpdateChunk {
 	type: "status_update"
 	turn?: number
 	phase?: string
+}
+
+export interface ApiStreamInteractionChunk {
+	type: "interaction"
+	interaction: InteractionPayload
+	sourceEvent?: string
+	turn?: number
 }
 
 export interface ApiStreamThinkingChunk {

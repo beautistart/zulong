@@ -2,18 +2,17 @@
 
 <img src="./docs/images/zulong_logo_transparent.png" alt="Zulong Logo" width="120" height="120" />
 
-# 祖龙 (ZULONG)
+# 祖龙 (ZULONG) v2.0.0
 
 ### 给 AI 代理装上能保持跨年级别完整记忆的"海马体"
 
-**82K+ 行 Python | 一个设计师用 AI 搓出来的**
+**100K+ 行 Python | 一个设计师用 AI 搓出来的**
 
 [![License](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://www.python.org/)
 [![VS Code](https://img.shields.io/badge/VS%20Code-Extension-green.svg)](https://code.visualstudio.com/)
 [![GitHub release](https://img.shields.io/github/release/beautistart/zulong.svg)](https://github.com/beautistart/zulong/releases)
 [![Discord](https://dcbadge.limes.pink/api/server/zZMgtSyHV?style=flat)](https://discord.gg/zZMgtSyHV)
-[![Juejin](https://img.shields.io/badge/📖_掘金技术解析-1E80FF?style=flat&logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cGF0aCBkPSJNMTIgMkwxNS4wOSA1LjA5TDE4IDJMMjAuOTEgNS4wOUwyNCAyTDIwLjkxIDguMDlMMjQgMTFMMjAuOTEgMTQuMDlMMjQgMTdMMjAuOTEgMjAuMDlMMjQgMjNMMTggMjBMMTUuMDkgMjNMMTIgMjBMOCAyM0w0LjkxIDIwTDEgMjNMNC4wOSAyMEwxIDE3TDQuMDkgMTQuMDlMMSAxMUw0LjA5IDguMDlMMSA1TDQuOTEgMi4wOUw4IDVMMTEuMDkgMkwxMiAyWiIgZmlsbD0iIzFFODBGRiIvPjwvc3ZnPg==)](https://juejin.cn/post/7639026628014014473)
 [![Stars](https://img.shields.io/github/stars/beautistart/zulong?style=social)](https://github.com/beautistart/zulong)
 
 [English](./docs/README_EN.md) | 简体中文
@@ -31,15 +30,15 @@
 </p>
 
 <p align="center">
-  <a href="https://zhuanlan.zhihu.com/p/2037757466839085217" target="_blank"> 知乎深度解析</a> · 
-  <a href="https://juejin.cn/post/7639026628014014473" target="_blank">📖 掘金技术解析</a>
+  <a href="https://juejin.cn/post/7639026628014014473" target="_blank">📖 掘金技术解析</a> · 
+  <a href="https://zhuanlan.zhihu.com/p/2037757466839085217" target="_blank">知乎深度解析</a>
 </p>
 
 ---
 
 ## 为何一个室内设计师，敢去造 AI 大脑？
 
-我是一名室内设计师，用 **2 个月的时间**，独立开发了祖龙 **82000+ 行代码**。
+我是一名室内设计师，用 **2 个月的时间**，独立开发了祖龙 **100000+ 行代码**。
 
 不用感到不可思议，因为设计师的素养就是作为项目的"总工程师"规划蓝图，让各个专业板块的人士去落地蓝图。
 
@@ -68,16 +67,23 @@
 
 ---
 
-> **📢 v1.0.0 正式发布（2026-05-12）**
+> **📢 v2.0.0 正式发布（2026-05-27）**
 >
-> 记忆板块经过重大架构升级后，这次是祖龙的首次正式发布，包含完整的记忆图谱、死循环检测、跨年级完整记忆等核心能力。
+> 祖龙 v2.0.0 是一次重大架构升级，聚焦于**任务编排重构**与**交互体验革新**。
 >
 > **核心更新**：
-> - ✅ **MemoryGraph 记忆图谱** - 9节点+7边+赫布学习+艾宾浩斯衰减
-> - ✅ **CircuitBreaker 6信号检测** - 信息增益检测等6种信号
-> - ✅ **跨年级完整记忆** - 完整状态序列化
-> - ✅ **5层防护链** - 基于qwen3.6-27B模型
-> - ✅ **完整的 VS Code 扩展+ TTS/ASR 语音交互**
+> - ✅ **FC 循环合并与协议统一** — 统一 IDE 与 Web 端 FC 执行路径，消除双轨维护
+> - ✅ **交互式任务卡片系统** — 审批卡(ApprovalCard)、交互卡(InteractionCard)、启动卡(StartupCard)、摘要卡(SummaryCard)
+> - ✅ **审批白名单机制** — 支持操作权限分级审批，每步操作人工确认与实时进度跟踪
+> - ✅ **VS Code 执行桥接** — 代码在安全环境执行，支持受控文件系统访问
+> - ✅ **工具袋系统 (ToolBag)** — 工具智能路由与预测加载，减少工具选择延迟
+> - ✅ **对话编排器** — 统一的多轮对话与任务编排流程
+> - ✅ **记忆镜像系统 (MemoryMirror)** — 会话窗口与记忆节点实时绑定
+> - ✅ **记忆图谱可视化面板** — BFS 动画、注意力视图、交互式记忆浏览
+> - ✅ **事件存储 (EventStore)** — 持久化事件流，支持回放与审计
+> - ✅ **统一协议层** — 规范化交互载荷与跨层通信协议
+> - ✅ **L2 FC 节点化重构** — 模块化 FC 节点 (fc_nodes.py + fc_runner.py)
+> - ✅ **废弃模块清理** — 移除 graph.py/state.py/types.py/session_tool.py 等旧代码
 >
 > 详见 [CHANGELOG.md](./CHANGELOG.md)
 
@@ -106,13 +112,32 @@
 | CrewAI | max_iterations 硬限制 |
 | OpenDevin | 时间/步数限制 |
 
-### 3. ⏸️ 跨天级任务挂起/恢复
+### 3. 🎯 交互式任务编排 (v2.0 新特性)
+
+借鉴 Claude Code、Devin、Cursor 的设计理念，支持：
+
+- **权限分级审批**：操作自动分类为安全/需确认/危险级别，对应自动执行/弹窗确认/强制拒绝
+- **进度实时跟踪**：任务卡片系统 (Approval/Interaction/Startup/Summary) 提供完整的任务生命周期可视化
+- **智能工具路由**：ToolBag 根据上下文预测所需工具，减少 LLM 工具选择延迟
+- **安全执行桥接**：VS Code Extension 作为执行宿主，代码在受控环境运行
+
+```
+用户输入 → 对话编排器 → 意图分类 → FC循环/TaskGraph规划
+                ↓              ↓
+           交互卡片渲染    工具袋预测加载
+                ↓              ↓
+           审批白名单检查  VS Code执行桥接
+                ↓              ↓
+           记忆镜像绑定    事件存储持久化
+```
+
+### 4. ⏸️ 跨天级任务挂起/恢复
 
 支持：`暂停 → 关机 → 第二天开机 → 恢复继续执行`
 
 适用场景：24 小时陪伴式机器人、超长程项目管理（跨周/跨月）、中断后环境变化自动重评估
 
-### 4. 🧠 两阶段意图分类 + FC 循环
+### 5. 🧠 两阶段意图分类 + FC 循环
 
 ```
 Round 1: 意图分类 → CHAT/COMPLEX/RESUME
@@ -124,30 +149,25 @@ Round 2: 场景化执行
 
 配套 5 层防护链（CB 强制收敛、RuleGuardian 过早完成拦截、InfoGap 信息缺口检测等）
 
-### 5. 🎙️ 语音交互能力（TTS + ASR）
+### 6. 🎙️ 语音交互能力（TTS + ASR）
 
 - **TTS (Kokoro-82M)**：82M 参数，<0.3s (CPU)，zf_xiaoxiao 中文女声
 - **ASR (SenseVoice-Small)**：244M (ONNX INT8 量化)，中/英/日/韩/粤语 + 情感识别 + 事件检测
 - **整体延迟**：3-4s (端到端，云端API调用)
 
-### 6. 🤖 具身机器人能力
+### 7. 🤖 具身机器人能力
 
 祖龙定位为**具身机器人认知大脑后端**，通过四层架构实现从传感器到认知决策的完整闭环：
 
-- **L0 设备层**：USB 摄像头 / 麦克风 / 扬声器驱动，GPU 加速光流运动检测（RTX 3060, 150+ FPS），多关节执行器模拟（位置/速度/扭矩跟踪）
+- **L0 设备层**：USB 摄像头 / 麦克风 / 扬声器驱动，GPU 加速光流运动检测（RTX 3060, 150+ FPS），多关节执行器模拟
 - **L1 模块化插件架构**：松耦合热插拔设计，4 级优先级调度（CRITICAL > HIGH > NORMAL > LOW）
-  - **L1-A 感知与受控反射层**：障碍物自动刹车（<50ms 响应），紧急停止，跌落保护，音频融合控制，运动控制（可接入厂家运动控制模块或端到端模型），与L1-C/L1-D紧密协作
-  - **L1-B 调度与意图守门层**：三层注意力机制（无需注意 → 静默注意 → 交互注意），ALBERT-tiny 15类细粒度意图分类（与L1-C/D的交互意图判断不同），事件风暴削减 ~90%
-  - **L1-C 静默视觉注意层**：YOLOv10 人体检测 → MediaPipe 姿态/手势(10种) → MobileNetV4-TSM 动作分类 → 交互意图判断(5类: WAVING/APPROACHING/GAZING/STILL/UNKNOWN)，可接入轻量视觉交互意图模型
-  - **L1-D 听觉层**：音频采集 → 预加重+滤波(80Hz) → YAMNet环境音分类(521类) → VAD → SenseVoice-Small单次推理(转录+情感+事件+语种) → 交互意图判断(基于事件标签) → L1-B串行协作(ALBERT 15类)；唤醒词("你好"/"救命"/"小紫")，"救命"CRITICAL直达L1-B
-  - **L1-E 安全层**：MQ-2烟雾传感器 → 气体浓度检测(阈值500ppm) → CRITICAL事件穿透直达L1-B + 语音报警，60秒冷却
+  - **L1-A 感知与受控反射层**：障碍物自动刹车（<50ms 响应），紧急停止，跌落保护，音频融合控制，运动控制
+  - **L1-B 调度与意图守门层**：三层注意力机制，ALBERT-tiny 15类细粒度意图分类，事件风暴削减 ~90%
+  - **L1-C 静默视觉注意层**：YOLOv10 → MediaPipe姿态/手势(10种) → MobileNetV4-TSM动作分类 → 交互意图判断(5类)
+  - **L1-D 听觉层**：音频采集 → YAMNet(521类) → VAD → SenseVoice-Small(转录+情感+事件+语种) → 交互意图判断
+  - **L1-E 安全层**：MQ-2烟雾传感器 → CRITICAL事件穿透，60秒冷却
 - **L2 认知层**：推理与决策，不做意图判断
 - **L3 导航专家**：A* 路径规划 + DWA 动态窗口避障（2s 轨迹预测，0.5m 安全距离）
-- **OpenClaw Bridge**：实体机器人桥接模块，通过 EventBus 与祖龙 L1-B 实时通信
-
-**与 NVIDIA GR00T 互补**：GR00T 处理视觉-动作映射与运动泛化，祖龙处理认知规划、记忆检索与长程推理。两者可同时部署在同一机器人上。
-
-> 详细技术分析请参阅：[深度技术分析报告 §3.9](./docs/architecture/system-overview.md) | [L1 插件开发指南](./docs/architecture/l1-plugin-guide.md)
 
 ---
 
@@ -158,16 +178,16 @@ Round 2: 场景化执行
 ```
 L3 专家层 (Expert Layer)           - 专家模型池，热切换 < 10ms
   ↓
-L2 认知层 (Cognitive Layer)        - InferenceEngine (5700+ 行)，推理与决策(不做意图判断)
+L2 认知层 (Cognitive Layer)        - FC循环 + TaskGraph + 5层防护 + 记忆系统
   ↓
-L1-B 调度层 (Scheduler Layer)      - Gatekeeper + AttentionController，事件优先级路由
+L1-B 调度层 (Scheduler Layer)      - Gatekeeper + AttentionController + ToolPredictor
   ↓
-L1-A 反射层 (Reflex Layer)         - 障碍物刹车/紧急停止/运动控制 + 与L1-C/D协作
-L1-C 视觉层 (Vision Layer)         - YOLOv10 → MediaPipe → MobileNetV4-TSM → 交互意图判断
-L1-D 听觉层 (Auditory Layer)       - YAMNet → VAD → SenseVoice-Small → 交互意图判断
+L1-A 反射层 (Reflex Layer)         - 障碍物刹车/紧急停止/运动控制
+L1-C 视觉层 (Vision Layer)         - YOLOv10 → MediaPipe → MobileNetV4-TSM
+L1-D 听觉层 (Auditory Layer)       - YAMNet → VAD → SenseVoice-Small
 L1-E 安全层 (Safety Layer)         - MQ-2 气体检测 → CRITICAL 穿透
   ↓ → 输出(文本/语音/动作)
-L0 设备层 (Device Layer)           - USB 摄像头/麦克风/扬声器驱动，运动检测
+L0 设备层 (Device Layer)           - USB 摄像头/麦克风/扬声器驱动
 ```
 
 ### 前后端分离架构
@@ -175,9 +195,10 @@ L0 设备层 (Device Layer)           - USB 摄像头/麦克风/扬声器驱动�
 ```
 VS Code Extension (前端)  ←WebSocket→  Python Backend (后端)
   ├─ React + Vite Webview                ├─ FastAPI + WebSocket
-  ├─ TypeScript + esbuild                ├─ L2 推理引擎
-  └─ 工具执行 + UI 渲染                  ├─ MemoryGraph 记忆系统
-                                         └─ TTS/ASR 语音交互
+  ├─ 交互卡片系统                        ├─ L2 推理引擎 (FC循环合并)
+  ├─ 审批白名单 UI                       ├─ MemoryGraph 记忆系统
+  ├─ 记忆图谱可视化                      ├─ 工具袋 (ToolBag)
+  └─ 工具执行 + UI 渲染                  └─ TTS/ASR 语音交互
 ```
 
 ---
@@ -218,8 +239,6 @@ code --install-extension zulong-ide-0.1.0.vsix --force
 ```
 
 ### 启动服务
-
-祖龙系统统一使用start.py启动（在项目根目录启动终端并运行start.py）：
 
 ```bash
 # 统一启动脚本（位于项目根目录）
@@ -264,33 +283,34 @@ audio:
 |------|------|-----------|--------|--------------|---------|
 | **统一记忆图谱** | ✅ LMDB + GraphML | ❌ 内存 DAG | ❌ | ❌ 单路向量 | ❌ 基于文件 |
 | **赫布学习** | ✅ 共激活增强 | ❌ | ❌ | ❌ | ❌ |
-| **艾宾浩斯衰减** | ✅ exp 衰减 | ❌ | ❌ | ❌ | ❌ 基于年龄 |
+| **艾宾浩斯衰减** | ✅ exp 衰减 | ❌ | ❌ | ❌ | ❌ |
 | **双路径检索** | ✅ BFS + FAISS | ❌ | ❌ | ❌ 单路 | ❌ 单路 |
 | **死循环检测** | ✅ 6 信号熔断 | ❌ 硬限制 | ❌ 硬限制 | ❌ | ❌ 硬限制 |
 | **任务挂起/恢复** | ✅ 跨天级 | ❌ | ❌ | ❌ | ❌ |
+| **审批白名单** | ✅ 分级审批 | ❌ | ❌ | ❌ | ❌ |
 | **语音交互** | ✅ TTS + ASR | ❌ | ❌ | ❌ | ❌ |
 | **具身机器人能力** | ✅ L0-L3 四层 + 导航 | ❌ | ❌ | ❌ | ❌ |
-| **安全反射机制** | ✅ 三级中断 + 自动刹车 | ❌ | ❌ | ❌ | ❌ |
 
 ---
 
 ## 📂 项目结构
 
 ```
-zulong_beta4/
+zulong/
 ├── zulong-ide/                 # VS Code 扩展前端 (React + TypeScript)
 ├── zulong/                     # Python 后端核心
 │   ├── ide/                    # IDE 模式 (WebSocket 服务 + 工具注册)
-│   ├── l2/                     # L2 推理引擎 (推理 + 记忆 + 熔断 + 任务图)
+│   ├── l2/                     # L2 推理引擎 (FC循环 + 记忆 + 熔断 + 任务图)
 │   ├── memory/                 # 记忆系统 (MemoryGraph + RAG)
 │   ├── l0/                     # L0 设备层 (摄像头/麦克风/执行器/运动检测)
 │   ├── l1a/ / l1b/ / l1c/     # 感知层 (音频融合/调度/视觉)
 │   ├── l3/                     # L3 多专家模型层
-│   ├── expert_skills/          # L3 专家技能 (导航/DWA避障/视觉)
-│   ├── modules/l1/             # L1 模块化插件接口
-│   └── plugins/                # L1 插件实现 (电机/视觉/语音/气体)
-├── openclaw_bridge/            # 实体机器人桥接 (EventBus + 适配器)
-├── config/                     # 配置文件 (zulong_config.yaml, l1_plugins.yaml)
+│   ├── plugins/                # L1 插件实现 (视觉/语音/气体)
+│   ├── events/                 # 事件存储 (EventStore)
+│   ├── tools/                  # 工具系统 (ToolBag + IDE桥接)
+│   ├── launcher/               # 启动器 (对话编排器/交互存储/记忆镜像)
+│   └── core/                   # 核心 (EventBus + 统一协议)
+├── config/                     # 配置文件
 ├── docs/                       # 技术文档与使用指南
 └── requirements.txt            # Python 依赖
 ```
@@ -299,14 +319,17 @@ zulong_beta4/
 
 ## 🔧 核心模块
 
-| 模块 | 文件 | 行数 | 核心能力 |
-|------|------|------|----------|
-| **MemoryGraph** | `zulong/memory/memory_graph.py` | 2784 行 | 双路径检索、赫布学习、艾宾浩斯衰减、BFS 扩散激活 |
-| **CircuitBreaker** | `zulong/l2/circuit_breaker.py` | 800+ 行 | 6 信号检测、状态机 (GREEN→YELLOW→RED) |
-| **TaskGraph** | `zulong/l2/task_graph.py` | 1500+ 行 | 无限深度递归树、模板节点、任务依赖管理 |
-| **InferenceEngine** | `zulong/l2/inference_engine.py` | 5700+ 行 | 两阶段推理、记忆检索、注意力窗口、FC 循环、5 层防护 |
-| **L1 插件管理器** | `zulong/modules/l1/core/plugin_manager.py` | - | 热插拔、优先级调度、异常隔离、共享内存通信 |
-| **导航专家** | `zulong/expert_skills/navigation_skill.py` | 16K | A* 路径规划、DWA 动态窗口避障 |
+| 模块 | 文件 | 核心能力 |
+|------|------|----------|
+| **MemoryGraph** | `zulong/memory/memory_graph.py` | 双路径检索、赫布学习、艾宾浩斯衰减、BFS 扩散激活 |
+| **CircuitBreaker** | `zulong/l2/circuit_breaker.py` | 6 信号检测、状态机 (GREEN→YELLOW→RED) |
+| **TaskGraph** | `zulong/l2/task_graph.py` | 无限深度递归树、模板节点、任务依赖管理 |
+| **InferenceEngine** | `zulong/l2/inference_engine.py` | 两阶段推理、记忆检索、注意力窗口、FC 循环、5 层防护 |
+| **FC Runner** | `zulong/l2/fc_runner.py` | 重构后统一 FC 执行器，合并 IDE/Web 双轨 |
+| **ConversationOrchestrator** | `zulong/launcher/conversation_orchestrator.py` | 多轮对话编排、任务生命周期管理 |
+| **ToolBag** | `zulong/tools/tool_bag.py` | 工具智能路由、预测加载 |
+| **MemoryMirror** | `zulong/launcher/memory_mirror.py` | 会话窗口与记忆节点实时绑定 |
+| **EventStore** | `zulong/events/event_store.py` | 持久化事件流、回放与审计 |
 
 ---
 
@@ -315,6 +338,8 @@ zulong_beta4/
 **内部工具**（后端执行）：`task_create_plan` | `task_add_node` | `task_mark_status` | `recall_memory` | `read_memory_node` | `save_memory_note` | `discover_related` | `focus_on_chain`
 
 **远程工具**（前端执行）：`read_file` | `write_to_file` | `execute_command` | `search_files` | `browser_action`
+
+**v2.0 新增**：`tool_bag` (工具袋预测路由) | `ide_bridge` (IDE执行桥接) | `read_file_tool` (安全文件读取)
 
 ---
 
@@ -340,21 +365,16 @@ Server("zulong-memory")
 
 ## 📚 详细文档
 
-**快速导航**：[文档索引页](./docs/index.md) - 快速查找你需要的文档
-
 ### 技术文档
-- [技术规格说明书 (TSD)](./docs/architecture/technical-spec-v3.md) - 完整系统架构设计
-- [深度技术分析报告](./docs/architecture/system-overview.md) - 代码审查与竞品对比
-- [L1 感知与具身控制层](./docs/architecture/system-overview.md#39-l0l1-感知与具身控制层-深度技术分析) - L0/L1 层深度技术分析
-- [L1 插件开发指南](./docs/architecture/l1-plugin-guide.md) - 自定义 L1 插件开发入门
-- [异构图记忆系统详解](./docs/memory_graph/) - MemoryGraph 设计与实现
-- [熔断器设计文档](./docs/CircuitBreaker_Design.md) - 6信号死循环检测机制
+- [技术规格说明书 (TSD)](./TSD/) - 完整系统架构设计
+- [深度技术分析报告](./docs/记忆板块深度技术分析报告.md) - 记忆系统代码审查
+- [异构图记忆系统详解](./docs/记忆图谱RAG与分片存储优化方案.md) - MemoryGraph 设计与实现
+- [FC循环合并与协议统一方案](./docs/FC循环合并与协议统一方案.md) - v2.0 架构升级详解
+- [任务执行记忆化与经验化架构任务书](./docs/任务执行记忆化与经验化架构任务书.md) - 任务编排设计
 
 ### 使用指南
 - [IDE 使用指南](./docs/Zulong_IDE使用指南.md) - 用户操作手册
-- [快速启动指南](./docs/guides/quick-start.md) - 3步安装与启动
-- [配置指南](./docs/guides/configuration.md) - 系统配置说明
-- [Docker 部署指南](./docs/guides/docker-deployment.md) - 容器化部署
+- [用户体验改进方案](./docs/用户体验改进方案.md) - 交互设计说明
 
 ### 开发文档
 - [贡献指南](./CONTRIBUTING.md) - 如何贡献代码
@@ -370,9 +390,10 @@ Server("zulong-memory")
 
 - [ ] 扩展 MCP 工具集（7 → 30+）
 - [ ] 添加基准测试数据
-- [ ] TaskGraph UI 可视化
+- [ ] TaskGraph UI 可视化增强
 - [ ] 多 Agent 协作支持
 - [ ] 性能优化（关键路径 Rust/Cython 重写）
+- [ ] 记忆图谱可视化面板更多交互功能
 
 ---
 
@@ -397,7 +418,7 @@ Server("zulong-memory")
 
 ---
 
-##  致谢
+## 致谢
 
 祖龙系统的开发离不开众多优秀的开源项目与社区贡献。在此向以下项目团队表示诚挚感谢：
 
@@ -435,7 +456,6 @@ Server("zulong-memory")
 - **[Model Context Protocol (MCP)](https://modelcontextprotocol.io/)** - 模型上下文协议 SDK
 - **[OpenTelemetry](https://opentelemetry.io/)** - 可观测性与链路追踪
 - **[Playwright](https://playwright.dev/)** - 浏览器自动化测试
-- **[Mermaid](https://mermaid.js.org/)** - 图表与流程图渲染
 
 ### 模型与权重
 

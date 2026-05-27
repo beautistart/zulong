@@ -37,6 +37,7 @@ class EventBus:
             self._running = False
             self._thread = None
             self._lock = threading.Lock()
+            self._event_store = None  # 可选的事件持久化存储
             self._initialized = True
             self._start_dispatch_thread()
             logger.info("EventBus initialized with background dispatch thread")
@@ -104,6 +105,9 @@ class EventBus:
             logger.debug(f"📡 [EventBus] 事件来源：{event.source}")
             logger.debug(f"📡 [EventBus] Payload: {event.payload}")
             logger.debug(f"{'='*80}\n")
+        
+        # 可选事件持久化 (非阻塞，默认关闭)
+        self._persist_event(event)
         
         # 🎯 [核心架构] 所有事件统一路由到 L1-B (TSD v1.7 增强版)
         # L1-B Gatekeeper 负责所有事件的判断、过滤、优先级排序和转发
@@ -211,6 +215,28 @@ class EventBus:
         else:
             logger.warning(f"📡 [EventBus] 事件 {event.type.name} 没有订阅者")
     
+    def set_event_store(self, store) -> None:
+        """设置事件持久化存储 (可选钩子)
+        
+        Args:
+            store: EventStore 实例或 None (关闭持久化)
+        """
+        self._event_store = store
+        if store is not None:
+            logger.info("EventBus 事件持久化已启用")
+        else:
+            logger.info("EventBus 事件持久化已关闭")
+
+    def _persist_event(self, event: ZulongEvent) -> None:
+        """异步持久化事件 (非阻塞，失败静默)"""
+        if self._event_store is None:
+            return
+        try:
+            self._event_store.persist(event)
+        except Exception:
+            # 持久化失败不应影响事件分发
+            logger.debug("EventBus 持久化事件失败", exc_info=True)
+
     def stop(self):
         """停止事件总线"""
         self._running = False

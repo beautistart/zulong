@@ -12,6 +12,7 @@ import time
 from typing import Dict, Optional, Any
 
 from zulong.ide.audio_logger import logger
+from zulong.utils.device import resolve_device
 
 _audio_container = None
 
@@ -28,7 +29,7 @@ def _get_audio_container():
             cm = ConfigManager()
             
             sensevoice_model_path = cm.get('audio.asr.model_path', './models/OpenASR/sensevoice-small-onnx')
-            asr_device = cm.get('audio.asr.device', 'cuda')
+            asr_device = resolve_device(cm.get('audio.asr.device', 'auto'), prefer_gpu=True)
             
             initialized = _audio_container.initialize(
                 enable_yamnet=False,

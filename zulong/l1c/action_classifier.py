@@ -27,6 +27,7 @@ import os
 import torch
 import torch.nn as nn
 from torchvision import models
+from zulong.utils.device import torch_device
 
 logger = logging.getLogger("ActionClassifier")
 
@@ -69,7 +70,7 @@ class MobileNetV4_TSM:
         
         # 模型占位符
         self._model = None
-        self._device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self._device = torch_device('auto', prefer_gpu=True)
         
         # 意图类型
         self.intent_types = [

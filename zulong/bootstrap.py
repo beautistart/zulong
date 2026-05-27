@@ -4,6 +4,36 @@
 
 import sys
 import os
+import warnings
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 全局第三方库警告抑制 (2026-05-25)
+# 这些警告来自第三方库内部代码，不影响功能，统一在此屏蔽
+# ════════════════════════════════════════════════════════════════════════════════
+
+# 1. PyTorch RNN dropout + num_layers=1 (SenseVoice/Sherpa-ONNX 模型加载时触发)
+warnings.filterwarnings(
+    "ignore",
+    message="dropout option adds dropout after all but last recurrent layer.*",
+    category=UserWarning,
+    module=r"torch\.nn\.modules\.rnn",
+)
+
+# 2. torch.nn.utils.weight_norm 弃用 (Kokoro-82M 内部使用)
+warnings.filterwarnings(
+    "ignore",
+    message=".*weight_norm.*deprecated.*",
+    category=FutureWarning,
+    module=r"torch\.nn\.utils\.weight_norm",
+)
+
+# 3. jieba 内部使用 pkg_resources (jieba/_compat.py)
+warnings.filterwarnings(
+    "ignore",
+    message="pkg_resources is deprecated as an API.*",
+    category=UserWarning,
+    module=r"jieba\._compat",
+)
 
 # ================================================================================
 # 🔥 配置系统初始化 (必须在导入其他模块之前)
@@ -126,18 +156,28 @@ except Exception as e:
 # 🧠 [BOOTSTRAP] 初始化 MemoryGraph (记忆图谱)
 logger.info("🧠 [BOOTSTRAP] 初始化 MemoryGraph...")
 try:
-    from zulong.memory.memory_graph_factory import create_memory_graph
+    from zulong.memory.memory_graph_factory import create_memory_graph, get_memory_graph_type
     _memory_graph = create_memory_graph(persist_path="./data/memory_graph")
-    from zulong.memory.graph_adapters import register_all_adapters
-    register_all_adapters(_memory_graph)
-    logger.info(f"✅ [BOOTSTRAP] MemoryGraph 初始化完成: {_memory_graph.stats['total_nodes']} 节点")
+    backend_type = get_memory_graph_type(_memory_graph)
     
-    # 全量同步各适配器数据到 MemoryGraph
-    try:
-        _memory_graph.sync_all()
-        logger.info(f"✅ [BOOTSTRAP] MemoryGraph 全量同步完成")
-    except Exception as sync_err:
-        logger.warning(f"⚠️ [BOOTSTRAP] MemoryGraph sync_all 失败: {sync_err}")
+    if backend_type == "networkx":
+        from zulong.memory.graph_adapters import register_all_adapters
+        register_all_adapters(_memory_graph)
+        logger.info(f"✅ [BOOTSTRAP] MemoryGraph 初始化完成: {_memory_graph.stats['total_nodes']} 节点")
+        
+        # 全量同步各适配器数据到 MemoryGraph
+        try:
+            _memory_graph.sync_all()
+            logger.info(f"✅ [BOOTSTRAP] MemoryGraph 全量同步完成")
+        except Exception as sync_err:
+            logger.warning(f"⚠️ [BOOTSTRAP] MemoryGraph sync_all 失败: {sync_err}")
+    else:
+        # Hybrid/Sharded 后端：适配器不适用
+        from zulong.memory.memory_graph import MemoryGraph
+        MemoryGraph._instance = _memory_graph  # 设置单例引用，供其他模块使用
+        stats = _memory_graph.get_stats() if hasattr(_memory_graph, 'get_stats') else {}
+        node_count = stats.get('total_nodes', stats.get('node_count', 0))
+        logger.info(f"✅ [BOOTSTRAP] {_memory_graph.__class__.__name__} 初始化完成 ({backend_type}): {node_count} 节点")
     
 except Exception as e:
     logger.warning(f"⚠️ [BOOTSTRAP] MemoryGraph 初始化失败 (降级运行): {e}")
@@ -307,6 +347,28 @@ class SystemBootstrap:
         except Exception as e:
             logger.warning(f"⚠️ [BOOTSTRAP] RecoveryNotifier 检查失败: {e}")
         
+        # 事件持久化: 启用 EventStore 并注入 EventBus
+        try:
+            from zulong.core.event_bus import event_bus
+            from zulong.events import get_event_store
+            
+            event_persistence_enabled = get_config('memory.event_persistence.enabled', False)
+            if event_persistence_enabled:
+                db_path = get_config('memory.event_persistence.db_path', './data/events.db')
+                retention_days = get_config('memory.event_persistence.retention_days', 30)
+                batch_size = get_config('memory.event_persistence.batch_size', 100)
+                event_store = get_event_store(
+                    db_path=db_path,
+                    retention_days=retention_days,
+                    batch_size=batch_size,
+                )
+                event_bus.set_event_store(event_store)
+                logger.info(f"✅ [BOOTSTRAP] EventStore 已启用: {db_path} (retention={retention_days}天)")
+            else:
+                logger.info("ℹ️ [BOOTSTRAP] EventStore 未启用 (event_persistence.enabled=false)")
+        except Exception as e:
+            logger.warning(f"⚠️ [BOOTSTRAP] EventStore 初始化失败（非致命）: {e}")
+        
         logger.info("=== Initialization Complete ===")
     
     async def _start_camera(self):
@@ -321,8 +383,11 @@ class SystemBootstrap:
             # 启动 MemoryGraph 修剪循环（衰减、重要度审查、孤立节点清理）
             if _memory_graph:
                 try:
-                    asyncio.create_task(_memory_graph.start_prune_loop())
-                    logger.info("✅ [BOOTSTRAP] MemoryGraph 修剪循环已启动")
+                    if hasattr(_memory_graph, 'start_prune_loop'):
+                        asyncio.create_task(_memory_graph.start_prune_loop())
+                        logger.info("✅ [BOOTSTRAP] MemoryGraph 修剪循环已启动")
+                    else:
+                        logger.info(f"✅ [BOOTSTRAP] {_memory_graph.__class__.__name__} 自带管理机制，跳过修剪循环")
                 except Exception as prune_err:
                     logger.warning(f"⚠️ [BOOTSTRAP] MemoryGraph 修剪循环启动失败: {prune_err}")
             
@@ -407,7 +472,7 @@ class SystemBootstrap:
         # 1. 启动摄像头设备 (真实模式)
         logger.info("[BOOTSTRAP] Starting Camera Device...")
         # 使用独立线程启动摄像头，避免事件循环问题
-        camera_thread = threading.Thread(target=self._run_camera_async, daemon=False)  # 改为非守护线程
+        camera_thread = threading.Thread(target=self._run_camera_async, daemon=True)  # 🔥 守护线程，不阻止进程退出
         camera_thread.start()
         self._threads.append(camera_thread)
         
@@ -444,7 +509,7 @@ class SystemBootstrap:
             await start_websocket_server()
         
         # 在后台线程中启动 WebSocket 服务器（非守护线程，确保服务器持续运行）
-        ws_thread = threading.Thread(target=lambda: asyncio.run(start_ws()), daemon=False)
+        ws_thread = threading.Thread(target=lambda: asyncio.run(start_ws()), daemon=True)  # 🔥 守护线程，不阻止进程退出
         ws_thread.start()
         
         # 等待 WebSocket Server 启动（最多等待 5 秒）
@@ -576,7 +641,10 @@ class SystemBootstrap:
             from zulong.memory.memory_graph import MemoryGraph
             if MemoryGraph._instance is not None:
                 logger.info("   保存 MemoryGraph...")
-                MemoryGraph._instance.save()
+                if hasattr(MemoryGraph._instance, "save_all"):
+                    MemoryGraph._instance.save_all()
+                elif hasattr(MemoryGraph._instance, "save"):
+                    MemoryGraph._instance.save()
                 stats = MemoryGraph._instance.stats
                 logger.info(f"   ✅ MemoryGraph 已保存 ({stats['total_nodes']} 节点, {stats['total_edges']} 边)")
         except Exception as e:

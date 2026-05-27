@@ -212,6 +212,35 @@ class InterruptHandler:
             # 2. 🎯 重评估：对比环境快照
             re_eval_result = self._re_evaluate_environment(task_id, snapshot)
             
+            # 🎯 TSD v2.7: 综合 ReEvalNode 决策（合并环境对比结果）
+            try:
+                from zulong.l2.re_eval_node import ReEvalNode, ReEvalDecision
+                _re_eval = ReEvalNode()
+                _re_eval_decision = _re_eval.evaluate(
+                    task_id,
+                    new_context={
+                        "environment_changes": re_eval_result.changes,
+                        "severity": re_eval_result.severity,
+                        "env_recommendation": re_eval_result.recommendation,
+                    }
+                )
+                _decision = _re_eval_decision.get("decision")
+                logger.info(
+                    f"[InterruptHandler] ReEvalNode 决策: {_decision}, "
+                    f"reason: {_re_eval_decision.get('reason')}"
+                )
+                # ReEvalNode 决策优先于环境对比
+                if _decision == ReEvalDecision.ABORT:
+                    re_eval_result.recommendation = "ABORT"
+                elif _decision == ReEvalDecision.REPLAN:
+                    re_eval_result.recommendation = "REPLAN"
+                elif _decision == ReEvalDecision.MERGE:
+                    re_eval_result.recommendation = "REPLAN"  # MERGE 降级为 REPLAN
+                    logger.info(f"[InterruptHandler] ReEvalNode MERGE → 降级为 REPLAN")
+                # RESUME → 保持现有 recommendation（CONTINUE）
+            except Exception as _ree:
+                logger.warning(f"[InterruptHandler] ReEvalNode 调用失败: {_ree}")
+            
             if re_eval_result.recommendation == "ABORT":
                 logger.warning(f"环境变化过大，任务中止：{re_eval_result.changes}")
                 # 发布任务中止通知

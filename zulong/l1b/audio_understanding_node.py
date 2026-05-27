@@ -37,6 +37,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from zulong.core.types import ZulongEvent, EventType, EventPriority
 from zulong.core.event_bus import event_bus
+from zulong.utils.device import empty_accelerator_cache, torch_device
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,11 @@ class L1BAudioUnderstandingNode:
     """
     
     # 模型配置（使用 L2 模型）
-    MODEL_PATH = r"d:\AI\project\zulong_beta4\models\Intel\Qwen3___5-0___8B-int4-AutoRound"  # int4 量化模型
+    import os
+    from pathlib import Path
+    _PROJECT_ROOT = Path(os.environ.get("ZULONG_HOME", Path(__file__).resolve().parent.parent.parent))
+    _MODEL_BASE = Path(os.environ.get("ZULONG_MODEL_BASE_DIR", str(_PROJECT_ROOT / "models")))
+    MODEL_PATH = str(_MODEL_BASE / "Intel" / "Qwen3___5-0___8B-int4-AutoRound")  # int4 量化模型
     MAX_LENGTH = 200  # 最大生成长度
     
     def __init__(self):
@@ -60,8 +65,8 @@ class L1BAudioUnderstandingNode:
         self.model: Optional[AutoModelForCausalLM] = None
         self.tokenizer: Optional[AutoTokenizer] = None
         self.is_loaded = False
-        # L1-B 运行在 GPU
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # L1-B 优先 GPU；macOS Apple Silicon 自动使用 MPS
+        self.device = torch_device("auto", prefer_gpu=True)
         
         # 上下文缓冲区（过去 30 秒）
         self.context_buffer: List[Dict[str, Any]] = []
@@ -120,9 +125,7 @@ class L1BAudioUnderstandingNode:
             self.model = None
             self.is_loaded = False
             
-            # 清理 CUDA 缓存
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            empty_accelerator_cache()
             
             logger.info("✅ VL 模型已卸载")
     

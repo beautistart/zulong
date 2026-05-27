@@ -4,10 +4,10 @@
 
 Plan-Execute-Reflect 循环，基于 LangGraph StateGraph 实现。
 5 个节点: plan → schedule → execute → reflect → synthesize
-内层 FC 循环（fc_graph.py）完全不动，7 层安全网原封不动。
+工具执行循环只在模型真实发起 tool_call 后启动，安全网保留在工具闭环内。
 
 设计原则：
-- plan / execute 通过 run_fc_loop 调用 LLM（保留全部安全网）
+- plan / execute 先做单次 L2 决策，真实 tool_call 出现后再进入 run_fc_loop
 - schedule 是纯代码逻辑（拓扑排序 + 注意力切换 + 检查点）
 - reflect 是轻量 LLM 调用（质量评估 → CONTINUE/REDO/REPLAN）
 - synthesize 支持分级汇总（大项目按 Tier 分层总结）
@@ -81,6 +81,37 @@ _PLAN_TOOLS = {
     "recall_memory", "discover_related",
 }
 
+# 🔥 做事模板：给 LLM 的 few-shot 操作示例
+# 当模型不了解如何调用工具时，此示例教它正确的工具调用格式
+_PLAN_FEW_SHOT_EXAMPLE = """\
+【任务规划操作示例 — 你必须调用工具函数，禁止用文字代替！】
+
+示例场景：用户说"帮我写一个坦克大战网页游戏"
+
+你应该依次调用以下工具（直接调函数，不要回复"我将创建..."之类的文字！）：
+
+① task_create_plan(title="坦克大战游戏", user_requirement="帮我写一个坦克大战网页游戏")
+
+② task_add_node(parent_id="req", label="创建项目结构", desc="创建文件夹和HTML文件")
+
+③ task_add_node(parent_id="req", label="编写游戏逻辑", desc="实现坦克移动、射击、碰撞检测等核心逻辑")
+
+④ task_add_node(parent_id="req", label="添加样式和UI", desc="实现计分板、生命值等UI元素")
+
+⑤ task_add_dependency(from_id="o1", to_id="o2", via="需要先有项目结构")
+
+⑥ task_add_dependency(from_id="o2", to_id="o3", via="需要先完成游戏逻辑")
+
+⑦ task_view_overview()
+
+⚠️ 核心规则：
+- 第一步永远是 task_create_plan，不能跳过
+- 所有子任务用 task_add_node 挂到 parent_id="req" 下
+- 有依赖关系的用 task_add_dependency 连接
+- 最后用 task_view_overview 确认结构
+- 禁止回复文字描述，必须实际调用工具函数
+"""
+
 # Execute 阶段工具集：执行+读写节点
 _EXECUTE_TOOLS = {
     "task_mark_status", "task_get_detail", "task_update_node",
@@ -91,6 +122,132 @@ _EXECUTE_TOOLS = {
 }
 
 
+# ═══════════════════════════════════════════════════════════════
+# 经验系统：搜索 + 存储
+# ═══════════════════════════════════════════════════════════════
+
+def _search_task_experiences(user_input: str, engine) -> Optional[str]:
+    """从 ExperienceRAG 检索相关任务经验
+    
+    返回格式化后的经验提示文本，无经验时返回 None。
+    经验格式为 JSON，包含 trigger/plan/execution 三层。
+    """
+    try:
+        if not hasattr(engine, 'rag_manager') or engine.rag_manager is None:
+            return None
+        
+        results = engine.rag_manager.search("experience", user_input, top_k=2)
+        if not results:
+            return None
+        
+        hints = []
+        for i, doc in enumerate(results):
+            try:
+                data = json.loads(doc.content)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            
+            if data.get("type") != "task_experience":
+                continue
+            
+            plan = data.get("plan", {})
+            title = plan.get("title", "未知任务")
+            nodes = plan.get("nodes", [])
+            deps = plan.get("dependencies", [])
+            
+            if not nodes:
+                continue
+            
+            lines = [f"经验 {i + 1}: 任务「{title}」"]
+            lines.append("  子任务结构:")
+            for n in nodes:
+                lines.append(
+                    f"    - {n.get('id', '?')}: {n.get('label', '?')}"
+                )
+            if deps:
+                lines.append("  依赖关系:")
+                for d in deps:
+                    lines.append(
+                        f"    {d.get('from', '?')} → {d.get('to', '?')}"
+                        f": {d.get('via', '?')}"
+                    )
+            hints.append("\n".join(lines))
+        
+        if hints:
+            return (
+                "【历史经验参考】以下是你之前完成类似任务时的规划，"
+                "请参考其结构：\n\n" + "\n\n".join(hints)
+            )
+        return None
+    except Exception:
+        return None
+
+
+def _store_task_experience(state: OrchestratorState, tg, engine):
+    """从成功完成的任务中提取并存储经验
+    
+    采集 PLAN 阶段的计划结构 + EXECUTE 阶段的执行统计，
+    序列化为 JSON 存入 ExperienceRAG。
+    """
+    try:
+        if state.get("should_terminate") != "done":
+            return
+        if state.get("total_fc_turns", 0) < 3:
+            return
+        
+        if not hasattr(engine, 'rag_manager') or engine.rag_manager is None:
+            return
+        
+        plan_nodes = []
+        plan_deps = []
+        for n in tg.nodes:
+            if n.id == "req":
+                continue
+            plan_nodes.append({
+                "id": n.id,
+                "label": n.label,
+                "desc": n.desc or "",
+                "status": n.status,
+            })
+        for e in tg.d_edges:
+            plan_deps.append({"from": e.s, "to": e.t, "via": e.via})
+        
+        if not plan_nodes:
+            return
+        
+        experience = {
+            "type": "task_experience",
+            "version": 1,
+            "trigger": {
+                "user_requirement": state.get("user_input_text", "")[:500],
+            },
+            "plan": {
+                "title": tg.title,
+                "nodes": plan_nodes,
+                "dependencies": plan_deps,
+            },
+            "execution": {
+                "fc_turns_total": state.get("total_fc_turns", 0),
+                "plan_version": state.get("plan_version", 0),
+                "success": True,
+            },
+        }
+        
+        content = json.dumps(experience, ensure_ascii=False)
+        engine.rag_manager.add_experience(
+            content=content,
+            category="task_success",
+            importance="must_learn",
+            domain="general",
+        )
+        logger.info(
+            f"[Orchestrator] 经验已存储: title={tg.title}, "
+            f"nodes={len(plan_nodes)}, deps={len(plan_deps)}"
+        )
+    except Exception as e:
+        logger.warning(f"[Orchestrator] 经验存储失败: {e}")
+
+
 def _filter_tool_definitions(
     all_tools: List[Dict], allowed_names: set
 ) -> List[Dict]:
@@ -99,6 +256,55 @@ def _filter_tool_definitions(
         t for t in all_tools
         if t.get("function", {}).get("name", "") in allowed_names
     ]
+
+
+def _run_tool_cycle_after_decision(
+    engine,
+    *,
+    messages: List[Dict],
+    tool_definitions: List[Dict],
+    vllm_model_id: str,
+    user_input: str,
+    response_max_tokens: int = 1024,
+    force_first_tool: bool = False,
+    forced_first_tool_name: str = "",
+    is_resume: bool = False,
+) -> Tuple[Optional[str], int]:
+    """先做一次 L2 决策，只有真实 tool_call 才进入 FC 工具循环。"""
+    from zulong.l2.fc_runner import run_fc_loop
+
+    decision = engine._call_l2_once(
+        messages,
+        tool_definitions=tool_definitions,
+        vllm_model_id=vllm_model_id,
+        response_max_tokens=response_max_tokens,
+        force_first_tool=force_first_tool,
+        forced_first_tool_name=forced_first_tool_name,
+        user_input=user_input,
+    )
+    initial_tool_calls = decision.get("tool_calls_data") or []
+    response = decision.get("response_content") or ""
+    if not initial_tool_calls:
+        logger.info("[Orchestrator] L2 单次决策未调用工具，跳过 FC 工具循环")
+        return response, 0
+
+    logger.info(
+        "[Orchestrator] L2 单次决策返回 %d 个工具调用，进入 FC 工具循环",
+        len(initial_tool_calls),
+    )
+    return run_fc_loop(
+        engine=engine,
+        messages=messages,
+        tool_definitions=tool_definitions,
+        vllm_model_id=vllm_model_id,
+        force_first_tool=False,
+        forced_first_tool_name="",
+        user_input=user_input,
+        is_resume=is_resume,
+        response_max_tokens=response_max_tokens,
+        initial_tool_calls_data=initial_tool_calls,
+        initial_response_content=response,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -169,11 +375,10 @@ def should_enter_synthesize(state: OrchestratorState) -> bool:
 # ═══════════════════════════════════════════════════════════════
 
 def plan_node(state: OrchestratorState, engine) -> OrchestratorState:
-    """Plan 节点：通过 FC 循环让模型建立/修改任务图
+    """Plan 节点：通过 L2 决策 + 工具循环建立/修改任务图
 
     模型可用工具限定为规划工具集，不允许执行类工具。
     """
-    from zulong.l2.unified_fc_runner import run_fc_loop
     from zulong.tools.task_tools import get_active_task_graph
 
     logger.info("[Orchestrator] >>> 进入 PLAN 阶段")
@@ -217,20 +422,71 @@ def plan_node(state: OrchestratorState, engine) -> OrchestratorState:
 
     # 注入规划指令到消息
     messages = list(state["messages"])
+
+    # 🔥 经验优先注入：检索相关经验，无经验时 fallback 静态模板
+    if not has_active_graph and not is_replan and not state.get("_plan_example_injected"):
+        experience_hint = _search_task_experiences(state["user_input_text"], engine)
+        if experience_hint:
+            messages.append({
+                "role": "system",
+                "content": f"[编排器-经验参考] {experience_hint}",
+            })
+            logger.info("[Orchestrator] PLAN: 注入历史经验")
+        else:
+            messages.append({
+                "role": "system",
+                "content": f"[编排器-操作示例] {_PLAN_FEW_SHOT_EXAMPLE}",
+            })
+            logger.info("[Orchestrator] PLAN: 注入静态模板（无相关经验）")
+        state["_plan_example_injected"] = True
+
     messages.append({
         "role": "system",
         "content": f"[编排器-规划阶段] {plan_hint}",
     })
 
-    response, fc_turn = run_fc_loop(
-        engine=engine,
+    # 🔥 无活跃图谱时，强制首轮调用 task_create_plan（禁止模型回复文字）
+    _force_tool = "task_create_plan" if not has_active_graph else ""
+
+    response, fc_turn = _run_tool_cycle_after_decision(
+        engine,
         messages=messages,
         tool_definitions=plan_tools,
         vllm_model_id=state["vllm_model_id"],
         force_first_tool=False,
+        forced_first_tool_name=_force_tool,
         user_input=state["user_input_text"],
-        intent_max_tokens=2048,
+        response_max_tokens=2048,
     )
+
+    # 🔥 Post-PLAN 验证: TaskGraph 是否已被创建
+    # 防止模型"不听话"（回复文字而非调用工具）导致后续阶段空转
+    tg_after = get_active_task_graph()
+    if tg_after is None:
+        plan_retry = state.get("_plan_retry_count", 0)
+        if plan_retry < 2:
+            logger.warning(
+                f"[Orchestrator] PLAN 未生成 TaskGraph，"
+                f"重试 {plan_retry + 1}/2"
+            )
+            state["_plan_retry_count"] = plan_retry + 1
+            state["phase"] = PHASE_PLAN
+            return state
+        else:
+            logger.error(
+                f"[Orchestrator] PLAN 多次重试仍无 TaskGraph，终止编排"
+            )
+            state["should_terminate"] = "plan_no_graph"
+            state["phase"] = PHASE_SYNTHESIZE
+            return state
+
+    # 重试成功后清理计数
+    if state.get("_plan_retry_count", 0) > 0:
+        logger.info(
+            f"[Orchestrator] PLAN 重试成功"
+            f"（第 {state['_plan_retry_count']} 次重试后创建了 TaskGraph）"
+        )
+    state["_plan_retry_count"] = 0
 
     state["total_fc_turns"] = state.get("total_fc_turns", 0) + fc_turn
     state["plan_version"] = state.get("plan_version", 0) + 1
@@ -290,6 +546,16 @@ def schedule_node(state: OrchestratorState, engine) -> OrchestratorState:
     if not next_executable:
         # 所有叶节点都已完成 → synthesize
         leaves = tg.get_leaf_nodes()
+        if not leaves:
+            # 空叶子列表：可能只有根节点，无子任务 — 尚未规划完成
+            total_nodes = len(tg._nodes)
+            if total_nodes <= 1:
+                logger.info(
+                    f"[Orchestrator] 任务图仅有根节点({total_nodes}个)，无子任务，"
+                    f"进入 synthesize（规划可能未展开）"
+                )
+                state["phase"] = PHASE_SYNTHESIZE
+                return state
         all_done = all(n.status in ("completed", "skipped") for n in leaves)
         if all_done:
             logger.info("[Orchestrator] 所有子任务已完成，进入 synthesize")
@@ -302,6 +568,46 @@ def schedule_node(state: OrchestratorState, engine) -> OrchestratorState:
                 f"[Orchestrator] 无可执行节点，{len(blocked)} 个阻塞: "
                 f"{[n.id for n in blocked[:5]]}"
             )
+            
+            # 🔥 [Fix] 超时检测：检查 in_progress 节点是否超时（默认60秒）
+            NODE_TIMEOUT_SECONDS = 60
+            import time
+            current_time = time.time()
+            timeout_recovered = False
+            
+            for node in blocked:
+                if node.status == "in_progress":
+                    # 检查节点是否有时间戳
+                    started_at = getattr(node, "started_at", None) or \
+                                (node.metadata or {}).get("started_at")
+                    
+                    if started_at:
+                        elapsed = current_time - started_at
+                        if elapsed > NODE_TIMEOUT_SECONDS:
+                            # 超时节点重置为 pending，允许重新执行
+                            node.status = "pending"
+                            node.result = f"超时重置 (耗时 {elapsed:.1f}s > {NODE_TIMEOUT_SECONDS}s)"
+                            if not node.metadata:
+                                node.metadata = {}
+                            node.metadata["timeout_reset"] = True
+                            logger.warning(
+                                f"[Orchestrator] 节点 {node.id} 超时重置: "
+                                f"{elapsed:.1f}s > {NODE_TIMEOUT_SECONDS}s → pending"
+                            )
+                            timeout_recovered = True
+                    else:
+                        # 没有时间戳的 in_progress 节点，设置当前时间
+                        if not node.metadata:
+                            node.metadata = {}
+                        node.metadata["started_at"] = current_time
+                        logger.info(
+                            f"[Orchestrator] 节点 {node.id} 缺少 started_at，已设置为当前时间"
+                        )
+            
+            # 如果有节点被超时恢复，重新调度
+            if timeout_recovered:
+                logger.info("[Orchestrator] 超时节点已重置，重新调度")
+                return state
             
             # 🔥 详细诊断：分析每个阻塞节点的原因
             for node in blocked:
@@ -375,12 +681,11 @@ def schedule_node(state: OrchestratorState, engine) -> OrchestratorState:
 
 
 def execute_node(state: OrchestratorState, engine) -> OrchestratorState:
-    """Execute 节点：通过 FC 循环执行单个子任务
+    """Execute 节点：通过 L2 决策 + 工具循环执行单个子任务
 
     依赖产出注册到 AttentionWindow（不暴力注入），
     由 BFS 激活扩散 + 评分驱逐机制自动决定保留。
     """
-    from zulong.l2.unified_fc_runner import run_fc_loop
     from zulong.tools.task_tools import get_active_task_graph
 
     subtask_id = state.get("current_subtask_id")
@@ -442,14 +747,14 @@ def execute_node(state: OrchestratorState, engine) -> OrchestratorState:
     remaining_global = state.get("max_total_fc_turns", 100) - state.get("total_fc_turns", 0)
     effective_budget = min(subtask_budget, remaining_global)
 
-    response, fc_turn = run_fc_loop(
-        engine=engine,
+    response, fc_turn = _run_tool_cycle_after_decision(
+        engine,
         messages=messages,
         tool_definitions=exec_tools,
         vllm_model_id=state["vllm_model_id"],
         force_first_tool=False,
         user_input=f"执行子任务: {node.label}",
-        intent_max_tokens=4096,
+        response_max_tokens=4096,
     )
 
     state["total_fc_turns"] = state.get("total_fc_turns", 0) + fc_turn
@@ -583,10 +888,9 @@ def reflect_node(state: OrchestratorState, engine) -> OrchestratorState:
 def synthesize_node(state: OrchestratorState, engine) -> OrchestratorState:
     """Synthesize 节点：分级汇总所有子任务产出
 
-    小项目（≤ threshold）：直接 FC 循环汇总
+    小项目（≤ threshold）：L2 决策汇总，必要时再进入工具循环
     大项目（> threshold）：按 Tier 分层总结，再汇合
     """
-    from zulong.l2.unified_fc_runner import run_fc_loop
     from zulong.tools.task_tools import get_active_task_graph
     from zulong.l2.task_graph import TaskScheduler
 
@@ -625,15 +929,15 @@ def synthesize_node(state: OrchestratorState, engine) -> OrchestratorState:
             ),
         })
 
-        # 汇总阶段不限制工具
-        response, fc_turn = run_fc_loop(
-            engine=engine,
+        # 汇总阶段同样先由 L2 单次决策，真实工具调用才进入 FC
+        response, fc_turn = _run_tool_cycle_after_decision(
+            engine,
             messages=messages,
             tool_definitions=state["tool_definitions"],
             vllm_model_id=state["vllm_model_id"],
             force_first_tool=False,
             user_input=state.get("user_input_text", ""),
-            intent_max_tokens=4096,
+            response_max_tokens=4096,
         )
         state["total_fc_turns"] = state.get("total_fc_turns", 0) + fc_turn
         state["response"] = response
@@ -654,7 +958,7 @@ def synthesize_node(state: OrchestratorState, engine) -> OrchestratorState:
             if not tier_content:
                 continue
 
-            # 每个 Tier 生成简短摘要（通过 FC 循环）
+            # 每个 Tier 生成简短摘要；无工具时只做单次 L2 生成
             tier_messages = list(state["messages"])
             tier_messages.append({
                 "role": "system",
@@ -664,14 +968,14 @@ def synthesize_node(state: OrchestratorState, engine) -> OrchestratorState:
                 ),
             })
 
-            tier_response, tier_turns = run_fc_loop(
-                engine=engine,
+            tier_response, tier_turns = _run_tool_cycle_after_decision(
+                engine,
                 messages=tier_messages,
                 tool_definitions=[],  # 汇总不需要工具
                 vllm_model_id=state["vllm_model_id"],
                 force_first_tool=False,
                 user_input="",
-                intent_max_tokens=512,
+                response_max_tokens=512,
             )
             state["total_fc_turns"] = state.get("total_fc_turns", 0) + tier_turns
             tier_summaries.append(
@@ -690,14 +994,14 @@ def synthesize_node(state: OrchestratorState, engine) -> OrchestratorState:
             ),
         })
 
-        response, fc_turn = run_fc_loop(
-            engine=engine,
+        response, fc_turn = _run_tool_cycle_after_decision(
+            engine,
             messages=messages,
             tool_definitions=state["tool_definitions"],
             vllm_model_id=state["vllm_model_id"],
             force_first_tool=False,
             user_input=state.get("user_input_text", ""),
-            intent_max_tokens=4096,
+            response_max_tokens=4096,
         )
         state["total_fc_turns"] = state.get("total_fc_turns", 0) + fc_turn
         state["response"] = response
@@ -869,6 +1173,9 @@ def build_orchestrator_graph(engine) -> Any:
         
         # 固定边：schedule → execute
         workflow.add_edge("schedule", "execute")
+        
+        # 🔥 [Fix] 添加 execute → reflect 边，使 reflect 节点可达
+        workflow.add_edge("execute", "reflect")
         
         # 条件路由：reflect → schedule/execute/plan/synthesize
         workflow.add_conditional_edges(
@@ -1319,9 +1626,7 @@ def run_orchestrator(
         iteration += 1
         phase = state["phase"]
 
-        if state.get("should_terminate"):
-            break
-
+        # Phase dispatch（先执行阶段，再检查终止信号）
         if phase == PHASE_PLAN:
             state = plan_node(state, engine)
         elif phase == PHASE_SCHEDULE:
@@ -1337,8 +1642,28 @@ def run_orchestrator(
             logger.error(f"[Orchestrator] 未知阶段: {phase}")
             break
 
+        # Post-phase: 非 SYNTHESIZE 阶段的终止检查
+        if state.get("should_terminate"):
+            # should_terminate 设置时预期进入 synthesize 汇总
+            # 再跑一轮 synthesize 完成最终输出
+            state["phase"] = PHASE_SYNTHESIZE
+            logger.info(
+                f"[Orchestrator] 编排器终止信号: {state['should_terminate']}, "
+                f"进入 synthesize 汇总"
+            )
+
     if iteration >= max_iterations:
         logger.error("[Orchestrator] 达到最大迭代次数，强制终止")
+
+    # 🔥 经验提取：成功完成的任务存入 ExperienceRAG，供后续任务复用
+    if state.get("should_terminate") == "done":
+        try:
+            from zulong.tools.task_tools import get_active_task_graph
+            tg_final = get_active_task_graph()
+            if tg_final is not None:
+                _store_task_experience(state, tg_final, engine)
+        except Exception:
+            pass
 
     response = state.get("response")
     total_turns = state.get("total_fc_turns", 0)

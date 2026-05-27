@@ -49,7 +49,7 @@ class SearchToolsTool(BaseTool):
         Args:
             request.parameters:
                 - query: 需求描述（如"我需要拆解任务"、"帮我读取文件"）
-                - top_k: 返回数量（默认 3）
+                - top_k: 返回数量（默认 3，仅 search_tools 自身使用）
         """
         import time
         start_time = time.time()
@@ -136,4 +136,111 @@ class SearchToolsTool(BaseTool):
                 }
             },
             "required": ["query"]
+        }
+
+
+class RequestToolSupplementTool(BaseTool):
+    """request_tool_supplement — L2 常驻工具补充机制。
+
+    当 L1-B 预判注入的工具不够时，L2 调用此工具说明缺少的能力，
+    服务端会从工具袋中匹配工具并把 schema 动态注入后续 FC 轮次。
+    """
+
+    def __init__(self, registry=None):
+        super().__init__(name="request_tool_supplement", category=ToolCategory.CUSTOM)
+        self.description = (
+            "请求补充当前未注入但任务需要的工具。"
+            "当你发现当前工具不足以完成任务时调用，说明缺什么能力、为什么需要、风险等级。"
+            "系统会从工具袋匹配工具，并在下一轮把可用工具补充进来。"
+        )
+        self._registry = registry
+
+    def set_registry(self, registry):
+        self._registry = registry
+
+    def initialize(self) -> bool:
+        return True
+
+    def cleanup(self) -> None:
+        pass
+
+    def execute(self, request: ToolRequest) -> ToolResult:
+        import time
+        start_time = time.time()
+        if self._registry is None:
+            return self._create_result(
+                success=False,
+                error="工具注册表未绑定，无法补充工具",
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
+            )
+
+        params = request.parameters or {}
+        try:
+            from zulong.tools.tool_bag import supplement_tools
+            data = supplement_tools(
+                self._registry,
+                missing_capability=params.get("missing_capability", ""),
+                reason=params.get("reason", ""),
+                suggested_tools=params.get("suggested_tools") or [],
+                max_results=params.get("max_results"),
+                list_all_tools=bool(params.get("list_all_tools", False)),
+            )
+            logger.info(
+                "[RequestToolSupplement] missing=%r suggested=%s -> %s",
+                params.get("missing_capability", ""),
+                params.get("suggested_tools") or [],
+                data.get("supplemented_tools", []),
+            )
+            return self._create_result(
+                success=True,
+                data=data,
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
+            )
+        except Exception as e:
+            logger.warning("[RequestToolSupplement] 补充失败: %s", e)
+            return self._create_result(
+                success=False,
+                error=str(e),
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
+            )
+
+    def _get_parameters_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "missing_capability": {
+                    "type": "string",
+                    "description": "缺少的能力，例如'读取项目文件'、'联网搜索'、'运行测试'、'创建任务图'",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "为什么当前工具包不够，以及补充工具会如何帮助完成任务",
+                },
+                "suggested_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "希望补充的工具名，可以为空；不确定时只描述 missing_capability",
+                },
+                "risk_level": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "description": "补充能力可能带来的风险等级",
+                },
+                "user_visible_message": {
+                    "type": "string",
+                    "description": "给用户看的简短说明，例如'我需要补充联网搜索工具来查询实时天气'",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "可选：最多返回几个匹配工具。不填则返回全部匹配工具。",
+                },
+                "list_all_tools": {
+                    "type": "boolean",
+                    "description": "为 true 时返回工具袋里的全部工具清单和 schema，不做匹配过滤。",
+                },
+            },
+            "required": ["missing_capability", "reason"],
         }

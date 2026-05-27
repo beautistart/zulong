@@ -60,6 +60,14 @@ class IDEServerModule(Module):
         except Exception as e:
             logger.warning(f"[IDEServerModule] Embedding 模型预热失败（非致命）: {e}")
 
+        # 4.5 后台预热 TTS，避免首次语音回复阻塞在 Kokoro/HF 加载。
+        try:
+            from zulong.l3.tts_expert_node import prewarm_tts_expert_async
+            prewarm_tts_expert_async()
+            logger.info("[IDEServerModule] TTS 模型后台预热已启动")
+        except Exception as e:
+            logger.warning(f"[IDEServerModule] TTS 预热启动失败（非致命）: {e}")
+
         # 5. 标记 IDE 就绪（Launcher 用此切换根路由）
         self._context["ide_ready"] = True
 

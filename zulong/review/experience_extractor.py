@@ -150,10 +150,13 @@ class ExperienceExtractor:
         logger.info(f"[ExperienceExtractor] 调用 L2 进行分析（真实模型）...")
         
         try:
-            # 复用系统已有的 vLLM 配置
+            # 复用系统已有的 vLLM 配置（模型路径从环境变量派生）
             import os
+            from pathlib import Path
             vllm_base_url = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
-            vllm_model_id = "/mnt/d/AI/project/zulong_beta4/models/Qwen/Qwen3___5-0.8B-AWQ"
+            _project_root = Path(os.environ.get("ZULONG_HOME", str(Path(__file__).resolve().parent.parent.parent)))
+            _model_base = Path(os.environ.get("ZULONG_MODEL_BASE_DIR", str(_project_root / "models")))
+            vllm_model_id = str(_model_base / "Qwen" / "Qwen3___5-0.8B-AWQ")
             
             try:
                 from openai import OpenAI

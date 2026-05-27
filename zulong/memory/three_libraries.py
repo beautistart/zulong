@@ -10,13 +10,6 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 import numpy as np
 
-# 导入增强版经验库
-from .enhanced_experience_store import (
-    EnhancedExperienceStore,
-    get_enhanced_experience_store,
-    Experience as EnhancedExperience
-)
-
 logger = logging.getLogger(__name__)
 
 
@@ -262,8 +255,8 @@ class SkillStore:
 
 
 @dataclass
-class Experience:
-    """经验数据结构"""
+class ThreeLibExperience:
+    """经验数据结构（three_libraries 专用，与 enhanced_experience_store.Experience 区隔）"""
     id: str
     content: str
     experience_type: str  # "logic", "failure", "success", "preference"
@@ -301,7 +294,7 @@ class ExperienceStore:
         """
         if not hasattr(self, '_initialized'):
             self.db_path = db_path or "data/experience_db"
-            self._experiences: Dict[str, Experience] = {}
+            self._experiences: Dict[str, ThreeLibExperience] = {}
             self._embedding_model = None
             self._initialized = True
             logger.info(f"[ExperienceStore] 初始化完成，路径: {self.db_path}")
@@ -338,7 +331,7 @@ class ExperienceStore:
     
     def search(self, query_vector: np.ndarray,
                filter_type: Optional[str] = "logic",
-               limit: int = 5) -> List[Experience]:
+               limit: int = 5) -> List[ThreeLibExperience]:
         """语义检索 + 强过滤
         
         Args:
@@ -347,7 +340,7 @@ class ExperienceStore:
             limit: 返回数量限制
             
         Returns:
-            List[Experience]: 匹配的经验列表
+            List[ThreeLibExperience]: 匹配的经验列表
         """
         results = []
         
@@ -366,7 +359,7 @@ class ExperienceStore:
     
     def search_by_text(self, query: str,
                        filter_type: Optional[str] = "logic",
-                       limit: int = 5) -> List[Experience]:
+                       limit: int = 5) -> List[ThreeLibExperience]:
         """通过文本查询
         
         Args:
@@ -375,7 +368,7 @@ class ExperienceStore:
             limit: 返回数量限制
             
         Returns:
-            List[Experience]: 匹配的经验列表
+            List[ThreeLibExperience]: 匹配的经验列表
         """
         query_vector = self._get_embedding(query)
         return self.search(query_vector, filter_type, limit)
@@ -400,7 +393,7 @@ class ExperienceStore:
         exp_id = str(uuid.uuid4())
         embedding = self._get_embedding(content)
         
-        experience = Experience(
+        experience = ThreeLibExperience(
             id=exp_id,
             content=content,
             experience_type=experience_type,
@@ -415,14 +408,14 @@ class ExperienceStore:
         
         return exp_id
     
-    def get(self, exp_id: str) -> Optional[Experience]:
+    def get(self, exp_id: str) -> Optional[ThreeLibExperience]:
         """获取单个经验
         
         Args:
             exp_id: 经验 ID
             
         Returns:
-            Optional[Experience]: 经验对象
+            Optional[ThreeLibExperience]: 经验对象
         """
         return self._experiences.get(exp_id)
     
@@ -472,14 +465,14 @@ class ExperienceStore:
         logger.info(f"[ExperienceStore] 清空所有经验: {count} 条")
         return count
     
-    def get_recent(self, limit: int = 10) -> List[Experience]:
+    def get_recent(self, limit: int = 10) -> List[ThreeLibExperience]:
         """获取最近的经验
         
         Args:
             limit: 返回数量限制
             
         Returns:
-            List[Experience]: 最近的经验列表
+            List[ThreeLibExperience]: 最近的经验列表
         """
         sorted_exps = sorted(
             self._experiences.values(),
@@ -488,7 +481,7 @@ class ExperienceStore:
         )
         return sorted_exps[:limit]
     
-    def to_prompt_context(self, experiences: List[Experience]) -> str:
+    def to_prompt_context(self, experiences: List[ThreeLibExperience]) -> str:
         """将经验转换为 Prompt 上下文
         
         Args:

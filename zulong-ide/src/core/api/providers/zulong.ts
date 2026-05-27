@@ -188,10 +188,10 @@ export class ZulongHandler implements ApiHandler {
 			if (text && !payload?.task_result) {
 				pushChunk({ type: "text" as const, text })
 			}
-			// 🔥 修复：检查payload中的task_complete信息
+			// task_status=completed 只表示文本流结束；v2.7 的 task_summary / graph_memory_diff
+			// 会在其后抵达，必须等待正式 task_complete 再结束 generator。
 			if (payload && payload.complete && payload.task_status === "completed") {
-				Logger.info(`[ZulongHandler] ← display_text包含task_complete, 发送done chunk`)
-				pushChunk({ type: "done" as const })
+				Logger.info(`[ZulongHandler] ← display_text标记文本完成，等待task_complete以接收最终interaction事件`)
 			}
 		})
 
@@ -234,11 +234,11 @@ export class ZulongHandler implements ApiHandler {
 			pushChunk({ type: "error", error })
 		})
 
-		// 🎯 P3改进：任务进度汇报（仅记录日志，不显示给用户）
+		// 🎯 P3改进：任务进度汇报（作为心跳保持流存活，不显示给用户）
 		this.transport.on("task_progress", (progress: { phase: string; message: string; current_turn?: number; max_turns?: number }) => {
 			Logger.info(`[ZulongHandler] \u2190 task_progress: phase=${progress.phase}, message=${progress.message}`)
-			// 🔥 修复：不将内部调试信息推送给用户
-			// pushChunk({ type: "text", text: `\n[${progress.phase}] ${progress.message}` })
+			// 不作为 text 显示给用户，仅作为 heartbeat chunk 重置流超时
+			pushChunk({ type: "status_update", turn: progress.current_turn, phase: progress.phase })
 		})
 
 		// P2-15: 监听FC循环状态更新（进度展示）
@@ -246,6 +246,18 @@ export class ZulongHandler implements ApiHandler {
 			Logger.info(`[ZulongHandler] \u2190 status_update: turn=${payload.turn} phase=${payload.phase}`)
 			// Push as chunk so the stream loop can check abort flag
 			pushChunk({ type: "status_update", turn: payload.turn, phase: payload.phase })
+		})
+
+		this.transport.on("interaction", (interaction: any, rawMsg?: { type?: string; payload?: Record<string, any> }) => {
+			Logger.info(
+				`[ZulongHandler] \u2190 interaction: kind=${interaction?.kind} status=${interaction?.status} source=${rawMsg?.type || "unknown"}`,
+			)
+			pushChunk({
+				type: "interaction",
+				interaction,
+				sourceEvent: rawMsg?.type,
+				turn: interaction?.turn ?? rawMsg?.payload?.turn,
+			})
 		})
 
 		this.transport.on("error", (err: Error) => {

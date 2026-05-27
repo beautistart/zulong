@@ -140,15 +140,17 @@ class L1D_AudioPlugin(L1PluginBase):
             if self._enable_yamnet or self._enable_sensevoice or self._enable_whisper:
                 try:
                     from zulong.models.audio_model_container import get_audio_model_container
+                    from zulong.utils.device import resolve_device
                     self._audio_model_container = get_audio_model_container()
+                    audio_device = resolve_device(self.get_config("device", "auto"), prefer_gpu=True)
                     
                     success = self._audio_model_container.initialize(
                         enable_yamnet=self._enable_yamnet,
                         enable_sensevoice=self._enable_sensevoice,
                         enable_whisper=self._enable_whisper,
-                        sensevoice_device="cuda",
-                        whisper_device="cuda",
-                        yamnet_device="cuda",
+                        sensevoice_device=audio_device,
+                        whisper_device=audio_device,
+                        yamnet_device=audio_device,
                         sensevoice_model_path="./models/OpenASR/sensevoice-small-onnx",
                     )
                     
@@ -157,11 +159,11 @@ class L1D_AudioPlugin(L1PluginBase):
                     self._whisper_enabled = self._audio_model_container.whisper_enabled
                     
                     if self._yamnet_enabled:
-                        logger.info("   - YAMNet 环境音分类已启用 (GPU)")
+                        logger.info(f"   - YAMNet 环境音分类已启用 ({audio_device})")
                     if self._sensevoice_enabled:
-                        logger.info("   - SenseVoice-Small 语音转文本已启用 (ONNX GPU)")
+                        logger.info(f"   - SenseVoice-Small 语音转文本已启用 ({audio_device})")
                     if self._whisper_enabled:
-                        logger.info("   - Whisper 语音转文本已启用 (GPU, 备选)")
+                        logger.info(f"   - Whisper 语音转文本已启用 ({audio_device}, 备选)")
                         
                 except Exception as e:
                     logger.warning(f"   - 音频模型加载失败: {e}，将使用备用方案")

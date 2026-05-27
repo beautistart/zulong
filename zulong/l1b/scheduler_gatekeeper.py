@@ -2017,66 +2017,72 @@ class Gatekeeper:
         voice_mode = self._detect_voice_mode(text, event_type or EventType.USER_TEXT)
         logger.info(f"✅ [Gatekeeper] 语音模式检测完成：{voice_mode}")
         
-        # 5. L1-B 意图分类 → 映射到 L2 的 3 类意图
+        # 5. L1-B 细粒度语义分析（仅作为工具预判辅助信号）
         intent_result = None
-        pre_classified_intent = None  # L2 预分类意图
         
         if self._intent_filter:
-            logger.info(f"🔍 [Gatekeeper] 步骤 4: L1-B 意图分类 (ALBERT)...")
+            logger.debug(f"🔍 [Gatekeeper] 步骤 4: L1-B 细粒度分类 (ALBERT) - 仅用于工具预判输入")
             try:
                 intent_result = self._intent_filter.analyze(text)
-                logger.info(
-                    f"✅ [Gatekeeper] 意图分类完成: {intent_result.get('intent', 'unknown')} "
+                logger.debug(
+                    f"✅ [Gatekeeper] 细粒度分类（辅助信息）: {intent_result.get('intent', 'unknown')} "
                     f"(置信度: {intent_result.get('confidence', 0):.3f}, "
                     f"模型: {intent_result.get('model', 'keyword')})"
                 )
-                
-                # 🎯 将 L1-B 的 15 类意图映射到 L2 的 3 类意图
-                l1b_intent = intent_result.get('intent', 'unknown').lower()
-                
-                # 映射规则：
-                # - chat, vision_query, audio_query → CHAT
-                # - task_execute, task_code, task_analysis, task_write, task_read, task_search → COMPLEX
-                # - command_start, command_stop, command_config, vision_control, audio_control → CHAT（简单命令）
-                # - unknown → CHAT（默认）
-                intent_mapping = {
-                    'chat': 'chat',
-                    'vision_query': 'chat',
-                    'audio_query': 'chat',
-                    'command_start': 'chat',
-                    'command_stop': 'chat',
-                    'command_config': 'chat',
-                    'vision_control': 'chat',
-                    'audio_control': 'chat',
-                    'unknown': 'chat',
-                    'task_execute': 'complex',
-                    'task_code': 'complex',
-                    'task_analysis': 'complex',
-                    'task_write': 'complex',
-                    'task_read': 'complex',
-                    'task_search': 'complex',
-                }
-                
-                pre_classified_intent = intent_mapping.get(l1b_intent, 'chat')
-                logger.info(f"🎯 [Gatekeeper] L1-B → L2 意图映射: {l1b_intent} → {pre_classified_intent}")
-                
             except Exception as e:
-                logger.warning(f"[Gatekeeper] 意图分类失败: {e}")
+                logger.debug(f"[Gatekeeper] 细粒度分类失败（不影响工具预判）: {e}")
                 intent_result = None
-                pre_classified_intent = 'chat'  # 默认 CHAT
         else:
-            logger.debug("[Gatekeeper] 意图分类器未初始化，跳过")
-            pre_classified_intent = 'chat'  # 默认 CHAT
+            logger.debug("[Gatekeeper] 细粒度分类器未初始化，跳过")
+
+        # 5.5 L1-B 工具预判：输出工具包和上下文，不再把会话判死为某种模式
+        tool_prediction = None
+        try:
+            from zulong.l2.inference_engine import InferenceEngine
+            from zulong.tools.task_tools import get_active_task_graph
+            from zulong.tools.tool_bag import predict_tools_for_turn
+
+            _predict_engine = InferenceEngine().tool_engine
+            _active_tg = get_active_task_graph()
+            tool_prediction = predict_tools_for_turn(
+                text,
+                registry=_predict_engine.registry,
+                intent_result=intent_result,
+                referenced_nodes=None,
+                has_task_graph=_active_tg is not None,
+            ).to_dict()
+            logger.info(
+                "[Gatekeeper] 工具预判完成: tools=%s, policy=%s",
+                tool_prediction.get("predicted_tools", []),
+                tool_prediction.get("task_graph_policy", "none"),
+            )
+        except Exception as e:
+            logger.warning(f"[Gatekeeper] 工具预判失败: {e}")
+            tool_prediction = {
+                "predicted_tools": ["request_tool_supplement"],
+                "context_bundle": {},
+                "reasons": ["工具预判失败，保留工具补充入口"],
+                "risk_notes": [],
+                "task_graph_policy": "none",
+            }
+        self._publish_tool_prediction_event(
+            tool_prediction,
+            request_id=request_id,
+            session_id=session_id,
+        )
         
-        # 6. 打包新任务：用户原文 + 局部上下文 + 共享上下文快照 + 语音模式 + 意图结果 + 预分类意图 + 预检索记忆
+        # 6. 打包新任务：用户原文 + 局部上下文 + 共享上下文快照 + 语音模式 + 工具预判 + 预检索记忆
         packaged_task = {
             "text": text,
             "local_context": local_context,
             "shared_context_snapshot": shared_context_snapshot,
             "voice_mode": voice_mode,
-            "intent_result": intent_result,  # L1-B 意图分类结果（15类）
-            "pre_classified_intent": pre_classified_intent,  # L2 预分类意图（3类）
+            "intent_result": intent_result,  # L1-B 细粒度分类结果，仅作为工具预判辅助
             "pre_retrieved_memory": pre_retrieved_memory,  # L1-B 预检索的记忆上下文
+            "tool_prediction": tool_prediction,
+            "tool_bundle": tool_prediction.get("predicted_tools", []) if tool_prediction else [],
+            "context_bundle": tool_prediction.get("context_bundle", {}) if tool_prediction else {},
+            "task_graph_policy": tool_prediction.get("task_graph_policy", "none") if tool_prediction else "none",
         }
         
         # 🔥 新增：添加 session_id（如果有）
@@ -2108,6 +2114,60 @@ class Gatekeeper:
         )
         event_bus.publish(l2_command_event)
     
+    def _publish_tool_prediction_event(self, tool_prediction, request_id: Optional[str] = None, session_id: Optional[str] = None):
+        """向 Web 前端发布 L1-B 工具预判启动说明。"""
+        if not tool_prediction:
+            return
+        try:
+            tools = tool_prediction.get("predicted_tools", []) or []
+            reasons = tool_prediction.get("reasons", []) or []
+            policy = tool_prediction.get("task_graph_policy", "none")
+            context_bundle = tool_prediction.get("context_bundle", {}) or {}
+            interaction = {
+                "pair_id": f"l1b-tool-prediction-{request_id or int(time.time() * 1000)}",
+                "kind": "plan",
+                "status": "running",
+                "title": "L1-B 已完成工具预判",
+                "detail": (
+                    "工具: " + (", ".join(tools) if tools else "无") +
+                    "\n策略: " + str(policy) +
+                    ("\n依据: " + "；".join(str(r) for r in reasons[:3]) if reasons else "")
+                ),
+                "progress": 0,
+                "next_step": "L2 将基于工具包、上下文和记忆自主推理",
+            }
+            payload = {
+                "request_id": request_id or f"req_{int(time.time() * 1000)}",
+                "session_id": session_id or "",
+                "step_type": "pipeline.agent_start",
+                "iteration": 0,
+                "timestamp": time.time(),
+                "data": {
+                    "tools": tools,
+                    "predicted_tools": tools,
+                    "reasons": reasons,
+                    "task_graph_policy": policy,
+                    "context_bundle": context_bundle,
+                    "tool_count": len(tools),
+                    "progress": {
+                        "total": 0,
+                        "completed": 0,
+                        "running": 0,
+                        "blocked": 0,
+                        "percent": 0,
+                    },
+                    "interaction": interaction,
+                },
+            }
+            event_bus.publish(ZulongEvent(
+                type=EventType.L2_THINKING_STEP,
+                priority=EventPriority.NORMAL,
+                source="Gatekeeper",
+                payload=payload,
+            ))
+        except Exception as e:
+            logger.debug(f"[Gatekeeper] 工具预判前端事件发布失败: {e}")
+
     # ── MemoryGraph 对话节点管理 ──
 
     def _ensure_dialogue_node(self, text, packaged_task):

@@ -162,48 +162,50 @@ EXCLUDE_FILES_PATTERNS = [
 
 # --- 硬编码路径替换规则 ---
 # 格式: (文件相对路径, 原字符串, 替换字符串)
+# 注意：源文件已使用 ZULONG_HOME/ZULONG_MODEL_BASE_DIR 环境变量，
+# 此处的旧规则保留作为向后兼容（如果仍有 beta4 硬编码路径则替换）
 PATH_REPLACEMENTS = [
-    # zulong/models/model_configs.py
+    # zulong/models/model_configs.py (已迁移到 ZULONG_HOME 环境变量)
     (
         "zulong/models/model_configs.py",
         'MODEL_BASE_DIR = Path(r"d:\\AI\\project\\zulong_beta4\\models")',
-        'PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent\nMODEL_BASE_DIR = PROJECT_ROOT / "models"',
+        '_PROJECT_ROOT = Path(os.environ.get("ZULONG_HOME", Path(__file__).resolve().parent.parent.parent))\nMODEL_BASE_DIR = Path(os.environ.get("ZULONG_MODEL_BASE_DIR", str(_PROJECT_ROOT / "models")))',
     ),
-    # zulong/l2/l2_config.py
+    # zulong/l2/l2_config.py (已迁移到 ZULONG_HOME 环境变量)
     (
         "zulong/l2/l2_config.py",
         'L2_CORE_MODEL_PATH = Path(r"d:\\AI\\project\\zulong_beta4\\models\\Qwen\\Qwen3___5-2B")',
-        'PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent\nL2_CORE_MODEL_PATH = PROJECT_ROOT / "models" / "Qwen" / "Qwen3___5-2B"',
+        '_PROJECT_ROOT = Path(os.environ.get("ZULONG_HOME", Path(__file__).resolve().parent.parent.parent))\n_MODEL_BASE = Path(os.environ.get("ZULONG_MODEL_BASE_DIR", str(_PROJECT_ROOT / "models")))\nL2_CORE_MODEL_PATH = _MODEL_BASE / "Qwen" / "Qwen3___5-2B"',
     ),
-    # zulong/l1b/l1b_config.py
+    # zulong/l1b/l1b_config.py (已迁移到 ZULONG_HOME 环境变量)
     (
         "zulong/l1b/l1b_config.py",
         'L1B_AUDIO_MODEL_PATH = Path(r"d:\\AI\\project\\zulong_beta4\\zulong\\models\\Qwen3.5-0.8B-int4-L1B")',
-        'PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent\nL1B_AUDIO_MODEL_PATH = PROJECT_ROOT / "models" / "Qwen3.5-0.8B-int4-L1B"',
+        '_PROJECT_ROOT = Path(os.environ.get("ZULONG_HOME", Path(__file__).resolve().parent.parent.parent))\nL1B_AUDIO_MODEL_PATH = _PROJECT_ROOT / "models" / "Qwen3.5-0.8B-int4-L1B"',
     ),
-    # zulong/tts/cosyvoice_config.py
+    # zulong/tts/cosyvoice_config.py (已迁移到 ZULONG_MODEL_BASE_DIR)
     (
         "zulong/tts/cosyvoice_config.py",
         'MODEL_BASE_DIR = Path(r"d:\\AI\\project\\zulong_beta4\\models")',
-        'PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent\nMODEL_BASE_DIR = PROJECT_ROOT / "models"',
+        'MODEL_BASE_DIR = Path(os.environ.get("ZULONG_MODEL_BASE_DIR", str(_PROJECT_ROOT / "models")))',
     ),
-    # zulong/l3/expert_config.py
+    # zulong/l3/expert_config.py (已迁移到 ZULONG_MODEL_BASE_DIR)
     (
         "zulong/l3/expert_config.py",
         'MODEL_BASE_DIR = Path(r"d:\\AI\\project\\zulong_beta4\\models")',
-        'MODEL_BASE_DIR = Path(__file__).resolve().parent.parent.parent / "models"',
+        'MODEL_BASE_DIR = Path(os.environ.get("ZULONG_MODEL_BASE_DIR", str(_PROJECT_ROOT / "models")))',
     ),
-    # zulong/l3/tts_expert_node.py - model_path
+    # zulong/l3/tts_expert_node.py - model_path (已迁移到 ZULONG_MODEL_BASE_DIR)
     (
         "zulong/l3/tts_expert_node.py",
         'self.model_path = Path(r"d:\\AI\\project\\zulong_beta4\\models\\CosyVoice3-0.5B\\FunAudioLLM\\Fun-CosyVoice3-0___5B-2512")',
-        '_project_root = Path(__file__).resolve().parent.parent.parent\n        self.model_path = _project_root / "models" / "CosyVoice3-0.5B" / "FunAudioLLM" / "Fun-CosyVoice3-0___5B-2512"',
+        'self.model_path = MODEL_BASE_DIR / "CosyVoice3-0.5B" / "FunAudioLLM" / "Fun-CosyVoice3-0___5B-2512"',
     ),
-    # zulong/l3/tts_expert_node.py - ttsfrd_path
+    # zulong/l3/tts_expert_node.py - ttsfrd_path (已迁移到 ZULONG_MODEL_BASE_DIR)
     (
         "zulong/l3/tts_expert_node.py",
         'self.ttsfrd_path = Path(r"d:\\AI\\project\\zulong_beta4\\models\\iic\\CosyVoice-ttsfrd")',
-        'self.ttsfrd_path = _project_root / "models" / "iic" / "CosyVoice-ttsfrd"',
+        'self.ttsfrd_path = MODEL_BASE_DIR / "iic" / "CosyVoice-ttsfrd"',
     ),
     # --- short_term_memory.py: 闭源导入降级 (社区版开放) ---
     # 1. 顶层 MemoryConsolidator 导入
@@ -794,10 +796,10 @@ def verify_release(output_dir: Path) -> list:
                 except Exception:
                     continue
 
-                # 检查硬编码绝对路径
-                if r"d:\AI\project\zulong_beta4" in content.lower() or \
-                   r"d:/ai/project/zulong_beta4" in content.lower():
-                    issues.append(f"LEAK: Hardcoded project path in {rel_forward}")
+                # 检查硬编码绝对路径 (Windows 盘符 + 绝对路径)
+                import re
+                if re.search(r'[a-zA-Z]:[/\\]', content):
+                    issues.append(f"LEAK: Hardcoded absolute path in {rel_forward}")
 
                 # 检查 BaiduNetdisk 路径
                 if "BaiduNetdisk" in content:
@@ -873,7 +875,12 @@ def build_release(output_dir: Path, dry_run: bool = False):
             # 复制文件
             dst_file = output_dir / rel_file
             dst_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_file, dst_file)
+            try:
+                shutil.copy2(src_file, dst_file)
+            except OSError:
+                # Fallback: read/write bypassing Windows path length limits
+                content = src_file.read_bytes()
+                dst_file.write_bytes(content)
             copied_count += 1
 
             # 应用替换

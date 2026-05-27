@@ -375,12 +375,12 @@ class TopologyIndex:
         
         self._node_type_counts = defaultdict(int)
         for vertex in self.graph.vs:
-            node_type = vertex.get("type", "unknown")
+            node_type = vertex["type"] if "type" in vertex.attributes() else "unknown"
             self._node_type_counts[node_type] += 1
             
         self._edge_type_counts = defaultdict(int)
         for edge in self.graph.es:
-            edge_type = edge.get("type", "unknown")
+            edge_type = edge["type"] if "type" in edge.attributes() else "unknown"
             self._edge_type_counts[edge_type] += 1
             
         logger.info(f"拓扑索引已加载: {filepath} (节点={self._node_count}, 边={self._edge_count})")

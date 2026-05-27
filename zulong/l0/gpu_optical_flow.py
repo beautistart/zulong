@@ -9,6 +9,7 @@ from typing import Optional, Tuple
 from dataclasses import dataclass
 
 from zulong.ide.video_logger import logger
+from zulong.utils.device import resolve_device
 
 
 @dataclass
@@ -44,7 +45,7 @@ class GPUOpticalFlow:
         初始化 GPU 光流计算器
         
         Args:
-            device: 计算设备 ('auto', 'cuda', 'cpu')
+            device: 计算设备 ('auto', 'cuda', 'mps', 'cpu')
             window_size: Lucas-Kanade 窗口大小
             max_flow: 最大光流幅值限制
         """
@@ -52,9 +53,9 @@ class GPUOpticalFlow:
         self.max_flow = max_flow
         
         if device == 'auto':
-            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.device = resolve_device('auto', prefer_gpu=True)
         else:
-            self.device = device
+            self.device = resolve_device(device, prefer_gpu=True)
         
         self._initialized = False
         self._prev_tensor: Optional[torch.Tensor] = None
@@ -65,7 +66,7 @@ class GPUOpticalFlow:
     
     def _init_kernels(self):
         """初始化卷积核"""
-        if self.device == 'cuda':
+        if self.device in ('cuda', 'mps'):
             self.kernel_x = torch.tensor(
                 [[-1, 0, 1]], dtype=torch.float32, device=self.device
             ).view(1, 1, 1, 3)
@@ -79,7 +80,7 @@ class GPUOpticalFlow:
     def _to_tensor(self, frame: np.ndarray) -> torch.Tensor:
         """将 numpy 数组转换为 GPU 张量"""
         tensor = torch.from_numpy(frame.astype(np.float32))
-        if self.device == 'cuda':
+        if self.device in ('cuda', 'mps'):
             tensor = tensor.to(self.device, non_blocking=True)
         return tensor.unsqueeze(0).unsqueeze(0)
     
@@ -230,7 +231,7 @@ class GPUOpticalFlow:
         Returns:
             GPUFlowResult: 光流计算结果
         """
-        if use_gpu and self.device == 'cuda':
+        if use_gpu and self.device in ('cuda', 'mps'):
             return self.compute_flow_gpu(prev_frame, curr_frame)
         else:
             return self.compute_flow_cpu(prev_frame, curr_frame)
@@ -239,7 +240,8 @@ class GPUOpticalFlow:
         """获取设备信息"""
         info = {
             'device': self.device,
-            'gpu_available': torch.cuda.is_available()
+            'gpu_available': self.device in ('cuda', 'mps'),
+            'mps_available': self.device == 'mps'
         }
         
         if self.device == 'cuda':
@@ -275,7 +277,7 @@ class HybridOpticalFlow:
         self.fallback_on_error = fallback_on_error
         
         self.gpu_flow = GPUOpticalFlow(device='auto')
-        self._use_gpu = prefer_gpu and self.gpu_flow.device == 'cuda'
+        self._use_gpu = prefer_gpu and self.gpu_flow.device in ('cuda', 'mps')
         
         self._stats = {
             'gpu_calls': 0,
@@ -287,7 +289,7 @@ class HybridOpticalFlow:
         
         logger.info(
             f"🔄 [HybridOpticalFlow] 初始化完成 "
-            f"(prefer_gpu={prefer_gpu}, actual_device={'cuda' if self._use_gpu else 'cpu'})"
+            f"(prefer_gpu={prefer_gpu}, actual_device={self.gpu_flow.device if self._use_gpu else 'cpu'})"
         )
     
     def compute(
@@ -336,7 +338,7 @@ class HybridOpticalFlow:
     
     def enable_gpu(self, enable: bool = True):
         """启用/禁用 GPU"""
-        if enable and self.gpu_flow.device == 'cuda':
+        if enable and self.gpu_flow.device in ('cuda', 'mps'):
             self._use_gpu = True
             logger.info("✅ [HybridOpticalFlow] GPU 已启用")
         elif not enable:

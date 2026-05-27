@@ -11,6 +11,8 @@ import uuid
 import time
 import json
 import threading
+import os
+import hashlib
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Tuple, Optional, Callable, Any
 
@@ -60,10 +62,81 @@ class TaskNode:
 
     def add_file(self, name: str, path: str):
         """添加关联文件（去重）"""
-        for f in self.files:
-            if f.path == path:
+        new_ref = FileRef(name=name, path=path)
+        new_key = self._file_ref_key(new_ref)
+        for idx, f in enumerate(self.files):
+            if self._file_ref_key(f) == new_key:
                 return
-        self.files.append(FileRef(name=name, path=path))
+            if self._looks_like_same_file(f, new_ref):
+                if self._prefer_file_ref(new_ref, f):
+                    self.files[idx] = new_ref
+                return
+        self.files.append(new_ref)
+
+    @staticmethod
+    def _file_ref_key(ref: "FileRef") -> str:
+        path = (ref.path or "").strip()
+        if not path:
+            return ""
+        try:
+            path = os.path.abspath(path) if os.path.isabs(path) else os.path.normpath(path)
+            return os.path.normcase(path)
+        except Exception:
+            return path.replace("/", "\\").lower()
+
+    @staticmethod
+    def _file_ref_name(ref: "FileRef") -> str:
+        return (ref.name or os.path.basename(ref.path or "")).strip().lower()
+
+    @staticmethod
+    def _hash_file(path: str) -> Optional[str]:
+        try:
+            if not path or not os.path.isfile(path):
+                return None
+            h = hashlib.sha256()
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return None
+
+    @classmethod
+    def _looks_like_same_file(cls, a: "FileRef", b: "FileRef") -> bool:
+        if cls._file_ref_name(a) != cls._file_ref_name(b):
+            return False
+        try:
+            if os.path.isfile(a.path) and os.path.isfile(b.path):
+                if os.path.getsize(a.path) != os.path.getsize(b.path):
+                    return False
+                return cls._hash_file(a.path) == cls._hash_file(b.path)
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
+    def _prefer_file_ref(candidate: "FileRef", current: "FileRef") -> bool:
+        cand_path = candidate.path or ""
+        curr_path = current.path or ""
+        if os.path.isabs(cand_path) != os.path.isabs(curr_path):
+            return os.path.isabs(cand_path)
+        return len(cand_path) < len(curr_path)
+
+    def _deduped_files(self) -> List["FileRef"]:
+        deduped: List[FileRef] = []
+        for ref in self.files:
+            candidate = FileRef(name=ref.name, path=ref.path)
+            key = self._file_ref_key(candidate)
+            replaced = False
+            for idx, existing in enumerate(deduped):
+                if self._file_ref_key(existing) == key or self._looks_like_same_file(existing, candidate):
+                    if self._prefer_file_ref(candidate, existing):
+                        deduped[idx] = candidate
+                    replaced = True
+                    break
+            if not replaced:
+                deduped.append(candidate)
+        return deduped
 
     def to_dict(self) -> dict:
         """转换为字典（兼容前端格式）"""
@@ -76,8 +149,9 @@ class TaskNode:
         }
         if self.result is not None:
             d["result"] = self.result
-        if self.files:
-            d["files"] = [f.to_dict() for f in self.files]
+        deduped_files = self._deduped_files()
+        if deduped_files:
+            d["files"] = [f.to_dict() for f in deduped_files]
         if self.analysis_content is not None:
             d["analysis_content"] = self.analysis_content
         if self.semantic_summary is not None:

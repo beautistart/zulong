@@ -10,34 +10,11 @@ const prefix = name === "claude-dev" || name === "zulong-ide" ? "zulong" : name
  * In production, all commands are registered under "zulong" for consistency.
  */
 const ZulongCommands = {
-	PlusButton: prefix + ".plusButtonClicked",
-	McpButton: prefix + ".mcpButtonClicked",
-	SettingsButton: prefix + ".settingsButtonClicked",
-	HistoryButton: prefix + ".historyButtonClicked",
-	AccountButton: prefix + ".accountButtonClicked",
-	WorktreesButton: prefix + ".worktreesButtonClicked",
-	TerminalOutput: prefix + ".addTerminalOutputToChat",
-	AddToChat: prefix + ".addToChat",
-	FixWithZulong: prefix + ".fixWithZulong",
-	ExplainCode: prefix + ".explainCode",
-	ImproveCode: prefix + ".improveCode",
-	FocusChatInput: prefix + ".focusChatInput",
+	OpenCurrentFileInWebTask: prefix + ".openCurrentFileInWebTask",
+	OpenTerminal: prefix + ".openTerminal",
 	Walkthrough: prefix + ".openWalkthrough",
-	GenerateCommit: prefix + ".generateGitCommitMessage",
 	AbortCommit: prefix + ".abortGitCommitMessage",
 	ReconstructTaskHistory: prefix + ".reconstructTaskHistory",
-	// Jupyter Notebook commands
-	JupyterGenerateCell: prefix + ".jupyterGenerateCell",
-	JupyterExplainCell: prefix + ".jupyterExplainCell",
-	JupyterImproveCell: prefix + ".jupyterImproveCell",
-}
-
-/**
- * IDs for the views registered by the extension.
- * These should match the name + view IDs defined in package.json.
- */
-const ZulongViewIds = {
-	Sidebar: name === "claude-dev" || name === "zulong-ide" ? "claude-dev.SidebarProvider" : name + ".SidebarProvider",
 }
 
 /**
@@ -50,7 +27,7 @@ export const ExtensionRegistryInfo = {
 	version,
 	publisher,
 	commands: ZulongCommands,
-	views: ZulongViewIds,
+	views: {},
 }
 
 export interface HostInfo {

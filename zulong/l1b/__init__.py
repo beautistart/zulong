@@ -4,6 +4,7 @@
 from .scheduler_gatekeeper import gatekeeper
 from .audio_understanding_node import l1b_audio_understanding, L1BAudioUnderstandingNode
 from .async_scheduler import AsyncL1BScheduler, async_scheduler, get_async_scheduler
+from .tool_predictor import L1BToolPredictor, predict_from_tool_bag
 
 __all__ = [
     'gatekeeper', 
@@ -11,5 +12,7 @@ __all__ = [
     'L1BAudioUnderstandingNode',
     'AsyncL1BScheduler',
     'async_scheduler',
-    'get_async_scheduler'
+    'get_async_scheduler',
+    'L1BToolPredictor',
+    'predict_from_tool_bag',
 ]

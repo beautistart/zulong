@@ -100,8 +100,9 @@ class TTSExpertNode(BaseExpertNode):
         self._kokoro_lock = threading.Lock()
 
         # CosyVoice 配置 (备选引擎 1)
-        self.model_path = Path(r"d:\AI\project\zulong_beta4\models\CosyVoice3-0.5B\FunAudioLLM\Fun-CosyVoice3-0___5B-2512")
-        self.ttsfrd_path = Path(r"d:\AI\project\zulong_beta4\models\iic\CosyVoice-ttsfrd")
+        from zulong.tts.cosyvoice_config import MODEL_BASE_DIR
+        self.model_path = MODEL_BASE_DIR / "CosyVoice3-0.5B" / "FunAudioLLM" / "Fun-CosyVoice3-0___5B-2512"
+        self.ttsfrd_path = MODEL_BASE_DIR / "iic" / "CosyVoice-ttsfrd"
 
         # 模型实例 (懒加载)
         self.tts_model = None  # CosyVoice 实例
@@ -632,8 +633,12 @@ class TTSExpertNode(BaseExpertNode):
                     audio_chunk = result['audio']
 
                 if audio_chunk is not None:
-                    # 确保是 float32
-                    if audio_chunk.dtype != np.float32:
+                    # 确保是 float32 numpy array — Kokoro 可能返回 PyTorch Tensor
+                    import torch as _torch
+                    if hasattr(audio_chunk, 'numpy'):
+                        # PyTorch Tensor → detach to numpy first
+                        audio_chunk = audio_chunk.cpu().numpy()
+                    if hasattr(audio_chunk, 'astype') and audio_chunk.dtype != np.float32:
                         audio_chunk = audio_chunk.astype(np.float32)
 
                     # 应用音量
@@ -714,6 +719,8 @@ class TTSExpertNode(BaseExpertNode):
 
 # 导出单例
 _tts_expert_instance: Optional[TTSExpertNode] = None
+_tts_prewarm_started = False
+_tts_prewarm_lock = threading.Lock()
 
 
 def get_tts_expert() -> TTSExpertNode:
@@ -727,6 +734,31 @@ def get_tts_expert() -> TTSExpertNode:
     if _tts_expert_instance is None:
         _tts_expert_instance = TTSExpertNode()
     return _tts_expert_instance
+
+
+def prewarm_tts_expert_async() -> None:
+    """后台预热 TTS，避免首次语音回复时下载/加载模型。"""
+    global _tts_prewarm_started
+    if _tts_prewarm_started:
+        return
+    with _tts_prewarm_lock:
+        if _tts_prewarm_started:
+            return
+        _tts_prewarm_started = True
+
+    def _prewarm() -> None:
+        try:
+            expert = get_tts_expert()
+            if expert._load_model():
+                logger.info("[TTS] 后台预热模型完成")
+        except Exception as e:
+            logger.warning(f"[TTS] 后台预热失败: {e}")
+
+    threading.Thread(
+        target=_prewarm,
+        name="zulong-tts-prewarm",
+        daemon=True,
+    ).start()
 
 
 # 便捷函数

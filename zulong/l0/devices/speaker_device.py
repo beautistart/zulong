@@ -19,6 +19,7 @@ TSD v1.7 对应:
 
 import asyncio
 import logging
+import threading
 from typing import Optional, Callable, Any
 import pyaudio
 import numpy as np
@@ -87,6 +88,8 @@ class SpeakerDevice:
         
         # 🎯 事件循环用于处理异步任务（延迟创建）
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._event_loop_thread: Optional[threading.Thread] = None
+        self._loop_ready = threading.Event()
         
         # 🎯 订阅 ACTION_SPEAK 事件 (TSD v1.7 规范)
         self._register_event_handlers()
@@ -102,27 +105,50 @@ class SpeakerDevice:
         # 订阅 L2 发出的语音合成指令
         event_bus.subscribe(
             EventType.ACTION_SPEAK,
-            self._on_speak_command_sync,  # 🎯 使用同步包装器
+            self._on_speak_command_sync,
             "SpeakerDevice"
         )
         logger.debug("✅ SpeakerDevice subscribed to ACTION_SPEAK events")
+
+    def _ensure_background_loop(self):
+        """确保 TTS 使用独立后台事件循环，避免阻塞 EventBus 分发线程。"""
+        if self._event_loop and not self._event_loop.is_closed() and self._event_loop_thread and self._event_loop_thread.is_alive():
+            return
+
+        self._loop_ready.clear()
+
+        def _run_loop():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._event_loop = loop
+            self._loop_ready.set()
+            loop.run_forever()
+
+        self._event_loop_thread = threading.Thread(
+            target=_run_loop,
+            name="SpeakerDeviceLoop",
+            daemon=True,
+        )
+        self._event_loop_thread.start()
+        self._loop_ready.wait(timeout=2.0)
     
     def _on_speak_command_sync(self, event: ZulongEvent):
         """
-        同步包装器 - 处理语音合成指令
+        同步入口 - 将语音任务投递到后台事件循环
         
         Args:
             event: ACTION_SPEAK 事件
         """
-        # 🎯 确保事件循环已创建
-        if self._event_loop is None or self._event_loop.is_closed():
-            self._event_loop = asyncio.new_event_loop()
-        
-        # 🎯 在事件循环中运行异步方法
         try:
-            self._event_loop.run_until_complete(self._on_speak_command(event))
+            self._ensure_background_loop()
+            if self._event_loop is None or self._event_loop.is_closed():
+                raise RuntimeError("SpeakerDevice 后台事件循环未就绪")
+            asyncio.run_coroutine_threadsafe(
+                self._on_speak_command(event),
+                self._event_loop,
+            )
         except Exception as e:
-            logger.error(f"❌ _on_speak_command_sync 执行失败：{e}", exc_info=True)
+            logger.error(f"❌ _on_speak_command_sync 投递失败：{e}", exc_info=True)
     
     async def _on_speak_command(self, event: ZulongEvent):
         """
@@ -156,9 +182,9 @@ class SpeakerDevice:
             logger.info(f"   - 语音模式：{voice_mode}")
             
             # 🎯 调用 TTS 专家生成音频并播放
-            from zulong.l3.tts_expert_node import TTSExpertNode
+            from zulong.l3.tts_expert_node import get_tts_expert
             
-            tts_expert = TTSExpertNode()
+            tts_expert = get_tts_expert()
             
             logger.info("📥 开始 TTS 流式合成...")
             

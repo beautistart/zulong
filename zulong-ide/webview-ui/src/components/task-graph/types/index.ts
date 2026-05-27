@@ -22,6 +22,33 @@ export interface FileRef {
 	path: string
 }
 
+/** 工具节点元数据 (TSD 23.5.1) */
+export interface ToolNodeMeta {
+	/** 工具名称 */
+	tool_name: string
+	/** L2 选择该工具的原因 */
+	thought: string
+	/** 参数摘要 */
+	args_summary: string
+	/** 风险等级 */
+	risk_level: string
+	/** 审批状态 */
+	approval_status: string
+	/** 执行结果摘要 */
+	result_summary?: string
+	/** 执行耗时 (ms) */
+	duration_ms?: number
+}
+
+/** 并行工具组 (TSD 23.5.2) */
+export interface ParallelGroup {
+	/** 组内工具节点ID列表 */
+	tool_node_ids: string[]
+	/** 成功/总数 */
+	completed: number
+	total: number
+}
+
 export interface NodeAttribute {
 	id: string
 	label: string
@@ -34,6 +61,10 @@ export interface NodeAttribute {
 	parentId: string | null
 	position: Position
 	metadata: Record<string, unknown>
+	/** v2.7: 工具节点元数据 (仅工具节点有效) */
+	tool_meta?: ToolNodeMeta
+	/** v2.7: 所属并行组ID */
+	parallel_group_id?: string
 }
 
 export interface EdgeAttribute {
@@ -124,6 +155,10 @@ export interface GraphFullSyncPayload {
 		parentId: string | null
 		taskDomain: TaskDomain
 		metadata: Record<string, unknown>
+		/** v2.7: 工具节点元数据 */
+		tool_meta?: ToolNodeMeta
+		/** v2.7: 所属并行组ID */
+		parallel_group_id?: string
 	}>
 	hEdges: Array<[string, string]>
 	dEdges: Array<{
@@ -132,6 +167,8 @@ export interface GraphFullSyncPayload {
 		via: string
 		cross: boolean
 	}>
+	/** v2.7: 并行工具组定义 */
+	parallel_groups?: ParallelGroup[]
 }
 
 export interface LayoutRequestMessage {

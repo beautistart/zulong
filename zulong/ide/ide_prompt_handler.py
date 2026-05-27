@@ -34,20 +34,22 @@ class IDEPromptHandler:
         memory_context: str = "",
         task_context: str = "",
         experience_hints: str = "",
-        intent: str = "complex",
+        task_graph_policy: str = "inspect_or_create",
+        cwd: str = "",
     ) -> List[Dict]:
         """处理消息列表中的 system prompt
 
         1. 提取并移除 IDE 的 XML 工具定义区域
         2. 保留非工具定义部分（角色设定、规则等）
-        3. 根据意图注入不同强度的祖龙增强内容
+        3. 根据 L1-B 任务图策略注入祖龙增强内容
 
         Args:
             messages: 原始消息列表
             memory_context: 检索到的记忆上下文
             task_context: 当前任务图状态
             experience_hints: 经验提示
-            intent: "complex" 或 "resume"
+            task_graph_policy: L1-B 任务图策略
+            cwd: 当前工作目录
 
         Returns:
             处理后的消息列表（浅拷贝）
@@ -66,7 +68,8 @@ class IDEPromptHandler:
         if sys_idx is None:
             # 没有 system 消息 → 创建一个
             zulong_prompt = self._build_zulong_system_prompt(
-                "", memory_context, task_context, experience_hints, intent=intent
+                "", memory_context, task_context, experience_hints,
+                task_graph_policy=task_graph_policy, cwd=cwd
             )
             processed.insert(0, {"role": "system", "content": zulong_prompt})
             return processed
@@ -94,9 +97,9 @@ class IDEPromptHandler:
                     f"(长度={len(sys_content)})"
                 )
 
-        # 构建增强的 system prompt（根据意图选择 COMPLEX 或 RESUME 模板）
         enhanced = self._build_zulong_system_prompt(
-            remaining, memory_context, task_context, experience_hints, intent=intent
+            remaining, memory_context, task_context, experience_hints,
+            task_graph_policy=task_graph_policy, cwd=cwd
         )
         processed[sys_idx] = dict(processed[sys_idx])
         processed[sys_idx]["content"] = enhanced
@@ -163,12 +166,14 @@ class IDEPromptHandler:
         memory_context: str,
         task_context: str,
         experience_hints: str,
-        intent: str = "complex",
+        task_graph_policy: str = "inspect_or_create",
+        cwd: str = "",
     ) -> str:
         """构建包含祖龙增强内容的 system prompt
 
         Args:
-            intent: "complex" 使用强任务管理规则; "resume" 使用恢复规则
+            task_graph_policy: L1-B 任务图策略
+            cwd: 当前工作目录
         """
         # 检测终端环境
         import os
@@ -189,32 +194,30 @@ class IDEPromptHandler:
             terminal_type = f"Unknown ({shell})"
             shell_hint = "根据环境变量判断命令语法"
         
-        terminal_env = f"\n\n【终端环境】\n终端类型: {terminal_type}\n{shell_hint}\nSHELL={shell}, TERM={term}"
+        terminal_env = f"\n\n【工作环境】\n工作目录: {cwd}\n【重要】所有文件路径必须使用绝对路径（以工作目录为根）\n终端类型: {terminal_type}\n{shell_hint}\nSHELL={shell}, TERM={term}"
         
-        if intent == "resume":
-            return self._build_zulong_prompt_resume(
-                ide_base, memory_context, task_context, experience_hints, terminal_env
-            )
-        return self._build_zulong_prompt_complex(
-            ide_base, memory_context, task_context, experience_hints, terminal_env
+        return self._build_zulong_prompt_unified(
+            ide_base, memory_context, task_context, experience_hints,
+            terminal_env, task_graph_policy=task_graph_policy
         )
 
-    def _build_zulong_prompt_complex(
+    def _build_zulong_prompt_unified(
         self,
         ide_base: str,
         memory_context: str,
         task_context: str,
         experience_hints: str,
         terminal_env: str = "",
+        task_graph_policy: str = "inspect_or_create",
     ) -> str:
-        """COMPLEX 意图：强任务管理规则（参照原生 intent_prompt_builder）"""
+        """统一工具预判提示词：按工具包与任务图策略构建。"""
         parts = []
 
         if ide_base:
             parts.append(ide_base)
 
         parts.append(
-            "\n\n# 祖龙认知增强 — 任务规划模式\n"
+            "\n\n# 祖龙认知增强 — 工具预判执行模式\n"
             "\n"
             "你配备了祖龙记忆系统。内部工具（task/memory/attention）由服务端直接执行，"
             "文件和终端工具（read_file, write_to_file, execute_command 等）由 IDE 客户端执行。\n"
@@ -223,17 +226,22 @@ class IDEPromptHandler:
             "【重要】当项目记忆与你的通用知识冲突时，优先遵循项目记忆。\n"
             f"{terminal_env}\n"
             "\n"
-            "【任务管理规则】\n"
-            "当前已进入任务规划模式。系统已自动创建任务图骨架。\n"
+            "【统一主链】\n"
+            "用户输入已由 L1-B 做工具预判、上下文检索和工具袋打包。\n"
+            f"当前任务图策略: {task_graph_policy}\n"
+            "不要输出内部路由标签；只根据工具包、任务图状态和上下文决定下一步。\n"
             "\n"
-            "⚠️ 核心原则：不要反问用户！直接根据已有信息开始规划和执行。\n"
-            "即使信息不完整，也要基于合理假设直接输出完整方案。\n"
+            "【任务管理规则】\n"
+            "只有确实需要多步骤执行或持续跟踪时才使用 task_* 工具。\n"
+            "\n"
+            "⚠️ 核心原则：根据已有信息开始规划和执行。\n"
+            "信息不完整但可合理假设时，直接执行；确实无法继续时再向用户追问。\n"
             "\n"
             "你需要做的：\n"
-            "1. 用 task_add_node 向任务图添加子任务节点\n"
+            "1. 若需要任务图，先确认已有任务图状态；必要时用 task_add_node 添加子任务节点\n"
             "   - 先创建顶层模块节点（parent_id='req'），每个代表一个独立的工作阶段\n"
             "   - 对于复杂模块，再创建子步骤节点（parent_id='上级模块的节点ID'）\n"
-            "   - 目标深度：至少 2 层（阶段→具体步骤），复杂任务可达 3 层\n"
+            "   - 目标深度：阶段→具体步骤，复杂任务可达 3 层\n"
             "   - 先搭建完整大纲再执行，不要边做边加\n"
             "   - 示例结构：\n"
             "     req（根）\n"
@@ -243,27 +251,40 @@ class IDEPromptHandler:
             "       └─ phase2（阶段2）← parent_id='req'\n"
             "            ├─ step2_1 ← parent_id='phase2的ID'\n"
             "            └─ step2_2 ← parent_id='phase2的ID'\n"
-            "2. 用 task_view_overview 查看一次任务概览确认结构（只需查看一次）\n"
+            "2. 需要理解/推进已有图时，用 task_view_overview 查看任务概览（只需查看一次）\n"
             "3. 按顺序逐个执行每个子任务：\n"
             "   a) 调用 task_mark_status(node_id='节点ID', status='in_progress')\n"
-            "   b) 实际执行工作：\n"
-            "      - 分析项目/代码 → 先调用 index_project 或 index_code_file 构建代码图谱\n"
-            "      - 查找代码结构 → 使用 search_code_symbols / get_symbol_context\n"
-            "      - 写代码/文档 → 用 write_to_file / replace_in_file\n"
-            "      - 运行命令 → 用 execute_command\n"
-            "      - 查看代码 → 用 read_file\n"
+            "   b) 【关键】实际执行工作 —— 必须调用工具，不能只口头叙述！\n"
+            "      ╔══════════════════════════════════════════════════════════╗\n"
+            "      ║  ⚠️ 只说「开始编写」「我将创建」而不调用工具 = 什么都没做！  ║\n"
+            "      ║  ⚠️ 文本叙述不等于执行！你必须发出 function_call 调用工具！ ║\n"
+            "      ╚══════════════════════════════════════════════════════════╝\n"
+            "      - 写代码/创建文件 → 必须调用: write_to_file(path='文件绝对路径（工作目录+文件名）', content='文件完整内容')\n"
+            "        示例: write_to_file(path='<工作目录>/index.html', content='...')\n"
+            "      - 修改现有文件 → 必须调用: replace_in_file(path='<工作目录>/src/main.py', diff='...')\n"
+            "      - 查看代码 → 用 read_file(path='文件绝对路径')\n"
+            "      - 运行命令 → 用 execute_command(command='命令', requires_approval=false)\n"
+            "      - 分析项目/代码 → 用 index_project(root_dir='项目根目录') 或 index_code_file(file_path='文件路径')\n"
+            "      - 查找代码结构 → 用 search_code_symbols / get_symbol_context\n"
+            "      - VS Code 命令 → 用 vscode_run_command(command='editor.action.formatDocument') 执行格式化/重构/Git等\n"
+            "      - 检查代码错误 → 用 get_diagnostics() 获取 lint/编译诊断\n"
+            "      - 用户输入 → 用 ask_user_input(prompt='提示') 或 ask_user_select_file 让用户选择文件\n"
+            "      - 管理扩展 → 用 vscode_manage_extension(action='list') 查看已安装扩展\n"
             "   c) 调用 task_mark_status(node_id='节点ID', status='completed', "
             "result='详细结果，不少于50字')\n"
             "   d) 立即开始下一个子任务\n"
             "\n"
             "重要规则：\n"
-            "- 不需要调用 task_create_plan（任务图已自动创建）\n"
+            "- 不要为了形式强行创建任务图；直接回答能解决的问题就直接回答\n"
             "- 所有子节点必须通过 parent_id 正确挂到父节点下\n"
             "- task_view_overview 只需要调用一次，不要重复调用\n"
             "- 每完成一个子任务必须调用 task_mark_status 标记为 completed\n"
             "- ⚠️ 在还有未完成的子任务时，绝对不能声称任务已全部完成\n"
-            "- ⚠️ 绝对不要向用户反问或要求补充信息\n"
+            "- ⚠️ 不要无意义反问；确需用户决策时才追问\n"
             "- ⚠️ 工具调用中的 label、desc、result 等字段必须使用与用户相同的语言\n"
+            "- ⚠️ 【最重要】写代码/创建文件时必须调用 write_to_file！口头叙述不算执行！\n"
+            "- ⚠️ 需要执行时必须调用工具；无需执行时可以纯文本回复\n"
+            "- ⚠️ 如果你发现自己连续说了两次类似的叙述性文本，说明你陷入了循环，必须立即调用工具\n"
             "\n"
             "【代码图谱 — 必须使用】\n"
             "你配备了代码图谱系统（CRG），这是你分析和理解代码的核心能力。\n"
@@ -288,6 +309,17 @@ class IDEPromptHandler:
             "- 如果信息不完整，基于合理假设直接执行\n"
         )
 
+        if task_graph_policy in {"reuse", "inspect", "continue"}:
+            progress_summary, first_uncompleted_id = self._build_progress_table()
+            if progress_summary:
+                parts.append(f"\n\n【当前任务进度】\n{progress_summary}")
+            if first_uncompleted_id:
+                parts.append(
+                    "\n【继续执行提示】\n"
+                    f"优先从未完成节点 {first_uncompleted_id} 开始推进；"
+                    "仍有未完成子任务时，不能声称任务已全部完成。"
+                )
+
         if memory_context:
             parts.append(f"\n\n## 项目记忆\n{memory_context}")
         if task_context:
@@ -297,93 +329,14 @@ class IDEPromptHandler:
 
         parts.append(
             "\n\n⚠️ 语言要求：必须使用与用户输入相同的语言回复，包括工具调用中的所有字段。\n"
-            "\n请开始规划和执行用户的任务："
-        )
-
-        return "\n".join(parts)
-
-    def _build_zulong_prompt_resume(
-        self,
-        ide_base: str,
-        memory_context: str,
-        task_context: str,
-        experience_hints: str,
-        terminal_env: str = "",
-    ) -> str:
-        """RESUME 意图：恢复规则 + 动态进度表（参照原生 _build_resume_prompt）"""
-        parts = []
-
-        if ide_base:
-            parts.append(ide_base)
-
-        parts.append(
-            "\n\n# 祖龙认知增强 — 任务恢复模式\n"
-            "\n"
-            "你配备了祖龙记忆系统。内部工具（task/memory/attention）由服务端直接执行，"
-            "文件和终端工具（read_file, write_to_file, execute_command 等）由 IDE 客户端执行。\n"
-            "【重要】请通过 function calling（工具调用）来使用工具，"
-            "不要在文本中输出 XML 标签格式的工具调用。\n"
-            f"{terminal_env}\n"
-            "\n"
-            "【任务恢复模式】\n"
-            "系统已自动恢复之前挂起的任务。任务图已加载到内存中。\n"
-        )
-
-        # 动态注入任务进度表
-        progress_summary, first_uncompleted_id = self._build_progress_table()
-        if progress_summary:
-            parts.append(f"\n【当前任务进度】\n{progress_summary}\n")
-
-        parts.append(
-            "\n【执行规则】\n"
-            "对每个未完成节点：先调用 task_mark_status(node_id, 'in_progress') 开始，"
-            "完成后调用 task_mark_status(node_id, 'completed', result='结果摘要')。\n"
-        )
-        if first_uncompleted_id:
-            parts.append(
-                f"第一步：请立即调用 task_mark_status(node_id='{first_uncompleted_id}', "
-                f"status='in_progress')\n"
-            )
-        
-        # 检查是否只有根节点（需要创建任务结构）
-        from zulong.tools.task_tools import get_active_task_graph
-        tg = get_active_task_graph()
-        has_only_root = tg and len(tg.nodes) == 1 and 'req' in tg.nodes
-        
-        if has_only_root:
-            parts.append(
-                "\n⚠️ 任务图当前只有根节点，需要先创建任务结构：\n"
-                "✓ 请使用 task_add_node 添加子任务节点（parent_id='req'）\n"
-                "✓ 创建至少2层结构（阶段→具体步骤）\n"
-                "✓ 添加完成后调用 task_view_overview 确认结构\n"
-                "✓ 然后按顺序执行每个子任务\n"
-            )
-        else:
-            parts.append(
-                "\n⚠️ 恢复后的执行规则：\n"
-                "✗ 禁止调用 task_create_plan — 这会创建全新图谱，丢弃已恢复的进度\n"
-                "✗ 禁止调用 task_add_node — 节点已经在恢复的图谱中了\n"
-                "✓ 只使用 task_mark_status 更新现有节点状态，然后继续执行\n"
-                "⚠️ 未完成子任务时，不能声称任务已全部完成。\n"
-            )
-
-        if memory_context:
-            parts.append(f"\n\n## 项目记忆\n{memory_context}")
-        if task_context:
-            parts.append(f"\n\n## 当前任务上下文\n{task_context}")
-        if experience_hints:
-            parts.append(f"\n\n## 相关经验\n{experience_hints}")
-
-        parts.append(
-            "\n\n⚠️ 语言要求：必须使用与用户输入相同的语言回复。\n"
-            "\n请继续执行之前的任务："
+            "\n请根据当前工具预判和上下文开始回答或执行："
         )
 
         return "\n".join(parts)
 
     @staticmethod
     def _build_progress_table() -> tuple:
-        """构建任务进度表（用于 RESUME 提示词注入）
+        """构建任务进度表（用于继续已有任务图时的提示词注入）
 
         Returns:
             (progress_summary: str, first_uncompleted_id: str)

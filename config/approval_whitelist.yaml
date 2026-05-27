@@ -1,0 +1,33 @@
+# TSD v1.7 §23.4.3: 审批白名单配置
+# 匹配白名单的工具自动放行，不触发审批流程
+
+# 目录白名单: 该目录下的写操作自动放行
+directories:
+  - "src/"
+  - "tests/"
+  - "docs/"
+
+# 命令白名单: 这些命令自动放行
+commands:
+  - "npm test"
+  - "python -m pytest"
+  - "git status"
+  - "git diff"
+
+# 工具白名单: 这些工具在任何路径都自动放行
+tools:
+  - "read_file"
+  - "search_files"
+  - "list_files"
+  - "recall_memory"
+  - "read_memory_node"
+  - "search_knowledge"
+  - "discover_related"
+  - "open_file"
+  - "show_diff"
+
+# 模式白名单: 匹配这些正则的自动放行
+patterns:
+  - "^pip install"
+  - "^npm run"
+  - "^cargo "

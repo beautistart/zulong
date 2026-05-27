@@ -2,15 +2,21 @@
 # 祖龙 (ZULONG) 系统 - L1-B (Gatekeeper) 层配置
 # TSD v1.7 规范：L1-B 运行在 GPU，使用无量化模式加载
 
+import os
 from pathlib import Path
 from typing import Dict, Any
 import torch
+from zulong.utils.device import torch_device
+
+# 项目根目录（优先从环境变量 ZULONG_HOME 获取，否则自动检测）
+_PROJECT_ROOT = Path(os.environ.get("ZULONG_HOME", Path(__file__).resolve().parent.parent.parent))
+_MODEL_BASE = Path(os.environ.get("ZULONG_MODEL_BASE_DIR", str(_PROJECT_ROOT / "models")))
 
 # 模型路径 (无量化模式)
-L1B_AUDIO_MODEL_PATH = Path(r"d:\AI\project\zulong_beta4\zulong\models\Qwen3.5-0.8B-int4-L1B")
+L1B_AUDIO_MODEL_PATH = _PROJECT_ROOT / "zulong" / "models" / "Qwen3.5-0.8B-int4-L1B"
 
-# 设备配置 (L1-B 运行在 GPU)
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# 设备配置 (Windows/Linux 优先 CUDA，macOS Apple Silicon 优先 MPS)
+DEVICE = torch_device("auto", prefer_gpu=True)
 
 # 模型参数
 MAX_LENGTH = 512  # 最大生成长度

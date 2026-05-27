@@ -242,6 +242,13 @@ class MemoryGraphHybrid:
         if node:
             self._stats["property_load_count"] += 1
         return node
+
+    def update_node(self, node: NodeProperties) -> bool:
+        """更新节点属性。"""
+        if node.node_id not in self.topology:
+            return False
+        self.properties.set_node(node)
+        return True
         
     def get_edge(self, src_id: str, dst_id: str) -> Optional[EdgeProperties]:
         """获取边属性"""
@@ -493,6 +500,32 @@ class MemoryGraphHybrid:
             f"节点={len(self.topology)}, "
             f"边={self.topology._edge_count}"
         )
+
+    def rebuild_topology_from_properties(self) -> None:
+        """从 LMDB 属性库重建 igraph 拓扑。
+
+        分片存储的权威属性在 LMDB。GraphML 拓扑文件是加速启动的缓存，
+        如果缺失或为空，必须能从属性库恢复，否则前端图谱会出现
+        “分片计数有节点但快照为空”的 split-brain 状态。
+        """
+        self.topology.clear()
+        node_count = 0
+        edge_count = 0
+
+        for node in self.properties.iter_nodes():
+            self.topology.add_node(node.node_id, node.node_type)
+            node_count += 1
+
+        for edge in self.properties.iter_edges():
+            if edge.src_id in self.topology and edge.dst_id in self.topology:
+                if self.topology.add_edge(edge.src_id, edge.dst_id, edge.edge_type, edge.weight) is not None:
+                    edge_count += 1
+
+        logger.info(
+            f"拓扑已从属性库重建: shard={self.shard_id}, "
+            f"节点={node_count}, 边={edge_count}"
+        )
+        self.save()
         
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""

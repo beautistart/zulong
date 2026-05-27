@@ -152,7 +152,8 @@ def check_memory_files():
     logger.info("📊 步骤 4: 检查记忆文件")
     logger.info("=" * 80)
     
-    base_path = Path("d:/AI/project/zulong_beta4/data")
+    ZULONG_HOME = Path(os.environ.get('ZULONG_HOME', Path(__file__).resolve().parent.parent))
+    base_path = ZULONG_HOME / "data"
     
     files_to_check = [
         "short_term_memory/index.json",

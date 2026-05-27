@@ -288,8 +288,8 @@ class VLMAgent:
         # 获取最后一个用户 Prompt
         last_prompt = self.history[-1]["content"]
         
-        # 模拟响应
-        response = f"收到指令：{last_prompt[:50]}... (模拟响应)"
+        # Mock 路径不得伪装成正常会话回复
+        response = "系统当前出问题了，VLM 代理仍处于模拟生成路径，无法正常回复。"
         
         # 添加到历史
         self.history.append({"role": "assistant", "content": response})
@@ -385,8 +385,8 @@ class VLMAgentMock:
         
         logger.info(f"💬 [MockVLM] 收到 Prompt (优先级：{priority}): {prompt[:50]}...")
         
-        # 模拟生成完成
-        response = f"模拟响应：{prompt[:30]}..."
+        # Mock 路径不得伪装成正常会话回复
+        response = "系统当前出问题了，VLM Mock 代理被误用于会话链路，无法正常回复。"
         self.history.append({"role": "assistant", "content": response})
         self.status = "IDLE"
     
@@ -398,8 +398,8 @@ class VLMAgentMock:
         
         logger.info(f"📥 [MockVLM] 处理事件：{prompt[:50]}...")
         
-        # 模拟生成完成
-        response = f"模拟响应：{prompt[:30]}..."
+        # Mock 路径不得伪装成正常会话回复
+        response = "系统当前出问题了，VLM Mock 代理被误用于会话链路，无法正常回复。"
         self.history.append({"role": "assistant", "content": response})
         self.status = "IDLE"
     
