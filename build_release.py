@@ -875,7 +875,12 @@ def build_release(output_dir: Path, dry_run: bool = False):
             # 复制文件
             dst_file = output_dir / rel_file
             dst_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_file, dst_file)
+            try:
+                shutil.copy2(src_file, dst_file)
+            except OSError:
+                # Fallback: read/write bypassing Windows path length limits
+                content = src_file.read_bytes()
+                dst_file.write_bytes(content)
             copied_count += 1
 
             # 应用替换
