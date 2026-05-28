@@ -429,6 +429,18 @@ class FCRunner:
         通用安全网: 检查进度停滞
         """
         if self._detect_progress_stall(state):
+            if self._has_uncompleted_task_graph():
+                result["should_terminate"] = ""
+                state["cb_force_no_tools"] = False
+                state.setdefault("messages", []).append({
+                    "role": "user",
+                    "content": (
+                        "[系统提示] 当前任务图仍有未完成节点。"
+                        "请继续调用工具推进任务，不要把阶段性进度当作最终回答。"
+                    ),
+                })
+                logger.warning("[FCRunner] 检测到进度停滞，但任务图未完成，继续工具循环")
+                return
             result["should_terminate"] = "progress_stalled"
             state["response"] = self.engine._get_fallback_response(
                 state.get("user_input_text", "")
@@ -473,6 +485,27 @@ class FCRunner:
     ) -> None:
         """钩子: 循环完成"""
         pass
+
+    @staticmethod
+    def _has_uncompleted_task_graph() -> bool:
+        try:
+            from zulong.tools.task_tools import get_active_task_graph
+
+            tg = get_active_task_graph()
+            if not tg:
+                return False
+            leaves = [
+                node for node in tg.get_leaf_nodes()
+                if not getattr(node, "id", "").startswith("crg_")
+            ]
+            if not leaves:
+                return False
+            return any(
+                getattr(node, "status", "") not in ("completed", "skipped")
+                for node in leaves
+            )
+        except Exception:
+            return False
 
 
 def run_fc_loop(

@@ -564,13 +564,15 @@ class ShardedMemoryGraph:
         Returns:
             NodeProperties 列表
         """
+        node_type_value = getattr(node_type, "value", node_type)
+        node_type_value = str(node_type_value)
         results = []
         for shard_id in self.list_all_shards():
             shard = self.get_shard(shard_id, load_if_missing=True)
             if shard:
                 for vertex in shard.topology.graph.vs:
                     vt = vertex["type"] if "type" in vertex.attributes() else "unknown"
-                    if vt == node_type:
+                    if vt == node_type_value:
                         nid = self._vertex_node_id(vertex)
                         node = shard.get_node(nid)
                         if node:

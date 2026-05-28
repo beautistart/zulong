@@ -10,12 +10,14 @@ graph even when the L1-B/L2 route changes.
 from __future__ import annotations
 
 import logging
+import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
 _LAST_ROUND_BY_CONVERSATION: Dict[str, str] = {}
+_LAST_TOOL_CALL_BY_ROUND: Dict[str, str] = {}
 
 
 def _compact_id(value: str) -> str:
@@ -40,6 +42,192 @@ def _persist_node_update(graph: Any, node: Any) -> None:
             graph.update_node(node)
         except Exception:
             pass
+
+
+def _metadata_of(node: Any) -> Dict[str, Any]:
+    return getattr(node, "metadata", {}) or {}
+
+
+def _node_type_value(node: Any) -> str:
+    node_type = getattr(node, "node_type", "")
+    return getattr(node_type, "value", node_type) or ""
+
+
+def _node_id_of(node: Any) -> str:
+    return getattr(node, "node_id", "") or ""
+
+
+def _get_payload_interaction(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    interaction = payload.get("interaction")
+    if isinstance(interaction, dict):
+        return interaction
+    data = payload.get("data")
+    if isinstance(data, dict) and isinstance(data.get("interaction"), dict):
+        return data["interaction"]
+    return {}
+
+
+def _payload_source_event_id(payload: Dict[str, Any]) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    return (
+        str(payload.get("source_event_id") or "")
+        or str(payload.get("event_id") or "")
+        or str(payload.get("id") or "")
+    )
+
+
+def _payload_task_graph_id(payload: Dict[str, Any]) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    return str(
+        payload.get("task_graph_id")
+        or payload.get("graph_id")
+        or payload.get("task_id")
+        or ""
+    )
+
+
+def _payload_files(payload: Dict[str, Any], interaction: Dict[str, Any]) -> List[str]:
+    files: List[str] = []
+    candidates: Iterable[Any] = (
+        payload.get("files") if isinstance(payload, dict) else None,
+        payload.get("affected_files") if isinstance(payload, dict) else None,
+        interaction.get("affected_files") if isinstance(interaction, dict) else None,
+        payload.get("path") if isinstance(payload, dict) else None,
+        payload.get("file_path") if isinstance(payload, dict) else None,
+    )
+    for item in candidates:
+        if not item:
+            continue
+        if isinstance(item, (list, tuple, set)):
+            for value in item:
+                if value:
+                    files.append(str(value))
+        elif isinstance(item, str):
+            files.append(item)
+    if isinstance(payload, dict):
+        for result in payload.get("results") or []:
+            if isinstance(result, dict):
+                for key in ("path", "file_path"):
+                    if result.get(key):
+                        files.append(str(result[key]))
+    seen = set()
+    deduped = []
+    for path in files:
+        norm = path.strip()
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        deduped.append(norm)
+    return deduped
+
+
+def _event_node_type(event_type: str, interaction: Dict[str, Any], payload: Dict[str, Any]):
+    try:
+        from zulong.memory.memory_graph import NodeType
+    except Exception:
+        return None
+    kind = str(interaction.get("kind") or "").lower()
+    event = str(event_type or "").lower()
+    if kind == "approval" or "approval" in event:
+        return NodeType.APPROVAL
+    if kind == "action":
+        return NodeType.TOOL_CALL
+    if kind == "observation":
+        if (
+            interaction.get("tool_name")
+            or payload.get("tool_name")
+            or payload.get("results")
+            or "tool" in event
+        ):
+            return NodeType.TOOL_RESULT
+    if event in {"tool_call", "ide_tool_request", "ide_tool_exec"}:
+        return NodeType.TOOL_CALL
+    if event in {"ide_tool_result"} or event.endswith("tool_finished"):
+        return NodeType.TOOL_RESULT
+    return None
+
+
+def _stable_execution_node_id(
+    round_id: str,
+    node_type: Any,
+    event_type: str,
+    interaction: Dict[str, Any],
+    payload: Dict[str, Any],
+) -> str:
+    node_type_value = getattr(node_type, "value", str(node_type))
+    pair_id = (
+        interaction.get("pair_id")
+        or interaction.get("interaction_id")
+        or payload.get("pair_id")
+        or payload.get("call_id")
+        or payload.get("tool_call_id")
+        or payload.get("approval_id")
+        or payload.get("approvalId")
+        or _payload_source_event_id(payload)
+        or event_type
+    )
+    phase = interaction.get("phase") or payload.get("phase") or event_type
+    if node_type_value == "approval":
+        suffix = f"{pair_id}_{phase}_{interaction.get('status') or payload.get('approved', '')}"
+    else:
+        suffix = str(pair_id)
+    return f"{round_id}/{node_type_value}_{_compact_id(suffix)}"
+
+
+def _find_execution_node_by_pair(mg: Any, node_type: Any, round_id: str, pair_id: str) -> str:
+    if not pair_id:
+        return ""
+    try:
+        for node in mg.get_nodes_by_type(node_type):
+            meta = _metadata_of(node)
+            if meta.get("parent_round") == round_id and str(meta.get("pair_id") or "") == str(pair_id):
+                return _node_id_of(node)
+    except Exception:
+        pass
+    return ""
+
+
+def _add_file_references(mg: Any, source_node_id: str, files: List[str], metadata: Dict[str, Any]) -> None:
+    if not files:
+        return
+    try:
+        from zulong.memory.memory_graph import EdgeType, GraphNode, NodeType
+    except Exception:
+        return
+    for path in files[:20]:
+        safe_path = path.replace("\\", "/")
+        file_id = f"file:{_compact_id(safe_path)}"
+        if not mg.has_node(file_id):
+            try:
+                mg.add_node(GraphNode(
+                    node_id=file_id,
+                    node_type=NodeType.FILE,
+                    label=os.path.basename(path) or path[-80:],
+                    backend_ref=f"file:{path}",
+                    metadata={
+                        "path": path,
+                        "content": path,
+                        "source": "execution_event",
+                    },
+                ))
+            except Exception:
+                continue
+        if mg.has_node(file_id) and not _edge_exists(mg, source_node_id, file_id):
+            try:
+                mg.add_edge(
+                    source_node_id,
+                    file_id,
+                    EdgeType.REFERENCE,
+                    weight=0.8,
+                    protected=True,
+                    metadata={**metadata, "link_type": "execution_file_reference"},
+                )
+            except Exception:
+                pass
 
 
 def mirror_interaction_to_memory_graph(
@@ -196,9 +384,26 @@ def mirror_interaction_to_memory_graph(
             except Exception:
                 pass
         _attach_task_if_present(mg, session_id, round_id, payload or {})
+        execution_node_id = _mirror_execution_event(
+            mg=mg,
+            session_id=session_id,
+            round_id=round_id,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            role=role,
+            text=text,
+            event_type=event_type,
+            source=source,
+            payload=payload or {},
+        )
         if event_type in {"approval_required", "checkpoint_created", "ide:file_changed"}:
             try:
                 mg.set_importance(message_id, Importance.IMPORTANT)
+            except Exception:
+                pass
+        if execution_node_id:
+            try:
+                mg.set_importance(execution_node_id, Importance.IMPORTANT)
             except Exception:
                 pass
         try:
@@ -212,11 +417,12 @@ def mirror_interaction_to_memory_graph(
         except Exception:
             pass
         try:
-            if not mg.update_focus_to_node(message_id):
-                mg.set_active_nodes([session_id, round_id, message_id])
+            focus_node_id = execution_node_id or message_id
+            if not mg.update_focus_to_node(focus_node_id):
+                mg.set_active_nodes([session_id, round_id, focus_node_id])
         except Exception:
             try:
-                mg.set_active_nodes([session_id, round_id, message_id])
+                mg.set_active_nodes([session_id, round_id, execution_node_id or message_id])
             except Exception:
                 pass
         try:
@@ -314,8 +520,298 @@ def _attach_task_if_present(mg: Any, session_id: str, round_id: str, payload: Di
         _persist_node_update(mg, task_node)
 
 
-def backfill_recent_interactions_to_memory_graph(limit: int = 50) -> int:
-    """Rebuild recent Web conversations into MemoryGraph from InteractionStore."""
+def _mirror_execution_event(
+    *,
+    mg: Any,
+    session_id: str,
+    round_id: str,
+    conversation_id: str,
+    turn_id: str,
+    role: str,
+    text: str,
+    event_type: str,
+    source: str,
+    payload: Dict[str, Any],
+) -> str:
+    """Project tool/approval cards into dedicated MemoryGraph execution nodes."""
+    interaction = _get_payload_interaction(payload)
+    node_type = _event_node_type(event_type, interaction, payload)
+    if node_type is None:
+        return ""
+
+    try:
+        from zulong.memory.memory_graph import EdgeType, GraphNode, Importance
+    except Exception:
+        return ""
+
+    node_type_value = getattr(node_type, "value", str(node_type))
+    pair_id = str(
+        interaction.get("pair_id")
+        or payload.get("pair_id")
+        or payload.get("call_id")
+        or payload.get("tool_call_id")
+        or payload.get("approval_id")
+        or payload.get("approvalId")
+        or _payload_source_event_id(payload)
+        or event_type
+    )
+    tool_name = str(interaction.get("tool_name") or payload.get("tool_name") or "")
+    source_event_id = _payload_source_event_id(payload)
+    task_graph_id = _payload_task_graph_id(payload)
+    status = str(interaction.get("status") or payload.get("status") or "")
+    phase = str(interaction.get("phase") or payload.get("phase") or event_type)
+    node_id = _stable_execution_node_id(round_id, node_type, event_type, interaction, payload)
+
+    if node_type_value == "tool_call":
+        title = interaction.get("title") or f"工具调用: {tool_name or pair_id}"
+        content = interaction.get("detail") or text
+        metadata = {
+            "pair_id": pair_id,
+            "tool_name": tool_name,
+            "arguments_summary": interaction.get("tool_args") or payload.get("tool_args") or payload.get("args"),
+            "fc_turn": interaction.get("turn") or payload.get("turn"),
+            "task_graph_id": task_graph_id,
+            "risk_level": interaction.get("risk_level") or payload.get("risk_level") or "",
+            "source_event_id": source_event_id,
+        }
+    elif node_type_value == "tool_result":
+        title = interaction.get("title") or f"工具结果: {tool_name or pair_id}"
+        content = interaction.get("result_preview") or payload.get("result_preview") or text
+        is_failed = status in {"failed", "error"} or bool(payload.get("is_error"))
+        files = _payload_files(payload, interaction)
+        metadata = {
+            "pair_id": pair_id,
+            "tool_name": tool_name,
+            "success": not is_failed,
+            "latency_ms": payload.get("latency_ms") or interaction.get("latency_ms"),
+            "result_preview": content[:1000] if isinstance(content, str) else str(content)[:1000],
+            "affected_files": files,
+            "source_event_id": source_event_id,
+        }
+    else:
+        approval_id = str(
+            payload.get("approval_id")
+            or payload.get("approvalId")
+            or interaction.get("approval_id")
+            or pair_id
+        )
+        decision = ""
+        if "approved" in payload:
+            decision = "approved" if payload.get("approved") else "rejected"
+        elif status in {"approved", "rejected", "denied"}:
+            decision = status
+        title = interaction.get("title") or payload.get("action_summary") or "审批事件"
+        content = interaction.get("detail") or payload.get("risk_reason") or text
+        metadata = {
+            "approval_id": approval_id,
+            "pair_id": pair_id,
+            "tool_name": tool_name,
+            "phase": phase,
+            "decision": decision,
+            "risk_level": interaction.get("risk_level") or payload.get("risk_level") or "",
+            "approval_mode": interaction.get("approval_mode") or payload.get("approval_mode") or "",
+            "action_summary": payload.get("action_summary") or payload.get("summary") or interaction.get("title") or "",
+            "source_event_id": source_event_id,
+        }
+
+    common_metadata = {
+        "content": content,
+        "conversation_id": conversation_id,
+        "request_id": turn_id,
+        "event_type": event_type,
+        "role": role,
+        "source": source,
+        "interaction": interaction,
+        "payload": payload,
+        "parent_round": round_id,
+        "parent_session": session_id,
+        "full_path": node_id,
+        "node_role": node_type_value,
+        "graph_level": 2,
+        "created_from": "interaction_store_mirror",
+        "importance": Importance.IMPORTANT.value,
+    }
+    common_metadata.update({k: v for k, v in metadata.items() if v is not None})
+
+    mg.add_node(GraphNode(
+        node_id=node_id,
+        node_type=node_type,
+        label=str(title)[:120],
+        backend_ref=f"interaction:{conversation_id}/{turn_id}/{event_type}/{source_event_id or pair_id}",
+        metadata=common_metadata,
+    ))
+    if not _edge_exists(mg, round_id, node_id):
+        mg.add_edge(
+            round_id,
+            node_id,
+            EdgeType.HIERARCHY,
+            weight=1.0,
+            protected=True,
+            metadata={"link_type": "round_execution_event"},
+        )
+
+    _attach_execution_task_edges(mg, session_id, round_id, node_id, node_type_value, payload)
+    if node_type_value == "tool_call":
+        previous_tool_call = _LAST_TOOL_CALL_BY_ROUND.get(round_id)
+        if previous_tool_call and previous_tool_call != node_id and mg.has_node(previous_tool_call):
+            if not _edge_exists(mg, previous_tool_call, node_id):
+                mg.add_edge(
+                    previous_tool_call,
+                    node_id,
+                    EdgeType.TEMPORAL,
+                    weight=0.8,
+                    protected=True,
+                    metadata={"link_type": "tool_chain_order"},
+                )
+        _LAST_TOOL_CALL_BY_ROUND[round_id] = node_id
+    elif node_type_value == "tool_result":
+        call_node_id = _find_execution_node_by_pair(mg, node_type.__class__.TOOL_CALL, round_id, pair_id)
+        if call_node_id and not _edge_exists(mg, call_node_id, node_id):
+            mg.add_edge(
+                call_node_id,
+                node_id,
+                EdgeType.CAUSAL,
+                weight=1.0,
+                protected=True,
+                metadata={"link_type": "tool_call_result", "pair_id": pair_id},
+            )
+        _add_file_references(mg, node_id, _payload_files(payload, interaction), {"pair_id": pair_id})
+    elif node_type_value == "approval":
+        if status in {"approved", "rejected", "denied"} or common_metadata.get("decision"):
+            request_node_id = _find_matching_approval_request(mg, round_id, pair_id, node_id)
+            if request_node_id and not _edge_exists(mg, request_node_id, node_id):
+                mg.add_edge(
+                    request_node_id,
+                    node_id,
+                    EdgeType.CAUSAL,
+                    weight=1.0,
+                    protected=True,
+                    metadata={"link_type": "approval_request_decision", "pair_id": pair_id},
+                )
+            call_node_id = _find_execution_node_by_pair(mg, node_type.__class__.TOOL_CALL, round_id, pair_id)
+            if call_node_id and not _edge_exists(mg, node_id, call_node_id):
+                mg.add_edge(
+                    node_id,
+                    call_node_id,
+                    EdgeType.CAUSAL,
+                    weight=0.9,
+                    protected=True,
+                    metadata={"link_type": "approval_decision_tool_call", "pair_id": pair_id},
+                )
+    return node_id
+
+
+def _find_task_node_id(mg: Any, session_id: str, task_graph_id: str) -> str:
+    if not task_graph_id:
+        return ""
+    task_candidates = [
+        f"task:{task_graph_id}",
+        f"{session_id}/task:{task_graph_id}",
+    ]
+    for candidate in task_candidates:
+        try:
+            if mg.has_node(candidate):
+                return candidate
+        except Exception:
+            pass
+    try:
+        from zulong.memory.memory_graph import NodeType
+        for node in mg.get_nodes_by_type(NodeType.TASK):
+            if _metadata_of(node).get("graph_id") == task_graph_id:
+                return _node_id_of(node)
+    except Exception:
+        pass
+    try:
+        for nid, node in getattr(mg, "_nodes", {}).items():
+            if _node_type_value(node) == "task" and _metadata_of(node).get("graph_id") == task_graph_id:
+                return nid
+    except Exception:
+        pass
+    return ""
+
+
+def _attach_execution_task_edges(
+    mg: Any,
+    session_id: str,
+    round_id: str,
+    execution_node_id: str,
+    execution_type: str,
+    payload: Dict[str, Any],
+) -> None:
+    task_graph_id = _payload_task_graph_id(payload)
+    task_node_id = _find_task_node_id(mg, session_id, task_graph_id)
+    if not task_node_id:
+        return
+    try:
+        from zulong.memory.memory_graph import EdgeType
+        if not _edge_exists(mg, round_id, task_node_id):
+            mg.add_edge(
+                round_id,
+                task_node_id,
+                EdgeType.REFERENCE,
+                weight=0.9,
+                protected=True,
+                metadata={"link_type": "dialogue_round_task"},
+            )
+        edge_type = EdgeType.DEPENDENCY if execution_type == "tool_call" else EdgeType.REFERENCE
+        source_id = task_node_id if execution_type == "tool_call" else execution_node_id
+        target_id = execution_node_id if execution_type == "tool_call" else task_node_id
+        if not _edge_exists(mg, source_id, target_id):
+            mg.add_edge(
+                source_id,
+                target_id,
+                edge_type,
+                weight=0.9,
+                protected=True,
+                metadata={
+                    "link_type": "task_execution_event",
+                    "task_graph_id": task_graph_id,
+                    "execution_type": execution_type,
+                },
+            )
+    except Exception:
+        pass
+
+
+def _find_matching_approval_request(mg: Any, round_id: str, pair_id: str, exclude_node_id: str) -> str:
+    try:
+        from zulong.memory.memory_graph import NodeType
+        for node in mg.get_nodes_by_type(NodeType.APPROVAL):
+            node_id = _node_id_of(node)
+            if node_id == exclude_node_id:
+                continue
+            meta = _metadata_of(node)
+            if meta.get("parent_round") != round_id:
+                continue
+            if str(meta.get("pair_id") or "") != str(pair_id):
+                continue
+            if not meta.get("decision"):
+                return node_id
+    except Exception:
+        pass
+    return ""
+
+
+def _event_has_execution_signal(event: Dict[str, Any]) -> bool:
+    event_type = str(event.get("event_type") or "").lower()
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    interaction = _get_payload_interaction(payload)
+    return bool(
+        interaction
+        or "tool" in event_type
+        or "approval" in event_type
+        or event_type.startswith("pipeline.")
+        or event_type.startswith("ide:")
+    )
+
+
+def backfill_recent_interactions_to_memory_graph(limit: int = 50, events_per_conversation: int = 500) -> int:
+    """Rebuild recent interaction events into MemoryGraph from InteractionStore.
+
+    This uses raw events instead of display messages so tool calls, tool
+    observations, approvals, and IDE bridge events can be projected into the
+    dedicated TOOL_CALL / TOOL_RESULT / APPROVAL node types after a restart.
+    """
     try:
         from zulong.launcher.interaction_store import get_interaction_store
 
@@ -325,7 +821,20 @@ def backfill_recent_interactions_to_memory_graph(limit: int = 50) -> int:
             conversation_id = conv.get("conversation_id")
             if not conversation_id:
                 continue
-            for msg in store.get_messages(conversation_id, limit=200):
+            try:
+                events = store.get_events(conversation_id, limit=events_per_conversation, include_system=True)
+            except Exception:
+                events = store.get_messages(conversation_id, limit=events_per_conversation)
+            for msg in events:
+                payload = dict(msg.get("payload") or {})
+                if msg.get("event_id"):
+                    payload.setdefault("source_event_id", msg.get("event_id"))
+                if msg.get("task_graph_id") and not payload.get("task_graph_id"):
+                    payload["task_graph_id"] = msg.get("task_graph_id")
+                if not _event_has_execution_signal(msg):
+                    # Keep ordinary dialogue backfill small; execution nodes are
+                    # the reason this compensation path exists.
+                    continue
                 mirror_interaction_to_memory_graph(
                     conversation_id=conversation_id,
                     turn_id=msg.get("turn_id") or msg.get("event_id"),
@@ -333,6 +842,7 @@ def backfill_recent_interactions_to_memory_graph(limit: int = 50) -> int:
                     text=msg.get("text") or msg.get("content") or "",
                     event_type=msg.get("event_type") or "message",
                     source=msg.get("source") or "interaction_store",
+                    payload=payload,
                 )
                 count += 1
         return count

@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.routing import APIRouter
@@ -87,10 +87,10 @@ def _extract_text_from_message(message: dict) -> str:
 def _resolve_conversation_binding(message: dict) -> Dict[str, Optional[str]]:
     payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
     turn_id = (
-        message.get("request_id")
-        or message.get("turn_id")
-        or payload.get("request_id")
+        message.get("turn_id")
         or payload.get("turn_id")
+        or message.get("request_id")
+        or payload.get("request_id")
     )
     explicit_conversation_id = (
         message.get("conversation_id")
@@ -200,7 +200,7 @@ def _persist_web_visible_message(message: dict) -> None:
     if not text:
         return
     try:
-        get_interaction_store().append_event(
+        event_id = get_interaction_store().append_event(
             conversation_id=conversation_id,
             turn_id=binding.get("turn_id"),
             event_type=event_type or "web_event",
@@ -212,6 +212,35 @@ def _persist_web_visible_message(message: dict) -> None:
             project_id=binding.get("project_id"),
             task_graph_id=binding.get("task_graph_id"),
         )
+        try:
+            from zulong.launcher.memory_mirror import mirror_interaction_to_memory_graph
+
+            mirror_payload = dict(payload)
+            mirror_payload.setdefault("source_event_id", event_id)
+            if binding.get("task_graph_id") and not mirror_payload.get("task_graph_id"):
+                mirror_payload["task_graph_id"] = binding["task_graph_id"]
+            mirror_interaction_to_memory_graph(
+                conversation_id=conversation_id,
+                turn_id=binding.get("turn_id") or event_id,
+                role=role,
+                text=text,
+                event_type=event_type or "web_event",
+                source="web_runtime" if role == "assistant" else "ide_bridge",
+                payload=mirror_payload,
+            )
+        except Exception as mirror_exc:
+            logger.debug(f"[WebChatRouter] MemoryGraph 镜像跳过: {event_type}: {mirror_exc}")
+        try:
+            from zulong.review.task_execution_extractor import maybe_finalize_task_execution_trace
+
+            maybe_finalize_task_execution_trace(
+                conversation_id=conversation_id,
+                turn_id=binding.get("turn_id"),
+                task_graph_id=binding.get("task_graph_id") or payload.get("task_graph_id"),
+                event_type=event_type or "web_event",
+            )
+        except Exception as trace_exc:
+            logger.debug(f"[WebChatRouter] TaskExecutionTrace 跳过: {event_type}: {trace_exc}")
     except Exception as exc:
         logger.debug(f"[WebChatRouter] 消息持久化跳过: {event_type}: {exc}")
 
@@ -938,6 +967,262 @@ async def _handle_ide_action(ws: WebSocket, action: str, data: dict) -> None:
         })
 
 
+_EXECUTION_NODE_TYPES = {"tool_call", "tool_result", "approval"}
+_MEMORY_GRAPH_EXECUTION_BACKFILL_DONE = False
+
+
+def _enum_value(value: Any) -> str:
+    return str(getattr(value, "value", value) or "")
+
+
+def _memory_node_id(node: Any) -> str:
+    if isinstance(node, dict):
+        return str(node.get("id") or node.get("node_id") or "")
+    return str(getattr(node, "node_id", "") or getattr(node, "id", "") or "")
+
+
+def _memory_node_type(node: Any) -> str:
+    if isinstance(node, dict):
+        return _enum_value(node.get("type") or node.get("node_type"))
+    return _enum_value(getattr(node, "node_type", "") or getattr(node, "type", ""))
+
+
+def _memory_node_metadata(node: Any) -> Dict[str, Any]:
+    if isinstance(node, dict):
+        meta = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+        return dict(meta)
+    meta = getattr(node, "metadata", None)
+    return dict(meta or {}) if isinstance(meta, dict) else {}
+
+
+def _get_memory_node(mg: Any, node_id: str) -> Optional[Any]:
+    try:
+        if hasattr(mg, "get_node"):
+            return mg.get_node(node_id)
+    except Exception:
+        return None
+    return None
+
+
+def _serialize_memory_node_for_snapshot(mg: Any, node: Any) -> Dict[str, Any]:
+    node_id = _memory_node_id(node)
+    node_type = _memory_node_type(node)
+    metadata = _memory_node_metadata(node)
+    content = getattr(node, "content", None)
+    if content and "content" not in metadata:
+        metadata["content"] = content
+    content_summary = getattr(node, "content_summary", None)
+    if content_summary and "content_summary" not in metadata:
+        metadata["content_summary"] = content_summary
+    if node_type in _EXECUTION_NODE_TYPES:
+        metadata["is_execution_event"] = True
+
+    label = ""
+    activation = 0.0
+    if isinstance(node, dict):
+        label = str(node.get("label") or node_id)
+        try:
+            activation = float(node.get("activation") or 0.0)
+        except (TypeError, ValueError):
+            activation = 0.0
+    else:
+        label = str(getattr(node, "label", "") or node_id)
+        try:
+            activation = float(getattr(node, "activation", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            activation = 0.0
+
+    data = {
+        "id": node_id,
+        "type": node_type,
+        "label": label,
+        "activation": round(activation, 3),
+        "metadata": metadata,
+    }
+    for attr in ("backend_ref", "created_at", "last_accessed", "access_count"):
+        value = node.get(attr) if isinstance(node, dict) else getattr(node, attr, None)
+        if value not in (None, ""):
+            data[attr] = value
+    try:
+        if hasattr(mg, "get_children"):
+            data["children_count"] = len(mg.get_children(node_id))
+    except Exception:
+        pass
+    return data
+
+
+def _serialize_memory_edge_for_snapshot(src: str, dst: str, edge_type: Any, edge_data: Any = None) -> Dict[str, Any]:
+    if isinstance(edge_data, dict):
+        edge_type = edge_data.get("edge_type") or edge_data.get("type") or edge_type
+        weight = edge_data.get("weight", 1.0)
+        protected = edge_data.get("protected", False)
+        metadata = edge_data.get("metadata", {})
+    else:
+        edge_type = getattr(edge_data, "edge_type", edge_type)
+        weight = getattr(edge_data, "weight", 1.0)
+        protected = getattr(edge_data, "protected", False)
+        metadata = getattr(edge_data, "metadata", {})
+    try:
+        weight = round(float(weight), 3)
+    except (TypeError, ValueError):
+        weight = 1.0
+    return {
+        "source": src,
+        "target": dst,
+        "type": _enum_value(edge_type) or "reference",
+        "weight": weight,
+        "protected": bool(protected),
+        "metadata": metadata if isinstance(metadata, dict) else {},
+    }
+
+
+def _collect_execution_edges_networkx(mg: Any, execution_ids: Set[str]) -> List[Dict[str, Any]]:
+    graph = getattr(mg, "_graph", None)
+    if graph is None or not hasattr(graph, "edges"):
+        return []
+    edges: List[Dict[str, Any]] = []
+    for src, dst, data in graph.edges(data=True):
+        if src in execution_ids or dst in execution_ids:
+            edges.append(_serialize_memory_edge_for_snapshot(str(src), str(dst), data.get("edge_type"), data))
+    return edges
+
+
+def _collect_execution_edges_sharded(mg: Any, execution_ids: Set[str]) -> List[Dict[str, Any]]:
+    if not hasattr(mg, "list_all_shards") or not hasattr(mg, "get_shard"):
+        return []
+    edges: List[Dict[str, Any]] = []
+    for shard_id in mg.list_all_shards():
+        try:
+            shard = mg.get_shard(shard_id, load_if_missing=True)
+        except TypeError:
+            shard = mg.get_shard(shard_id)
+        except Exception:
+            shard = None
+        if not shard or not getattr(shard, "topology", None):
+            continue
+        graph = getattr(shard.topology, "graph", None)
+        if graph is None:
+            continue
+        for edge in graph.es:
+            try:
+                src = mg._vertex_node_id(graph.vs[edge.source]) if hasattr(mg, "_vertex_node_id") else graph.vs[edge.source]["name"]
+                dst = mg._vertex_node_id(graph.vs[edge.target]) if hasattr(mg, "_vertex_node_id") else graph.vs[edge.target]["name"]
+                if src not in execution_ids and dst not in execution_ids:
+                    continue
+                edge_type = edge["type"] if "type" in edge.attributes() else "association"
+                edge_props = shard.get_edge(src, dst) if hasattr(shard, "get_edge") else None
+                edges.append(_serialize_memory_edge_for_snapshot(str(src), str(dst), edge_type, edge_props))
+            except Exception:
+                continue
+    return edges
+
+
+def _get_memory_graph_execution_view(mg: Any) -> Dict[str, Any]:
+    nodes_by_id: Dict[str, Dict[str, Any]] = {}
+    execution_ids: Set[str] = set()
+
+    if hasattr(mg, "get_nodes_by_type"):
+        for node_type in sorted(_EXECUTION_NODE_TYPES):
+            try:
+                nodes = mg.get_nodes_by_type(node_type)
+            except Exception:
+                nodes = []
+            for node in nodes or []:
+                node_id = _memory_node_id(node)
+                if not node_id:
+                    continue
+                execution_ids.add(node_id)
+                nodes_by_id[node_id] = _serialize_memory_node_for_snapshot(mg, node)
+
+    edges = _collect_execution_edges_networkx(mg, execution_ids)
+    if not edges:
+        edges = _collect_execution_edges_sharded(mg, execution_ids)
+
+    for edge in edges:
+        for endpoint in (edge.get("source"), edge.get("target")):
+            if endpoint and endpoint not in nodes_by_id:
+                node = _get_memory_node(mg, str(endpoint))
+                if node:
+                    nodes_by_id[str(endpoint)] = _serialize_memory_node_for_snapshot(mg, node)
+
+    nodes = list(nodes_by_id.values())
+    nodes.sort(key=lambda item: (item.get("created_at") or 0, item.get("id") or ""))
+
+    type_counts: Dict[str, int] = {node_type: 0 for node_type in sorted(_EXECUTION_NODE_TYPES)}
+    for node_id in execution_ids:
+        node_type = nodes_by_id.get(node_id, {}).get("type")
+        if node_type in type_counts:
+            type_counts[node_type] += 1
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "execution_node_ids": sorted(execution_ids),
+        "stats": {
+            "total_execution_nodes": len(execution_ids),
+            "total_execution_edges": len(edges),
+            **type_counts,
+        },
+    }
+
+
+def _ensure_execution_events_backfilled(mg: Any) -> None:
+    global _MEMORY_GRAPH_EXECUTION_BACKFILL_DONE
+    if _MEMORY_GRAPH_EXECUTION_BACKFILL_DONE:
+        return
+    _MEMORY_GRAPH_EXECUTION_BACKFILL_DONE = True
+    try:
+        from zulong.launcher.memory_mirror import backfill_recent_interactions_to_memory_graph
+
+        count = backfill_recent_interactions_to_memory_graph(limit=20, events_per_conversation=800)
+        if count:
+            logger.info("[WebChatRouter] MemoryGraph 执行事件回填完成: %s events", count)
+    except Exception as exc:
+        logger.debug("[WebChatRouter] MemoryGraph 执行事件回填跳过: %s", exc)
+
+
+def _merge_execution_view_into_payload(payload: Dict[str, Any], execution_view: Dict[str, Any]) -> Dict[str, Any]:
+    if not execution_view:
+        return payload
+    payload = dict(payload or {})
+    nodes = list(payload.get("nodes") or [])
+    edges = list(payload.get("edges") or [])
+
+    node_ids = {str(node.get("id")) for node in nodes if isinstance(node, dict) and node.get("id")}
+    for node in execution_view.get("nodes") or []:
+        node_id = str(node.get("id") or "")
+        if node_id and node_id not in node_ids:
+            nodes.append(node)
+            node_ids.add(node_id)
+
+    edge_keys = {
+        (
+            str(edge.get("source") if not isinstance(edge.get("source"), dict) else edge.get("source", {}).get("id")),
+            str(edge.get("target") if not isinstance(edge.get("target"), dict) else edge.get("target", {}).get("id")),
+            str(edge.get("type") or ""),
+        )
+        for edge in edges
+        if isinstance(edge, dict)
+    }
+    for edge in execution_view.get("edges") or []:
+        key = (str(edge.get("source") or ""), str(edge.get("target") or ""), str(edge.get("type") or ""))
+        if key[0] and key[1] and key not in edge_keys:
+            edges.append(edge)
+            edge_keys.add(key)
+
+    stats = dict(payload.get("stats") or {})
+    execution_stats = dict(execution_view.get("stats") or {})
+    stats["execution"] = execution_stats
+    stats["execution_nodes"] = execution_stats.get("total_execution_nodes", 0)
+
+    payload["nodes"] = nodes
+    payload["edges"] = edges
+    payload["stats"] = stats
+    payload["execution_view"] = execution_view
+    payload["execution_node_ids"] = execution_view.get("execution_node_ids") or []
+    return payload
+
+
 async def _push_memory_graph_snapshot(ws: WebSocket) -> None:
     """推送记忆图谱快照到指定 WebSocket"""
     try:
@@ -980,6 +1265,9 @@ def _get_memory_graph_snapshot_payload() -> dict:
             payload = mg.get_snapshot_for_frontend()
         else:
             payload = {}
+        _ensure_execution_events_backfilled(mg)
+        execution_view = _get_memory_graph_execution_view(mg)
+        payload = _merge_execution_view_into_payload(payload or {}, execution_view)
         return {
             "update_type": "full",
             "ts": time.time(),

@@ -1224,11 +1224,7 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                         if req_node and req_node.status not in ("completed", "skipped"):
                             uncompleted_uc = [req_node]
                             total_uc = 1
-                    if (
-                        total_uc > 0
-                        and len(uncompleted_uc) > 0
-                        and len(uncompleted_uc) >= total_uc * 0.3
-                    ):
+                    if total_uc > 0 and len(uncompleted_uc) > 0:
                         current_uc = next(
                             (n for n in uncompleted_uc if n.status == "in_progress"),
                             uncompleted_uc[0],

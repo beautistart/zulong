@@ -928,7 +928,7 @@ def _record_runtime_event(
                 conversation_id = active.get("conversation_id") if active else None
             except Exception:
                 conversation_id = None
-        get_interaction_store().append_event(
+        event_id = get_interaction_store().append_event(
             conversation_id=conversation_id,
             turn_id=session.web_turn_id,
             event_type=event_type,
@@ -951,8 +951,18 @@ def _record_runtime_event(
             text=text,
             event_type=event_type,
             source=source,
-            payload={"session_id": session.session_id, **payload},
+            payload={"session_id": session.session_id, "source_event_id": event_id, **payload},
         )
+        try:
+            from zulong.review.task_execution_extractor import maybe_finalize_task_execution_trace
+            maybe_finalize_task_execution_trace(
+                conversation_id=conversation_id,
+                turn_id=session.web_turn_id,
+                task_graph_id=session.task_graph_id,
+                event_type=event_type,
+            )
+        except Exception:
+            pass
     except Exception as exc:
         logger.debug(f"[ZulongIDE] runtime event 记录跳过: {exc}")
 

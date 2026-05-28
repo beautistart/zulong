@@ -416,6 +416,50 @@ class InteractionStore:
             result.append(item)
         return result
 
+    def get_events(
+        self,
+        conversation_id: str,
+        *,
+        turn_id: Optional[str] = None,
+        limit: int = 1000,
+        include_system: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Return raw interaction events for trace extraction and audit.
+
+        Unlike get_messages(), this keeps tool/system events and preserves the
+        original event_type so TaskExecutionTrace can reconstruct tool chains,
+        approvals, terminal status, and source event ids.
+        """
+        clauses = ["conversation_id = ?"]
+        params: List[Any] = [conversation_id]
+        if turn_id:
+            clauses.append("turn_id = ?")
+            params.append(turn_id)
+        if not include_system:
+            clauses.append("role IN ('user', 'assistant', 'tool')")
+        params.append(limit)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM interaction_event
+                WHERE {' AND '.join(clauses)}
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["payload"] = json.loads(item.get("payload_json") or "{}")
+            except Exception:
+                item["payload"] = {}
+            item["content"] = item.get("text") or ""
+            item["node_id"] = item.get("event_id")
+            result.append(item)
+        return result
+
     def save_voice_record(
         self,
         *,

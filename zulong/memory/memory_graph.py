@@ -60,6 +60,9 @@ class NodeType(Enum):
     DOCUMENT = "document"       # 预留: 未来文档/知识切片摄入
     CODE_SYMBOL = "code_symbol" # 来自 Tree-sitter AST (函数/类/方法)
     MODULE = "module"           # 目录/包/模块 (PROJECT→MODULE→FILE 层次链)
+    TOOL_CALL = "tool_call"     # L2 真实发起的工具调用
+    TOOL_RESULT = "tool_result" # 工具调用产生的结果/错误/影响摘要
+    APPROVAL = "approval"       # 审批请求、审批决策和审批偏好
 
 
 class EdgeType(Enum):
@@ -710,7 +713,8 @@ class MemoryGraph:
 
     def get_nodes_by_type(self, node_type: NodeType) -> List[GraphNode]:
         """按类型查询节点"""
-        return [n for n in self._nodes.values() if n.node_type == node_type]
+        type_value = node_type.value if hasattr(node_type, "value") else str(node_type)
+        return [n for n in self._nodes.values() if n.node_type.value == type_value]
 
     def has_node(self, node_id: str) -> bool:
         """检查节点是否存在"""
@@ -3026,6 +3030,9 @@ class MemoryGraph:
         "concept": "概念",
         "person": "人物",
         "document": "文档",
+        "tool_call": "工具调用",
+        "tool_result": "工具结果",
+        "approval": "审批",
     }
 
     def get_focus_path_summary(self) -> str:
@@ -3247,6 +3254,9 @@ class MemoryGraph:
         "document": "文档",
         "dialogue": "对话",
         "task": "任务",
+        "tool_call": "工具调用",
+        "tool_result": "工具结果",
+        "approval": "审批",
     }
 
     def to_frontend_dict(self, depth: Optional[int] = None) -> Dict[str, Any]:

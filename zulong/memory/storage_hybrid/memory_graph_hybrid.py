@@ -31,6 +31,9 @@ class NodeType(Enum):
     DOCUMENT = "document"
     CODE_SYMBOL = "code_symbol"
     MODULE = "module"
+    TOOL_CALL = "tool_call"
+    TOOL_RESULT = "tool_result"
+    APPROVAL = "approval"
 
 
 class EdgeType(Enum):

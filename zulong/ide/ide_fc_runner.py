@@ -1751,7 +1751,7 @@ class IDEFCRunner(FCRunner):
         """Best-effort event ledger + graph memory sink."""
         try:
             from zulong.launcher.interaction_store import get_interaction_store
-            get_interaction_store().append_event(
+            event_id = get_interaction_store().append_event(
                 conversation_id=getattr(self.ide_session, "conversation_id", None),
                 turn_id=getattr(self.ide_session, "web_turn_id", None),
                 event_type=event.phase,
@@ -1763,6 +1763,7 @@ class IDEFCRunner(FCRunner):
                     "phase": event.phase,
                     "turn": event.turn,
                     "session_id": self.session.session_id,
+                    "source_event_id": "",
                     **event.payload,
                     "interaction": event.interaction,
                 },
@@ -1770,6 +1771,36 @@ class IDEFCRunner(FCRunner):
                 project_id=getattr(self.ide_session, "project_id", None),
                 task_graph_id=getattr(self.ide_session, "task_graph_id", None),
             )
+            try:
+                from zulong.launcher.memory_mirror import mirror_interaction_to_memory_graph
+                from zulong.review.task_execution_extractor import maybe_finalize_task_execution_trace
+
+                payload = {
+                    "event_type": event.event_type,
+                    "phase": event.phase,
+                    "turn": event.turn,
+                    "session_id": self.session.session_id,
+                    "source_event_id": event_id,
+                    **event.payload,
+                    "interaction": event.interaction,
+                }
+                mirror_interaction_to_memory_graph(
+                    conversation_id=getattr(self.ide_session, "conversation_id", None),
+                    turn_id=getattr(self.ide_session, "web_turn_id", None),
+                    role="system",
+                    text=event.message,
+                    event_type=event.phase,
+                    source="ide_fc_runner",
+                    payload=payload,
+                )
+                maybe_finalize_task_execution_trace(
+                    conversation_id=getattr(self.ide_session, "conversation_id", None),
+                    turn_id=getattr(self.ide_session, "web_turn_id", None),
+                    task_graph_id=getattr(self.ide_session, "task_graph_id", None),
+                    event_type=event.phase,
+                )
+            except Exception:
+                pass
         except Exception as exc:
             logger.debug(f"[IDEFCRunner] InteractionStore 事件记录跳过: {exc}")
 

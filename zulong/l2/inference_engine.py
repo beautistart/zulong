@@ -69,6 +69,7 @@ except ImportError:
 # 线程安全的 request_id 追踪（替代 self._current_request_id 避免竞态）
 _current_request_id_var = contextvars.ContextVar('current_request_id', default=None)
 _current_session_id_var = contextvars.ContextVar('current_session_id', default=None)
+_current_user_turn_id_var = contextvars.ContextVar('current_user_turn_id', default=None)
 
 
 class InferenceEngine:
@@ -693,6 +694,7 @@ class InferenceEngine:
                 "turn": fc_turn,
                 "tool": tool_name,
                 "tool_call_id": tool_call_id,
+                "task_graph_id": getattr(tg, "id", ""),
                 "tool_count": len(tg._nodes),
                 "progress": progress,
             }
@@ -849,12 +851,15 @@ class InferenceEngine:
 
             # 获取当前请求 ID
             try:
-                request_id = _current_request_id_var.get() or f"req_{int(time.time() * 1000)}"
+                user_turn_id = _current_user_turn_id_var.get() or getattr(self, "_current_user_turn_id", None)
+                request_id = _current_request_id_var.get() or user_turn_id or f"req_{int(time.time() * 1000)}"
             except Exception:
+                user_turn_id = getattr(self, "_current_user_turn_id", None)
                 request_id = f"req_{int(time.time() * 1000)}"
 
             payload = {
                 "request_id": request_id,
+                "turn_id": user_turn_id or request_id,
                 "step_type": step_type,
                 "data": data,
                 "timestamp": time.time(),
@@ -1233,6 +1238,8 @@ class InferenceEngine:
         request_id = event.payload.get("request_id")
         if request_id:
             _current_request_id_var.set(request_id)
+            _current_user_turn_id_var.set(request_id)
+            self._current_user_turn_id = request_id
         session_id = event.payload.get("session_id") or event.payload.get("conversation_id")
         if session_id:
             _current_session_id_var.set(session_id)
