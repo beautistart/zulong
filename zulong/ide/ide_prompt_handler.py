@@ -413,7 +413,12 @@ class IDEPromptHandler:
                         node_type = r.get("node_type", "")
                         label = r.get("label", "")
                         content = (r.get("content", "") or "")[:200]
-                        sections.append(f"- [{node_type}] {label}: {content}")
+                        graph_memory_id = r.get("graph_memory_id") or r.get("node_id", "")
+                        shard_id = r.get("shard_id", "")
+                        address_hint = ""
+                        if graph_memory_id:
+                            address_hint = f" [graph_memory_id={graph_memory_id}" + (f", shard={shard_id}" if shard_id else "") + "]"
+                        sections.append(f"- [{node_type}] {label}: {content}{address_hint}")
                     memory_context = "\n".join(sections)
         except Exception as e:
             logger.info(f"[IDEPromptHandler] 记忆检索跳过: {e}")

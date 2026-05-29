@@ -144,25 +144,31 @@ def _inject_memory_context(
                         node_type = result.get("node_type", "")
                         content = result.get("content", "")
                         label = result.get("label", "")
+                        graph_memory_id = result.get("graph_memory_id") or result.get("node_id", "")
+                        shard_id = result.get("shard_id", "")
+                        address_hint = ""
+                        if graph_memory_id:
+                            address_hint = f"（图记忆ID：{graph_memory_id}" + (f"，分片：{shard_id}" if shard_id else "") + "）"
                         if not content:
                             continue
                         if node_type == "experience":
                             continue
                         if node_type == "dialogue":
-                            memory_sections.append(f"【历史对话】{content[:content_limit]}")
+                            memory_sections.append(f"【历史对话】{content[:content_limit]}{address_hint}")
                         elif node_type == "task":
                             status = result.get("metadata", {}).get("status", "")
                             memory_sections.append(
                                 f"【相关任务】{label}" + (f"（状态：{status}）" if status else "")
+                                + address_hint
                             )
                         elif node_type == "knowledge":
-                            memory_sections.append(f"【知识参考】{content[:content_limit]}")
+                            memory_sections.append(f"【知识参考】{content[:content_limit]}{address_hint}")
                         elif node_type == "episode":
-                            memory_sections.append(f"【历史摘要】{content[:content_limit]}")
+                            memory_sections.append(f"【历史摘要】{content[:content_limit]}{address_hint}")
                         elif node_type in ("person", "concept"):
-                            memory_sections.append(f"【知识参考】{label}: {content[:content_limit]}")
+                            memory_sections.append(f"【知识参考】{label}: {content[:content_limit]}{address_hint}")
                         else:
-                            memory_sections.append(f"【参考】{content[:content_limit]}")
+                            memory_sections.append(f"【参考】{content[:content_limit]}{address_hint}")
 
                     if memory_sections:
                         system_parts.append("\n【记忆上下文】\n" + "\n".join(memory_sections) + "\n")

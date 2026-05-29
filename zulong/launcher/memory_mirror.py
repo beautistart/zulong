@@ -484,6 +484,28 @@ def _attach_task_if_present(mg: Any, session_id: str, round_id: str, payload: Di
     )
     if not task_graph_id:
         return
+    if hasattr(mg, "get_task_node_id_for_graph"):
+        try:
+            task_node_id = mg.get_task_node_id_for_graph(task_graph_id) or ""
+        except Exception:
+            task_node_id = ""
+        if task_node_id:
+            if not _edge_exists(mg, round_id, task_node_id):
+                mg.add_edge(
+                    round_id,
+                    task_node_id,
+                    EdgeType.REFERENCE,
+                    weight=0.9,
+                    protected=True,
+                    metadata={"link_type": "dialogue_round_task"},
+                )
+            task_node = mg.get_node(task_node_id)
+            if task_node:
+                task_node.metadata.setdefault("parent_session", session_id)
+                task_node.metadata.setdefault("parent_round", round_id)
+                task_node.metadata.setdefault("full_path", f"{session_id}/{task_node.node_id}")
+                _persist_node_update(mg, task_node)
+            return
     task_candidates = [
         f"task:{task_graph_id}",
         f"{session_id}/task:{task_graph_id}",
@@ -704,6 +726,13 @@ def _mirror_execution_event(
 def _find_task_node_id(mg: Any, session_id: str, task_graph_id: str) -> str:
     if not task_graph_id:
         return ""
+    if hasattr(mg, "get_task_node_id_for_graph"):
+        try:
+            node_id = mg.get_task_node_id_for_graph(task_graph_id)
+            if node_id:
+                return node_id
+        except Exception:
+            pass
     task_candidates = [
         f"task:{task_graph_id}",
         f"{session_id}/task:{task_graph_id}",

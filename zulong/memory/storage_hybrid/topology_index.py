@@ -7,11 +7,17 @@
 # - 支持未加载属性即可发现关联节点
 
 import logging
+import os
+import pickle
+import struct
 from typing import Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 import time
 
 logger = logging.getLogger(__name__)
+
+TOPOLOGY_BIN_MAGIC = b"ZLTG"
+TOPOLOGY_BIN_VERSION = 1
 
 try:
     import igraph as ig
@@ -357,6 +363,47 @@ class TopologyIndex:
         """保存为GraphML格式"""
         self.graph.write_graphml(filepath)
         logger.info(f"拓扑索引已保存: {filepath} (节点={self._node_count}, 边={self._edge_count})")
+
+    def save_to_binary(self, filepath: str):
+        """保存为紧凑二进制拓扑侧车。
+
+        P3 兼容第一步：当前仍以 igraph 作为运行态拓扑对象，二进制文件
+        作为比 GraphML 更快加载的侧车缓存。后续可在该文件格式基础上
+        演进为 mmap/CSR 运行态。
+        """
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        nodes = [
+            (
+                vertex["name"],
+                vertex["type"] if "type" in vertex.attributes() else "unknown",
+            )
+            for vertex in self.graph.vs
+        ]
+        edges = [
+            (
+                self.idx_to_node_id[edge.source],
+                self.idx_to_node_id[edge.target],
+                edge["type"] if "type" in edge.attributes() else "association",
+                float(edge["weight"]) if "weight" in edge.attributes() else 1.0,
+            )
+            for edge in self.graph.es
+        ]
+        payload = pickle.dumps(
+            {
+                "version": TOPOLOGY_BIN_VERSION,
+                "created_at": time.time(),
+                "nodes": nodes,
+                "edges": edges,
+            },
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+        tmp_path = f"{filepath}.tmp"
+        with open(tmp_path, "wb") as f:
+            f.write(TOPOLOGY_BIN_MAGIC)
+            f.write(struct.pack("<IIQ", TOPOLOGY_BIN_VERSION, len(nodes), len(edges)))
+            f.write(payload)
+        os.replace(tmp_path, filepath)
+        logger.info(f"二进制拓扑已保存: {filepath} (节点={len(nodes)}, 边={len(edges)})")
         
     def load_from_graphml(self, filepath: str):
         """从GraphML格式加载"""
@@ -384,6 +431,33 @@ class TopologyIndex:
             self._edge_type_counts[edge_type] += 1
             
         logger.info(f"拓扑索引已加载: {filepath} (节点={self._node_count}, 边={self._edge_count})")
+
+    def load_from_binary(self, filepath: str):
+        """从二进制拓扑侧车加载。"""
+        with open(filepath, "rb") as f:
+            magic = f.read(4)
+            if magic != TOPOLOGY_BIN_MAGIC:
+                raise ValueError(f"无效 topology.bin magic: {magic!r}")
+            version, node_count, edge_count = struct.unpack("<IIQ", f.read(16))
+            if version != TOPOLOGY_BIN_VERSION:
+                raise ValueError(f"不支持 topology.bin version={version}")
+            payload = pickle.loads(f.read())
+
+        nodes = payload.get("nodes") or []
+        edges = payload.get("edges") or []
+        if len(nodes) != node_count or len(edges) != edge_count:
+            raise ValueError(
+                f"topology.bin 计数不一致: header={node_count}/{edge_count}, "
+                f"payload={len(nodes)}/{len(edges)}"
+            )
+
+        self.clear()
+        for node_id, node_type in nodes:
+            self.add_node(str(node_id), str(node_type or "unknown"))
+        for src_id, dst_id, edge_type, weight in edges:
+            self.add_edge(str(src_id), str(dst_id), str(edge_type or "association"), float(weight))
+
+        logger.info(f"二进制拓扑已加载: {filepath} (节点={self._node_count}, 边={self._edge_count})")
         
     def get_stats(self) -> Dict:
         """获取统计信息"""

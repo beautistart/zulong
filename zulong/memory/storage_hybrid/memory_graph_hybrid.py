@@ -9,6 +9,7 @@
 import logging
 import os
 import time
+import json
 from typing import Dict, List, Optional, Set, Tuple, Any
 from dataclasses import dataclass
 from enum import Enum
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 from .topology_index import TopologyIndex
 from .property_store import PropertyStore, NodeProperties, EdgeProperties
+from .csr_topology import CSRTopologyReader, save_topology_to_csr
 
 
 class NodeType(Enum):
@@ -92,6 +94,7 @@ class MemoryGraphHybrid:
         self.data_dir = data_dir
         
         self.topology = TopologyIndex()
+        self.csr_topology: Optional[CSRTopologyReader] = None
         
         lmdb_path = os.path.join(data_dir, "properties")
         self.properties = PropertyStore(
@@ -129,6 +132,134 @@ class MemoryGraphHybrid:
         except Exception as e:
             logger.warning(f"FAISS向量索引初始化失败: {e}")
             self.vector_index = None
+
+    def _topology_delta_path(self) -> str:
+        return os.path.join(self.data_dir, "topology_delta.log")
+
+    def _csr_topology_path(self) -> str:
+        return os.path.join(self.data_dir, "topology.csr")
+
+    def _close_csr_topology(self) -> None:
+        if self.csr_topology is not None:
+            try:
+                self.csr_topology.close()
+            except Exception:
+                pass
+            self.csr_topology = None
+
+    def _delta_has_content(self) -> bool:
+        path = self._topology_delta_path()
+        try:
+            return os.path.exists(path) and os.path.getsize(path) > 0
+        except OSError:
+            return False
+
+    def _load_csr_topology_if_fresh(self) -> bool:
+        csr_path = self._csr_topology_path()
+        if not os.path.exists(csr_path) or self._delta_has_content():
+            return False
+        try:
+            self._close_csr_topology()
+            reader = CSRTopologyReader(csr_path)
+            if reader.node_count != len(self.topology) or reader.edge_count != getattr(self.topology, "_edge_count", 0):
+                reader.close()
+                return False
+            self.csr_topology = reader
+            return True
+        except Exception as exc:
+            logger.debug(f"CSR 拓扑加载跳过 shard={self.shard_id}: {exc}")
+            self._close_csr_topology()
+            return False
+
+    def _append_topology_delta(self, op: str, **payload) -> None:
+        """追加拓扑增量日志，供 topology.bin 快照之后增量回放。"""
+        try:
+            record = {"op": op, "ts": time.time(), **payload}
+            with open(self._topology_delta_path(), "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+                f.write("\n")
+        except Exception as exc:
+            logger.debug(f"拓扑 delta 写入失败 shard={self.shard_id}: {exc}")
+
+    def _apply_topology_delta_record(self, record: Dict[str, Any]) -> bool:
+        op = record.get("op")
+        try:
+            if op == "add_node":
+                node_id = str(record.get("node_id", ""))
+                if node_id and node_id not in self.topology:
+                    self.topology.add_node(node_id, str(record.get("node_type") or "unknown"))
+                return True
+            if op == "add_edge":
+                src_id = str(record.get("src_id", ""))
+                dst_id = str(record.get("dst_id", ""))
+                if src_id and dst_id and src_id in self.topology and dst_id in self.topology:
+                    if self.topology.get_edge_info(src_id, dst_id) is None:
+                        self.topology.add_edge(
+                            src_id,
+                            dst_id,
+                            str(record.get("edge_type") or "association"),
+                            float(record.get("weight", 1.0) or 1.0),
+                        )
+                return True
+            if op == "remove_node":
+                node_id = str(record.get("node_id", ""))
+                if node_id in self.topology:
+                    self.topology.remove_node(node_id)
+                return True
+            if op == "remove_edge":
+                src_id = str(record.get("src_id", ""))
+                dst_id = str(record.get("dst_id", ""))
+                if self.topology.get_edge_info(src_id, dst_id) is not None:
+                    self.topology.graph.delete_edges(
+                        self.topology.graph.es.select(
+                            _source=self.topology.node_id_to_idx[src_id],
+                            _target=self.topology.node_id_to_idx[dst_id],
+                        )
+                    )
+                    self.topology._edge_count = len(self.topology.graph.es)
+                return True
+        except Exception as exc:
+            logger.debug(f"拓扑 delta 回放失败 shard={self.shard_id}, record={record}: {exc}")
+        return False
+
+    def replay_topology_delta(self) -> int:
+        """回放 topology_delta.log，返回成功应用的记录数。"""
+        delta_path = self._topology_delta_path()
+        if not os.path.exists(delta_path):
+            return 0
+
+        applied = 0
+        try:
+            with open(delta_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        logger.debug(f"跳过损坏拓扑 delta 行 shard={self.shard_id}: {line[:120]}")
+                        continue
+                    if self._apply_topology_delta_record(record):
+                        applied += 1
+        except Exception as exc:
+            logger.warning(f"拓扑 delta 回放失败 shard={self.shard_id}: {exc}")
+            return applied
+
+        if applied:
+            logger.info(f"拓扑 delta 已回放: shard={self.shard_id}, records={applied}")
+            self._close_csr_topology()
+        return applied
+
+    def compact_topology_delta(self) -> None:
+        """清空已压实进 topology.bin/GraphML 的增量日志。"""
+        delta_path = self._topology_delta_path()
+        if not os.path.exists(delta_path):
+            return
+        try:
+            open(delta_path, "w", encoding="utf-8").close()
+        except Exception as exc:
+            logger.debug(f"拓扑 delta 清空失败 shard={self.shard_id}: {exc}")
             
     def add_node(
         self,
@@ -179,6 +310,8 @@ class MemoryGraphHybrid:
         )
         
         self.properties.set_node(node_props)
+        self._append_topology_delta("add_node", node_id=node_id, node_type=node_type)
+        self._close_csr_topology()
         
         self._stats["node_add_count"] += 1
         return True
@@ -231,6 +364,14 @@ class MemoryGraphHybrid:
         )
         
         self.properties.set_edge(edge_props)
+        self._append_topology_delta(
+            "add_edge",
+            src_id=src_id,
+            dst_id=dst_id,
+            edge_type=edge_type,
+            weight=weight,
+        )
+        self._close_csr_topology()
         
         self._stats["edge_add_count"] += 1
         return True
@@ -256,6 +397,21 @@ class MemoryGraphHybrid:
     def get_edge(self, src_id: str, dst_id: str) -> Optional[EdgeProperties]:
         """获取边属性"""
         return self.properties.get_edge(src_id, dst_id)
+
+    def get_topology_neighbors(
+        self,
+        node_id: str,
+        edge_type: Optional[str] = None,
+        mode: str = "out",
+    ) -> List[str]:
+        if self.csr_topology is not None:
+            return self.csr_topology.get_neighbors(node_id, edge_type=edge_type, mode=mode)
+        return self.topology.get_neighbors(node_id, edge_type=edge_type, mode=mode)
+
+    def get_topology_edge_info(self, src_id: str, dst_id: str) -> Optional[Tuple[str, float]]:
+        if self.csr_topology is not None:
+            return self.csr_topology.get_edge_info(src_id, dst_id)
+        return self.topology.get_edge_info(src_id, dst_id)
         
     def discover_related_nodes(
         self,
@@ -302,14 +458,34 @@ class MemoryGraphHybrid:
         Returns:
             [(node_id, score), ...] 按分数降序
         """
-        result = self.topology.bfs_spread_weighted(
-            seed_ids,
-            max_depth=max_depth,
-            decay_factor=decay_factor
-        )
+        if self.csr_topology is not None:
+            result = self.csr_topology.bfs_spread_weighted(
+                seed_ids,
+                max_depth=max_depth,
+                decay_factor=decay_factor,
+            )
+        else:
+            result = self.topology.bfs_spread_weighted(
+                seed_ids,
+                max_depth=max_depth,
+                decay_factor=decay_factor
+            )
         
         self._stats["bfs_query_count"] += 1
         return result
+
+    def bfs_spread_weighted(
+        self,
+        seed_ids: List[str],
+        max_depth: int = 3,
+        decay_factor: float = 0.5,
+    ) -> List[Tuple[str, float]]:
+        """兼容 Sharded 层的加权 BFS 入口，优先使用 CSR mmap。"""
+        return self.discover_related_nodes_weighted(
+            seed_ids=seed_ids,
+            max_depth=max_depth,
+            decay_factor=decay_factor,
+        )
         
     def load_nodes_properties(
         self,
@@ -388,7 +564,7 @@ class MemoryGraphHybrid:
         Returns:
             邻居节点ID列表
         """
-        return self.topology.get_neighbors(node_id, edge_type=edge_type, mode=mode)
+        return self.get_topology_neighbors(node_id, edge_type=edge_type, mode=mode)
         
     def update_node_activation(
         self,
@@ -428,8 +604,8 @@ class MemoryGraphHybrid:
         
     def remove_node(self, node_id: str) -> bool:
         """删除节点及其所有边"""
-        neighbors_out = self.topology.get_neighbors(node_id, mode="out")
-        neighbors_in = self.topology.get_neighbors(node_id, mode="in")
+        neighbors_out = self.get_topology_neighbors(node_id, mode="out")
+        neighbors_in = self.get_topology_neighbors(node_id, mode="in")
         
         for neighbor_id in neighbors_out:
             self.properties.delete_edge(node_id, neighbor_id)
@@ -440,12 +616,14 @@ class MemoryGraphHybrid:
             return False
             
         self.properties.delete_node(node_id)
+        self._append_topology_delta("remove_node", node_id=node_id)
+        self._close_csr_topology()
         
         return True
         
     def remove_edge(self, src_id: str, dst_id: str) -> bool:
         """删除边"""
-        edge_info = self.topology.get_edge_info(src_id, dst_id)
+        edge_info = self.get_topology_edge_info(src_id, dst_id)
         if edge_info is None:
             return False
             
@@ -457,6 +635,8 @@ class MemoryGraphHybrid:
         )
         
         self.properties.delete_edge(src_id, dst_id)
+        self._append_topology_delta("remove_edge", src_id=src_id, dst_id=dst_id)
+        self._close_csr_topology()
         
         return True
         
@@ -469,8 +649,21 @@ class MemoryGraphHybrid:
         """
         if filepath is None:
             filepath = os.path.join(self.data_dir, "topology.graphml")
-            
+
+        binary_path = os.path.join(os.path.dirname(filepath), "topology.bin")
+        self._close_csr_topology()
+        try:
+            self.topology.save_to_binary(binary_path)
+        except Exception as exc:
+            logger.warning(f"二进制拓扑保存失败，继续保存 GraphML: {exc}")
+        try:
+            save_topology_to_csr(self.topology, self._csr_topology_path())
+        except Exception as exc:
+            logger.warning(f"CSR 拓扑保存失败，继续保存 GraphML: {exc}")
+
         self.topology.save_to_graphml(filepath)
+        self.compact_topology_delta()
+        self._load_csr_topology_if_fresh()
         
         self.properties.sync()
         
@@ -478,21 +671,40 @@ class MemoryGraphHybrid:
         
         logger.info(f"图谱已保存: {self.shard_id}")
         
-    def load(self, filepath: Optional[str] = None):
+    def load(self, filepath: Optional[str] = None, prefer_binary: bool = True):
         """
         从磁盘加载图谱
         
         Args:
             filepath: 拓扑文件路径（可选）
+            prefer_binary: 优先读取 topology.bin，失败再回退 GraphML
         """
         if filepath is None:
             filepath = os.path.join(self.data_dir, "topology.graphml")
-            
-        if not os.path.exists(filepath):
+
+        binary_path = os.path.join(os.path.dirname(filepath), "topology.bin")
+
+        loaded_from = ""
+        if prefer_binary and os.path.exists(binary_path):
+            try:
+                self.topology.load_from_binary(binary_path)
+                loaded_from = binary_path
+            except Exception as exc:
+                logger.warning(f"二进制拓扑加载失败，回退 GraphML: {exc}")
+
+        if not loaded_from:
+            if not os.path.exists(filepath):
+                logger.warning(f"拓扑文件不存在: {filepath}")
+                return
+            self.topology.load_from_graphml(filepath)
+            loaded_from = filepath
+
+        if not os.path.exists(filepath) and not loaded_from:
             logger.warning(f"拓扑文件不存在: {filepath}")
             return
-            
-        self.topology.load_from_graphml(filepath)
+
+        delta_count = self.replay_topology_delta()
+        csr_ready = self._load_csr_topology_if_fresh()
         
         saved_stats = self.properties.get_metadata("stats")
         if saved_stats:
@@ -500,6 +712,9 @@ class MemoryGraphHybrid:
             
         logger.info(
             f"图谱已加载: {self.shard_id}, "
+            f"source={loaded_from}, "
+            f"delta={delta_count}, "
+            f"csr_ready={csr_ready}, "
             f"节点={len(self.topology)}, "
             f"边={self.topology._edge_count}"
         )
@@ -560,6 +775,7 @@ class MemoryGraphHybrid:
     def close(self):
         """关闭图谱"""
         self.save()
+        self._close_csr_topology()
         self.properties.close()
         logger.info(f"图谱已关闭: {self.shard_id}")
         

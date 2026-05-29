@@ -24,6 +24,10 @@ def create_memory_graph(persist_path: str = "./data/memory_graph", config: Optio
     Returns:
         ShardedMemoryGraph 实例
     """
+    if isinstance(persist_path, dict) and config is None:
+        config = persist_path
+        persist_path = config.get('data_dir', './data/memory_graph_hybrid')
+
     try:
         from zulong.config.config_manager import get_config
     except ImportError:
@@ -37,12 +41,25 @@ def create_memory_graph(persist_path: str = "./data/memory_graph", config: Optio
         logger.error(f"[MemoryGraphFactory] 无法导入 hybrid 存储: {e}")
         raise RuntimeError("MemoryGraph 分片存储不可用，已禁止回退到单 JSON 后端") from e
 
-    data_dir = config.get('data_dir') if config else get_config('memory.hybrid_storage.data_dir', './data/memory_graph_hybrid')
-    map_size_gb = config.get('map_size_gb') if config else get_config('memory.hybrid_storage.map_size_gb', 10)
-    shard_strategy = config.get('shard_strategy') if config else get_config('memory.hybrid_storage.shard_strategy', 'month')
-    max_active_shards = config.get('max_active_shards') if config else get_config('memory.hybrid_storage.max_active_shards', 3)
-    enable_vector_index = config.get('enable_vector_index') if config else get_config('memory.hybrid_storage.enable_vector_index', False)
-    max_nodes_per_shard = config.get('max_nodes_per_shard') if config else get_config('memory.hybrid_storage.max_nodes_per_shard', 150000)
+    def _cfg(name: str, default):
+        if config and config.get(name) is not None:
+            return config.get(name)
+        return get_config(f'memory.hybrid_storage.{name}', default)
+
+    data_dir = _cfg('data_dir', './data/memory_graph_hybrid')
+    map_size_gb = _cfg('map_size_gb', 10)
+    shard_strategy = _cfg('shard_strategy', 'month')
+    max_active_shards = _cfg('max_active_shards', 3)
+    enable_vector_index = _cfg('enable_vector_index', False)
+    max_nodes_per_shard = _cfg('max_nodes_per_shard', 150000)
+    max_shard_property_mb_warning = _cfg('max_shard_property_mb_warning', 150)
+    max_shard_property_mb_split = _cfg('max_shard_property_mb_split', 200)
+    max_shard_topology_mb_warning = _cfg('max_shard_topology_mb_warning', 64)
+    max_shard_topology_delta_mb_compact = _cfg('max_shard_topology_delta_mb_compact', 32)
+    max_active_skeleton_nodes = _cfg('max_active_skeleton_nodes', 50000)
+    local_index_map_size_mb = _cfg('local_index_map_size_mb', 64)
+    shard_size_check_interval_nodes = _cfg('shard_size_check_interval_nodes', 100)
+    global_index_map_size_mb = _cfg('global_index_map_size_mb', 256)
 
     Path(data_dir).mkdir(parents=True, exist_ok=True)
 
@@ -58,7 +75,15 @@ def create_memory_graph(persist_path: str = "./data/memory_graph", config: Optio
         max_active_shards=max_active_shards,
         map_size_gb=map_size_gb,
         enable_vector_index=enable_vector_index,
-        max_nodes_per_shard=max_nodes_per_shard
+        max_nodes_per_shard=max_nodes_per_shard,
+        max_shard_property_mb_warning=max_shard_property_mb_warning,
+        max_shard_property_mb_split=max_shard_property_mb_split,
+        max_shard_topology_mb_warning=max_shard_topology_mb_warning,
+        max_shard_topology_delta_mb_compact=max_shard_topology_delta_mb_compact,
+        max_active_skeleton_nodes=max_active_skeleton_nodes,
+        local_index_map_size_mb=local_index_map_size_mb,
+        shard_size_check_interval_nodes=shard_size_check_interval_nodes,
+        global_index_map_size_mb=global_index_map_size_mb
     )
 
 

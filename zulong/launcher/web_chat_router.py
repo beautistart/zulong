@@ -43,6 +43,12 @@ _ws_protocols: Dict[int, str] = {}
 # 客户端类型追踪 (ws id → client_type: "dashboard" | "ide_plugin" | ...)
 _ws_client_types: Dict[int, str] = {}
 
+# 每个 WebSocket 连接独立的发送锁。
+#
+# starlette/uvicorn 底层使用 websockets legacy protocol；同一连接如果被多个
+# asyncio task 并发 send_json，会在 drain waiter 上触发 AssertionError。
+_ws_send_locks: Dict[int, asyncio.Lock] = {}
+
 # 统一协议桥接器
 _protocol_bridge = ProtocolBridge()
 
@@ -54,6 +60,29 @@ _event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 # 活跃聊天取消事件（IDE 模式使用）
 _chat_cancels: Dict[str, asyncio.Event] = {}
+
+
+def _get_ws_send_lock(ws: WebSocket) -> asyncio.Lock:
+    ws_id = id(ws)
+    lock = _ws_send_locks.get(ws_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ws_send_locks[ws_id] = lock
+    return lock
+
+
+def _forget_ws_connection(ws: WebSocket) -> None:
+    """清理 /ws 连接相关状态，供断连和发送失败路径复用。"""
+    ws_id = id(ws)
+    _ws_clients.discard(ws)
+    _ws_protocols.pop(ws_id, None)
+    _ws_client_types.pop(ws_id, None)
+    _ws_send_locks.pop(ws_id, None)
+    try:
+        from zulong.ide.ide_server import _monitor_connections
+        _monitor_connections.discard(ws)
+    except Exception:
+        pass
 
 
 def _extract_text_from_message(message: dict) -> str:
@@ -758,8 +787,11 @@ async def _retrieve_memory_context_for_prompt(text: str, top_k: int = 3) -> str:
         for r in context_results or []:
             label = r.get("label", "")
             content = r.get("content", "")
+            graph_memory_id = r.get("graph_memory_id") or r.get("node_id", "")
+            shard_id = r.get("shard_id", "")
             if label or content:
-                memory_lines.append(f"- {label}: {content[:200]}")
+                address_hint = f" [graph_memory_id={graph_memory_id}" + (f", shard={shard_id}" if shard_id else "") + "]"
+                memory_lines.append(f"- {label}: {content[:200]}{address_hint}")
         return "\n".join(memory_lines)
     except Exception as e:
         logger.debug(f"[WebChatRouter] retrieve memory context failed: {e}")
@@ -1290,6 +1322,37 @@ async def get_memory_graph_snapshot():
     return _get_memory_graph_snapshot_payload()
 
 
+@router.get("/api/memory-graph/context-seed")
+async def get_memory_graph_context_seed(
+    conversation_id: Optional[str] = None,
+    task_graph_id: Optional[str] = None,
+):
+    """Return indexed MemoryGraph addresses for Web restore paths."""
+    try:
+        mg = _get_active_memory_graph()
+        if not mg:
+            return {"ok": False, "error": "memory graph unavailable"}
+
+        payload: Dict[str, Any] = {"ok": True}
+        if conversation_id:
+            if hasattr(mg, "get_context_seed_for_conversation"):
+                payload["conversation"] = mg.get_context_seed_for_conversation(conversation_id)
+            else:
+                payload["conversation"] = None
+        if task_graph_id:
+            if hasattr(mg, "get_task_node_id_for_graph"):
+                task_node_id = mg.get_task_node_id_for_graph(task_graph_id)
+            else:
+                task_node_id = f"task:{task_graph_id}" if hasattr(mg, "has_node") and mg.has_node(f"task:{task_graph_id}") else None
+            payload["task_graph"] = {
+                "task_graph_id": task_graph_id,
+                "task_node_id": task_node_id,
+            }
+        return payload
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 async def _handle_expand_node(node_id: str, ws: WebSocket) -> None:
     """处理展开节点请求"""
     try:
@@ -1312,27 +1375,43 @@ async def _handle_expand_node(node_id: str, ws: WebSocket) -> None:
         logger.debug(f"[WebChatRouter] 展开节点失败: {e}")
 
 
+async def _handle_memory_context_seed(ws: WebSocket, data: Dict[str, Any]) -> None:
+    payload = await get_memory_graph_context_seed(
+        conversation_id=data.get("conversation_id") or data.get("session_id"),
+        task_graph_id=data.get("task_graph_id") or data.get("graph_id"),
+    )
+    await _send_to_ws(ws, {
+        "type": "MEMORY_GRAPH_CONTEXT_SEED",
+        "ts": time.time(),
+        "payload": payload,
+    })
+
+
 # ── 对话会话管理（Web 前端会话栏重建） ─────────────────
 
 async def _handle_list_dialogue_sessions(ws: WebSocket) -> None:
     """查询 MemoryGraph 中所有对话会话节点，返回会话列表"""
     try:
         session_store = _collect_dialogue_sessions()
-        await _send_to_ws(ws, {
+        sent = await _send_to_ws(ws, {
             "type": "SESSION_LIST",
             "ts": time.time(),
             "sessions": session_store["sessions"],
             "activeSessionId": session_store.get("activeSessionId"),
         })
-        logger.info(f"[WebChatRouter] SESSION_LIST: 返回 {len(session_store['sessions'])} 个会话")
+        if sent:
+            logger.info(f"[WebChatRouter] SESSION_LIST: 返回 {len(session_store['sessions'])} 个会话")
     except Exception as e:
         logger.error(f"[WebChatRouter] LIST_DIALOGUE_SESSIONS 失败: {e}", exc_info=True)
-        await _send_to_ws(ws, {
+        try:
+            await _send_to_ws(ws, {
             "type": "SESSION_LIST",
             "ts": time.time(),
             "sessions": [],
             "error": str(e),
-        })
+            })
+        except Exception:
+            pass
 
 
 async def _handle_get_session_messages(ws: WebSocket, session_id: str) -> None:
@@ -1374,13 +1453,16 @@ async def _handle_get_session_messages(ws: WebSocket, session_id: str) -> None:
             f"[WebChatRouter] SESSION_MESSAGES: {session_id} → {len(messages)} 条消息")
     except Exception as e:
         logger.error(f"[WebChatRouter] GET_SESSION_MESSAGES 失败: {e}", exc_info=True)
-        await _send_to_ws(ws, {
+        try:
+            await _send_to_ws(ws, {
             "type": "SESSION_MESSAGES",
             "ts": time.time(),
             "session_id": session_id,
             "messages": [],
             "error": str(e),
-        })
+            })
+        except Exception:
+            pass
 
 
 async def _handle_delete_dialogue_session(ws: WebSocket, session_id: str) -> None:
@@ -1588,14 +1670,23 @@ async def _send_to_ws(ws: WebSocket, message: dict, *, persist: bool = True) -> 
         )
 
     try:
-        await ws.send_json(message)
+        async with _get_ws_send_lock(ws):
+            await ws.send_json(message)
         return True
     except WebSocketDisconnect:
         logger.debug("[WebChatRouter] WebSocket 已断开，跳过发送")
+        _forget_ws_connection(ws)
         return False
     except Exception as e:
-        if "close message has been sent" in str(e) or "ClientDisconnected" in type(e).__name__:
-            logger.debug(f"[WebChatRouter] WebSocket 已关闭，跳过发送: {e}")
+        text = str(e)
+        exc_name = type(e).__name__
+        if (
+            "close message has been sent" in text
+            or "ClientDisconnected" in exc_name
+            or "AssertionError" in exc_name
+        ):
+            logger.debug(f"[WebChatRouter] WebSocket 发送不可用，跳过发送: {exc_name}: {text}")
+            _forget_ws_connection(ws)
             return False
         raise
 
@@ -1759,6 +1850,8 @@ async def handle_unified_root_ws(
                     asyncio.create_task(_handle_ide_action(ws, msg_type, unified))
                 elif legacy_type == "REQUEST_MEMORY_GRAPH":
                     asyncio.create_task(_push_memory_graph_snapshot(ws))
+                elif legacy_type in ("REQUEST_MEMORY_CONTEXT_SEED", "GET_MEMORY_CONTEXT_SEED"):
+                    asyncio.create_task(_handle_memory_context_seed(ws, legacy))
                 elif legacy_type == "EXPAND_NODE":
                     node_id = legacy.get("node_id")
                     if node_id:
@@ -1927,6 +2020,8 @@ async def ws_chat_endpoint(ws: WebSocket):
                     asyncio.create_task(_handle_ide_action(ws, msg_type, data))
                 elif msg_type == "REQUEST_MEMORY_GRAPH":
                     asyncio.create_task(_push_memory_graph_snapshot(ws))
+                elif msg_type in ("REQUEST_MEMORY_CONTEXT_SEED", "GET_MEMORY_CONTEXT_SEED"):
+                    asyncio.create_task(_handle_memory_context_seed(ws, data))
                 elif msg_type == "EXPAND_NODE":
                     node_id = data.get("node_id")
                     if node_id:

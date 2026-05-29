@@ -462,14 +462,17 @@ async def _retrieve_session_context(conversation_id: str) -> Optional[Dict[str, 
         if mg is None:
             return None
 
-        # 推导 session_node_id（确定性规则，与 memory_mirror.py _compact_id 一致）
-        safe_id = "".join(
-            ch if ch.isalnum() or ch in "-_" else "_"
-            for ch in str(conversation_id or "")
-        )
-        session_node_id = f"dialogue:session_{safe_id}"
+        if hasattr(mg, "get_session_node_id_for_conversation"):
+            session_node_id = mg.get_session_node_id_for_conversation(conversation_id)
+        else:
+            # 推导 session_node_id（确定性规则，与 memory_mirror.py _compact_id 一致）
+            safe_id = "".join(
+                ch if ch.isalnum() or ch in "-_" else "_"
+                for ch in str(conversation_id or "")
+            )
+            session_node_id = f"dialogue:session_{safe_id}"
 
-        if not mg.has_node(session_node_id):
+        if not session_node_id or not mg.has_node(session_node_id):
             return None
 
         # BFS 扩散激活
@@ -2005,18 +2008,27 @@ async def _handle_expand_node(node_id: str, ws: WebSocket) -> None:
         mg = get_memory_graph()
         if not mg:
             return
-        node = mg._nodes.get(node_id)
-        if node:
-            # 获取邻居节点
-            neighbors = mg.get_neighbors(node_id) if hasattr(mg, "get_neighbors") else []
-            await ws.send_json({
-                "type": "MEMORY_GRAPH_EXPAND_RESULT",
-                "ts": time.time(),
-                "payload": {
-                    "node_id": node_id,
-                    "neighbors": neighbors,
-                },
-            })
+        if hasattr(mg, "get_node_children_for_frontend"):
+            result = mg.get_node_children_for_frontend(node_id)
+            if isinstance(result, dict):
+                result.setdefault("node_id", result.get("parent_id", node_id))
+        else:
+            node = (
+                mg.get_node(node_id)
+                if hasattr(mg, "get_node")
+                else getattr(mg, "_nodes", {}).get(node_id)
+            )
+            if not node:
+                return
+            result = {
+                "node_id": node_id,
+                "neighbors": mg.get_neighbors(node_id) if hasattr(mg, "get_neighbors") else [],
+            }
+        await ws.send_json({
+            "type": "MEMORY_GRAPH_EXPAND_RESULT",
+            "ts": time.time(),
+            "payload": result,
+        })
     except Exception as e:
         logger.debug(f"[WebChat] 展开节点失败: {e}")
 

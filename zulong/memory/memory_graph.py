@@ -18,10 +18,8 @@ import json
 import time
 import os
 import math
-import base64
 import asyncio
 import threading
-import atexit
 from collections import deque
 from queue import Empty, Queue
 from typing import Dict, Any, List, Optional, Tuple, Set
@@ -216,6 +214,10 @@ class SummarySidecarIndex:
         self._initialized = False
         # P0-3: 关键词索引 — 存储摘要文本以支持冷路径 BM25 关键词检索
         self._text_index: Dict[str, str] = {}  # node_id → summary_text
+
+    def get_summary_text(self, node_id: str) -> str:
+        """返回摘要文本，供检索结果暴露摘要导航内容。"""
+        return self._text_index.get(node_id, "")
 
     def _ensure_init(self) -> bool:
         """延迟初始化 FAISS 和 Embedding（首次调用时加载）"""
@@ -549,12 +551,9 @@ class MemoryGraph:
         self._running = False
         self._prune_task: Optional[asyncio.Task] = None
 
-        # 自动保存（防抖写盘）
-        self._dirty = False                # 是否有未保存的变更
-        self._auto_save_delay = 2          # 防抖延迟（秒），VS Code 风格：变更后最多 2 秒落盘
-        self._auto_save_timer = None       # threading.Timer 实例
-        self._last_save_time = 0.0         # 上次保存时间戳
-        self._save_lock = threading.Lock() # 保存操作锁（防并发写）
+        # 兼容层变更标记。运行态持久化由 ShardedMemoryGraph 接管；
+        # 这里仅保留 _mark_dirty 供增量广播钩子使用。
+        self._dirty = False
         self._data_lock = threading.RLock()  # 内存数据结构读写锁（_nodes/_graph/_embeddings/_coactivation_counter）
         self._candidates_lock = threading.Lock()  # _pending_llm_candidates 读写锁
         self._pending_llm_candidates: List[str] = []
@@ -589,9 +588,6 @@ class MemoryGraph:
         self._sanitize_association_edges()
 
         self._initialized = True
-
-        # P2-3: atexit 安全网 — 进程退出时强制刷盘防抖窗口内未保存的变更
-        atexit.register(self._atexit_flush)
 
         self._start_embedding_worker()
 
@@ -2243,6 +2239,35 @@ class MemoryGraph:
             self._summary_index._text_index[node_id] = summary_text
         except Exception:
             pass
+        try:
+            node = self.get_node(node_id)
+            metadata = dict(getattr(node, "metadata", {}) or {}) if node else {}
+            full_path = (
+                metadata.get("full_path")
+                or metadata.get("graph_address")
+                or metadata.get("task_graph_address")
+                or node_id
+            )
+            source_node_ids = metadata.get("source_node_ids") or [node_id]
+            if isinstance(source_node_ids, str):
+                source_node_ids = [source_node_ids]
+            from .summary_store import get_dual_index_summary_store
+            store = get_dual_index_summary_store()
+            summary_ref_id = store.store_graph_summary(
+                summary_text=summary_text,
+                graph_memory_id=node_id,
+                shard_id="",
+                full_path=full_path,
+                source_node_ids=source_node_ids,
+                topic=metadata.get("summary_topic", ""),
+                importance=float(metadata.get("summary_importance", 0.5) or 0.5),
+            )
+            if summary_ref_id and node:
+                node.metadata["summary_ref_id"] = summary_ref_id
+                node.metadata.setdefault("graph_memory_id", node_id)
+                node.metadata.setdefault("full_path", full_path)
+        except Exception as e:
+            logger.debug(f"[MemoryGraph] DualIndexSummaryStore 写入跳过 {node_id}: {e}")
         self._enqueue_summary_index(node_id, summary_text)
         return True
 
@@ -2300,7 +2325,22 @@ class MemoryGraph:
         hot_results, cold_results = await asyncio.gather(hot_task, cold_task)
 
         # 合并结果（两路互斥，天然无重复），按 score 降序排序
-        combined = hot_results + cold_results
+        summary_results = await loop.run_in_executor(
+            None, self._retrieve_summary_navigation, query_text, top_k
+        )
+        combined_by_id: Dict[str, Dict[str, Any]] = {}
+        combined = []
+        for item in hot_results + cold_results:
+            node_id = item.get("node_id")
+            if node_id:
+                combined_by_id[node_id] = item
+            combined.append(item)
+        for item in summary_results:
+            node_id = item.get("node_id") or item.get("graph_memory_id")
+            if node_id and node_id in combined_by_id:
+                self._merge_summary_navigation_result(combined_by_id[node_id], item)
+            else:
+                combined.append(item)
         combined.sort(key=lambda x: x["score"], reverse=True)
         final = combined[:top_k]
 
@@ -2321,6 +2361,142 @@ class MemoryGraph:
                 self._update_coactivation_counter(_coact_pairs)
 
         return final
+
+    def _retrieve_summary_navigation(
+        self,
+        query_text: str,
+        top_k: int,
+        exclude_node_ids: Optional[Set[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """检索 L1 摘要导航层，命中后返回图记忆地址。
+
+        NetworkX MemoryGraph 是兼容实现；运行态 Hybrid/Sharded 后端也
+        使用同名逻辑。这里保留同样的返回契约，避免非分片配置下丢失
+        graph_memory_id 回跳能力。
+        """
+        exclude_node_ids = exclude_node_ids or set()
+        if not query_text:
+            return []
+
+        try:
+            from .summary_store import get_dual_index_summary_store
+            store = get_dual_index_summary_store()
+            summary_hits = store.search_graph_summaries(query_text, top_k=max(top_k, 3))
+        except Exception as exc:
+            logger.debug(f"[MemoryGraph] 摘要导航检索跳过: {exc}")
+            return []
+
+        results: List[Dict[str, Any]] = []
+        for hit in summary_hits:
+            graph_memory_id = (
+                getattr(hit, "graph_memory_id", "")
+                or (getattr(hit, "source_node_ids", []) or [""])[0]
+            )
+            if not graph_memory_id or graph_memory_id in exclude_node_ids:
+                continue
+
+            summary_text = getattr(hit, "summary_text", "") or ""
+            lexical_score = self._bigram_overlap_score(query_text, summary_text)
+            try:
+                importance_score = float(getattr(hit, "relevance_score", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                importance_score = 0.0
+            score = max(0.12, lexical_score * 0.9 + importance_score * 0.1)
+
+            node = self._nodes.get(graph_memory_id)
+            if node is not None:
+                result = self._node_to_result(node, score, "summary_navigation")
+                result["content"] = summary_text or result.get("content", "")
+                result["summary"] = summary_text or result.get("summary", "")
+                result["summary_ref_id"] = getattr(hit, "summary_id", "")
+                result["recall_hint"] = "这是摘要导航命中；需要详情时，用 graph_memory_id 调用 read_memory_node 或 discover_related 做增量回忆。"
+                result["memory_address"]["summary_ref_id"] = getattr(hit, "summary_id", "")
+                if getattr(hit, "source_node_ids", None):
+                    result["memory_address"]["source_node_ids"] = hit.source_node_ids
+                results.append(result)
+                continue
+
+            source_node_ids = getattr(hit, "source_node_ids", []) or [graph_memory_id]
+            full_path = getattr(hit, "full_path", "") or graph_memory_id
+            results.append({
+                "node_id": graph_memory_id,
+                "graph_memory_id": graph_memory_id,
+                "shard_id": getattr(hit, "shard_id", ""),
+                "full_path": full_path,
+                "node_type": "summary",
+                "label": full_path,
+                "content": summary_text,
+                "summary": summary_text,
+                "score": score,
+                "source": "summary_navigation",
+                "importance": "normal",
+                "metadata": {
+                    "summary_ref_id": getattr(hit, "summary_id", ""),
+                    "source_node_ids": source_node_ids,
+                    "summary_navigation_only": True,
+                },
+                "memory_address": {
+                    "graph_memory_id": graph_memory_id,
+                    "node_id": graph_memory_id,
+                    "shard_id": getattr(hit, "shard_id", ""),
+                    "full_path": full_path,
+                    "source_node_ids": source_node_ids,
+                    "backend_ref": "",
+                    "summary_ref_id": getattr(hit, "summary_id", ""),
+                    "source": "summary_navigation",
+                },
+                "summary_ref_id": getattr(hit, "summary_id", ""),
+                "recall_hint": "这是摘要导航命中；需要详情时，用 graph_memory_id 调用 read_memory_node 或 discover_related 做增量回忆。",
+            })
+
+        return results
+
+    @staticmethod
+    def _merge_summary_navigation_result(existing: Dict[str, Any], summary_item: Dict[str, Any]) -> None:
+        """把摘要导航命中合并到已有热/冷结果，避免同节点重复或摘要丢失。"""
+        summary_text = summary_item.get("summary") or summary_item.get("content") or ""
+        if summary_text:
+            existing["summary"] = summary_text
+
+        summary_ref_id = summary_item.get("summary_ref_id") or ""
+        if summary_ref_id:
+            existing["summary_ref_id"] = summary_ref_id
+
+        existing["graph_memory_id"] = existing.get("graph_memory_id") or summary_item.get("graph_memory_id")
+        existing["shard_id"] = existing.get("shard_id") or summary_item.get("shard_id", "")
+        existing["full_path"] = existing.get("full_path") or summary_item.get("full_path", "")
+        existing["recall_hint"] = summary_item.get("recall_hint") or existing.get("recall_hint", "")
+
+        try:
+            existing["score"] = max(float(existing.get("score", 0.0)), float(summary_item.get("score", 0.0)))
+        except (TypeError, ValueError):
+            pass
+
+        sources = existing.get("sources")
+        if not sources:
+            sources = [existing.get("source")] if existing.get("source") else []
+        if "summary_navigation" not in sources:
+            sources.append("summary_navigation")
+        existing["sources"] = sources
+
+        metadata = existing.setdefault("metadata", {})
+        if isinstance(metadata, dict):
+            if summary_ref_id:
+                metadata["summary_ref_id"] = summary_ref_id
+            source_node_ids = (summary_item.get("memory_address") or {}).get("source_node_ids")
+            if source_node_ids:
+                metadata.setdefault("source_node_ids", source_node_ids)
+
+        address = existing.setdefault("memory_address", {})
+        item_address = summary_item.get("memory_address") or {}
+        if isinstance(address, dict):
+            for key in ("graph_memory_id", "shard_id", "full_path", "source_node_ids"):
+                if item_address.get(key) and not address.get(key):
+                    address[key] = item_address[key]
+            if summary_ref_id:
+                address["summary_ref_id"] = summary_ref_id
+            address.setdefault("source", existing.get("source", ""))
+            address["summary_navigation_matched"] = True
 
     @staticmethod
     def _bigram_overlap_score(query: str, text: str) -> float:
@@ -2679,15 +2855,38 @@ class MemoryGraph:
                 if backend_data and backend_data.get("content"):
                     content = backend_data["content"]
 
+        summary_text = ""
+        try:
+            summary_text = self._summary_index.get_summary_text(node.node_id)
+        except Exception:
+            summary_text = ""
+
+        address = {
+            "graph_memory_id": node.node_id,
+            "node_id": node.node_id,
+            "shard_id": "",
+            "full_path": node.metadata.get("full_path") or node.metadata.get("graph_address") or node.node_id,
+            "source_node_ids": node.metadata.get("source_node_ids") or [node.node_id],
+            "backend_ref": node.backend_ref,
+            "summary_ref_id": node.metadata.get("summary_ref_id", ""),
+            "source": source,
+        }
+
         return {
             "node_id": node.node_id,
+            "graph_memory_id": node.node_id,
+            "shard_id": "",
+            "full_path": address["full_path"],
             "node_type": node.node_type.value,
             "label": node.label,
             "content": content,
+            "summary": summary_text or node.metadata.get("content_summary", ""),
             "score": round(score, 4),
             "source": source,
             "importance": node.metadata.get("importance", "normal"),
             "metadata": node.metadata,
+            "memory_address": address,
+            "recall_hint": "需要详情时，用 graph_memory_id 调用 read_memory_node 或 discover_related。",
         }
 
     # ============================================================
@@ -2831,51 +3030,18 @@ class MemoryGraph:
     # ============================================================
 
     def _mark_dirty(self):
-        """标记数据已变更，调度防抖保存
+        """标记兼容层图谱已变更。
 
-        写操作（add_node / add_edge / remove_node / remove_edge）调用此方法。
-        采用防抖策略：最后一次变更后延迟 _auto_save_delay 秒再落盘，
-        避免频繁写入，同时保证数据不会长时间停留在内存中。
+        旧 NetworkX 单 JSON 持久化已退出运行链路；此方法只保留给
+        IDE/Web 监控钩子读取 _pending_changes 并推送增量。
         """
         self._dirty = True
-        # 取消上一个未触发的定时器，重新计时
-        if self._auto_save_timer is not None:
-            self._auto_save_timer.cancel()
-        self._auto_save_timer = threading.Timer(
-            self._auto_save_delay, self._do_auto_save,
-        )
-        self._auto_save_timer.daemon = True
-        self._auto_save_timer.start()
-
-    def _do_auto_save(self):
-        """定时器回调：执行实际的磁盘保存"""
-        if not self._dirty:
-            return
-        try:
-            self.save()
-        except Exception as e:
-            logger.warning(f"[MemoryGraph] 自动保存失败: {e}")
-
-    def _atexit_flush(self):
-        """P2-3: 进程退出安全网 — 取消挂起的定时器并立即刷盘"""
-        self._embedding_worker_stop.set()
-        if self._auto_save_timer is not None:
-            self._auto_save_timer.cancel()
-            self._auto_save_timer = None
-        if self._dirty:
-            try:
-                self.save()
-                logger.info("[MemoryGraph] atexit: 已刷盘未保存的变更")
-            except Exception as e:
-                logger.error(f"[MemoryGraph] atexit: 刷盘失败: {e}")
 
     def save(self) -> bool:
         """旧 NetworkX 单 JSON 持久化已废弃。"""
         logger.warning("[MemoryGraph] NetworkX 单 JSON 保存已废弃，运行态应使用分片 Hybrid 后端")
         self._dirty = False
         return False
-
-    _SCHEMA_VERSION = "1.0"
 
     def _load(self) -> bool:
         """旧 NetworkX 单 JSON 加载已废弃。"""
@@ -2954,26 +3120,6 @@ class MemoryGraph:
         # 触发保存
         self._dirty = True
         self.save()
-
-    def _serialize_embeddings(self) -> Dict[str, str]:
-        """将 embeddings 序列化为 base64 字符串"""
-        if np is None:
-            return {}
-        result = {}
-        for nid, emb in self._embeddings.items():
-            result[nid] = base64.b64encode(emb.tobytes()).decode('ascii')
-        return result
-
-    def _deserialize_embeddings(self, data: Dict[str, str]):
-        """从 base64 字符串反序列化 embeddings"""
-        if np is None:
-            return
-        for nid, b64_str in data.items():
-            try:
-                raw = base64.b64decode(b64_str)
-                self._embeddings[nid] = np.frombuffer(raw, dtype=np.float32).copy()
-            except Exception:
-                pass
 
     # ============================================================
     # 活跃节点管理（前端高亮用）

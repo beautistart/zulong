@@ -226,6 +226,9 @@ class RAGIntegrationNode:
                     "similarity": score,  # 融合后的分数
                     "metadata": getattr(doc, 'metadata', {}),
                     "doc_id": doc_id,
+                    "graph_memory_id": getattr(doc, 'metadata', {}).get("graph_memory_id", ""),
+                    "shard_id": getattr(doc, 'metadata', {}).get("shard_id", ""),
+                    "full_path": getattr(doc, 'metadata', {}).get("full_path", ""),
                     "bm25_score": bm25_results.get(doc_id, 0.0),
                     "vector_score": vector_results.get(doc_id, {}).get('similarity', 0.0)
                 })
@@ -282,7 +285,10 @@ class RAGIntegrationNode:
                             "content": doc.content[:200] if hasattr(doc, 'content') else str(doc),
                             "similarity": getattr(doc, 'similarity', 0.0),
                             "metadata": getattr(doc, 'metadata', {}),
-                            "doc_id": getattr(doc, 'doc_id', '')
+                            "doc_id": getattr(doc, 'doc_id', ''),
+                            "graph_memory_id": getattr(doc, 'metadata', {}).get("graph_memory_id", ""),
+                            "shard_id": getattr(doc, 'metadata', {}).get("shard_id", ""),
+                            "full_path": getattr(doc, 'metadata', {}).get("full_path", ""),
                         }
                         
                         # 🔥 调试日志：打印所有检索结果
@@ -375,9 +381,14 @@ class RAGIntegrationNode:
             
             # 添加检索到的文档
             for i, doc in enumerate(retrieved_docs[:3], 1):  # 最多使用前 3 个
+                graph_memory_id = doc.get("graph_memory_id") or doc.get("metadata", {}).get("graph_memory_id", "")
+                shard_id = doc.get("shard_id") or doc.get("metadata", {}).get("shard_id", "")
+                address_hint = ""
+                if graph_memory_id:
+                    address_hint = f" 图记忆ID={graph_memory_id}" + (f" 分片={shard_id}" if shard_id else "")
                 context_parts.append(
                     f"[{doc['rag'].upper()}] {doc['content']} "
-                    f"(相似度：{doc['similarity']:.2f})"
+                    f"(相似度：{doc['similarity']:.2f}{address_hint})"
                 )
             
             # 更新上下文
@@ -423,8 +434,10 @@ class RAGIntegrationNode:
             if retrieved_docs:
                 response_parts.append("📚 参考信息:")
                 for i, doc in enumerate(retrieved_docs[:3], 1):
+                    graph_memory_id = doc.get("graph_memory_id") or doc.get("metadata", {}).get("graph_memory_id", "")
+                    address_hint = f" [图记忆ID: {graph_memory_id}]" if graph_memory_id else ""
                     response_parts.append(
-                        f"{i}. [{doc['rag']}] {doc['content'][:100]}..."
+                        f"{i}. [{doc['rag']}] {doc['content'][:100]}...{address_hint}"
                     )
             
             # 更新消息历史

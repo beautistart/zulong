@@ -7,6 +7,8 @@ from .property_store import (
     NodeProperties,
     EdgeProperties
 )
+from .global_index import GlobalMemoryIndex
+from .local_index import LocalShardIndex
 from .memory_graph_hybrid import (
     MemoryGraphHybrid,
     NodeType,
@@ -23,6 +25,8 @@ __all__ = [
     "PropertyStore",
     "NodeProperties",
     "EdgeProperties",
+    "GlobalMemoryIndex",
+    "LocalShardIndex",
     "MemoryGraphHybrid",
     "NodeType",
     "EdgeType",

@@ -306,9 +306,17 @@ memory:
     data_dir: ./data/memory_graph_hybrid
     enable_vector_index: false
     enabled: true
+    global_index_map_size_mb: 256
+    local_index_map_size_mb: 64
     map_size_gb: 10
     max_active_shards: 3
     max_nodes_per_shard: 150000
+    max_shard_property_mb_warning: 150
+    max_shard_property_mb_split: 200
+    max_shard_topology_mb_warning: 64
+    max_shard_topology_delta_mb_compact: 32
+    max_active_skeleton_nodes: 50000
+    shard_size_check_interval_nodes: 100
     shard_strategy: month
     use_sharding: true
   rag:

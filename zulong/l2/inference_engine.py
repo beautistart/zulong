@@ -2745,25 +2745,31 @@ class InferenceEngine:
                         ntype = r.get("node_type", "")
                         content = r.get("content", "")
                         label = r.get("label", "")
+                        graph_memory_id = r.get("graph_memory_id") or r.get("node_id", "")
+                        shard_id = r.get("shard_id", "")
+                        address_hint = ""
+                        if graph_memory_id:
+                            address_hint = f"（图记忆ID：{graph_memory_id}" + (f"，分片：{shard_id}" if shard_id else "") + "）"
                         if not content:
                             continue
                         if ntype == "experience":
                             continue  # EXPERIENCE 由 search_experience FC 工具按需获取
                         elif ntype == "dialogue":
-                            memory_sections.append(f"【历史对话】{content[:200]}")
+                            memory_sections.append(f"【历史对话】{content[:200]}{address_hint}")
                         elif ntype == "task":
                             status = r.get("metadata", {}).get("status", "")
                             memory_sections.append(
                                 f"【相关任务】{label}" + (f"（状态：{status}）" if status else "")
+                                + address_hint
                             )
                         elif ntype == "knowledge":
-                            memory_sections.append(f"【知识参考】{content[:300]}")
+                            memory_sections.append(f"【知识参考】{content[:300]}{address_hint}")
                         elif ntype == "episode":
-                            memory_sections.append(f"【历史摘要】{content[:200]}")
+                            memory_sections.append(f"【历史摘要】{content[:200]}{address_hint}")
                         elif ntype in ("person", "concept"):
-                            memory_sections.append(f"【知识参考】{label}: {content[:200]}")
+                            memory_sections.append(f"【知识参考】{label}: {content[:200]}{address_hint}")
                         else:
-                            memory_sections.append(f"【参考】{content[:200]}")
+                            memory_sections.append(f"【参考】{content[:200]}{address_hint}")
                     
                     if memory_sections:
                         system_parts.append(
@@ -2782,7 +2788,7 @@ class InferenceEngine:
         _attn_lines = ["\n【注意力状态】"]
         if _has_memory:
             _attn_lines.append(f"已注入 {_mem_count} 段记忆/上下文到当前对话。")
-            _attn_lines.append("如果这些信息不足以回答用户问题，请主动调用 recall_memory 工具检索更多相关记忆。")
+            _attn_lines.append("如果这些信息不足以回答用户问题，请主动调用 recall_memory；若某条记忆带有图记忆ID，可用该 ID 调用 read_memory_node 或 discover_related 增量展开。")
         else:
             _attn_lines.append("当前对话未注入任何记忆上下文。")
             _attn_lines.append("如果用户的问题涉及历史信息或个人偏好，请主动调用 recall_memory 工具进行检索。")
@@ -3438,6 +3444,11 @@ class InferenceEngine:
                         ntype = r.get("node_type", "")
                         content = r.get("content", "")
                         label = r.get("label", "")
+                        graph_memory_id = r.get("graph_memory_id") or r.get("node_id", "")
+                        shard_id = r.get("shard_id", "")
+                        address_hint = ""
+                        if graph_memory_id:
+                            address_hint = f"（图记忆ID：{graph_memory_id}" + (f"，分片：{shard_id}" if shard_id else "") + "）"
                         if not content:
                             continue
                         # 按节点类型格式化
@@ -3445,20 +3456,21 @@ class InferenceEngine:
                             # EXPERIENCE 不自动注入（由 search_experience FC 工具按需获取）
                             continue
                         elif ntype == "dialogue":
-                            memory_sections.append(f"【历史对话】{content[:200]}")
+                            memory_sections.append(f"【历史对话】{content[:200]}{address_hint}")
                         elif ntype == "task":
                             status = r.get("metadata", {}).get("status", "")
                             memory_sections.append(
                                 f"【相关任务】{label}" + (f"（状态：{status}）" if status else "")
+                                + address_hint
                             )
                         elif ntype == "knowledge":
-                            memory_sections.append(f"【知识参考】{content[:300]}")
+                            memory_sections.append(f"【知识参考】{content[:300]}{address_hint}")
                         elif ntype == "episode":
-                            memory_sections.append(f"【历史摘要】{content[:200]}")
+                            memory_sections.append(f"【历史摘要】{content[:200]}{address_hint}")
                         elif ntype in ("person", "concept"):
-                            memory_sections.append(f"【知识参考】{label}: {content[:200]}")
+                            memory_sections.append(f"【知识参考】{label}: {content[:200]}{address_hint}")
                         else:
-                            memory_sections.append(f"【参考】{content[:200]}")
+                            memory_sections.append(f"【参考】{content[:200]}{address_hint}")
 
                     if memory_sections:
                         system_parts.append(
@@ -3476,7 +3488,7 @@ class InferenceEngine:
         _attn_lines = ["\n【注意力状态】"]
         if _has_memory:
             _attn_lines.append(f"已注入 {_mem_count} 段记忆/上下文到当前对话。")
-            _attn_lines.append("如果这些信息不足以回答用户问题，请主动调用 recall_memory 工具检索更多相关记忆。")
+            _attn_lines.append("如果这些信息不足以回答用户问题，请主动调用 recall_memory；若某条记忆带有图记忆ID，可用该 ID 调用 read_memory_node 或 discover_related 增量展开。")
         else:
             _attn_lines.append("当前对话未注入任何记忆上下文。")
             _attn_lines.append("如果用户的问题涉及历史信息或个人偏好，请主动调用 recall_memory 工具进行检索。")

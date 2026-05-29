@@ -51,9 +51,15 @@ class SummaryEntry:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     access_count: int = 0            # 访问次数
-    
+
     # 关联的详情向量 ID 列表（指向 L2 详情层）
     detail_vector_ids: List[str] = field(default_factory=list)
+
+    # 图记忆地址：RAG 摘要命中后可回跳 MemoryGraph 做 BFS 增量回忆
+    graph_memory_id: str = ""        # MemoryGraph 节点 ID，优先作为 recall/read/discover 种子
+    shard_id: str = ""               # Hybrid 分片 ID，供低延迟定位/调试
+    full_path: str = ""              # 人类可读图地址，如 dialogue/session/round 路径
+    source_node_ids: List[str] = field(default_factory=list)  # 摘要覆盖的原始节点
 
 
 @dataclass
@@ -77,6 +83,10 @@ class HybridSearchResult:
     sql_matched: bool = False         # 是否 SQL 命中
     vector_score: float = 0.0         # 向量相似度得分
     details: List[Dict] = field(default_factory=list)  # 关联的详情
+    graph_memory_id: str = ""         # 命中摘要对应的图记忆种子
+    shard_id: str = ""
+    full_path: str = ""
+    source_node_ids: List[str] = field(default_factory=list)
 
 
 # ============================================================
@@ -109,20 +119,41 @@ class SummaryIndex:
                 created_at REAL,
                 updated_at REAL,
                 access_count INTEGER DEFAULT 0,
-                detail_vector_ids TEXT DEFAULT '[]'
+                detail_vector_ids TEXT DEFAULT '[]',
+                graph_memory_id TEXT DEFAULT '',
+                shard_id TEXT DEFAULT '',
+                full_path TEXT DEFAULT '',
+                source_node_ids TEXT DEFAULT '[]'
             )
         """)
+        self._ensure_address_columns(cursor)
         
         # 创建索引
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_topic ON summaries(topic)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_status ON summaries(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_importance ON summaries(importance)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON summaries(created_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_graph_memory_id ON summaries(graph_memory_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_shard_topic_status ON summaries(shard_id, topic, status)")
         
         conn.commit()
         conn.close()
         
         logger.info(f"[SummaryIndex] SQLite 初始化完成: {self.db_path}")
+
+    def _ensure_address_columns(self, cursor):
+        """兼容旧 summaries.db，增量添加图记忆地址列。"""
+        cursor.execute("PRAGMA table_info(summaries)")
+        existing = {row[1] for row in cursor.fetchall()}
+        columns = {
+            "graph_memory_id": "TEXT DEFAULT ''",
+            "shard_id": "TEXT DEFAULT ''",
+            "full_path": "TEXT DEFAULT ''",
+            "source_node_ids": "TEXT DEFAULT '[]'",
+        }
+        for column, ddl in columns.items():
+            if column not in existing:
+                cursor.execute(f"ALTER TABLE summaries ADD COLUMN {column} {ddl}")
     
     def add_summary(self, entry: SummaryEntry) -> bool:
         """添加摘要"""
@@ -134,8 +165,9 @@ class SummaryIndex:
                 INSERT OR REPLACE INTO summaries 
                 (summary_id, summary_text, topic, keywords, turn_start, turn_end,
                  turn_count, status, importance, created_at, updated_at, 
-                 access_count, detail_vector_ids)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 access_count, detail_vector_ids, graph_memory_id, shard_id,
+                 full_path, source_node_ids)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 entry.summary_id,
                 entry.summary_text,
@@ -150,6 +182,10 @@ class SummaryIndex:
                 entry.updated_at,
                 entry.access_count,
                 json.dumps(entry.detail_vector_ids),
+                entry.graph_memory_id,
+                entry.shard_id,
+                entry.full_path,
+                json.dumps(entry.source_node_ids, ensure_ascii=False),
             ))
             
             conn.commit()
@@ -231,6 +267,56 @@ class SummaryIndex:
         except Exception as e:
             logger.error(f"[SummaryIndex] 时间范围检索失败: {e}")
             return []
+
+    def get_summary(self, summary_id: str) -> Optional[SummaryEntry]:
+        """按摘要 ID 读取完整摘要条目。"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM summaries WHERE summary_id = ?", (summary_id,))
+            row = cursor.fetchone()
+            conn.close()
+            return self._row_to_entry(row) if row else None
+        except Exception as e:
+            logger.error(f"[SummaryIndex] 读取摘要失败: {e}")
+            return None
+
+    def search_by_route(
+        self,
+        shard_ids: Optional[List[str]] = None,
+        topic: str = "",
+        status: str = "",
+        limit: int = 50,
+    ) -> List[SummaryEntry]:
+        """按分片/主题/冷热状态粗筛摘要，供分段向量检索路由使用。"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            clauses = []
+            params: List[Any] = []
+            if shard_ids:
+                placeholders = ",".join("?" for _ in shard_ids)
+                clauses.append(f"shard_id IN ({placeholders})")
+                params.extend(shard_ids)
+            if topic:
+                clauses.append("topic LIKE ?")
+                params.append(f"%{topic}%")
+            if status:
+                clauses.append("status = ?")
+                params.append(status)
+            where_clause = " AND ".join(clauses) if clauses else "1=1"
+            cursor.execute(f"""
+                SELECT * FROM summaries
+                WHERE {where_clause}
+                ORDER BY importance DESC, updated_at DESC
+                LIMIT ?
+            """, params + [limit])
+            results = [self._row_to_entry(row) for row in cursor.fetchall()]
+            conn.close()
+            return results
+        except Exception as e:
+            logger.error(f"[SummaryIndex] 路由检索失败: {e}")
+            return []
     
     def update_status(self, summary_id: str, status: SummaryStatus) -> bool:
         """更新摘要状态（Hot/Warm/Cold 转换）"""
@@ -300,6 +386,10 @@ class SummaryIndex:
             updated_at=row[10],
             access_count=row[11],
             detail_vector_ids=json.loads(row[12]) if row[12] else [],
+            graph_memory_id=row[13] if len(row) > 13 else "",
+            shard_id=row[14] if len(row) > 14 else "",
+            full_path=row[15] if len(row) > 15 else "",
+            source_node_ids=json.loads(row[16]) if len(row) > 16 and row[16] else [],
         )
 
 
@@ -360,6 +450,7 @@ class DualIndexSummaryStore:
             "total_summaries_stored": 0,
             "total_details_stored": 0,
             "total_hybrid_searches": 0,
+            "summary_route_searches": 0,
         }
         
         # 尝试加载已有索引
@@ -371,12 +462,108 @@ class DualIndexSummaryStore:
     # ============================================================
     # 存储操作
     # ============================================================
+
+    def store_graph_summary(
+        self,
+        summary_text: str,
+        graph_memory_id: str,
+        shard_id: str = "",
+        full_path: str = "",
+        source_node_ids: Optional[List[str]] = None,
+        topic: str = "",
+        keywords: Optional[List[str]] = None,
+        importance: float = 0.5,
+        status: SummaryStatus = SummaryStatus.WARM,
+        detail_vector_ids: Optional[List[str]] = None,
+    ) -> str:
+        """轻量写入图记忆摘要导航层。
+
+        该方法只写 SQLite L1 摘要导航，不触发 embedding/FAISS。
+        适合 MemoryGraph.index_summary() 的热链路调用，保证摘要和
+        图记忆地址先可靠落盘；向量化可由后台任务或后续分段索引接管。
+        """
+        if not summary_text or not graph_memory_id:
+            return ""
+
+        source_node_ids = source_node_ids or [graph_memory_id]
+        summary_id = f"graph_summary:{graph_memory_id}"
+        entry = SummaryEntry(
+            summary_id=summary_id,
+            summary_text=summary_text,
+            topic=topic or self._infer_topic(graph_memory_id),
+            keywords=keywords or self._extract_keywords(summary_text),
+            status=status,
+            importance=importance,
+            detail_vector_ids=detail_vector_ids or [],
+            graph_memory_id=graph_memory_id,
+            shard_id=shard_id,
+            full_path=full_path or graph_memory_id,
+            source_node_ids=source_node_ids,
+        )
+
+        if self.summary_index.add_summary(entry):
+            self._stats["total_summaries_stored"] += 1
+            logger.debug(
+                "[DualIndexSummaryStore] 图摘要导航已写入: %s -> %s",
+                summary_id,
+                graph_memory_id,
+            )
+            return summary_id
+        return ""
+
+    @staticmethod
+    def _infer_topic(graph_memory_id: str) -> str:
+        if graph_memory_id.startswith("dialogue:"):
+            return "dialogue"
+        if graph_memory_id.startswith("task:"):
+            return "task"
+        if graph_memory_id.startswith("note:") or graph_memory_id.startswith("knowledge:"):
+            return "knowledge"
+        if graph_memory_id.startswith("episode:"):
+            return "episode"
+        return "memory"
+
+    @staticmethod
+    def _extract_keywords(text: str, limit: int = 8) -> List[str]:
+        """轻量关键词抽取，避免引入热路径分词依赖。"""
+        if not text:
+            return []
+        cleaned = (
+            text.replace("\n", " ")
+            .replace("，", " ")
+            .replace("。", " ")
+            .replace(",", " ")
+            .replace(".", " ")
+            .replace("：", " ")
+            .replace(":", " ")
+            .replace("；", " ")
+            .replace(";", " ")
+        )
+        words = []
+        seen = set()
+        for part in cleaned.split():
+            token = part.strip()
+            if len(token) < 2 or token in seen:
+                continue
+            seen.add(token)
+            words.append(token[:40])
+            if len(words) >= limit:
+                break
+        if words:
+            return words
+        # 中文无空格时，用短片段兜底，供 LIKE 检索命中。
+        compact = cleaned.strip()
+        return [compact[:20]] if compact else []
     
     async def store_summary(self, summary_text: str, 
                              detail_turns: List[Dict[str, str]],
                              topic: str = "",
                              keywords: List[str] = None,
-                             importance: float = 0.5) -> str:
+                             importance: float = 0.5,
+                             graph_memory_id: str = "",
+                             shard_id: str = "",
+                             full_path: str = "",
+                             source_node_ids: Optional[List[str]] = None) -> str:
         """存储摘要及其对应的详情
         
         流程：
@@ -390,12 +577,17 @@ class DualIndexSummaryStore:
             topic: 话题标签
             keywords: 关键词列表
             importance: 重要性评分
+            graph_memory_id: 对应 MemoryGraph 摘要/会话/轮次节点 ID
+            shard_id: Hybrid 分片 ID
+            full_path: 人类可读图记忆地址
+            source_node_ids: 该摘要覆盖的原始图节点 ID
             
         Returns:
             str: 摘要 ID
         """
         summary_id = f"summary_{int(time.time() * 1000)}"
         detail_vector_ids = []
+        source_node_ids = source_node_ids or ([graph_memory_id] if graph_memory_id else [])
         
         # 1. 向量化摘要文本
         summary_embedding = await asyncio.get_event_loop().run_in_executor(
@@ -407,7 +599,14 @@ class DualIndexSummaryStore:
         if summary_embedding is not None:
             self.summary_vector_store.add_vectors_with_ids(
                 vectors=summary_embedding.reshape(1, -1),
-                metadata=[{"summary_id": summary_id, "topic": topic}],
+                metadata=[{
+                    "summary_id": summary_id,
+                    "topic": topic,
+                    "graph_memory_id": graph_memory_id,
+                    "shard_id": shard_id,
+                    "full_path": full_path or graph_memory_id,
+                    "source_node_ids": source_node_ids,
+                }],
                 vector_ids=[summary_id]
             )
         
@@ -432,6 +631,9 @@ class DualIndexSummaryStore:
                         "summary_id": summary_id,
                         "user_text": user_text[:200],
                         "ai_text": ai_text[:200],
+                        "graph_memory_id": graph_memory_id,
+                        "shard_id": shard_id,
+                        "full_path": full_path or graph_memory_id,
                     }],
                     vector_ids=[detail_id]
                 )
@@ -449,6 +651,10 @@ class DualIndexSummaryStore:
             turn_count=len(detail_turns),
             importance=importance,
             detail_vector_ids=detail_vector_ids,
+            graph_memory_id=graph_memory_id,
+            shard_id=shard_id,
+            full_path=full_path or graph_memory_id,
+            source_node_ids=source_node_ids,
         )
         self.summary_index.add_summary(entry)
         
@@ -515,6 +721,74 @@ class DualIndexSummaryStore:
                 result.details = await self._load_details(result.summary_id)
         
         return merged
+
+    def search_graph_summaries(
+        self,
+        query: str,
+        top_k: int = 5,
+        topic_filter: Optional[str] = None,
+    ) -> List[HybridSearchResult]:
+        """只查 SQLite 摘要导航层，返回可回跳的图记忆地址。
+
+        这是冷摘要回跳 MemoryGraph 的低延迟入口；不依赖 FAISS 或
+        embedding 模型，适合作为热链路兜底和 P2 工程验证入口。
+        """
+        keywords = self._extract_keywords(query, limit=8)
+        if not keywords and query:
+            keywords = [query]
+
+        entries = self.summary_index.search_by_keywords(keywords, limit=max(top_k * 2, top_k))
+        if topic_filter:
+            entries = [entry for entry in entries if topic_filter in entry.topic]
+
+        results = []
+        for entry in entries[:top_k]:
+            results.append(HybridSearchResult(
+                summary_id=entry.summary_id,
+                summary_text=entry.summary_text,
+                relevance_score=entry.importance,
+                sql_matched=True,
+                vector_score=0.0,
+                graph_memory_id=entry.graph_memory_id,
+                shard_id=entry.shard_id,
+                full_path=entry.full_path,
+                source_node_ids=entry.source_node_ids,
+            ))
+            self.summary_index.increment_access(entry.summary_id)
+        return results
+
+    def route_graph_summaries(
+        self,
+        shard_ids: Optional[List[str]] = None,
+        topic: str = "",
+        status: str = "",
+        top_k: int = 50,
+    ) -> List[HybridSearchResult]:
+        """摘要分片化的 routing 入口。
+
+        当前返回 SQLite 路由候选；后续分段 FAISS/IVF 可用这些候选分片
+        决定打开哪些向量段。
+        """
+        self._stats["summary_route_searches"] += 1
+        entries = self.summary_index.search_by_route(
+            shard_ids=shard_ids,
+            topic=topic,
+            status=status,
+            limit=top_k,
+        )
+        return [
+            HybridSearchResult(
+                summary_id=entry.summary_id,
+                summary_text=entry.summary_text,
+                relevance_score=entry.importance,
+                sql_matched=True,
+                graph_memory_id=entry.graph_memory_id,
+                shard_id=entry.shard_id,
+                full_path=entry.full_path,
+                source_node_ids=entry.source_node_ids,
+            )
+            for entry in entries
+        ]
     
     def _sql_search(self, query: str, topic: Optional[str], 
                      time_range: Optional[Tuple], limit: int) -> List[Tuple[str, float]]:
@@ -599,12 +873,17 @@ class DualIndexSummaryStore:
             if data["sql_matched"]:
                 relevance += 0.1
             
+            entry = self.summary_index.get_summary(summary_id)
             merged.append(HybridSearchResult(
                 summary_id=summary_id,
-                summary_text="",  # 后续填充
+                summary_text=entry.summary_text if entry else "",
                 relevance_score=relevance,
                 sql_matched=data["sql_matched"],
                 vector_score=data["vector_score"],
+                graph_memory_id=entry.graph_memory_id if entry else "",
+                shard_id=entry.shard_id if entry else "",
+                full_path=entry.full_path if entry else "",
+                source_node_ids=entry.source_node_ids if entry else [],
             ))
         
         # 按综合分数排序
@@ -623,6 +902,9 @@ class DualIndexSummaryStore:
                     "detail_id": doc_id,
                     "user_text": meta.get("user_text", ""),
                     "ai_text": meta.get("ai_text", ""),
+                    "graph_memory_id": meta.get("graph_memory_id", ""),
+                    "shard_id": meta.get("shard_id", ""),
+                    "full_path": meta.get("full_path", ""),
                 })
         
         # 更新访问计数
