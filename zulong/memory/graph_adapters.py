@@ -85,11 +85,10 @@ class TaskGraphAdapter(BaseGraphAdapter):
         root_node = graph.get_node(task_root_mg_id)
         if root_node is None:
             # 尝试查找完整路径格式（task_create_plan 已创建的情况）
-            for nid, node in graph._nodes.items():
-                if (node.node_type == NodeType.TASK
-                        and node.metadata.get("graph_id") == graph_id):
+            for node in graph.get_nodes_by_type(NodeType.TASK):
+                if node.metadata.get("graph_id") == graph_id:
                     root_node = node
-                    task_root_mg_id = nid
+                    task_root_mg_id = node.node_id
                     break
 
         parent_prefix = ""
@@ -353,15 +352,15 @@ class TaskGraphAdapter(BaseGraphAdapter):
 # TaskGraph 从 MemoryGraph 重建（轻量级恢复路径）
 # ============================================================
 
-def rebuild_task_graph_from_memory(mg: MemoryGraph, graph_id: str):
-    """从 MemoryGraph 中重建 TaskGraph 运行时对象（无需磁盘 I/O）
+def rebuild_task_graph_from_memory(mg, graph_id: str):
+    """从 MemoryGraph/ShardedMemoryGraph 中重建 TaskGraph 运行时对象（无需磁盘 I/O）
 
-    通过遍历 MemoryGraph 中 graph_id 对应的 TASK 节点及 HIERARCHY/DEPENDENCY
+    通过遍历记忆图谱中 graph_id 对应的 TASK 节点及 HIERARCHY/DEPENDENCY
     边来还原完整的 TaskGraph 结构。这是轻量级恢复路径——当 LLM 通过节点地址
     引用一个历史任务时，无需从 JSON 文件反序列化即可恢复执行。
 
     Args:
-        mg: MemoryGraph 实例
+        mg: MemoryGraph 或 ShardedMemoryGraph 实例
         graph_id: 任务图谱 ID（如 "tg_1234567890"）
 
     Returns:
@@ -371,9 +370,8 @@ def rebuild_task_graph_from_memory(mg: MemoryGraph, graph_id: str):
 
     # 1. 收集属于该 graph_id 的所有 TASK 节点
     task_nodes = []
-    for node in mg._nodes.values():
-        if (node.node_type == NodeType.TASK
-                and node.metadata.get("graph_id") == graph_id):
+    for node in mg.get_nodes_by_type(NodeType.TASK):
+        if node.metadata.get("graph_id") == graph_id:
             task_nodes.append(node)
 
     if len(task_nodes) < 1:
@@ -430,33 +428,47 @@ def rebuild_task_graph_from_memory(mg: MemoryGraph, graph_id: str):
     local_ids_set = set(mg_id_to_local.keys())
     for mg_id in local_ids_set:
         try:
-            for _, neighbor, data in mg._graph.out_edges(mg_id, data=True):
-                if (data.get("edge_type") == EdgeType.HIERARCHY.value
-                        and neighbor in local_ids_set):
-                    parent_local = mg_id_to_local[mg_id]
-                    child_local = mg_id_to_local[neighbor]
-                    edge_tuple = (parent_local, child_local)
-                    if edge_tuple not in tg._h_edge_set:
-                        tg._h_edges.append(edge_tuple)
-                        tg._h_edge_set.add(edge_tuple)
+            for neighbor in mg.get_neighbors(
+                mg_id, edge_types={EdgeType.HIERARCHY}, max_depth=1
+            ):
+                if neighbor.node_id not in local_ids_set:
+                    continue
+                edge_data = mg.get_edge(mg_id, neighbor.node_id)
+                if not isinstance(edge_data, dict) or edge_data.get("edge_type") != EdgeType.HIERARCHY.value:
+                    continue
+                parent_local = mg_id_to_local[mg_id]
+                child_local = mg_id_to_local[neighbor.node_id]
+                edge_tuple = (parent_local, child_local)
+                if edge_tuple not in tg._h_edge_set:
+                    tg._h_edges.append(edge_tuple)
+                    tg._h_edge_set.add(edge_tuple)
         except Exception:
             pass
 
     # 5. 从 DEPENDENCY 边重建 d_edges
     for mg_id in local_ids_set:
         try:
-            for _, neighbor, data in mg._graph.out_edges(mg_id, data=True):
-                if (data.get("edge_type") == EdgeType.DEPENDENCY.value
-                        and neighbor in local_ids_set):
-                    s_local = mg_id_to_local[mg_id]
-                    t_local = mg_id_to_local[neighbor]
-                    dep_meta = data.get("metadata", {}) if isinstance(data.get("metadata"), dict) else {}
-                    dep = DependencyEdge(
-                        s=s_local, t=t_local,
-                        via=dep_meta.get("via", ""),
-                        cross=dep_meta.get("cross", False),
-                    )
-                    tg._d_edges.append(dep)
+            for neighbor in mg.get_neighbors(
+                mg_id, edge_types={EdgeType.DEPENDENCY}, max_depth=1
+            ):
+                if neighbor.node_id not in local_ids_set:
+                    continue
+                edge_data = mg.get_edge(mg_id, neighbor.node_id)
+                if not isinstance(edge_data, dict) or edge_data.get("edge_type") != EdgeType.DEPENDENCY.value:
+                    continue
+                s_local = mg_id_to_local[mg_id]
+                t_local = mg_id_to_local[neighbor.node_id]
+                dep_meta = (
+                    edge_data.get("metadata", {})
+                    if isinstance(edge_data.get("metadata"), dict)
+                    else {}
+                )
+                dep = DependencyEdge(
+                    s=s_local, t=t_local,
+                    via=dep_meta.get("via", ""),
+                    cross=dep_meta.get("cross", False),
+                )
+                tg._d_edges.append(dep)
         except Exception:
             pass
 
@@ -471,8 +483,10 @@ def rebuild_task_graph_from_memory(mg: MemoryGraph, graph_id: str):
     return tg
 
 
-def _extract_local_id(gnode: GraphNode, graph_id: str) -> str:
-    """从 GraphNode 的地址信息中提取 TaskGraph 本地 node_id"""
+def _extract_local_id(gnode, graph_id: str) -> str:
+    """从 GraphNode/NodeProperties 的地址信息中提取 TaskGraph 本地 node_id
+    （两者均有 node_id 和 metadata 字段，兼容）
+    """
     # 优先从 graph_address 提取: "tg:{graph_id}/task:{node_id}"
     addr = gnode.metadata.get("graph_address", "")
     if addr:

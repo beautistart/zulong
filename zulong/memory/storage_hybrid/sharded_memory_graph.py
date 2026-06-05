@@ -1603,6 +1603,82 @@ class ShardedMemoryGraph:
                 
         return None
 
+    def resolve_address(self, address: str) -> Optional[NodeProperties]:
+        """
+        解析图地址字符串，定位对应的记忆节点（兼容 MemoryGraph 接口）。
+
+        支持格式:
+        - "tg:{graph_id}/task:{node_id}" → TaskGraph 地址
+        - "task:o1_1"                    → 直接 node_id
+        - "dialogue:round_42"            → 对话节点
+        - 任意 node_id 字符串            → 直接查找
+
+        性能设计 (TSD v2.4 <50ms):
+        - 格式1-2: O(1) 通过 global_index (LMDB mmap)，<1ms
+        - 兜底: O(n) 通过 search_nodes 遍历所有分片
+
+        Returns:
+            NodeProperties 或 None（未找到）
+        """
+        if not address:
+            return None
+
+        # ── 格式1: tg:{graph_id}/task:{node_id} ──
+        if address.startswith("tg:"):
+            parts = address.split("/")
+            graph_id = parts[0][3:]  # 去掉 "tg:" 前缀
+            for part in parts[1:]:
+                if part.startswith("task:"):
+                    local_node_id = part[5:]
+                    # 尝试 task:{node_id} 格式（TaskGraphAdapter 写入的 node_id）
+                    node = self.get_node(f"task:{local_node_id}")
+                    if node:
+                        return node
+                    # 尝试 task:{graph_id}/{node_id} 格式（带 session 前缀的完整路径）
+                    node = self.get_node(f"task:{graph_id}/{local_node_id}")
+                    if node:
+                        return node
+                    # 尝试原始 part 作为 node_id
+                    node = self.get_node(part)
+                    if node:
+                        return node
+
+        # ── 格式2: 直接 node_id 查找 ──
+        node = self.get_node(address)
+        if node:
+            return node
+
+        # ── 格式3: tg: 地址通过 global_index 的 task_graph_node 映射 ──
+        if address.startswith("tg:"):
+            parts = address.split("/")
+            graph_id = parts[0][3:]
+            try:
+                indexed_nid = self.global_index.get_task_graph_node(graph_id)
+                if indexed_nid:
+                    node = self.get_node(indexed_nid)
+                    if node:
+                        return node
+            except Exception as exc:
+                logger.debug(
+                    f"[resolve_address] global_index 查询失败 "
+                    f"tg={graph_id}: {exc}"
+                )
+
+        # ── 格式4 (兜底): 通过 metadata graph_address/task_graph_address 遍历 ──
+        search_results = self.search_nodes(address, max_results=10)
+        for result in search_results:
+            meta = result.get("metadata", {}) or {}
+            if meta.get("graph_address") == address:
+                nid = result.get("node_id")
+                if nid:
+                    return self.get_node(nid)
+            if meta.get("task_graph_address") == address:
+                nid = result.get("node_id")
+                if nid:
+                    return self.get_node(nid)
+
+        return None
+
     def update_node(self, node: NodeProperties) -> bool:
         """更新节点属性（兼容 MemoryGraph 接口）。"""
         shard, shard_id, definitive_miss = self._get_indexed_shard_status(node.node_id)
@@ -2238,7 +2314,15 @@ class ShardedMemoryGraph:
     
     def set_importance(self, node_id: str, importance) -> None:
         """设置节点重要性（兼容 MemoryGraph 接口）"""
-        pass
+        node = self.get_node(node_id)
+        if not node:
+            return
+        importance_value = getattr(importance, "value", importance) or "normal"
+        node.importance = str(importance_value)
+        metadata = dict(getattr(node, "metadata", {}) or {})
+        metadata["importance"] = str(importance_value)
+        node.metadata = metadata
+        self.update_node(node)
     
     def get_children(self, node_id: str, edge_type=None) -> list:
         """获取子节点列表（兼容 MemoryGraph 接口）
@@ -2817,6 +2901,57 @@ class ShardedMemoryGraph:
     def set_rag_manager(self, rag_manager):
         """注入 RAGManager 供 backend_ref 反查使用（兼容 MemoryGraph 接口）"""
         self._rag_manager = rag_manager
+
+    def resolve_backend_ref(self, node_id: str) -> Optional[Dict[str, Any]]:
+        """通过 backend_ref 反查后端完整数据（兼容 MemoryGraph 接口）。"""
+        node = self.get_node(node_id)
+        if not node:
+            return None
+        metadata = dict(getattr(node, "metadata", {}) or {})
+        ref = getattr(node, "backend_ref", "") or metadata.get("backend_ref", "")
+        if not ref:
+            return None
+
+        parts = str(ref).split(":", 1)
+        if len(parts) != 2:
+            return None
+        backend_type, backend_id = parts[0], parts[1]
+
+        if backend_type == "task_graph":
+            return {"source": "task_graph", "ref": backend_id, "data": metadata}
+
+        rag_mgr = getattr(self, "_rag_manager", None)
+        if rag_mgr is None:
+            return None
+
+        lib_map = {
+            "experience_rag": "experience",
+            "knowledge": "knowledge",
+            "memory": "memory",
+        }
+        library = lib_map.get(backend_type, backend_type)
+        try:
+            if hasattr(rag_mgr, "get_document"):
+                doc = rag_mgr.get_document(library, backend_id)
+                if doc:
+                    return {
+                        "source": backend_type,
+                        "doc_id": backend_id,
+                        "content": getattr(doc, "content", "") or getattr(doc, "text", "") or str(doc),
+                        "metadata": getattr(doc, "metadata", {}) or {},
+                    }
+            if hasattr(rag_mgr, "get"):
+                doc = rag_mgr.get(library, backend_id)
+                if doc:
+                    return {
+                        "source": backend_type,
+                        "doc_id": backend_id,
+                        "content": getattr(doc, "content", "") or getattr(doc, "text", "") or str(doc),
+                        "metadata": getattr(doc, "metadata", {}) or {},
+                    }
+        except Exception as exc:
+            logger.debug(f"[ShardedMemoryGraph] resolve_backend_ref 失败 ({ref}): {exc}")
+        return None
 
     def save_all(self):
         """保存所有活跃分片"""
