@@ -2,11 +2,11 @@
 
 <img src="./docs/images/zulong_logo_transparent.png" alt="Zulong Logo" width="120" height="120" />
 
-# 祖龙 (ZULONG)
+# 祖龙 (ZULONG) v2.0.0
 
 ### 给 AI 代理装上能保持跨年级别完整记忆的"海马体"
 
-**82K+ 行 Python | 一个设计师用 AI 搓出来的**
+**100K+ 行 Python | 一个设计师用 AI 搓出来的**
 
 [![License](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://www.python.org/)
@@ -39,7 +39,7 @@
 
 ## 为何一个室内设计师，敢去造 AI 大脑？
 
-我是一名室内设计师，用 **2 个月的时间**，独立开发了祖龙 **82000+ 行代码**。
+我是一名室内设计师，用 **2 个月的时间**，独立开发了祖龙 **100000+ 行代码**。
 
 不用感到不可思议，因为设计师的素养就是作为项目的"总工程师"规划蓝图，让各个专业板块的人士去落地蓝图。
 
@@ -68,16 +68,16 @@
 
 ---
 
-> **📢 v1.0.0 正式发布（2026-05-12）**
+> **📢 v2.0.0 正式发布（2026-05-27）**
 >
-> 记忆板块经过重大架构升级后，这次是祖龙的首次正式发布，包含完整的记忆图谱、死循环检测、跨年级完整记忆等核心能力。
+> 重大架构升级：任务编排重构与交互体验革新。FC循环合并、交互式任务卡片、审批白名单、工具袋系统、记忆图谱可视化等。
 >
 > **核心更新**：
-> - ✅ **MemoryGraph 记忆图谱** - 9节点+7边+赫布学习+艾宾浩斯衰减
-> - ✅ **CircuitBreaker 6信号检测** - 信息增益检测等6种信号
-> - ✅ **跨年级完整记忆** - 完整状态序列化
-> - ✅ **5层防护链** - 基于qwen3.6-27B模型
-> - ✅ **完整的 VS Code 扩展+ TTS/ASR 语音交互**
+> - ✅ **交互式任务卡片系统** - ApprovalCard/InteractionCard/StartupCard/SummaryCard
+> - ✅ **L1-B预判 + L2统一主链** - 废弃CHAT/COMPLEX/RESUME意图分类
+> - ✅ **工具袋系统 (ToolBag)** - 工具智能路由与预测加载
+> - ✅ **记忆图谱可视化面板** - BFS动画、注意力视图
+> - ✅ **跨年级完整记忆** - 完整状态序列化与恢复
 >
 > 详见 [CHANGELOG.md](./CHANGELOG.md)
 
@@ -112,17 +112,18 @@
 
 适用场景：24 小时陪伴式机器人、超长程项目管理（跨周/跨月）、中断后环境变化自动重评估
 
-### 4. 🧠 两阶段意图分类 + FC 循环
+### 4. 🧠 L1-B预判 + L2统一主链 + FC 循环
 
 ```
-Round 1: 意图分类 → CHAT/COMPLEX/RESUME
-Round 2: 场景化执行
-  ├─ CHAT: 直接对话
-  ├─ COMPLEX: 启动 FC 循环 + TaskGraph 自动规划
-  └─ RESUME: 从快照恢复 + 继续执行
+L1-B 调度层: 预判工具需求 + 上下文信号（不再做意图分类）
+  ↓
+L2 统一主链: 推理 → 回复 → 工具执行 → 循环
+  ├─ 自然对话: 直接推理回复，无需工具
+  ├─ 任务执行: 启动 FC 循环 + TaskGraph 自动规划
+  └─ 任务恢复: 从快照恢复 + 继续执行
 ```
 
-配套 5 层防护链（CB 强制收敛、RuleGuardian 过早完成拦截、InfoGap 信息缺口检测等）
+配套 5 层防护链（CB 强制收敛、RuleGuardian 过早完成拦截、InfoGap 信息缺口检测等），新增交互式任务卡片系统与审批白名单。
 
 ### 5. 🎙️ 语音交互能力（TTS + ASR）
 
@@ -274,7 +275,7 @@ audio:
 ## 📂 项目结构
 
 ```
-zulong_beta4/
+zulong_beta5/
 ├── zulong-ide/                 # VS Code 后台执行桥 (React + TypeScript)
 ├── zulong/                     # Python 后端核心
 │   ├── ide/                    # IDE 模式 (WebSocket 服务 + 工具注册)
