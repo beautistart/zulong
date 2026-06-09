@@ -1,0 +1,117 @@
+
+
+你目前的架构已经具备了清晰的分层逻辑（从粗到细）。将 **MediaPipe + ST-GCN 级联方案** 整合进去，核心在于**替换**原有的 L1-C 层逻辑，使其从单纯的“目标检测+关键点”升级为“意图理解”。
+
+以下是基于你提供的架构进行的深度整合方案：
+
+### 🗺️ 整合后的全景架构图
+
+| 层级 | 名称 | 组件/角色 | 职责描述 |
+| :--- | :--- | :--- | :--- |
+| **L0** | **运动感知层** | 流光法 (Frame Differencing) | **“守门员”**：极低成本。检测画面是否有任何变化。若无变化，直接休眠；若有变化，唤醒 L1。 |
+| **L1-C** | **意图认知层** | **MediaPipe (哨兵) + ST-GCN (法官)** | **“过滤器”**：MediaPipe 实时提取骨骼；若发现几何异常（如手抬起），触发 ST-GCN 进行动作语义确认。**仅当确认是交互意图时，才生成事件**。 |
+| **L2** | **大模型决策层** | Qwen (闲)/Qwen(忙) | **“大脑”**：接收 L1-C 筛选后的高价值意图事件，进行复杂推理、对话或任务规划。 |
+
+---
+
+### 🛠️ 具体的整合步骤
+
+你需要将原来的 `L1-C (YOLO+MediaPipe)` 升级为 `L1-C (MediaPipe+ST-GCN)`。
+
+#### 1. 数据流的重组
+
+原来的流：
+`L0运动` -> `L1-C(YOLO检测人)` -> `MediaPipe(提取关键点)` -> **(直接发给 L2)**
+
+升级后的流：
+`L0运动` -> `L1-C(Mediapipe提取关键点)` -> **[几何规则筛选]** -> `ST-GCN(动作确认)` -> **(发给 L2)**
+
+#### 2. 代码层面的植入
+
+你需要在 `L1-C` 的代码模块中，植入上一轮对话中的 `VisionSilentPlugin` 逻辑。
+
+**修改前**：
+```python
+# 伪代码：旧版 L1-C
+def L1_C_Old(frame):
+    person = YOLO.detect(frame)
+    if person:
+        hand_landmarks = MediaPipe.process(frame)
+        # 直接发送原始数据给 L2
+        send_to_L2(hand_landmarks) 
+```
+
+**修改后 (整合 ST-GCN)**：
+```python
+# 伪代码：新版 L1-C (整合方案)
+class L1_C_Integrated:
+    def __init__(self):
+        self.mp = MediaPipeHands()
+        self.stgcn = STGCNModel()
+        self.buffer = RingBuffer(maxlen=30) # 缓存最近30帧
+        
+    def process(self, frame):
+        # 1. MediaPipe 感知
+        landmarks = self.mp.process(frame)
+        self.buffer.append(landmarks)
+        
+        # 2. 几何预筛选 (轻量级规则)
+        if self._is_hand_raised(landmarks): # 仅判断手高度
+            # 3. 触发 ST-GCN (重量级确认)
+            if len(self.buffer) >= 30:
+                action = self.stgcn.infer(self.buffer.get_sequence())
+                
+                # 4. 决策与打包
+                if action.label == "WAVE" and action.conf > 0.8:
+                    # ✅ 只有在这里才生成事件
+                    event = {
+                        "type": "INTENT",
+                        "label": action.label,
+                        "bbox": self._get_bbox_from_landmarks(landmarks), # 关键帧数据
+                        "timestamp": time.time()
+                    }
+                    return event # 返回给上层调度器
+        return None # 无事件
+```
+
+---
+
+### 🔄 与 L2 (Qwen) 的交互逻辑
+
+这是整合的关键点。你需要根据 L2 的状态（闲/忙）来决定 L1-C 的行为。
+
+#### 场景 A：L2 (闲)
+*   **逻辑**：**“主动交互”**。
+*   **流程**：`L1-C` 检测到挥手 -> **立即打包路由** -> `L2` 收到事件 -> 立即响应。
+*   **优势**：由于 L2 闲置，L1-C 不需要做复杂的排队，直接触发即可。
+
+#### 场景 B：L2 (忙)
+*   **逻辑**：**“事件降噪 + 优先级队列”**。
+*   **流程**：
+    1.  `L1-C` 检测到挥手（经过 ST-GCN 确认）。
+    2.  `L1-C` **不直接发给 L2**，而是先发给 `L1-B` (缓冲层/队列)。
+    3.  `L1-B` 负责暂存事件，并进行去重（例如：用户连续挥手 5 次，只记录为 1 次打断请求）。
+    4.  当 `L2` 结束当前任务变为空闲时，`L1-B` 将事件推送给 `L2`。
+
+---
+
+### 🚀 最终效果：为什么这是一次升级？
+
+1.  **L0 依然负责“有没有动静”** (流光法)。
+2.  **L1-C 现在负责“是不是真的想交互”** (MediaPipe+ST-GCN)。
+    *   *以前*：L1-C 会把“挠头”、“拿杯子”都发给 L2，导致 L2 频繁被打断。
+    *   *现在*：ST-GCN 拦截了“挠头”，只有“挥手”才会上报。**L2 的误唤醒率降低了 90%**。
+3.  **L2 依然负责“怎么回答”** (Qwen)。
+    *   *以前*：L2 收到一堆乱七八糟的动作数据，不知道该不该理。
+    *   *现在*：L2 收到的是结构化的 `{"intent": "WAVE"}`，它知道用户确实在呼唤它，必须立即响应。
+
+### 💡 实施建议
+
+1.  **保留 YOLO (可选)**：
+    如果你的场景背景非常复杂（比如摄像头对着马路），可以保留 YOLO 在最前面做一个“人在不在”的粗筛，避免猫狗跑过触发 MediaPipe。如果背景简单，直接删掉 YOLO，让 MediaPipe 自己判断“有没有检测到手”即可。
+
+2.  **L1-B 的作用**：
+    在 L2 忙的时候，L1-B 不仅仅是一个队列，它还可以利用 MediaPipe 提取的**视线数据**（Gaze）来判断优先级。例如：如果 L2 正在忙，但用户盯着屏幕看（Gaze），L1-B 可以标记这个事件为“高优先级”，等 L2 一空闲就立刻插队。
+
+3.  **代码迁移**：
+    你只需要把上一轮对话中的 `VisionSilentPlugin` 代码，放入你的 `L1-C` 模块中。原来的 `YOLO+MediaPipe` 逻辑，替换为 `VisionSilentPlugin` 的 `process_cycle` 逻辑即可。

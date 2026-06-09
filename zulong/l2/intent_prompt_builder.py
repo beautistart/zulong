@@ -2,12 +2,11 @@
 # 统一主链提示词构建器
 #
 # 当前 TSD 主链:
-# 用户事件 -> L1-B（工具预判 + 上下文/记忆检索 + 工具包打包）-> L2（推理）
+# 用户事件 -> L1-B（BFS/记忆预检索 + 输出模态 + ALBERT辅助 + 工具预判 + 上下文打包）-> L2（单次决策）
 #
 # 本模块只消费 L1-B 注入的工具包、任务图策略和上下文信号。
 # L2 据此决定直接回答、调用已有工具，或在工具增强轮次中自主补充工具。
 
-import asyncio
 import logging
 import os
 from datetime import datetime
@@ -45,27 +44,27 @@ def _build_time_header() -> str:
 
 
 def _build_environment_header(runtime_context: Optional[Dict[str, Any]] = None) -> str:
-    runtime_context = runtime_context or {}
+    try:
+        from zulong.utils.runtime_env import get_runtime_context
+        detected_context = get_runtime_context()
+    except Exception:
+        detected_context = {}
+
+    runtime_context = {**detected_context, **(runtime_context or {})}
     workspace_root = runtime_context.get("workspace_root") or "未提供工作区"
-    shell_name = runtime_context.get("shell") or os.environ.get("SHELL") or "PowerShell"
+    shell_name = runtime_context.get("shell") or os.environ.get("SHELL") or os.environ.get("COMSPEC") or "unknown"
     os_name = runtime_context.get("os_name") or ("Windows" if os.name == "nt" else os.name)
-    preferred_commands = runtime_context.get("preferred_commands") or [
-        "Get-ChildItem",
-        "Select-String",
-        "Get-Content",
-        "rg",
-        "python",
-        "npm",
-        "git",
-    ]
+    preferred_commands = runtime_context.get("preferred_commands") or ["rg", "python", "npm", "git"]
+    command_guidance = runtime_context.get("command_guidance") or "运行命令必须符合当前操作系统和 Shell。"
     return (
         "\n【运行环境】\n"
         f"- 操作系统: {os_name}\n"
         f"- Shell: {shell_name}\n"
         f"- 工作区根目录: {workspace_root}\n"
         f"- 推荐命令: {', '.join(preferred_commands)}\n"
-        "- 当前环境优先使用 Windows/PowerShell 命令，不要生成 Unix 专属命令（如 `find / -name`、`ls -la`、`pwd && ...`、`2>/dev/null`）。\n"
-        "- 代码阅读/架构分析优先使用代码工具：index_project(root_dir=...)、search_code_symbols(query=...)、zulong_code_query(file_path=...)。\n"
+        f"- 命令风格: {command_guidance}\n"
+        "- 代码阅读/架构分析如需创建代码图谱，必须先调用 task_create_plan 创建/绑定任务图根节点；必要时用 task_add_node 添加代码分析子节点，再调用 index_project(root_dir=...)。\n"
+        "- 已有活跃任务图时，在该图下调用 index_project；之后用 search_code_symbols(query=...)、zulong_code_query(file_path=...) 继续分析。\n"
         "- 如果结构化代码工具因解析器/索引限制失败，优先改用 read_file(file_path=...) 只读读取源码，再继续分析。\n"
         "- 若需要运行命令，再调用 exec_run_command，且命令必须符合当前 shell。\n"
     )
@@ -78,103 +77,12 @@ def _inject_memory_context(
     attn_stats: Optional[dict] = None,
     pre_retrieved_memory: Optional[str] = None,
 ) -> None:
-    """注入 MemoryGraph 上下文和注意力状态。"""
-    try:
-        from zulong.memory.memory_graph import get_memory_graph as _get_mg_nav
-
-        _mg_nav = _get_mg_nav()
-        if _mg_nav:
-            focus_summary = _mg_nav.get_focus_path_summary()
-            if focus_summary:
-                system_parts.append(f"\n{focus_summary}\n")
-                logger.debug("[Prompt] 已注入焦点路径 (%d chars)", len(focus_summary))
-    except Exception as e:
-        logger.debug("[Prompt] 焦点路径注入跳过: %s", e)
-
+    """只消费 L1-B 预检索记忆，不在 L2 侧主动检索 MemoryGraph。"""
     if pre_retrieved_memory:
         logger.info("[MemoryGraph] 使用 L1-B 预检索记忆 (%d 字符)", len(pre_retrieved_memory))
         system_parts.append("\n【记忆上下文】\n" + pre_retrieved_memory + "\n")
     else:
-        try:
-            from zulong.memory.memory_graph import get_memory_graph
-
-            _mg = get_memory_graph()
-            if _mg:
-                if not getattr(_mg, "_rag_manager", None) and rag_manager:
-                    _mg.set_rag_manager(rag_manager)
-
-                def _run_async_bridge(coro):
-                    try:
-                        loop = asyncio.get_running_loop()
-                    except RuntimeError:
-                        loop = None
-                    if loop is not None and loop.is_running():
-                        import concurrent.futures
-
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                            return pool.submit(asyncio.run, coro).result(timeout=30)
-                    return asyncio.run(coro)
-
-                _usage_ratio = 0.0
-                _context_window_size = 131072
-                if attn_stats:
-                    _usage_ratio = attn_stats.get("usage_ratio", 0.0)
-                    _context_window_size = attn_stats.get("context_window_size", 131072)
-
-                if hasattr(_mg, "retrieve_context_dynamic"):
-                    mg_results = _run_async_bridge(
-                        _mg.retrieve_context_dynamic(
-                            user_input,
-                            context_window_size=_context_window_size,
-                            usage_ratio=_usage_ratio,
-                            session_id="",
-                        )
-                    )
-                else:
-                    _top_k = 3 if _usage_ratio > 0.8 else 5 if _usage_ratio > 0.6 else 8
-                    mg_results = _run_async_bridge(
-                        _mg.retrieve_context(user_input, top_k=_top_k, session_id="")
-                    )
-
-                if mg_results:
-                    remaining_ratio = max(0.0, 1.0 - _usage_ratio)
-                    content_limit = max(100, min(500, int(500 * remaining_ratio)))
-                    memory_sections = []
-                    for result in mg_results:
-                        node_type = result.get("node_type", "")
-                        content = result.get("content", "")
-                        label = result.get("label", "")
-                        graph_memory_id = result.get("graph_memory_id") or result.get("node_id", "")
-                        shard_id = result.get("shard_id", "")
-                        address_hint = ""
-                        if graph_memory_id:
-                            address_hint = f"（图记忆ID：{graph_memory_id}" + (f"，分片：{shard_id}" if shard_id else "") + "）"
-                        if not content:
-                            continue
-                        if node_type == "experience":
-                            continue
-                        if node_type == "dialogue":
-                            memory_sections.append(f"【历史对话】{content[:content_limit]}{address_hint}")
-                        elif node_type == "task":
-                            status = result.get("metadata", {}).get("status", "")
-                            memory_sections.append(
-                                f"【相关任务】{label}" + (f"（状态：{status}）" if status else "")
-                                + address_hint
-                            )
-                        elif node_type == "knowledge":
-                            memory_sections.append(f"【知识参考】{content[:content_limit]}{address_hint}")
-                        elif node_type == "episode":
-                            memory_sections.append(f"【历史摘要】{content[:content_limit]}{address_hint}")
-                        elif node_type in ("person", "concept"):
-                            memory_sections.append(f"【知识参考】{label}: {content[:content_limit]}{address_hint}")
-                        else:
-                            memory_sections.append(f"【参考】{content[:content_limit]}{address_hint}")
-
-                    if memory_sections:
-                        system_parts.append("\n【记忆上下文】\n" + "\n".join(memory_sections) + "\n")
-                        logger.info("[MemoryGraph] 注入 %d 条记忆到上下文", len(memory_sections))
-        except Exception as e:
-            logger.warning("[MemoryGraph] 记忆检索失败，降级跳过: %s", e)
+        logger.debug("[MemoryGraph] L1-B 未提供预检索记忆；L2 不主动检索")
 
     memory_count = sum(1 for part in system_parts if "【记忆上下文】" in part or "【历史对话】" in part)
     attn_lines = ["\n【注意力状态】"]
@@ -314,43 +222,26 @@ def build_unified_system_prompt(
     )
     task_graph_policy = task_graph_policy or scaffold_data.get("policy") or "none"
     turn_shape = context_bundle.get("turn_shape", "")
-    simple_social = turn_shape == "simple_social" and not tool_bundle and task_graph_policy in ("", "none", None)
+    l1b_context_pack = scaffold_data.get("l1b_context_pack") or ""
     enable_voice_hint = voice_mode in ("AUTO_TTS", "FORCED_TTS")
 
     system_parts = [_build_time_header()]
-    if not simple_social:
-        system_parts.append(_build_environment_header(runtime_context))
+    system_parts.append(_build_environment_header(runtime_context))
 
-    if simple_social:
-        system_parts.append(
-            "\n【统一主链】\n"
-            "- 本轮已经由 L1-B 完成工具预判、上下文检索和任务打包。\n"
-            "- L1-B 判定当前轮次无需工具，你只需要进行自然语言推理并生成回复。\n"
-            "- 不要输出内部路由标签或状态标签。\n"
-            "- 主回答必须由模型生成，不能依赖固定回复模板。\n"
-        )
-    else:
-        system_parts.append(
-            "\n【统一主链】\n"
-            "- 本轮已经由 L1-B 完成工具预判、上下文检索和工具包打包。\n"
-            "- 你是 L2 推理层：根据当前消息、上下文和工具包自主决定直接回答、调用工具或请求补充工具。\n"
-            "- 不要输出内部路由标签或状态标签。\n"
-            "- 主回答必须由模型生成，不能依赖固定回复模板。\n"
-        )
+    system_parts.append(
+        "\n【统一主链】\n"
+        "- 本轮已经由 L1-B 同步完成 BFS 会话自恢复、MemoryGraph 预检索、输出模态辅助、ALBERT 辅助分类、工具预判和上下文打包。\n"
+        "- 你是 L2 推理层：直接基于 L1-B 任务包进行第一次模型决策。\n"
+        "- 只有当上下文不足或工具不足时，才通过已暴露工具进行增量补充；不要在决策前自行构建上下文。\n"
+        "- 不要输出内部路由标签或状态标签。\n"
+        "- 主回答必须由模型生成，不能依赖固定回复模板。\n"
+    )
 
     system_parts.append(
         "\n【交流风格】\n"
         "用自然、友好的口语和用户对话。\n"
         "必须使用用户输入的语言回复。用户用中文提问就用中文回答，用英文就用英文回答。\n"
     )
-
-    if simple_social:
-        system_parts.append(
-            "\n【轻量寒暄约束】\n"
-            "用户只是打招呼或寒暄时，直接自然回应即可。\n"
-            "不要要求用户提供具体任务，不要把寒暄改写成任务需求，不要调用工具。\n"
-            "回复保持简短、自然、有人味。\n"
-        )
 
     if enable_voice_hint:
         system_parts.append(
@@ -359,34 +250,19 @@ def build_unified_system_prompt(
             "如果用户明确要求语音回复，可以自然回应并继续生成正常内容。\n"
         )
 
-    if tool_bundle:
-        system_parts.append(
-            "\n【L1-B 工具包】\n"
-            f"- 建议工具: {', '.join(tool_bundle)}\n"
-            "- 这些工具只是预判结果，不代表必须全部调用。\n"
-            "- 如果要完成用户请求还缺工具，调用 request_tool_supplement 补充；如果无需工具，直接回答。\n"
-        )
-    elif not simple_social:
-        system_parts.append(
-            "\n【工具使用】\n"
-            "L1-B 未建议具体工具。若当前消息可直接回答，请直接回答；不要为了形式调用工具。\n"
-        )
+    system_parts.append(
+        "\n【执行规则】\n"
+        "1. 普通问答、确认、简短说明可以直接自然语言回复。\n"
+        "2. 需要读取项目代码时，优先使用代码/文件工具，不要先用 shell 穷举目录。\n"
+        "3. 需要多步骤持续执行时，再使用 task_* 工具创建、复用或推进任务图。\n"
+        "4. 运行命令必须符合【运行环境】中声明的当前操作系统和 Shell。\n"
+        "5. 工具调用中的 label、desc、result 等字段必须使用与用户相同的语言。\n"
+        "6. 内容型子任务写入工作目录时，优先使用相对 file_path。\n"
+        "7. 如信息不足，先调用记忆/任务/工具补充类工具增量补齐；确实无法继续时再向用户追问。\n"
+    )
 
-    if not simple_social:
-        system_parts.append(
-            "\n【执行规则】\n"
-            "1. 普通问答、确认、简短说明可以直接自然语言回复。\n"
-            "2. 需要读取项目代码时，优先使用代码/文件工具，不要先用 shell 穷举目录。\n"
-            "3. 需要多步骤持续执行时，再使用 task_* 工具创建、复用或推进任务图。\n"
-            "4. 运行命令必须符合当前 Windows/PowerShell 环境。\n"
-            "5. 工具调用中的 label、desc、result 等字段必须使用与用户相同的语言。\n"
-            "6. 内容型子任务写入工作目录时，优先使用相对 file_path。\n"
-            "7. 如信息不足，先用已有上下文和工具补齐；确实无法继续时再向用户追问。\n"
-        )
-
-    if not simple_social:
-        _append_active_task_context(system_parts, task_graph_policy or "none")
-        _append_completed_task_context(system_parts)
+    if l1b_context_pack:
+        system_parts.append("\n" + l1b_context_pack + "\n")
 
     if scaffold_data.get("graph_lost"):
         lost_graph_id = scaffold_data.get("lost_graph_id", "")
@@ -402,12 +278,7 @@ def build_unified_system_prompt(
     if rag_context:
         system_parts.append(f"\n【参考知识】\n{rag_context}\n")
 
-    if simple_social:
-        system_parts.append(
-            "\n【注意力状态】\n"
-            "轻量寒暄轮次不注入历史记忆，避免旧任务或旧回复污染当前问候。\n"
-        )
-    else:
+    if not l1b_context_pack:
         _inject_memory_context(
             system_parts,
             user_input,

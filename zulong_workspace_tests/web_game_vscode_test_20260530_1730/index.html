@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>星尘接球 — 祖龙 IDE/VSCode 链路测试</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="game-container">
+        <h1>🌟 星尘接球</h1>
+        <div id="hud">
+            <span id="score-display">⭐ 分数: <strong id="score">0</strong></span>
+            <span id="lives-display">❤️ 生命: <strong id="lives">3</strong></span>
+            <span id="level-display">📈 等级: <strong id="level">1</strong></span>
+        </div>
+        <canvas id="game-canvas" width="600" height="500"></canvas>
+        <div id="controls">
+            <button id="btn-start">▶ 开始游戏</button>
+            <button id="btn-pause">⏸ 暂停</button>
+            <button id="btn-restart">🔄 重新开始</button>
+        </div>
+        <div id="message"></div>
+    </div>
+    <script src="game.js"></script>
+</body>
+</html>

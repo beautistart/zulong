@@ -181,7 +181,7 @@ class EventBus:
                 else:
                     logger.info(f"📡 [EventBus]   ❌ 不匹配 L1-B，跳过")
         else:
-            logger.warning(f"📡 [EventBus] 事件 {event.type.name} 没有订阅者")
+            logger.debug(f"📡 [EventBus] 事件 {event.type.name} 没有订阅者")
     
     def _route_to_l2(self, event: ZulongEvent):
         """路由事件到 L2
@@ -213,7 +213,7 @@ class EventBus:
                     import traceback
                     logger.error(traceback.format_exc())
         else:
-            logger.warning(f"📡 [EventBus] 事件 {event.type.name} 没有订阅者")
+            logger.debug(f"📡 [EventBus] 事件 {event.type.name} 没有订阅者")
     
     def set_event_store(self, store) -> None:
         """设置事件持久化存储 (可选钩子)

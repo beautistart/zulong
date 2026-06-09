@@ -946,6 +946,41 @@ export class Task {
 		}
 		const sayTs = Date.now()
 		this.taskState.lastMessageTs = sayTs
+		const zulongMessages = this.messageStateHandler.getZulongMessages()
+		const existingIndex = findLastIndex(zulongMessages, (message) => {
+			const existing = message.interaction
+			if (!existing || existing.pair_id !== interaction.pair_id) {
+				return false
+			}
+			if (interaction.kind === "observation") {
+				return existing.kind === "action" || existing.kind === "observation"
+			}
+			if (interaction.kind === "approval" && ["approved", "rejected"].includes(interaction.status)) {
+				return existing.kind === "approval"
+			}
+			if (interaction.kind === "progress") {
+				return existing.kind === "progress"
+			}
+			if (interaction.kind === "action") {
+				return existing.kind === "action"
+			}
+			if (interaction.kind === "plan" || interaction.kind === "summary") {
+				return existing.kind === interaction.kind
+			}
+			return false
+		})
+		if (existingIndex !== -1) {
+			const existingInteraction = zulongMessages[existingIndex].interaction
+			const displayInteraction = existingInteraction
+				? this.mergeInteractionForDisplay(existingInteraction, interaction)
+				: interaction
+			await this.messageStateHandler.updateZulongMessage(existingIndex, {
+				text: displayInteraction.title,
+				interaction: displayInteraction,
+			})
+			await this.postStateToWebview()
+			return zulongMessages[existingIndex].ts
+		}
 		await this.messageStateHandler.addToZulongMessages({
 			ts: sayTs,
 			type: "say",
@@ -956,6 +991,65 @@ export class Task {
 		})
 		await this.postStateToWebview()
 		return sayTs
+	}
+
+	private mergeInteractionForDisplay(previous: InteractionPayload, incoming: InteractionPayload): InteractionPayload {
+		const merged: InteractionPayload = {
+			...previous,
+			...incoming,
+			title: incoming.title || previous.title,
+			detail: incoming.detail || previous.detail,
+			thought: incoming.thought || previous.thought,
+			tool_name: incoming.tool_name || previous.tool_name,
+			tool_args: incoming.tool_args ?? previous.tool_args,
+			risk_level: incoming.risk_level ?? previous.risk_level,
+			risk_reason: incoming.risk_reason || previous.risk_reason,
+			approval_mode: incoming.approval_mode ?? previous.approval_mode,
+			action_summary: incoming.action_summary || previous.action_summary,
+			next_step: incoming.next_step || previous.next_step,
+		}
+
+		if (
+			previous.kind === "action" &&
+			incoming.kind === "observation" &&
+			(!incoming.progress_items || incoming.progress_items.length === 0) &&
+			previous.progress_items?.length
+		) {
+			const finalStatus =
+				incoming.status === "failed" ? "failed" : incoming.status === "blocked" ? "blocked" : "completed"
+			merged.progress_items = previous.progress_items.map((item) =>
+				item.status === "running"
+					? {
+							...item,
+							status: finalStatus,
+							detail: incoming.detail || item.detail,
+						}
+					: item,
+			)
+		}
+
+		return merged
+	}
+
+	private normalizeTaskPhase(phase?: string): string | undefined {
+		switch ((phase || "").trim()) {
+			case "succeeded":
+			case "completed":
+			case "complete":
+			case "done":
+				return "completed"
+			case "failed":
+			case "error":
+				return "failed"
+			case "blocked":
+			case "cancelled":
+			case "initializing":
+			case "running":
+			case "idle":
+				return phase
+			default:
+				return phase || undefined
+		}
 	}
 
 	async sayAndCreateMissingParamError(toolName: ZulongDefaultTool, paramName: string, relPath?: string) {
@@ -2929,6 +3023,14 @@ export class Task {
 					switch (chunk.type) {
 						case "interaction": {
 							await this.sayInteraction(chunk.interaction)
+							// 根据interaction kind/status更新taskPhase（对齐TSD §23.3.6）
+							if (chunk.interaction.kind === "progress" || chunk.interaction.kind === "summary") {
+								const normalizedPhase = this.normalizeTaskPhase(chunk.interaction.status)
+								if (normalizedPhase && ["blocked", "completed", "failed", "cancelled"].includes(normalizedPhase)) {
+									this.taskState.taskPhase = normalizedPhase
+									await this.postStateToWebview()
+								}
+							}
 							didScheduleAnyContent = true
 							break
 						}
@@ -3003,6 +3105,15 @@ export class Task {
 								await this.flushAssistantPresentationOrThrow()
 							}
 							didScheduleAnyContent = true
+							break
+						}
+						case "status_update": {
+							// 任务阶段状态更新（对齐TSD §23.3.6）
+							const normalizedPhase = this.normalizeTaskPhase(chunk.phase)
+							if (normalizedPhase) {
+								this.taskState.taskPhase = normalizedPhase
+								await this.postStateToWebview()
+							}
 							break
 						}
 						case "text": {

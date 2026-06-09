@@ -25,7 +25,7 @@ class CosyVoiceGradioClient:
     
     def __init__(
         self,
-        server_url: str = "http://localhost:50000",
+        server_url: str = None,
         timeout: int = 120
     ):
         """
@@ -35,6 +35,10 @@ class CosyVoiceGradioClient:
             server_url: Gradio 服务器地址
             timeout: 请求超时时间（秒）
         """
+        from zulong.tts.cosyvoice_config import get_external_runtime_config
+
+        runtime = get_external_runtime_config()
+        server_url = server_url or runtime["server_url"]
         self.server_url = server_url.rstrip('/')
         self.timeout = timeout
         self.sample_rate = 22050
@@ -234,9 +238,15 @@ class CosyVoiceGradioClient:
                                         print(f"  直接读取 AAC 失败: {e}")
                                         
                                         import subprocess
+                                        from zulong.l0.audio.ffmpeg_resolver import find_ffmpeg
+
+                                        ffmpeg_exe = find_ffmpeg()
+                                        if not ffmpeg_exe:
+                                            print("  未找到 ffmpeg，无法转换 AAC")
+                                            continue
                                         wav_path = tmp_path.replace('.aac', '.wav')
                                         result_ffmpeg = subprocess.run(
-                                            ['ffmpeg', '-i', tmp_path, wav_path, '-y'],
+                                            [ffmpeg_exe, '-i', tmp_path, wav_path, '-y'],
                                             capture_output=True, text=True
                                         )
                                         if result_ffmpeg.returncode != 0:
@@ -273,8 +283,14 @@ class CosyVoiceGradioClient:
                         except Exception as e:
                             print(f"  直接读取失败: {e}")
                             import subprocess
+                            from zulong.l0.audio.ffmpeg_resolver import find_ffmpeg
+
+                            ffmpeg_exe = find_ffmpeg()
+                            if not ffmpeg_exe:
+                                logger.error("未找到 ffmpeg，无法转换 AAC")
+                                return False
                             wav_path = result.rsplit('.', 1)[0] + '.wav'
-                            subprocess.run(['ffmpeg', '-i', result, wav_path, '-y'], 
+                            subprocess.run([ffmpeg_exe, '-i', result, wav_path, '-y'],
                                           capture_output=True, check=False)
                             if os.path.exists(wav_path):
                                 data, sr = sf.read(wav_path)
@@ -319,11 +335,13 @@ def test_gradio_client():
     
     print("✓ 服务器已运行")
     
-    output_path = r"d:\AI\project\zulong_beta5\tests\output_cosyvoice_gradio.wav"
+    output_path = os.path.join(os.getcwd(), "tests", "output_cosyvoice_gradio.wav")
     
     print("\n测试 3s 极速复刻模式（CosyVoice2-0.5B 无预训练音色）...")
     
-    prompt_audio = r"D:\BaiduNetdiskDownload\CosyVoiceV2\CosyVoice\asset\zero_shot_prompt.wav"
+    from zulong.tts.cosyvoice_config import get_external_runtime_config
+
+    prompt_audio = get_external_runtime_config()["prompt_audio"]
     prompt_text = "希望你以后能够做的比我还好呦。"
     
     if not os.path.exists(prompt_audio):

@@ -19,6 +19,8 @@ import numpy as np
 from typing import Tuple, Optional
 import logging
 
+from zulong.l0.audio.ffmpeg_resolver import find_ffmpeg
+
 logger = logging.getLogger(__name__)
 
 
@@ -53,34 +55,12 @@ class NativeAudioDecoder:
         Returns:
             Optional[str]: ffmpeg.exe 路径，如果找不到则返回 None
         """
-        # 1. 尝试在项目 bin/ 目录下查找
-        try:
-            current_file = os.path.abspath(__file__)
-            # zulong/l0/audio/native_decoder.py -> ../../../../bin/ffmpeg.exe
-            project_root = os.path.abspath(os.path.join(
-                current_file, "..", "..", "..", ".."
-            ))
-            ffmpeg_path = os.path.join(project_root, "bin", "ffmpeg.exe")
-            
-            if os.path.exists(ffmpeg_path):
-                logger.info(f"✅ 找到内置 ffmpeg: {ffmpeg_path}")
-                return ffmpeg_path
-        except Exception as e:
-            logger.debug(f"查找项目 ffmpeg 失败：{e}")
-        
-        # 2. 尝试在系统 PATH 中查找
-        try:
-            import shutil
-            ffmpeg_path = shutil.which("ffmpeg")
-            if ffmpeg_path:
-                logger.info(f"✅ 找到系统 ffmpeg: {ffmpeg_path}")
-                return ffmpeg_path
-        except Exception as e:
-            logger.debug(f"查找系统 ffmpeg 失败：{e}")
-        
-        # 3. 找不到
-        logger.warning("⚠️ 未找到 ffmpeg.exe")
-        return None
+        ffmpeg_path = find_ffmpeg()
+        if ffmpeg_path:
+            logger.info(f"✅ 找到 ffmpeg: {ffmpeg_path}")
+        else:
+            logger.warning("⚠️ 未找到 ffmpeg")
+        return ffmpeg_path
     
     @staticmethod
     def decode_mp3_bytes(mp3_bytes: bytes) -> Tuple[np.ndarray, int]:
@@ -103,9 +83,8 @@ class NativeAudioDecoder:
         ffmpeg_path = NativeAudioDecoder._find_ffmpeg()
         if not ffmpeg_path:
             raise RuntimeError(
-                "未找到 ffmpeg.exe\n"
-                "请从 https://www.gyan.dev/ffmpeg/builds/ 下载\n"
-                "并将 ffmpeg.exe 放入项目 bin/ 目录"
+                "未找到 ffmpeg。请安装 ffmpeg，或安装 imageio-ffmpeg，"
+                "Windows 也可以将 ffmpeg.exe 放入项目 bin/ 目录。"
             )
         
         # 2. 使用临时文件保存 MP3 数据

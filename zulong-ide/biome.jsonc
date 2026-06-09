@@ -129,7 +129,6 @@
 			"!!**/playwright",
 			"!!**/test-results",
 			"!!**/node_modules",
-			"!!**/webview-ui/build",
 			"!!**/generated",
 			"!!**/proto",
 			"!!**/tests/specs"
@@ -165,7 +164,6 @@
 				"**",
 				"!!**/esbuild.*",
 				"!!**/*.mts",
-				"!!**/webview-ui/**",
 				"!!**/evals/**",
 				"!!**/standalone/**",
 				"!!**/cli/**",

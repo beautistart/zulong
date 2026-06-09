@@ -12,5 +12,5 @@
 - ide_coder: IDE编程
 
 已卸载的技能包：
-- complex_task: [已移除] 旧版复杂任务处理（融合 OpenClaw + AutoGPT 逻辑）
+- complex_task: [已移除] 旧版复杂任务处理（融合外部代理逻辑）
 """

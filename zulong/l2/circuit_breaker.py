@@ -77,6 +77,13 @@ class ToolCallCircuitBreaker:
         "delete_memory_edge", "set_importance",
     }
 
+    BATCH_ACTION_TOOLS = {
+        "delete_memory_node", "delete_memory_edge", "set_importance",
+        "save_memory_note", "task_mark_status", "task_add_node",
+        "task_update_node", "task_update_content", "task_attach_file",
+        "task_remove_node",
+    }
+
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}
         self._config = cfg
@@ -91,8 +98,8 @@ class ToolCallCircuitBreaker:
 
         # --- 信号 4: 上下文窗口压力 ---
         self._context_window_size = cfg.get("context_window_size", 131072)
-        self._context_yellow_ratio = cfg.get("context_yellow_ratio", 0.75)
-        self._context_red_ratio = cfg.get("context_red_ratio", 0.90)
+        self._context_yellow_ratio = cfg.get("context_yellow_ratio", 0.50)
+        self._context_red_ratio = cfg.get("context_red_ratio", 0.60)
 
         # --- 信号 5: 经过时间（已禁用） ---
         self._time_yellow_seconds = cfg.get("time_yellow_seconds", 60)
@@ -195,7 +202,13 @@ class ToolCallCircuitBreaker:
         if reds:
             reasons = "; ".join(r for _, r in reds)
             self._consecutive_yellow_count = 0
-            logger.warning(f"[CircuitBreaker] RED (iter={iteration}): {reasons}")
+            # 增强日志：包含调用历史摘要和各信号得分
+            call_summary = self._get_call_history_summary()
+            signal_scores = self._get_signal_scores(signals)
+            logger.warning(
+                f"[CircuitBreaker] RED (iter={iteration}): {reasons} | "
+                f"signals={signal_scores} | history={call_summary}"
+            )
             self._publish_state_change(CircuitBreakerState.RED, reasons, iteration)
             return CircuitBreakerState.RED, reasons
 
@@ -245,27 +258,76 @@ class ToolCallCircuitBreaker:
         for tool_name, count in tool_counts.items():
             if tool_name in self.PLANNING_TOOL_NAMES:
                 continue
+            tool_records = [r for r in window if r.function_name == tool_name]
+            if self._is_search_tool(tool_name):
+                state, reason = self._signal_search_pattern(tool_name, tool_records)
+                if state != CircuitBreakerState.GREEN:
+                    return state, reason
+                continue
+            if (
+                tool_name in self.BATCH_ACTION_TOOLS
+                and self._is_diverse_action_batch(tool_records)
+            ):
+                continue
             if count >= self._pattern_red_count:
                 return CircuitBreakerState.RED, (
                     f"模式循环: {tool_name} "
                     f"在最近 {self._pattern_window} 次调用中出现 {count} 次"
                 )
             if count >= self._pattern_yellow_count:
-                if self._is_search_tool(tool_name):
-                    queries = [r.query for r in window if r.function_name == tool_name and r.query]
-                    if len(queries) >= 3:
-                        high = sum(1 for i in range(len(queries) - 1)
-                                   if self._query_jaccard(queries[i], queries[i + 1]) > self._query_similarity_threshold)
-                        if high >= 2:
-                            return CircuitBreakerState.RED, (
-                                f"搜索循环: {tool_name} "
-                                f"最近查询高度相似 (>{self._query_similarity_threshold})"
-                            )
                 return CircuitBreakerState.YELLOW, (
                     f"模式警告: {tool_name} "
                     f"在最近 {self._pattern_window} 次中出现 {count} 次"
                 )
         return CircuitBreakerState.GREEN, ""
+
+    def _signal_search_pattern(
+        self,
+        tool_name: str,
+        records: List[ToolCallRecord],
+    ) -> Tuple[CircuitBreakerState, str]:
+        count = len(records)
+        if count < self._pattern_yellow_count:
+            return CircuitBreakerState.GREEN, ""
+        queries = [r.query for r in records if r.query]
+        if len(queries) < 3:
+            return CircuitBreakerState.GREEN, ""
+        high = sum(
+            1
+            for i in range(len(queries) - 1)
+            if self._query_jaccard(queries[i], queries[i + 1])
+            > self._query_similarity_threshold
+        )
+        if high >= 2:
+            return CircuitBreakerState.RED, (
+                f"搜索循环: {tool_name} "
+                f"最近查询高度相似 (>{self._query_similarity_threshold})"
+            )
+        return CircuitBreakerState.GREEN, ""
+
+    @staticmethod
+    def _is_diverse_action_batch(records: List[ToolCallRecord]) -> bool:
+        """Allow legitimate batch operations with varied targets/results.
+
+        Repeated identical action calls are still caught by the pattern signal;
+        varied delete/update batches should continue so cleanup tasks can finish.
+        """
+        count = len(records)
+        if count < 4:
+            return False
+        param_counts = Counter(r.params_hash for r in records)
+        result_counts = Counter(r.result_hash for r in records)
+        most_common_param = param_counts.most_common(1)[0][1] / count
+        most_common_result = result_counts.most_common(1)[0][1] / count
+        if most_common_param >= 0.80:
+            return False
+        if most_common_param >= 0.60 and most_common_result >= 0.60:
+            return False
+        diversity_floor = max(3, count // 2)
+        return (
+            len(param_counts) >= diversity_floor
+            or len(result_counts) >= diversity_floor
+        )
 
     # ==================== 信号 4: 上下文窗口压力 ====================
 
@@ -298,6 +360,9 @@ class ToolCallCircuitBreaker:
     def _signal_no_progress(self) -> Tuple[CircuitBreakerState, str]:
         if len(self._call_history) < self._no_progress_yellow:
             return CircuitBreakerState.GREEN, ""
+        # 宽松条件：若最近一次调用了行动工具则重置计数（模型在推进任务）
+        if self._call_history and self._call_history[-1].function_name in self.ACTION_TOOLS:
+            return CircuitBreakerState.GREEN, ""
         tail = self._call_history[-self._no_progress_red:]
         consecutive_info = 0
         for record in reversed(tail):
@@ -316,6 +381,31 @@ class ToolCallCircuitBreaker:
                 f"无进度警告: 连续 {consecutive_info} 次调用信息检索工具，请执行实际任务"
             )
         return CircuitBreakerState.GREEN, ""
+
+    # ==================== 辅助诊断方法 ====================
+
+    def _get_call_history_summary(self) -> str:
+        """生成调用历史摘要用于诊断日志"""
+        if not self._call_history:
+            return "empty"
+        tool_counts = Counter(r.function_name for r in self._call_history)
+        top_tools = tool_counts.most_common(5)
+        summary_parts = [f"{name}×{count}" for name, count in top_tools]
+        total_info = sum(1 for r in self._call_history if r.function_name in self.INFO_RETRIEVAL_TOOLS)
+        total_action = sum(1 for r in self._call_history if r.function_name in self.ACTION_TOOLS)
+        return (
+            f"total={len(self._call_history)}, info={total_info}, action={total_action}, "
+            f"top=[{', '.join(summary_parts)}]"
+        )
+
+    def _get_signal_scores(self, signals: List[Tuple[CircuitBreakerState, str]]) -> str:
+        """生成各信号得分摘要"""
+        signal_names = ["pattern_loop", "context_pressure", "elapsed_time", "no_progress"]
+        parts = []
+        for i, (state, _) in enumerate(signals):
+            name = signal_names[i] if i < len(signal_names) else f"sig{i}"
+            parts.append(f"{name}={state.value}")
+        return ", ".join(parts)
 
     # ==================== 序列化 ====================
 

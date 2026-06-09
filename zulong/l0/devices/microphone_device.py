@@ -514,10 +514,18 @@ class MicrophoneDevice:
         
         try:
             from zulong.models.audio_model_container import AudioModelContainer
+            from zulong.utils.device import resolve_audio_model_devices
             
             container = AudioModelContainer()
             if not hasattr(container, '_initialized') or not container._initialized:
-                container.initialize(enable_sensevoice=True, enable_whisper=True)
+                audio_devices = resolve_audio_model_devices("auto", prefer_gpu=True)
+                container.initialize(
+                    enable_sensevoice=True,
+                    enable_whisper=True,
+                    sensevoice_device=audio_devices["sensevoice"],
+                    whisper_device=audio_devices["whisper"],
+                    yamnet_device=audio_devices["yamnet"],
+                )
             
             audio_normalized = audio_array.astype(np.float32) / 32768.0
             result = container.transcribe_speech(audio_normalized, self.SAMPLE_RATE, "zh")

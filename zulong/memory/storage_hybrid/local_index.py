@@ -121,6 +121,26 @@ class LocalShardIndex:
                 logger.warning(f"local_index 反序列化失败 node={node_id}: {exc}")
                 return None
 
+    def delete_node_header(self, node_id: str, sync: bool = False) -> bool:
+        if not node_id:
+            return False
+        removed = False
+        with self.env.begin(write=True) as txn:
+            key = self._key(node_id)
+            data = txn.get(key, db=self.node_headers_db)
+            if data:
+                try:
+                    header = self.decoder.decode(data) or {}
+                    node_type = self._type_value(header.get("node_type", ""))
+                    if node_type:
+                        txn.delete(self._key(f"{node_type}:{node_id}"), db=self.node_type_db)
+                except Exception as exc:
+                    logger.debug(f"local_index 删除类型索引失败 node={node_id}: {exc}")
+                removed = txn.delete(key, db=self.node_headers_db)
+        if sync:
+            self.env.sync()
+        return bool(removed)
+
     def count_nodes(self) -> int:
         with self.env.begin() as txn:
             return txn.stat(self.node_headers_db)["entries"]

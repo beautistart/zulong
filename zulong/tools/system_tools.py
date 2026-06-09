@@ -561,14 +561,14 @@ class SystemCommandTool(BaseTool):
             # Windows
             if os.name == 'nt':
                 result = subprocess.run(
-                    "tasklist",
+                    ["tasklist"],
                     capture_output=True,
                     text=True
                 )
             else:
                 # Linux/Mac
                 result = subprocess.run(
-                    "ps aux",
+                    ["ps", "aux"],
                     capture_output=True,
                     text=True
                 )

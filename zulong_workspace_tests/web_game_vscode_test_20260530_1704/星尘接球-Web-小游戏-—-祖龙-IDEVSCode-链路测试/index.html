@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>星尘接球 ✦ Stardust Catcher</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="game-container">
+        <h1>🌟 星尘接球 ✦ Stardust Catcher</h1>
+        <div id="hud">
+            <span id="score-display">分数: 0</span>
+            <span id="lives-display">❤️ x 3</span>
+            <span id="level-display">等级: 1</span>
+        </div>
+        <canvas id="game-canvas" width="600" height="500"></canvas>
+        <div id="controls">
+            <button id="btn-start">▶ 开始</button>
+            <button id="btn-pause">⏸ 暂停</button>
+            <button id="btn-restart">↺ 重新开始</button>
+        </div>
+        <div id="instructions">
+            <p>🎮 操作：← → 方向键 或 A / D 键移动托盘</p>
+            <p>⭐ 接住金色星星得分 | 💀 红色陨石会扣命</p>
+        </div>
+    </div>
+    <div id="game-over-modal" class="hidden">
+        <div class="modal-content">
+            <h2>💫 游戏结束</h2>
+            <p id="final-score">最终分数: 0</p>
+            <p id="final-level">达到等级: 1</p>
+            <button id="btn-play-again">🔄 再来一局</button>
+        </div>
+    </div>
+    <script src="game.js"></script>
+</body>
+</html>

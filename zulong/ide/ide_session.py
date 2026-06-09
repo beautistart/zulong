@@ -49,7 +49,7 @@ class IDEFCState:
 
     # L1-B 工具预判扩展
     task_graph_policy: str = "none"
-    force_first_tool: bool = False  # 继续已有任务图时首轮强制 task_view_overview
+    force_first_tool: bool = False  # 兼容旧状态字段；预判不得强制 L2 调用工具
     force_graph_id: str = ""  # 确定性恢复: 前端传入的 graph_id，非空时跳过启发式
 
     # 错误恢复计数器
@@ -57,6 +57,9 @@ class IDEFCState:
 
     # CB 模式工具调用连续计数（防止 CB 模式下模型持续调用保留工具导致死循环）
     cb_tool_streak: int = 0
+
+    # CB 触发原因（用于_finalize判断是否blocked而非error，对齐TSD §23.3.6）
+    cb_trigger_reason: str = ""
 
     # 独白计数器：连续纯文本回复（无工具调用）次数，检测模型"叙述而不执行"的退化模式
     consecutive_text_only_count: int = 0
@@ -68,6 +71,10 @@ class IDEFCState:
     progress_reports: List[Dict] = field(default_factory=list)
     last_report_turn: int = 0
     auto_continue_count: int = 0  # 已自动续期次数
+
+    # 用户显式工具预算：例如“最多调用两个工具”
+    tool_call_budget: Optional[int] = None
+    tool_calls_used: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

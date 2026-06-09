@@ -202,6 +202,24 @@ class GlobalMemoryIndex:
                 logger.warning(f"全局索引反序列化失败 node_id={node_id}: {exc}")
                 return None
 
+    def delete_node_location(self, node_id: str, sync: bool = False) -> bool:
+        if not node_id:
+            return False
+        removed = False
+        with self.env.begin(write=True) as txn:
+            node_key = self._key(node_id)
+            removed = bool(txn.delete(node_key, db=self.node_to_shard_db))
+            for db in (
+                self.session_to_node_db,
+                self.conversation_to_node_db,
+                self.task_graph_to_node_db,
+            ):
+                self._delete_secondary_refs(txn, db, node_id)
+            self._delete_cross_edges_for_node(txn, node_id)
+        if sync:
+            self.env.sync()
+        return removed
+
     def get_session_node(self, session_id: str) -> Optional[str]:
         return self._get_text(session_id, self.session_to_node_db)
 
@@ -301,6 +319,82 @@ class GlobalMemoryIndex:
         if edge_type_value:
             return [edge for edge in edges if edge.get("edge_type") == edge_type_value]
         return edges
+
+    def _delete_secondary_refs(self, txn, db, node_id: str) -> None:
+        node_key_text = str(node_id)
+        stale_keys = []
+        cursor = txn.cursor(db=db)
+        for key, value in cursor:
+            key_text = self._decode_text(key)
+            value_text = self._decode_text(value)
+            if key_text == node_key_text or value_text == node_key_text:
+                stale_keys.append(key)
+        for key in stale_keys:
+            txn.delete(key, db=db)
+
+    def _decode_edge_list(self, data: Optional[bytes]) -> List[Dict[str, Any]]:
+        if not data:
+            return []
+        try:
+            return self.decoder.decode(data) or []
+        except Exception:
+            return []
+
+    def _remove_edge_list_item(
+        self,
+        txn,
+        db,
+        node_id: str,
+        compare_field: str,
+        compare_value: str,
+        edge_type: Optional[str],
+    ) -> None:
+        key = self._key(node_id)
+        edges = self._decode_edge_list(txn.get(key, db=db))
+        if not edges:
+            return
+        kept = [
+            edge for edge in edges
+            if not (
+                edge.get(compare_field) == compare_value
+                and (edge_type is None or edge.get("edge_type") == edge_type)
+            )
+        ]
+        if kept:
+            txn.put(key, self.encoder.encode(kept), db=db)
+        else:
+            txn.delete(key, db=db)
+
+    def _delete_cross_edges_for_node(self, txn, node_id: str) -> None:
+        node_key = self._key(node_id)
+
+        outgoing = self._decode_edge_list(txn.get(node_key, db=self.cross_edges_by_src_db))
+        for edge in outgoing:
+            dst_id = edge.get("dst_id")
+            if dst_id:
+                self._remove_edge_list_item(
+                    txn,
+                    self.cross_edges_by_dst_db,
+                    dst_id,
+                    compare_field="src_id",
+                    compare_value=node_id,
+                    edge_type=edge.get("edge_type"),
+                )
+        txn.delete(node_key, db=self.cross_edges_by_src_db)
+
+        incoming = self._decode_edge_list(txn.get(node_key, db=self.cross_edges_by_dst_db))
+        for edge in incoming:
+            src_id = edge.get("src_id")
+            if src_id:
+                self._remove_edge_list_item(
+                    txn,
+                    self.cross_edges_by_src_db,
+                    src_id,
+                    compare_field="dst_id",
+                    compare_value=node_id,
+                    edge_type=edge.get("edge_type"),
+                )
+        txn.delete(node_key, db=self.cross_edges_by_dst_db)
 
     def _upsert_edge_list(self, txn, db, node_id: str, edge: Dict[str, Any], compare_field: str) -> None:
         key = self._key(node_id)

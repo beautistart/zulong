@@ -440,7 +440,7 @@ class AsyncL1BScheduler:
         """
         parts = []
         
-        # 添加自定义系统指令（覆盖 OpenClaw 的 system message）
+        # 添加自定义系统指令（覆盖外部系统指令）
         # 必须放在最前面，确保模型优先遵循（即使没有消息也添加）
         # 使用强约束格式，明确禁止的行为
         parts.append("""[系统指令]
@@ -467,7 +467,7 @@ class AsyncL1BScheduler:
             if role == "system":
                 continue
             
-            # 清理 OpenClaw 的 metadata
+            # 清理 外部系统 metadata
             if isinstance(content, str):
                 if "[用户]" in content or "Sender (untrusted metadata)" in content:
                     # 提取实际的用户消息

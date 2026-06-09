@@ -29,11 +29,11 @@
 ## 📁 文件结构
 
 ```
-zulong_beta4/
+zulong_beta5/
 ├── config/
 │   ├── zulong_config.yaml    # 主配置文件
 │   ├── .env.example          # 环境变量示例
-│   └── load_env.bat          # Windows 环境变量加载脚本
+│   └── profiles/             # Windows/Linux/macOS 平台配置
 ├── zulong/
 │   ├── config/
 │   │   └── config_manager.py # 配置管理器
@@ -296,17 +296,15 @@ ZULONG_RAG_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
 
 ### 工具系统
 ```bash
-ZULONG_OPENCLAW_ENABLED=true
-ZULONG_OPENCLAW_API_URL=http://localhost:3000
 ZULONG_WEB_SEARCH_ENABLED=true
 ```
 
 ### Web 服务
 ```bash
-ZULONG_API_HOST=localhost
-ZULONG_API_PORT=3000
-ZULONG_WEBSOCKET_HOST=localhost
-ZULONG_WEBSOCKET_PORT=5555
+ZULONG_API_HOST=127.0.0.1
+ZULONG_API_PORT=8090
+ZULONG_WEBSOCKET_HOST=127.0.0.1
+ZULONG_WEBSOCKET_PORT=8090
 ```
 
 ### 安全
@@ -413,7 +411,11 @@ system:
 1. 检查 `config/zulong_config.yaml` 是否存在
 2. 设置环境变量 `ZULONG_CONFIG` 指向配置文件:
    ```bash
-   set ZULONG_CONFIG=D:\AI\project\zulong_beta4\config\zulong_config.yaml
+   # Windows PowerShell
+   $env:ZULONG_CONFIG="D:\AI\project\zulong_beta5\config\zulong_config.yaml"
+
+   # Linux/macOS
+   export ZULONG_CONFIG="/path/to/zulong_beta5/config/zulong_config.yaml"
    ```
 
 ### 问题 2: 环境变量未生效

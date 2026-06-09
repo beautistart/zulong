@@ -258,8 +258,8 @@ attention_selection:
   enabled: true
   
   # 压力阈值配置
-  pressure_threshold_high: 0.9      # 高压阈值 (推荐0.8-1.0)
-  pressure_threshold_medium: 0.75   # 中压阈值 (推荐0.6-0.8)
+  pressure_threshold_high: 0.6      # 高压阈值
+  pressure_threshold_medium: 0.5    # 中压阈值
   
   # 冷却时间配置
   cooldown_base_seconds: 30.0       # 基础冷却时间(秒)

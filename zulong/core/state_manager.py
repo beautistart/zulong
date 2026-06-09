@@ -3,7 +3,7 @@
 # 对应 TSD v1.7: 增强版全局状态
 
 import threading
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Set
 
 from zulong.core.types import PowerState, L2Status
 
@@ -32,6 +32,8 @@ class StateManager:
             self._l2_status = L2Status.IDLE
             self._active_task_id = None
             self._interrupt_flag = False
+            self._cancelled_request_ids: Set[str] = set()
+            self._cancelled_session_ids: Set[str] = set()
             self._context = {}
             self._lock = threading.Lock()
             self._last_activity_time = 0.0
@@ -141,6 +143,42 @@ class StateManager:
         """
         with self._lock:
             return self._interrupt_flag
+
+    def request_interrupt(self, request_id: str = None, session_id: str = None):
+        """记录用户主动停止请求，避免中断信号在 L2 启动前丢失。"""
+        request_key = str(request_id or "").strip()
+        session_key = str(session_id or "").strip()
+        with self._lock:
+            self._interrupt_flag = True
+            if request_key:
+                self._cancelled_request_ids.add(request_key)
+            elif session_key:
+                self._cancelled_session_ids.add(session_key)
+            logger.info(
+                "Interrupt requested: request_id=%s session_id=%s",
+                request_key or "-",
+                session_key or "-",
+            )
+
+    def is_cancelled_context(self, request_id: str = None, session_id: str = None) -> bool:
+        """检查指定请求/会话是否已经被用户停止。"""
+        request_key = str(request_id or "").strip()
+        session_key = str(session_id or "").strip()
+        with self._lock:
+            return bool(
+                (request_key and request_key in self._cancelled_request_ids)
+                or (session_key and session_key in self._cancelled_session_ids)
+            )
+
+    def clear_cancelled_context(self, request_id: str = None, session_id: str = None):
+        """清理已处理的停止请求。"""
+        request_key = str(request_id or "").strip()
+        session_key = str(session_id or "").strip()
+        with self._lock:
+            if request_key:
+                self._cancelled_request_ids.discard(request_key)
+            if session_key:
+                self._cancelled_session_ids.discard(session_key)
     
     def get_context(self, key: str, default: Any = None) -> Any:
         """获取上下文值

@@ -14,6 +14,39 @@
 
 ---
 
+## [2.0.0] - 2026-05-27
+
+### 重大架构升级 — 任务编排重构与交互体验革新
+
+#### 新增 (Added)
+- ✅ FC 循环合并与协议统一 — 统一 IDE 与 Web 端 FC 执行路径，消除双轨维护
+- ✅ 交互式任务卡片系统 — ApprovalCard、InteractionCard、StartupCard、SummaryCard
+- ✅ 审批白名单机制 — 操作权限分级审批，每步操作人工确认与实时进度跟踪
+- ✅ VS Code 执行桥接 — 代码在安全环境执行，支持受控文件系统访问
+- ✅ 工具袋系统 (ToolBag) — 工具智能路由与预测加载，减少工具选择延迟
+- ✅ 对话编排器 (ConversationOrchestrator) — 统一的多轮对话与任务编排流程
+- ✅ 记忆镜像系统 (MemoryMirror) — 会话窗口与记忆节点实时绑定
+- ✅ 记忆图谱可视化面板 — BFS 动画、注意力视图、交互式记忆浏览
+- ✅ 事件存储 (EventStore) — 持久化事件流，支持回放与审计
+- ✅ 统一协议层 — 规范化交互载荷与跨层通信协议
+- ✅ `navigate_attention` 注意力导航工具 — 替代 `focus_on_chain`
+- ✅ `request_tool_supplement` 工具补充工具 — 动态扩展工具能力
+- ✅ `search_experience` 经验库检索工具 — 被动历史经验检索
+
+#### 变更 (Changed)
+- ⚠️ 废弃会话意图分类 (CHAT/COMPLEX/RESUME 分类已移除)
+- L1-B 不再输出意图分类标签，改为输出工具预判与上下文信号
+- L2 统一主链负责推理、回复生成与工具执行决策
+- FC 循环节点化重构 (fc_nodes.py + fc_runner.py)
+- `focus_on_chain` → `navigate_attention`
+
+#### 移除 (Removed)
+- 移除 graph.py / state.py / types.py / session_tool.py 等旧代码
+- 移除 openclaw_plugin.py / openclaw_tool.py
+- 移除 l3_openclaw_skill.yaml 配置文件
+
+---
+
 ## [1.0.0] - 2026-05-12
 
 ### 首次正式发布

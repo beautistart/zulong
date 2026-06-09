@@ -12,7 +12,7 @@ import time
 from typing import Dict, Optional, Any
 
 from zulong.ide.audio_logger import logger
-from zulong.utils.device import resolve_device
+from zulong.utils.device import resolve_audio_model_devices
 
 _audio_container = None
 
@@ -29,18 +29,19 @@ def _get_audio_container():
             cm = ConfigManager()
             
             sensevoice_model_path = cm.get('audio.asr.model_path', './models/OpenASR/sensevoice-small-onnx')
-            asr_device = resolve_device(cm.get('audio.asr.device', 'auto'), prefer_gpu=True)
+            audio_devices = resolve_audio_model_devices(cm.get('audio.asr.device', 'auto'), prefer_gpu=True)
             
             initialized = _audio_container.initialize(
                 enable_yamnet=False,
                 enable_sensevoice=True,
                 enable_whisper=True,
-                sensevoice_device=asr_device,
+                sensevoice_device=audio_devices["sensevoice"],
+                whisper_device=audio_devices["whisper"],
                 sensevoice_model_path=sensevoice_model_path,
             )
             
             if initialized:
-                logger.info("[AudioHandler] AudioModelContainer 初始化成功")
+                logger.info(f"[AudioHandler] AudioModelContainer 初始化成功: devices={audio_devices}")
             else:
                 logger.warning("[AudioHandler] AudioModelContainer 初始化失败，ASR 不可用")
                 
@@ -224,12 +225,11 @@ async def _transcribe_buffer(session_id: str, is_final: bool = False) -> Optiona
         
         wav_path = None
         try:
-            # 获取 ffmpeg 路径
-            try:
-                import imageio_ffmpeg
-                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-            except Exception:
-                ffmpeg_exe = "ffmpeg"  # 回退到系统 PATH
+            from zulong.l0.audio.ffmpeg_resolver import find_ffmpeg
+
+            ffmpeg_exe = find_ffmpeg()
+            if not ffmpeg_exe:
+                raise RuntimeError("ffmpeg_not_available")
             
             # 使用 subprocess 调用 ffmpeg 转换
             wav_path = webm_path.replace(".webm", ".wav")

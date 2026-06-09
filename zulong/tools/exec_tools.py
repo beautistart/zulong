@@ -9,37 +9,44 @@ import logging
 import os
 import time
 import subprocess
-import platform
 from typing import Dict, Any
 from pathlib import Path
 
 from .base import BaseTool, ToolCategory, ToolRequest, ToolResult
+from zulong.utils.runtime_env import get_runtime_environment
 
 logger = logging.getLogger(__name__)
 
 # 工作区根目录（安全边界）
 WORKSPACE_DIR = os.environ.get("ZULONG_WORKSPACE", "./agent_workspace")
-WINDOWS_SHELL_HINT = (
-    "当前环境是 Windows/PowerShell。"
-    "请改用 PowerShell/Windows 命令，例如：Get-ChildItem、Select-String、Get-Content、rg。"
-)
-
 # 命令白名单
-COMMAND_WHITELIST = {
+COMMON_COMMAND_WHITELIST = {
     "python", "python3", "node", "npm", "npx", "pip", "pip3",
-    "cat", "ls", "dir", "echo", "type", "mkdir", "cd", "pwd", "get-content",
+    "echo", "mkdir", "cd", "pwd",
     "tree", "git", "cargo", "go", "javac", "java",
     # 扩展: 常用开发工具
     "curl", "wget", "tar", "unzip", "zip",
-    "cp", "mv", "rm", "touch", "chmod", "chown",
-    "find", "grep", "head", "tail", "wc", "sort",
-    "diff", "file", "which", "whereis",
     "pdflatex", "make", "cmake", "gcc", "g++",
     "ffmpeg", "imagemagick", "convert",
     "docker", "docker-compose", "kubectl",
     "npx", "tsc", "eslint", "prettier",
     "http-server", "live-server",
 }
+WINDOWS_COMMAND_WHITELIST = {
+    "dir", "type", "copy", "move", "del", "where",
+    "get-childitem", "select-string", "get-content", "set-content", "new-item",
+}
+POSIX_COMMAND_WHITELIST = {
+    "cat", "ls", "cp", "mv", "rm", "touch", "chmod", "chown",
+    "find", "grep", "head", "tail", "wc", "sort", "diff", "file", "which", "whereis",
+}
+
+
+def _command_whitelist_for_current_platform() -> set:
+    env = get_runtime_environment()
+    if env.os_family == "windows":
+        return COMMON_COMMAND_WHITELIST | WINDOWS_COMMAND_WHITELIST
+    return COMMON_COMMAND_WHITELIST | POSIX_COMMAND_WHITELIST
 
 
 def _scan_external_paths(command: str, workspace: Path) -> list:
@@ -202,7 +209,7 @@ class ExecRunCommandTool(BaseTool):
             "命令有 30 秒超时限制，输出限制 2000 字符。"
             "⚠️ 命令中不得包含工作区外的绝对路径（如 D:/other_project/file），"
             "所有文件操作必须在当前工作区内进行。"
-            "当前默认环境通常为 Windows + PowerShell，请避免 Unix 专属命令。"
+            "命令必须符合当前操作系统和 Shell。"
         )
 
     def initialize(self) -> bool:
@@ -227,30 +234,31 @@ class ExecRunCommandTool(BaseTool):
         cmd_parts = command.strip().split()
         cmd_base = cmd_parts[0].lower() if cmd_parts else ""
 
-        if cmd_base not in COMMAND_WHITELIST:
+        command_whitelist = _command_whitelist_for_current_platform()
+        if cmd_base not in command_whitelist:
             return self._create_result(
                 success=False,
-                error=f"命令 '{cmd_base}' 不在白名单中。允许: {sorted(COMMAND_WHITELIST)}",
+                error=f"命令 '{cmd_base}' 不在当前平台白名单中。允许: {sorted(command_whitelist)}",
                 execution_time=time.time() - start_time,
                 request_id=request.request_id,
             )
 
-        if platform.system().lower().startswith("win"):
-            unix_only_markers = (
-                "find / -name", "ls -la", "pwd &&", "2>/dev/null",
-                "| head", " head -", "grep ", "chmod ", "mkdir -p",
+        runtime_env = get_runtime_environment()
+        lowered = command.lower()
+        matched_markers = [
+            marker for marker in runtime_env.forbidden_command_markers
+            if marker.lower() in lowered
+        ]
+        if matched_markers:
+            return self._create_result(
+                success=False,
+                error=(
+                    f"检测到与当前环境不兼容的命令片段: {matched_markers}。\n"
+                    f"{runtime_env.command_guidance}"
+                ),
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
             )
-            lowered = command.lower()
-            if any(marker in lowered for marker in unix_only_markers):
-                return self._create_result(
-                    success=False,
-                    error=(
-                        f"检测到与当前 Windows 环境不兼容的 Unix 风格命令: {command}\n"
-                        f"{WINDOWS_SHELL_HINT}"
-                    ),
-                    execution_time=time.time() - start_time,
-                    request_id=request.request_id,
-                )
 
         # BP7 修复: 扫描命令中的绝对路径，禁止写入工作区外的文件
         try:
@@ -340,7 +348,11 @@ class ExecRunCommandTool(BaseTool):
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "要执行的命令（如 'python main.py'、'npm install'）。⚠️ 命令中不得包含工作区外的绝对路径（如 D:/other/file），所有文件操作必须在工作区内。当前环境优先使用 Windows/PowerShell 命令，如 Get-ChildItem、Select-String、Get-Content、rg。",
+                    "description": (
+                        "要执行的命令（如 'python main.py'、'npm install'）。"
+                        "⚠️ 命令中不得包含工作区外的绝对路径，所有文件操作必须在工作区内。"
+                        f"{get_runtime_environment().command_guidance}"
+                    ),
                 },
             },
             "required": ["command"],

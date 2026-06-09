@@ -82,13 +82,13 @@ this.transport.on("disconnected", (code, reason) => {
 ```
 
 **问题**：
-- Extension的WebSocket在VS Code侧，不是在webview-ui侧
-- 用户关闭的是webview-ui（前端），不是Extension
+- Extension的WebSocket在VS Code侧，不是在旧 IDE 内嵌前端（已移除）侧
+- 用户关闭的是旧 IDE 内嵌前端（已移除）（前端），不是Extension
 - Extension的WebSocket连接仍然存活
 
 **架构图**：
 ```
-Python后端 ←WebSocket→ Extension(VS Code侧) ←postMessage→ webview-ui(前端)
+Python后端 ←WebSocket→ Extension(VS Code侧) ←postMessage→ 旧 IDE 内嵌前端（已移除）(前端)
                 ↑                                         ↑
             仍存活                                   用户关闭这里
 ```
@@ -112,10 +112,10 @@ except Exception as e:
 
 **三层架构问题**：
 
-1. **Extension与webview-ui分离**
+1. **Extension与旧 IDE 内嵌前端（已移除）分离**
    - Extension运行在VS Code Extension Host
-   - webview-ui运行在独立WebView进程
-   - 用户关闭webview-ui，不影响Extension WebSocket
+   - 旧 IDE 内嵌前端（已移除）运行在独立WebView进程
+   - 用户关闭旧 IDE 内嵌前端（已移除），不影响Extension WebSocket
 
 2. **前端主动断开时机错误**
    - 前端收到display_text(complete=True)后立即断开
@@ -165,7 +165,7 @@ await send_callback("display_text", {
 
 **思路**：前端不要在complete=True后立即断开，等待task_complete
 
-**位置**：`webview-ui/src/components/chat/ChatView.tsx`
+**位置**：`旧 IDE 内嵌前端（已移除）/src/components/chat/ChatView.tsx`
 
 ```typescript
 // 当前：收到complete=True就认为完成

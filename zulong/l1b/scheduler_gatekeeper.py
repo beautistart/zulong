@@ -9,11 +9,12 @@ from zulong.core.power_manager import power_manager
 from zulong.l2.task_state_manager import task_state_manager
 from zulong.review.state_manager import get_review_state_manager, ReviewMode, ReviewStage
 
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import time
 import threading
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,181 @@ class Gatekeeper:
         
         logger.info("L1-B Gatekeeper: 已订阅所有事件类型，统一路由到 L2")
 
+    def _retrieve_bfs_context(self, conversation_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """TSD 23.11.3: 由 L1-B 使用 session/conversation anchor 执行 BFS 自恢复。"""
+        if not conversation_id:
+            return None
+        try:
+            from zulong.memory.memory_graph import get_memory_graph
+
+            mg = get_memory_graph()
+            if mg is None:
+                return None
+
+            if hasattr(mg, "get_session_node_id_for_conversation"):
+                session_node_id = mg.get_session_node_id_for_conversation(conversation_id)
+            else:
+                safe_id = "".join(
+                    ch if ch.isalnum() or ch in "-_" else "_"
+                    for ch in str(conversation_id or "")
+                )
+                session_node_id = f"dialogue:session_{safe_id}"
+
+            if not session_node_id or not mg.has_node(session_node_id):
+                return None
+
+            activations = mg.compute_activations(
+                seed_node_ids=[session_node_id],
+                max_depth=3,
+                decay=0.5,
+                min_activation=0.01,
+            )
+
+            recent_rounds: List[Dict[str, Any]] = []
+            active_tasks: List[Dict[str, Any]] = []
+            task_graph_id = ""
+            for node_id, activation in sorted(
+                activations.items(), key=lambda item: item[1], reverse=True
+            ):
+                node = mg.get_node(node_id)
+                if node is None:
+                    continue
+                meta = node.metadata or {}
+                ntype = node.node_type.value if hasattr(node.node_type, "value") else str(node.node_type)
+                label = node.label or ""
+                if ntype == "dialogue" and meta.get("sub_type") == "round":
+                    recent_rounds.append({
+                        "node_id": node_id,
+                        "label": label,
+                        "user_text": meta.get("user_text", ""),
+                        "bot_text": meta.get("bot_text", ""),
+                        "activation": round(float(activation), 3),
+                    })
+                elif ntype == "task":
+                    active_tasks.append({
+                        "node_id": node_id,
+                        "label": label,
+                        "status": meta.get("status", ""),
+                        "desc": meta.get("goal", ""),
+                        "activation": round(float(activation), 3),
+                    })
+                    if meta.get("task_graph_id") and not task_graph_id:
+                        task_graph_id = meta["task_graph_id"]
+
+            session_node = mg.get_node(session_node_id)
+            logger.info(
+                "[Gatekeeper][BFSContext] session=%s, activated_nodes=%s, rounds=%s, tasks=%s",
+                session_node_id,
+                len(activations),
+                len(recent_rounds),
+                len(active_tasks),
+            )
+            return {
+                "session_node_id": session_node_id,
+                "session_label": session_node.label if session_node else "",
+                "recent_rounds": recent_rounds[:5],
+                "active_tasks": active_tasks[:3],
+                "task_graph_id": task_graph_id,
+            }
+        except Exception as exc:
+            logger.warning(f"[Gatekeeper][BFSContext] 检索失败: {exc}")
+            return None
+
+    def _format_bfs_context_sections(self, bfs_context: Optional[Dict[str, Any]]) -> List[str]:
+        """将 BFS 自恢复结果压入 L2 可用的记忆上下文文本。"""
+        if not bfs_context:
+            return []
+        sections: List[str] = []
+        for round_ctx in bfs_context.get("recent_rounds", []) or []:
+            if not isinstance(round_ctx, dict):
+                continue
+            user_text = str(round_ctx.get("user_text") or "").strip()
+            bot_text = str(round_ctx.get("bot_text") or "").strip()
+            if user_text or bot_text:
+                sections.append(
+                    "【会话BFS历史】"
+                    + (f"用户：{user_text[:160]}" if user_text else "")
+                    + (f"\n回答：{bot_text[:180]}" if bot_text else "")
+                )
+        for task_ctx in bfs_context.get("active_tasks", []) or []:
+            if not isinstance(task_ctx, dict):
+                continue
+            label = str(task_ctx.get("label") or task_ctx.get("node_id") or "").strip()
+            status = str(task_ctx.get("status") or "").strip()
+            desc = str(task_ctx.get("desc") or "").strip()
+            if label or desc:
+                sections.append(
+                    "【会话BFS任务】"
+                    + (label[:120] if label else "")
+                    + (f"（状态：{status}）" if status else "")
+                    + (f"\n{desc[:180]}" if desc else "")
+                )
+        return sections
+
+    def _extract_bfs_task_graph_id(self, bfs_context: Optional[Dict[str, Any]]) -> str:
+        """从 BFS 自恢复上下文提取当前任务图兜底锚点。"""
+        if not bfs_context:
+            return ""
+        graph_id = str(bfs_context.get("task_graph_id") or "").strip()
+        if graph_id:
+            return graph_id
+        for task_ctx in bfs_context.get("active_tasks", []) or []:
+            if not isinstance(task_ctx, dict):
+                continue
+            node_id = str(task_ctx.get("node_id") or "").strip()
+            if node_id.startswith("task:"):
+                return node_id.split("task:", 1)[1].strip()
+        return ""
+
+    def _compact_context_value(self, value: Any, limit: int = 1200) -> str:
+        """压缩 L1-B 已采集上下文，避免任务包提示过长。"""
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                text = json.dumps(value, ensure_ascii=False, default=str)
+            except Exception:
+                text = str(value)
+        text = " ".join(text.split())
+        return text[:limit]
+
+    def _build_l1b_context_pack(
+        self,
+        *,
+        local_context: Any,
+        shared_context_snapshot: Any,
+        pre_retrieved_memory: Optional[str],
+        bfs_context: Optional[Dict[str, Any]],
+        tool_prediction: Optional[Dict[str, Any]],
+        voice_mode: str,
+    ) -> str:
+        """统一构建交给 L2 消费的 L1-B 上下文包。"""
+        lines: List[str] = ["【L1-B 打包上下文】"]
+        local_text = self._compact_context_value(local_context, 800)
+        if local_text:
+            lines.append(f"- 局部上下文: {local_text}")
+        shared_text = self._compact_context_value(shared_context_snapshot, 1000)
+        if shared_text:
+            lines.append(f"- 共享上下文快照: {shared_text}")
+        if bfs_context:
+            rounds = len(bfs_context.get("recent_rounds", []) or [])
+            tasks = len(bfs_context.get("active_tasks", []) or [])
+            lines.append(f"- 会话 BFS 自恢复: recent_rounds={rounds}, active_tasks={tasks}")
+        if tool_prediction:
+            context_bundle = tool_prediction.get("context_bundle", {}) or {}
+            lines.append(
+                "- 工具预判: "
+                f"tools={tool_prediction.get('predicted_tools', [])}, "
+                f"policy={tool_prediction.get('task_graph_policy', 'none')}, "
+                f"context={context_bundle}"
+            )
+        lines.append(f"- 输出模态辅助: voice_mode={voice_mode}")
+        if pre_retrieved_memory:
+            lines.append("\n【L1-B 预检索记忆】\n" + pre_retrieved_memory)
+        return "\n".join(lines)
+
     def _init_intent_filter(self):
         """初始化 L1-B 意图分类器 (ALBERT-tiny Chinese)"""
         try:
@@ -147,9 +323,22 @@ class Gatekeeper:
     def _on_l2_output_attention(self, event):
         """L2 回复后自主注意力循环：BFS 扩散 + 赫布学习 + 焦点漂移
         
-        在 EventBus 后台分发线程中执行（L2_OUTPUT 走优先级队列 → _dispatch_event）。
-        compute_activations 的 BFS 深度仅 2 跳，种子数 2-4，耗时 < 1ms，不会阻塞分发。
+        L2_OUTPUT 由 EventBus 串行分发，因此这里只调度后台任务；
+        实际 BFS/赫布不阻塞 Web Router 接收最终回复。
         """
+        try:
+            worker = threading.Thread(
+                target=self._run_l2_output_attention,
+                args=(event,),
+                name="zulong-l1b-attention-loop",
+                daemon=True,
+            )
+            worker.start()
+        except Exception as e:
+            logger.warning(f"[AttentionLoop] 后台调度异常: {e}")
+
+    def _run_l2_output_attention(self, event):
+        """后台执行 L2 回复后的注意力扩散。"""
         try:
             from zulong.memory.memory_graph import get_memory_graph
             mg = get_memory_graph()
@@ -393,7 +582,6 @@ class Gatekeeper:
                                         finally:
                                             new_loop.close()
                                     
-                                    import threading
                                     thread = threading.Thread(target=run_end_review, daemon=True)
                                     thread.start()
                                     logger.info("[Gatekeeper] ✅ 已在新线程中触发 handle_end_review()")
@@ -546,7 +734,6 @@ class Gatekeeper:
                                         finally:
                                             new_loop.close()
                                     
-                                    import threading
                                     thread = threading.Thread(target=run_end_review, daemon=True)
                                     thread.start()
                                     logger.info("[Gatekeeper] ✅ 已在新线程中触发 handle_end_review()")
@@ -677,7 +864,14 @@ class Gatekeeper:
         session_id = event.payload.get("session_id")
         request_id = event.payload.get("request_id")
         logger.info(f"🏷️ [Gatekeeper] on_user_text 收到 session_id: {session_id}, request_id: {request_id}")
-        self._handle_normal_command(text, event.priority, EventType.USER_TEXT, session_id, request_id)
+        worker = threading.Thread(
+            target=self._handle_normal_command,
+            args=(text, event.priority, EventType.USER_TEXT, session_id, request_id),
+            kwargs={"source_payload": dict(event.payload or {})},
+            name="zulong-l1b-user-text",
+            daemon=True,
+        )
+        worker.start()
     
     def on_user_command(self, event: ZulongEvent):
         """处理用户命令事件"""
@@ -1835,7 +2029,15 @@ class Gatekeeper:
         self._idle_check_timer.daemon = True  # 守护线程，主程序退出时自动终止
         self._idle_check_timer.start()
     
-    def _handle_normal_command(self, text: str, priority: EventPriority, event_type: str = None, session_id: Optional[str] = None, request_id: Optional[str] = None):
+    def _handle_normal_command(
+        self,
+        text: str,
+        priority: EventPriority,
+        event_type: str = None,
+        session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        source_payload: Optional[Dict[str, Any]] = None,
+    ):
         """处理普通命令
         
         Args:
@@ -1844,7 +2046,15 @@ class Gatekeeper:
             event_type: 事件类型 (用于语音模式检测)
             session_id: 会话 ID（来自 Web 测试 API）
             request_id: 请求 ID（用于思考过程和流式输出关联）
+            source_payload: 原始 USER_TEXT 载荷（包含 conversation/workspace/task anchors）
         """
+        source_payload = dict(source_payload or {})
+        conversation_id = (
+            source_payload.get("conversation_id")
+            or source_payload.get("session_id")
+            or session_id
+            or ""
+        )
         # 🔥 关键修复：移除复盘模式处理逻辑，统一由 _handle_review_mode_input 处理
         # review_mode = state_manager.get_context('review_mode', False)
         # if review_mode:
@@ -1934,139 +2144,183 @@ class Gatekeeper:
             except Exception as e:
                 logger.error(f"[Gatekeeper] 设置中断标志失败: {e}")
         
-        # 1. L1-B 局部理解：整理新任务的上下文
-        logger.info(f"🔍 [Gatekeeper] 步骤 1: 构建局部上下文...")
-        local_context = self._build_local_context(text)
-        logger.info(f"✅ [Gatekeeper] 局部上下文构建完成")
-        
-        # 2. L1-B 搜索共享上下文（视听 + MemoryGraph 记忆）
-        logger.info(f"🔍 [Gatekeeper] 步骤 2: 搜索共享上下文...")
-        shared_context_snapshot = self._search_shared_context(text)
-        
-        # 🎯 新增：L1-B 预检索 MemoryGraph 记忆上下文（避免 L2 重复检索）
-        pre_retrieved_memory = None
-        try:
-            from zulong.memory.memory_graph import get_memory_graph
-            _mg = get_memory_graph()
-            if _mg and hasattr(_mg, 'retrieve_context'):
-                logger.info(f"🔍 [Gatekeeper] 步骤 2.5: L1-B 预检索 MemoryGraph 记忆...")
-                
-                # 使用同步方式调用异步方法
-                import asyncio
-                def _run_async_bridge(coro):
-                    try:
-                        loop = asyncio.get_running_loop()
-                    except RuntimeError:
-                        loop = None
-                    if loop is not None and loop.is_running():
-                        import concurrent.futures
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                            return pool.submit(asyncio.run, coro).result(timeout=15)
-                    else:
-                        return asyncio.run(coro)
-                
-                # 检索记忆（top_k=5，比 L2 的 8 少，避免上下文过长）
-                mg_results = _run_async_bridge(
-                    _mg.retrieve_context(text, top_k=5, session_id="")
-                )
-                
-                if mg_results:
-                    # 格式化为字符串，供 L2 直接使用
-                    memory_sections = []
-                    for r in mg_results:
-                        ntype = r.get("node_type", "")
-                        content = r.get("content", "")
-                        label = r.get("label", "")
-                        if not content:
-                            continue
-                        if ntype == "experience":
-                            continue  # EXPERIENCE 由 FC 工具按需获取
-                        elif ntype == "dialogue":
-                            memory_sections.append(f"【历史对话】{content[:200]}")
-                        elif ntype == "task":
-                            status = r.get("metadata", {}).get("status", "")
-                            memory_sections.append(
-                                f"【相关任务】{label}" + (f"（状态：{status}）" if status else "")
-                            )
-                        elif ntype == "knowledge":
-                            memory_sections.append(f"【知识参考】{content[:300]}")
-                        elif ntype == "episode":
-                            memory_sections.append(f"【历史摘要】{content[:200]}")
-                        elif ntype in ("person", "concept"):
-                            memory_sections.append(f"【知识参考】{label}: {content[:200]}")
-                        else:
-                            memory_sections.append(f"【参考】{content[:200]}")
-                    
-                    if memory_sections:
-                        pre_retrieved_memory = "\n".join(memory_sections)
-                        logger.info(f"✅ [Gatekeeper] MemoryGraph 预检索完成：{len(memory_sections)} 条记忆")
-                    else:
-                        logger.debug("[Gatekeeper] MemoryGraph 未检索到相关记忆")
-                else:
-                    logger.debug("[Gatekeeper] MemoryGraph 检索结果为空")
-            else:
-                logger.debug("[Gatekeeper] MemoryGraph 未初始化，跳过预检索")
-        except Exception as e:
-            logger.warning(f"[Gatekeeper] MemoryGraph 预检索失败: {e}")
-            pre_retrieved_memory = None
-        
-        logger.info(f"✅ [Gatekeeper] 共享上下文搜索完成")
-        
-        # 🎯 3. 检测语音模式 (TSD v1.7 规范)
-        logger.info(f"🔍 [Gatekeeper] 步骤 3: 检测语音模式...")
-        voice_mode = self._detect_voice_mode(text, event_type or EventType.USER_TEXT)
-        logger.info(f"✅ [Gatekeeper] 语音模式检测完成：{voice_mode}")
-        
-        # 5. L1-B 细粒度语义分析（仅作为工具预判辅助信号）
-        intent_result = None
-        
-        if self._intent_filter:
-            logger.debug(f"🔍 [Gatekeeper] 步骤 4: L1-B 细粒度分类 (ALBERT) - 仅用于工具预判输入")
+        logger.info("[Gatekeeper] 步骤 1-4: L1-B 并行执行上下文恢复、输出模态、ALBERT 与工具预判")
+
+        def _run_async_bridge(coro, timeout: int = 15):
+            import asyncio
             try:
-                intent_result = self._intent_filter.analyze(text)
-                logger.debug(
-                    f"✅ [Gatekeeper] 细粒度分类（辅助信息）: {intent_result.get('intent', 'unknown')} "
-                    f"(置信度: {intent_result.get('confidence', 0):.3f}, "
-                    f"模型: {intent_result.get('model', 'keyword')})"
-                )
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None and loop.is_running():
+                import concurrent.futures as _cf_inner
+                with _cf_inner.ThreadPoolExecutor(max_workers=1) as pool:
+                    return pool.submit(asyncio.run, coro).result(timeout=timeout)
+            return asyncio.run(coro)
+
+        def _context_branch():
+            logger.info("🔍 [Gatekeeper] 并行分支/context: 局部上下文 + 共享上下文 + BFS + MemoryGraph")
+            local = self._build_local_context(text)
+            shared = self._search_shared_context(text)
+            bfs = source_payload.get("bfs_context") if isinstance(source_payload.get("bfs_context"), dict) else None
+            if not bfs and conversation_id:
+                logger.info("🔍 [Gatekeeper] L1-B BFS 自恢复上下文...")
+                bfs = self._retrieve_bfs_context(conversation_id)
+                if bfs:
+                    logger.info(
+                        "✅ [Gatekeeper] BFS 自恢复完成：rounds=%s, tasks=%s",
+                        len(bfs.get("recent_rounds", []) or []),
+                        len(bfs.get("active_tasks", []) or []),
+                    )
+                else:
+                    logger.info("[Gatekeeper] BFS 自恢复无结果，按全新上下文继续")
+
+            memory_sections = self._format_bfs_context_sections(bfs)
+            try:
+                from zulong.memory.memory_graph import get_memory_graph
+                _mg = get_memory_graph()
+                if _mg and hasattr(_mg, "retrieve_context"):
+                    logger.info("🔍 [Gatekeeper] L1-B 预检索 MemoryGraph 记忆（热/冷双路）...")
+                    mg_results = _run_async_bridge(
+                        _mg.retrieve_context(
+                            text,
+                            top_k=5,
+                            session_id=conversation_id or session_id or "",
+                        )
+                    )
+                    if mg_results:
+                        for r in mg_results:
+                            ntype = r.get("node_type", "")
+                            content = r.get("content", "")
+                            label = r.get("label", "")
+                            if not content:
+                                continue
+                            if ntype == "experience":
+                                continue
+                            if ntype == "dialogue":
+                                memory_sections.append(f"【历史对话】{content[:200]}")
+                            elif ntype == "task":
+                                status = r.get("metadata", {}).get("status", "")
+                                memory_sections.append(
+                                    f"【相关任务】{label}" + (f"（状态：{status}）" if status else "")
+                                )
+                            elif ntype == "knowledge":
+                                memory_sections.append(f"【知识参考】{content[:300]}")
+                            elif ntype == "episode":
+                                memory_sections.append(f"【历史摘要】{content[:200]}")
+                            elif ntype in ("person", "concept"):
+                                memory_sections.append(f"【知识参考】{label}: {content[:200]}")
+                            else:
+                                memory_sections.append(f"【参考】{content[:200]}")
+                        logger.info("✅ [Gatekeeper] MemoryGraph 预检索完成：%s 条候选", len(mg_results))
+                    else:
+                        logger.debug("[Gatekeeper] MemoryGraph 检索结果为空")
+                else:
+                    logger.debug("[Gatekeeper] MemoryGraph 未初始化，跳过预检索")
             except Exception as e:
-                logger.debug(f"[Gatekeeper] 细粒度分类失败（不影响工具预判）: {e}")
-                intent_result = None
-        else:
-            logger.debug("[Gatekeeper] 细粒度分类器未初始化，跳过")
+                logger.warning("[Gatekeeper] MemoryGraph 预检索失败: %s", e)
 
-        # 5.5 L1-B 工具预判：输出工具包和上下文，不再把会话判死为某种模式
+            pre_memory = "\n".join(memory_sections) if memory_sections else None
+            if pre_memory:
+                logger.info("✅ [Gatekeeper] 上下文记忆打包完成：%s 段", len(memory_sections))
+            return local, shared, bfs, pre_memory
+
+        def _voice_branch():
+            logger.info("🔍 [Gatekeeper] 并行分支/voice: 输出模态辅助判断")
+            mode = self._detect_voice_mode(text, event_type or EventType.USER_TEXT)
+            logger.info("✅ [Gatekeeper] 语音模式检测完成：%s", mode)
+            return mode
+
+        def _intent_and_tool_branch():
+            logger.info("🔍 [Gatekeeper] 并行分支/tool: ALBERT 辅助分类 + 工具预判")
+            intent = None
+            if self._intent_filter:
+                try:
+                    intent = self._intent_filter.analyze(text)
+                    logger.debug(
+                        "✅ [Gatekeeper] 细粒度分类（辅助信息）: %s (置信度: %.3f, 模型: %s)",
+                        intent.get("intent", "unknown"),
+                        intent.get("confidence", 0),
+                        intent.get("model", "keyword"),
+                    )
+                except Exception as e:
+                    logger.debug("[Gatekeeper] 细粒度分类失败（不影响工具预判）: %s", e)
+            else:
+                logger.debug("[Gatekeeper] 细粒度分类器未初始化，跳过")
+
+            try:
+                from zulong.l2.inference_engine import InferenceEngine
+                from zulong.tools.task_tools import get_active_task_graph
+                from zulong.tools.tool_bag import predict_tools_for_turn
+
+                _predict_engine = InferenceEngine().tool_engine
+                _active_tg = get_active_task_graph()
+                prediction = predict_tools_for_turn(
+                    text,
+                    registry=_predict_engine.registry,
+                    intent_result=intent,
+                    referenced_nodes=source_payload.get("referenced_nodes"),
+                    has_task_graph=_active_tg is not None,
+                ).to_dict()
+                logger.info(
+                    "[Gatekeeper] 工具预判完成: tools=%s, policy=%s",
+                    prediction.get("predicted_tools", []),
+                    prediction.get("task_graph_policy", "none"),
+                )
+                return intent, prediction
+            except Exception as e:
+                logger.warning("[Gatekeeper] 工具预判失败: %s", e)
+                return intent, {
+                    "predicted_tools": ["request_tool_supplement"],
+                    "context_bundle": {},
+                    "reasons": ["工具预判失败，保留工具补充入口"],
+                    "risk_notes": [],
+                    "task_graph_policy": "none",
+                }
+
+        local_context = {}
+        shared_context_snapshot = {}
+        bfs_context = None
+        pre_retrieved_memory = None
+        voice_mode = "TEXT_ONLY"
+        intent_result = None
         tool_prediction = None
-        try:
-            from zulong.l2.inference_engine import InferenceEngine
-            from zulong.tools.task_tools import get_active_task_graph
-            from zulong.tools.tool_bag import predict_tools_for_turn
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="l1b-pack") as pool:
+            context_future = pool.submit(_context_branch)
+            voice_future = pool.submit(_voice_branch)
+            tool_future = pool.submit(_intent_and_tool_branch)
+            try:
+                local_context, shared_context_snapshot, bfs_context, pre_retrieved_memory = context_future.result()
+            except Exception as exc:
+                logger.warning("[Gatekeeper] 上下文并行分支失败，使用空上下文继续: %s", exc)
+            try:
+                voice_mode = voice_future.result()
+            except Exception as exc:
+                logger.warning("[Gatekeeper] 输出模态并行分支失败，回退 TEXT_ONLY: %s", exc)
+            try:
+                intent_result, tool_prediction = tool_future.result()
+            except Exception as exc:
+                logger.warning("[Gatekeeper] 工具预判并行分支失败，保留工具补充入口: %s", exc)
+                tool_prediction = {
+                    "predicted_tools": ["request_tool_supplement"],
+                    "context_bundle": {},
+                    "reasons": ["工具预判失败，保留工具补充入口"],
+                    "risk_notes": [],
+                    "task_graph_policy": "none",
+                }
 
-            _predict_engine = InferenceEngine().tool_engine
-            _active_tg = get_active_task_graph()
-            tool_prediction = predict_tools_for_turn(
-                text,
-                registry=_predict_engine.registry,
-                intent_result=intent_result,
-                referenced_nodes=None,
-                has_task_graph=_active_tg is not None,
-            ).to_dict()
-            logger.info(
-                "[Gatekeeper] 工具预判完成: tools=%s, policy=%s",
-                tool_prediction.get("predicted_tools", []),
-                tool_prediction.get("task_graph_policy", "none"),
-            )
-        except Exception as e:
-            logger.warning(f"[Gatekeeper] 工具预判失败: {e}")
-            tool_prediction = {
-                "predicted_tools": ["request_tool_supplement"],
-                "context_bundle": {},
-                "reasons": ["工具预判失败，保留工具补充入口"],
-                "risk_notes": [],
-                "task_graph_policy": "none",
-            }
+        l1b_context_pack = self._build_l1b_context_pack(
+            local_context=local_context,
+            shared_context_snapshot=shared_context_snapshot,
+            pre_retrieved_memory=pre_retrieved_memory,
+            bfs_context=bfs_context,
+            tool_prediction=tool_prediction,
+            voice_mode=voice_mode,
+        )
+        logger.info("✅ [Gatekeeper] L1-B 统一上下文打包完成：%s 字符", len(l1b_context_pack))
         self._publish_tool_prediction_event(
-            tool_prediction,
+            {**(tool_prediction or {}), "user_text": text},
             request_id=request_id,
             session_id=session_id,
         )
@@ -2079,11 +2333,56 @@ class Gatekeeper:
             "voice_mode": voice_mode,
             "intent_result": intent_result,  # L1-B 细粒度分类结果，仅作为工具预判辅助
             "pre_retrieved_memory": pre_retrieved_memory,  # L1-B 预检索的记忆上下文
+            "l1b_context_pack": l1b_context_pack,
+            "bfs_context": bfs_context,
             "tool_prediction": tool_prediction,
             "tool_bundle": tool_prediction.get("predicted_tools", []) if tool_prediction else [],
             "context_bundle": tool_prediction.get("context_bundle", {}) if tool_prediction else {},
             "task_graph_policy": tool_prediction.get("task_graph_policy", "none") if tool_prediction else "none",
         }
+        _context_bundle = packaged_task.get("context_bundle") or {}
+        _simple_dialogue_turn = (
+            _context_bundle.get("turn_shape") in {"simple_social", "presentation_only"}
+            and packaged_task.get("task_graph_policy") == "none"
+        )
+        for key in (
+            "conversation_id",
+            "turn_id",
+            "workspace_path",
+            "cwd",
+            "project_id",
+            "task_graph_id",
+            "referenced_task_graph_id",
+            "task_graph_reference_mode",
+            "referenced_nodes",
+            "source",
+        ):
+            if _simple_dialogue_turn and key in {
+                "workspace_path",
+                "cwd",
+                "project_id",
+                "task_graph_id",
+                "referenced_task_graph_id",
+                "task_graph_reference_mode",
+                "referenced_nodes",
+            }:
+                continue
+            value = source_payload.get(key)
+            if value:
+                packaged_task[key] = value
+        recovered_task_graph_id = self._extract_bfs_task_graph_id(bfs_context)
+        _task_policy_allows_recovery = packaged_task.get("task_graph_policy") in {
+            "reuse",
+            "inspect",
+            "continue",
+            "inspect_or_create",
+        }
+        if (
+            recovered_task_graph_id
+            and _task_policy_allows_recovery
+            and not packaged_task.get("task_graph_id")
+        ):
+            packaged_task["task_graph_id"] = recovered_task_graph_id
         
         # 🔥 新增：添加 session_id（如果有）
         if session_id:
@@ -2123,18 +2422,39 @@ class Gatekeeper:
             reasons = tool_prediction.get("reasons", []) or []
             policy = tool_prediction.get("task_graph_policy", "none")
             context_bundle = tool_prediction.get("context_bundle", {}) or {}
+            task_text = str(tool_prediction.get("user_text") or tool_prediction.get("text") or "").strip()
+            if len(task_text) > 76:
+                task_text = task_text[:73].rstrip() + "..."
+            steps = []
+            if context_bundle.get("needs_memory") or any("memory" in str(t) for t in tools):
+                steps.append("先取相关记忆和经验")
+            if context_bundle.get("needs_project_context") or any(str(t) in {"read_file", "search_code_symbols", "index_project", "analyze_module"} for t in tools):
+                steps.append("读取或检索项目代码")
+            if policy in {"reuse", "inspect", "inspect_or_create", "continue"} or any(str(t).startswith("task_") for t in tools):
+                steps.append("同步任务图，确认当前进度")
+            if tools:
+                steps.append("把候选工具交给 L2 自主选择")
+            if not steps:
+                steps.append("判断是否需要工具，不需要时直接回复")
+            title = f"先看目标: {task_text}" if task_text else "先看目标和上下文"
+            detail_lines = [
+                "我会先确认这件事需要哪些上下文，再让 L2 决定是否真的调用工具。"
+            ]
+            if tools:
+                detail_lines.append("候选能力: " + ", ".join(str(t) for t in tools[:6]))
+            if policy and policy != "none":
+                detail_lines.append("任务图: " + str(policy))
+            if reasons:
+                detail_lines.append("判断依据: " + "；".join(str(r) for r in reasons[:2]))
             interaction = {
                 "pair_id": f"l1b-tool-prediction-{request_id or int(time.time() * 1000)}",
                 "kind": "plan",
                 "status": "running",
-                "title": "L1-B 已完成工具预判",
-                "detail": (
-                    "工具: " + (", ".join(tools) if tools else "无") +
-                    "\n策略: " + str(policy) +
-                    ("\n依据: " + "；".join(str(r) for r in reasons[:3]) if reasons else "")
-                ),
+                "title": title,
+                "detail": "\n".join(detail_lines),
                 "progress": 0,
-                "next_step": "L2 将基于工具包、上下文和记忆自主推理",
+                "plan_steps": steps[:5],
+                "next_step": "接下来由 L2 根据上下文做真实决策",
             }
             payload = {
                 "request_id": request_id or f"req_{int(time.time() * 1000)}",
@@ -2225,11 +2545,24 @@ class Gatekeeper:
                 f"[Gatekeeper] Round 骨架已创建: {round_id} (session 待 L2 分配)"
             )
             # 发布图谱更新事件到前端
-            self._publish_memory_graph_event(mg)
+            self._publish_memory_graph_event_async(mg)
             return round_id
         except Exception as e:
             logger.debug(f"[Gatekeeper] 对话节点创建跳过: {e}")
             return None
+
+    def _publish_memory_graph_event_async(self, mg):
+        """后台发布 MemoryGraph 前端更新，不阻塞 L1-B → L2 主链路。"""
+        try:
+            worker = threading.Thread(
+                target=self._publish_memory_graph_event,
+                args=(mg,),
+                name="zulong-l1b-memory-graph-update",
+                daemon=True,
+            )
+            worker.start()
+        except Exception as exc:
+            logger.debug(f"[Gatekeeper] MemoryGraph 异步更新调度跳过: {exc}")
 
     def _publish_memory_graph_event(self, mg):
         """发布 MemoryGraph 更新事件到前端"""

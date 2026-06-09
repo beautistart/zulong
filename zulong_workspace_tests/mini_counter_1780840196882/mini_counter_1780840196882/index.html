@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>网页计数器</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 60px 80px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            text-align: center;
+            max-width: 400px;
+            width: 90%;
+        }
+
+        h1 {
+            color: #333;
+            font-size: 2rem;
+            margin-bottom: 30px;
+            font-weight: 600;
+        }
+
+        .count-display {
+            font-size: 5rem;
+            font-weight: 700;
+            color: #667eea;
+            margin-bottom: 30px;
+            transition: transform 0.2s ease;
+        }
+
+        .count-display.pop {
+            transform: scale(1.2);
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 16px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .btn-increase {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 16px 48px;
+            font-size: 1.2rem;
+            font-weight: 600;
+            border-radius: 50px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+            letter-spacing: 1px;
+        }
+
+        .btn-increase:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(102, 126, 234, 0.6);
+        }
+
+        .btn-increase:active {
+            transform: translateY(0);
+            box-shadow: 0 2px 10px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-reset {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+            border: none;
+            padding: 16px 48px;
+            font-size: 1.2rem;
+            font-weight: 600;
+            border-radius: 50px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(245, 87, 108, 0.4);
+            letter-spacing: 1px;
+        }
+
+        .btn-reset:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(245, 87, 108, 0.6);
+        }
+
+        .btn-reset:active {
+            transform: translateY(0);
+            box-shadow: 0 2px 10px rgba(245, 87, 108, 0.4);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔢 网页计数器</h1>
+        <div class="count-display" id="countDisplay">0</div>
+        <div class="btn-group">
+            <button class="btn-increase" id="btnIncrease">➕ 增加</button>
+            <button class="btn-reset" id="btnReset">🔄 重置为 0</button>
+        </div>
+    </div>
+
+    <script>
+        // 获取 DOM 元素
+        const countDisplay = document.getElementById('countDisplay');
+        const btnIncrease = document.getElementById('btnIncrease');
+        const btnReset = document.getElementById('btnReset');
+
+        // 初始化计数
+        let count = 0;
+
+        // 点击增加按钮
+        btnIncrease.addEventListener('click', function() {
+            count++;
+            countDisplay.textContent = count;
+
+            // 添加弹跳动画
+            countDisplay.classList.remove('pop');
+            void countDisplay.offsetWidth; // 触发回流，重置动画
+            countDisplay.classList.add('pop');
+        });
+
+        // 点击重置按钮
+        btnReset.addEventListener('click', function() {
+            count = 0;
+            countDisplay.textContent = count;
+
+            // 添加弹跳动画
+            countDisplay.classList.remove('pop');
+            void countDisplay.offsetWidth;
+            countDisplay.classList.add('pop');
+        });
+    </script>
+</body>
+</html>

@@ -100,9 +100,9 @@ class TTSExpertNode(BaseExpertNode):
         self._kokoro_lock = threading.Lock()
 
         # CosyVoice 配置 (备选引擎 1)
-        from zulong.tts.cosyvoice_config import MODEL_BASE_DIR
-        self.model_path = MODEL_BASE_DIR / "CosyVoice3-0.5B" / "FunAudioLLM" / "Fun-CosyVoice3-0___5B-2512"
-        self.ttsfrd_path = MODEL_BASE_DIR / "iic" / "CosyVoice-ttsfrd"
+        from zulong.tts.cosyvoice_config import get_cosyvoice3_model_path, get_cosyvoice_ttsfrd_path
+        self.model_path = get_cosyvoice3_model_path()
+        self.ttsfrd_path = get_cosyvoice_ttsfrd_path()
 
         # 模型实例 (懒加载)
         self.tts_model = None  # CosyVoice 实例

@@ -40,8 +40,7 @@ evals/
 buf.yaml
 .clinerules/
 
-# VS Code 插件生产包只保留后台桥，不再携带 Webview 产物。
-webview-ui/**
+# VS Code 插件生产包只保留后台桥，用户交互入口统一到 Zulong Web。
 **/.gitignore
 
 # Ignore docs

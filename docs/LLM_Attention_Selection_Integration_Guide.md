@@ -323,8 +323,8 @@ attention_selection:
   enabled: true                      # 启用/禁用LLM自主选择
   
   # 压力阈值配置
-  pressure_threshold_high: 0.9       # 高压阈值 (推荐0.8-1.0)
-  pressure_threshold_medium: 0.75    # 中压阈值 (推荐0.6-0.8)
+  pressure_threshold_high: 0.6       # 高压阈值
+  pressure_threshold_medium: 0.5     # 中压阈值
   
   # 冷却时间配置
   cooldown_base_seconds: 30.0        # 基础冷却时间(秒)
@@ -359,7 +359,7 @@ def test_pressure_detection():
     
 def test_threshold_check():
     """测试阈值判断"""
-    config = AttentionConfig(pressure_threshold_high=0.9)
+    config = AttentionConfig(pressure_threshold_high=0.6)
     detector = PressureDetector(mock_awm, config)
     metrics = PressureMetrics(current_pressure=1.0, ...)
     result = detector.check_threshold(metrics)

@@ -15,6 +15,64 @@ from .base import BaseTool, ToolCategory, ToolRequest, ToolResult
 logger = logging.getLogger(__name__)
 
 
+def _graph_node_metadata(node: Any) -> Dict[str, Any]:
+    metadata = getattr(node, "metadata", None)
+    if isinstance(metadata, dict):
+        return metadata
+    return {}
+
+
+def _update_graph_node_metadata(mg: Any, node_id: str, updates: Dict[str, Any]) -> bool:
+    """Update MemoryGraph node metadata through the public compatibility API."""
+    node = mg.get_node(node_id) if hasattr(mg, "get_node") else None
+    if node is None:
+        return False
+    metadata = dict(_graph_node_metadata(node))
+    metadata.update(updates)
+    node.metadata = metadata
+    if hasattr(mg, "update_node"):
+        return bool(mg.update_node(node))
+    return True
+
+
+def _set_graph_importance(mg: Any, node_id: str, importance: Any) -> None:
+    if not hasattr(mg, "set_importance"):
+        return
+    try:
+        mg.set_importance(node_id, importance)
+    except Exception:
+        logger.debug("[code_anchor] set_importance skipped", exc_info=True)
+
+
+def _index_graph_summary(mg: Any, node_id: str, summary_text: str) -> None:
+    if not hasattr(mg, "index_summary"):
+        return
+    try:
+        mg.index_summary(node_id, summary_text)
+    except Exception:
+        logger.debug("[code_anchor] index_summary skipped", exc_info=True)
+
+
+def _get_last_focus_context(mg: Any) -> Dict[str, Any]:
+    if not hasattr(mg, "get_last_focus_context"):
+        return {}
+    try:
+        return mg.get_last_focus_context() or {}
+    except Exception:
+        return {}
+
+
+def _safe_shard_id(mg: Any, node_id: str) -> str:
+    try:
+        global_index = getattr(mg, "global_index", None)
+        if global_index is not None:
+            return str(global_index.get_node_shard(node_id) or "")
+    except Exception:
+        pass
+    node = mg.get_node(node_id) if hasattr(mg, "get_node") else None
+    return str(getattr(node, "storage_shard", "") or "")
+
+
 class MemoryWriteWithCodeTool(BaseTool):
     """zulong_memory_write_with_code — 保存记忆并关联代码位置
 
@@ -116,11 +174,11 @@ class MemoryWriteWithCodeTool(BaseTool):
             )
 
             mg.add_node(node)
-            mg.set_importance(node_id, imp_level)
-            mg.index_summary(node_id, f"{label} {content}")
+            _set_graph_importance(mg, node_id, imp_level)
+            _index_graph_summary(mg, node_id, f"{label} {content}")
 
             # 与当前焦点节点建立关联
-            ctx = mg.get_last_focus_context()
+            ctx = _get_last_focus_context(mg)
             if ctx and ctx.get("focused_task_node_id"):
                 mg.add_edge(
                     ctx["focused_task_node_id"],
@@ -166,13 +224,10 @@ class MemoryWriteWithCodeTool(BaseTool):
             anchor_ids = [a.id for a in created_anchors]
             code_ref_summary = build_code_ref_summary(created_anchors)
 
-            # 更新 GraphNode metadata
-            node_data = mg._graph.nodes.get(node_id)
-            if node_data:
-                meta = node_data.get("node_obj")
-                if meta and hasattr(meta, "metadata"):
-                    meta.metadata["code_anchors"] = anchor_ids
-                    meta.metadata["code_ref_summary"] = code_ref_summary
+            _update_graph_node_metadata(mg, node_id, {
+                "code_anchors": anchor_ids,
+                "code_ref_summary": code_ref_summary,
+            })
 
             # 4. 自动语义关联
             _semantic_count = 0
@@ -192,6 +247,9 @@ class MemoryWriteWithCodeTool(BaseTool):
                 success=True,
                 data={
                     "node_id": node_id,
+                    "graph_memory_id": node_id,
+                    "shard_id": _safe_shard_id(mg, node_id),
+                    "full_path": node_id,
                     "label": label,
                     "importance": imp_level.value,
                     "anchor_count": len(created_anchors),
@@ -404,20 +462,17 @@ class CodeQueryTool(BaseTool):
             if mg is None:
                 return None
 
-            node_data = mg._graph.nodes.get(node_id)
-            if not node_data:
-                return None
-
-            node_obj = node_data.get("node_obj")
+            node_obj = mg.get_node(node_id) if hasattr(mg, "get_node") else None
             if not node_obj:
                 return None
 
+            metadata = _graph_node_metadata(node_obj)
             return {
                 "node_id": node_id,
                 "type": node_obj.node_type.value if hasattr(node_obj.node_type, "value") else str(node_obj.node_type),
                 "label": node_obj.label,
-                "content": node_obj.metadata.get("content", ""),
-                "importance": node_obj.metadata.get("importance", "normal"),
+                "content": getattr(node_obj, "content", None) or metadata.get("content", ""),
+                "importance": getattr(node_obj, "importance", None) or metadata.get("importance", "normal"),
             }
         except Exception:
             return None
@@ -650,19 +705,21 @@ class TaskLinkCodeTool(BaseTool):
 
             # MemoryGraph 中任务节点 ID 格式: "task:{graph_id}/{node_id}"
             mg_node_id = f"task:{graph_id}/{task_node_id}"
-            node_data = mg._graph.nodes.get(mg_node_id)
-            if not node_data:
+            node_obj = mg.get_node(mg_node_id) if hasattr(mg, "get_node") else None
+            if not node_obj:
                 # 也尝试不带 graph_id 的格式
                 mg_node_id = f"task:{task_node_id}"
-                node_data = mg._graph.nodes.get(mg_node_id)
+                node_obj = mg.get_node(mg_node_id) if hasattr(mg, "get_node") else None
 
-            if node_data:
-                node_obj = node_data.get("node_obj")
-                if node_obj and hasattr(node_obj, "metadata"):
-                    existing_anchors = node_obj.metadata.get("code_anchors", [])
-                    existing_anchors.extend(anchor_ids)
-                    node_obj.metadata["code_anchors"] = existing_anchors
-                    node_obj.metadata["code_ref_summary"] = code_ref_summary
+            if node_obj:
+                metadata = dict(_graph_node_metadata(node_obj))
+                existing_anchors = list(metadata.get("code_anchors", []) or [])
+                existing_anchors.extend(anchor_ids)
+                metadata["code_anchors"] = existing_anchors
+                metadata["code_ref_summary"] = code_ref_summary
+                node_obj.metadata = metadata
+                if hasattr(mg, "update_node"):
+                    mg.update_node(node_obj)
         except Exception as e:
             logger.debug(f"[task_link_code] MemoryGraph 同步跳过: {e}")
 

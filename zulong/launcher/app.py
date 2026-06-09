@@ -40,7 +40,7 @@ _app_instance = None
 
 _LAUNCHER_STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 _DASHBOARD_STATIC = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "openclaw_bridge", "web", "static"
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "zulong_web", "static"
 )
 
 
@@ -101,13 +101,6 @@ class LauncherApp:
                 self.manager.register(mod)
         except ImportError:
             logger.debug("[LauncherApp] full_modules 未找到，跳过 Full 模式模块注册")
-
-        # 可选模块
-        try:
-            from zulong.launcher.modules.openclaw_module import OpenClawModule
-            self.manager.register(OpenClawModule())
-        except ImportError:
-            logger.debug("[LauncherApp] openclaw_module 未找到，跳过")
 
         try:
             from zulong.launcher.modules.mcp_module import MCPModule

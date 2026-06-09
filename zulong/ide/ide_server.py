@@ -19,7 +19,7 @@ import uuid
 from typing import Any, Dict, Optional, Set
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.routing import APIRouter
 from fastapi.staticfiles import StaticFiles
 import uvicorn
@@ -133,6 +133,8 @@ class IDESession:
         self.task_graph_id: Optional[str] = None
         self.conversation_id: Optional[str] = None
         self.web_turn_id: Optional[str] = None
+        self.workspace_trusted: Optional[bool] = None
+        self.trust_required: bool = False
 
     def to_info_dict(self) -> Dict[str, Any]:
         """序列化会话元数据（用于 REST API / WELCOME 消息）"""
@@ -145,6 +147,8 @@ class IDESession:
             "turn_id": self.web_turn_id,
             "created_at": self.created_at,
             "has_fc_task": self.fc_task is not None and not self.fc_task.done(),
+            "workspace_trusted": self.workspace_trusted,
+            "trust_required": self.trust_required,
         }
 
     async def send_msg(self, msg_type: str, payload: Dict[str, Any]) -> None:
@@ -223,9 +227,58 @@ class AgentRunSession:
 # 活跃会话
 _sessions: Dict[str, IDESession] = {}
 _agent_runs: Dict[str, AgentRunSession] = {}
+_workspace_trust_waiters: Dict[str, list[asyncio.Future]] = {}
 
 # ── Web 监控连接 ──────────────────────────────────────
 _monitor_connections: Set[WebSocket] = set()
+
+
+def _resolve_active_task_workspace(
+    preferred: Optional[str] = None,
+    task_graph_id: Optional[str] = None,
+) -> str:
+    """Resolve the current task workspace; never use repo cwd as an implicit task dir."""
+    candidates = []
+
+    def add_candidate(value: Optional[str]) -> None:
+        if value:
+            candidates.append(value)
+
+    if task_graph_id:
+        try:
+            from zulong.workspace.project_registry import get_project_registry
+            project = get_project_registry().get_project_by_graph_id(task_graph_id)
+            if project and project.path:
+                add_candidate(project.path)
+        except Exception:
+            pass
+
+    try:
+        from zulong.tools.task_tools import get_active_task_graph, get_active_workspace_dir
+        active_workspace = get_active_workspace_dir()
+        active_graph = get_active_task_graph()
+        active_graph_id = getattr(active_graph, "id", None) if active_graph else None
+        if active_workspace and (not task_graph_id or active_graph_id == task_graph_id):
+            add_candidate(active_workspace)
+        if active_graph is not None:
+            meta_workspace = getattr(active_graph, "metadata", {}).get("workspace_dir")
+            if meta_workspace and (not task_graph_id or active_graph_id == task_graph_id):
+                add_candidate(meta_workspace)
+    except Exception:
+        pass
+
+    # The request payload may contain stale IDE context (for example a parent
+    # folder). It is only a final fallback after TaskGraph/ProjectRegistry data.
+    add_candidate(preferred)
+
+    for candidate in candidates:
+        try:
+            path = os.path.abspath(os.path.expanduser(os.path.expandvars(str(candidate))))
+            if os.path.exists(path):
+                return path
+        except Exception:
+            continue
+    return ""
 
 
 def _find_run_by_ide_session(ide_session_id: str) -> Optional[AgentRunSession]:
@@ -259,6 +312,38 @@ async def broadcast_monitor_event(event_type: str, payload: dict) -> None:
         logger.info(f"[Monitor] broadcast {event_type} → {sent_count} 个监控连接")
 
 
+def _runtime_settings_payload(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    settings = dict(payload or {})
+    if not settings.get("approval_mode"):
+        try:
+            from zulong.config.approval_config import get_runtime_approval_mode
+            settings["approval_mode"] = get_runtime_approval_mode()
+        except Exception:
+            settings["approval_mode"] = "manual"
+    return settings
+
+
+async def _send_runtime_settings_to_session(session: IDESession, payload: Optional[Dict[str, Any]] = None) -> None:
+    await session.send_msg("ide_runtime_settings", _runtime_settings_payload(payload))
+
+
+async def broadcast_runtime_settings(payload: Optional[Dict[str, Any]] = None) -> int:
+    """同步 Web 运行时设置到已连接的 IDE 执行桥。"""
+    settings = _runtime_settings_payload(payload)
+    sent_count = 0
+    for session in list(_sessions.values()):
+        if session.client_type not in ("ide_plugin", "unknown"):
+            continue
+        try:
+            await _send_runtime_settings_to_session(session, settings)
+            sent_count += 1
+        except Exception as exc:
+            logger.debug("[ZulongIDE] 运行时设置同步失败 session=%s: %s", session.session_id[:12], exc)
+    if sent_count:
+        logger.info("[ZulongIDE] 运行时设置已同步到 %s 个 IDE 执行桥: %s", sent_count, settings)
+    return sent_count
+
+
 def _conversation_payload(session: IDESession) -> Dict[str, Any]:
     return {
         "conversation_id": session.conversation_id,
@@ -275,9 +360,11 @@ def _select_ide_bridge(workspace_path: Optional[str] = None) -> Optional[IDEClie
         if s.client_type in ("ide_plugin", "unknown")
     ]
     if workspace_path:
+        target = os.path.normcase(os.path.abspath(workspace_path))
         for session in candidates:
-            if session.cwd and os.path.normcase(os.path.abspath(session.cwd)) == os.path.normcase(os.path.abspath(workspace_path)):
+            if session.cwd and os.path.normcase(os.path.abspath(session.cwd)) == target:
                 return session
+        return None
     return candidates[-1] if candidates else None
 
 
@@ -288,6 +375,141 @@ def _workspace_matches(session: Optional[IDEClientConnection], workspace_path: O
         return os.path.normcase(os.path.abspath(session.cwd or "")) == os.path.normcase(os.path.abspath(workspace_path))
     except Exception:
         return False
+
+
+def _workspace_key(workspace_path: Optional[str]) -> str:
+    try:
+        return os.path.normcase(os.path.abspath(workspace_path or ""))
+    except Exception:
+        return os.path.normcase(str(workspace_path or ""))
+
+
+def _session_workspace_trusted(session: Optional[IDEClientConnection]) -> bool:
+    # Older plugin builds do not report Workspace Trust; keep backward compatibility.
+    return session is not None and session.workspace_trusted is not False and not session.trust_required
+
+
+async def _wait_for_workspace_trust(
+    workspace_path: str,
+    *,
+    reason: str = "",
+    timeout: float = 180.0,
+) -> Dict[str, Any]:
+    """Wait until VS Code reports the workspace as trusted."""
+    key = _workspace_key(workspace_path)
+    session = _select_ide_bridge(workspace_path)
+    if _session_workspace_trusted(session):
+        return {"ok": True, "status": "trusted", "session": session}
+
+    loop = asyncio.get_running_loop()
+    waiter: asyncio.Future = loop.create_future()
+    _workspace_trust_waiters.setdefault(key, []).append(waiter)
+    await broadcast_monitor_event("IDE_WORKSPACE_TRUST_REQUIRED", {
+        "status": "workspace_trust_required",
+        "workspace_path": workspace_path,
+        "reason": reason,
+        "message": "VS Code 已打开当前任务目录，正在等待你在 VS Code 信任该目录；信任后祖龙会自动继续。",
+        "interaction": {
+            "pair_id": f"workspace_trust:{workspace_path}",
+            "kind": "approval",
+            "status": "pending",
+            "title": "等待 VS Code 目录信任",
+            "detail": "请在 VS Code 弹出的信任窗口中确认当前任务目录。确认后祖龙会自动继续任务。",
+            "tool_name": "workspace_trust",
+        },
+    })
+    _notify_web_task_execution_status(
+        state="workspace_trust_required",
+        phase="workspace_trust_required",
+        message="任务已暂停，正在等待你在 VS Code 信任当前任务目录；确认后会自动继续。",
+        workspace_path=workspace_path,
+        awaiting_approval=True,
+        tool_name="workspace_trust",
+        approval={
+            "approval_id": f"workspace_trust:{workspace_path}",
+            "tool_name": "workspace_trust",
+            "action_summary": "等待 VS Code 目录信任",
+            "workspace_path": workspace_path,
+        },
+        progress_items=[{
+            "label": "等待 VS Code 目录信任",
+            "status": "running",
+            "source": "heartbeat",
+            "detail": workspace_path,
+            "timestamp": time.time(),
+        }],
+    )
+    try:
+        await asyncio.wait_for(waiter, timeout=max(1.0, timeout))
+    except asyncio.TimeoutError:
+        _notify_web_task_execution_status(
+            state="blocked",
+            phase="workspace_trust_timeout",
+            message="等待 VS Code 目录信任超时，任务已暂停。",
+            workspace_path=workspace_path,
+            awaiting_approval=False,
+            tool_name="workspace_trust",
+            progress_items=[{
+                "label": "等待 VS Code 目录信任",
+                "status": "blocked",
+                "source": "heartbeat",
+                "detail": workspace_path,
+                "timestamp": time.time(),
+            }],
+        )
+        return {
+            "ok": False,
+            "status": "workspace_trust_timeout",
+            "error": "已打开 VS Code，但当前任务目录未在限定时间内完成信任确认。",
+        }
+    finally:
+        waiters = _workspace_trust_waiters.get(key, [])
+        if waiter in waiters:
+            waiters.remove(waiter)
+        if not waiters:
+            _workspace_trust_waiters.pop(key, None)
+
+    session = _select_ide_bridge(workspace_path)
+    if _session_workspace_trusted(session):
+        _notify_web_task_execution_status(
+            state="running",
+            phase="workspace_trusted",
+            message="VS Code 已信任当前任务目录，任务继续执行。",
+            workspace_path=workspace_path,
+            awaiting_approval=False,
+            tool_name="workspace_trust",
+            progress_items=[{
+                "label": "VS Code 目录已信任",
+                "status": "completed",
+                "source": "heartbeat",
+                "detail": workspace_path,
+                "timestamp": time.time(),
+            }],
+        )
+        return {"ok": True, "status": "trusted_after_grant", "session": session}
+    return {
+        "ok": False,
+        "status": "workspace_untrusted",
+        "error": "VS Code 目录信任状态仍未确认，无法继续执行任务。",
+    }
+
+
+def _notify_workspace_trusted(workspace_path: Optional[str]) -> None:
+    key = _workspace_key(workspace_path)
+    waiters = _workspace_trust_waiters.pop(key, [])
+    for waiter in waiters:
+        if not waiter.done():
+            waiter.set_result(True)
+
+
+def _notify_web_task_execution_status(**kwargs: Any) -> None:
+    """Best-effort bridge to the Web task-status indicator."""
+    try:
+        from zulong.launcher.web_chat_router import update_task_execution_status
+
+        update_task_execution_status(**kwargs)
+    except Exception as exc:
+        logger.debug("[ZulongIDE] Web task status notify skipped: %s", exc)
 
 
 async def ensure_vscode_bridge(
@@ -302,9 +524,24 @@ async def ensure_vscode_bridge(
     This is intentionally an internal state helper, not a new event channel:
     status still goes through broadcast_monitor_event and normal IDE messages.
     """
-    requested_workspace = workspace_path or os.getcwd()
+    requested_workspace = _resolve_active_task_workspace(workspace_path)
+    if not requested_workspace:
+        return {
+            "ok": False,
+            "status": "workspace_required",
+            "error": "缺少当前任务工作目录，拒绝回退打开祖龙项目目录。",
+        }
     session = _select_ide_bridge(requested_workspace)
     if session:
+        if not _session_workspace_trusted(session):
+            trusted = await _wait_for_workspace_trust(
+                requested_workspace,
+                reason=reason,
+                timeout=max(timeout, 180.0),
+            )
+            if not trusted.get("ok"):
+                return trusted
+            session = trusted.get("session")
         return {
             "ok": True,
             "status": "connected",
@@ -331,13 +568,34 @@ async def ensure_vscode_bridge(
         "reason": reason,
         "message": "已启动 VS Code，正在等待祖龙插件后台桥连接。",
     })
+    _notify_web_task_execution_status(
+        state="running",
+        phase="waiting_ide_bridge",
+        message="已启动 VS Code，正在等待祖龙插件后台桥连接。",
+        workspace_path=launched.get("workspace_path") or requested_workspace,
+        awaiting_approval=False,
+        tool_name="ide_bridge",
+        progress_items=[{
+            "label": "等待 VS Code 后台桥连接",
+            "status": "running",
+            "source": "tool",
+            "timestamp": time.time(),
+        }],
+    )
 
     deadline = time.time() + max(1.0, timeout)
     while time.time() < deadline:
         session = _select_ide_bridge(requested_workspace)
-        if session is None and not workspace_path:
-            session = _select_ide_bridge()
         if session:
+            if not _session_workspace_trusted(session):
+                trusted = await _wait_for_workspace_trust(
+                    requested_workspace,
+                    reason=reason,
+                    timeout=max(1.0, deadline - time.time() + 180.0),
+                )
+                if not trusted.get("ok"):
+                    return trusted
+                session = trusted.get("session")
             return {
                 "ok": True,
                 "status": "connected_after_launch",
@@ -385,7 +643,11 @@ async def start_agent_run_from_web(run: AgentRunSession) -> Dict[str, Any]:
     _agent_runs[run.run_id] = run
 
     # TSD §23.11.5: 多层 task_graph_id 恢复
-    _effective_graph_id = run.task_graph_id or ""
+    try:
+        from zulong.tools.task_tools import normalize_task_graph_id
+        _effective_graph_id = normalize_task_graph_id(run.task_graph_id)
+    except Exception:
+        _effective_graph_id = run.task_graph_id or ""
 
     # Level A: 精确匹配 (前端传入或 Orchestrator 从已有记录补充)
     if _effective_graph_id:
@@ -397,7 +659,11 @@ async def start_agent_run_from_web(run: AgentRunSession) -> Dict[str, Any]:
             _store = get_interaction_store()
             _conv = _store.get_conversation(run.conversation_id)
             if _conv and _conv.get("task_graph_id"):
-                _effective_graph_id = _conv["task_graph_id"]
+                try:
+                    from zulong.tools.task_tools import normalize_task_graph_id
+                    _effective_graph_id = normalize_task_graph_id(_conv["task_graph_id"])
+                except Exception:
+                    _effective_graph_id = _conv["task_graph_id"]
                 logger.info(
                     f"[ZulongIDE] InteractionStore 恢复 graph_id: "
                     f"conv={run.conversation_id}, graph={_effective_graph_id}"
@@ -416,7 +682,11 @@ async def start_agent_run_from_web(run: AgentRunSession) -> Dict[str, Any]:
                 for _nid, _node in _mg._nodes.items():
                     if (_node.metadata.get("session_id") == run.conversation_id
                             and _node.metadata.get("task_graph_id")):
-                        _tgid = _node.metadata["task_graph_id"]
+                        try:
+                            from zulong.tools.task_tools import normalize_task_graph_id
+                            _tgid = normalize_task_graph_id(_node.metadata["task_graph_id"])
+                        except Exception:
+                            _tgid = _node.metadata["task_graph_id"]
                         if _tgid and _tgid not in _session_nodes:
                             _session_nodes.append(_tgid)
                 if _session_nodes:
@@ -542,7 +812,15 @@ async def _retrieve_session_context(conversation_id: str) -> Optional[Dict[str, 
 
 async def request_ide_action(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Forward a non-chat IDE command to the active VS Code backend bridge."""
-    workspace_path = payload.get("workspace_path") or payload.get("cwd")
+    task_graph_id = payload.get("task_graph_id") or payload.get("graph_id")
+    requested_workspace = payload.get("workspace_path") or payload.get("cwd")
+    workspace_path = _resolve_active_task_workspace(
+        requested_workspace,
+        task_graph_id,
+    )
+    if workspace_path:
+        payload["workspace_path"] = workspace_path
+        payload["cwd"] = workspace_path
     vscode_command = payload.get("vscode_command") or payload.get("vscode_path")
     if action in ("ide:execute_tool", "ide_execute_tool"):
         return await _request_ide_tool_execution(payload)
@@ -551,9 +829,29 @@ async def request_ide_action(action: str, payload: Dict[str, Any]) -> Dict[str, 
     session = _select_ide_bridge(workspace_path)
     if workspace_path and session and not _workspace_matches(session, workspace_path):
         session = None
+    logger.info(
+        "[ZulongIDE] request_ide_action action=%s requested_workspace=%s resolved_workspace=%s task_graph_id=%s bridge=%s",
+        action,
+        requested_workspace,
+        workspace_path,
+        task_graph_id,
+        getattr(session, "session_id", "")[:12] if session else "",
+    )
     if not session:
         if action in (MessageType.IDE_OPEN_WORKSPACE, "ide_open_workspace", "ide:open_workspace"):
-            launched = _launch_vscode_workspace(workspace_path or os.getcwd(), vscode_command)
+            if not workspace_path:
+                return {
+                    "ok": False,
+                    "status": "workspace_required",
+                    "error": "缺少当前任务工作目录，拒绝回退打开祖龙项目目录。",
+                }
+            launched = _launch_vscode_workspace(
+                workspace_path,
+                vscode_command,
+                active_file=payload.get("active_file") or payload.get("file_path") or payload.get("path"),
+                line=payload.get("line") or payload.get("start_line"),
+                column=payload.get("column") or payload.get("start_column"),
+            )
             if launched.get("ok"):
                 return {
                     "ok": True,
@@ -575,8 +873,52 @@ async def request_ide_action(action: str, payload: Dict[str, Any]) -> Dict[str, 
     return {"ok": True, "ide_session_id": session.session_id, "action": action}
 
 
+def _normalize_approval_result_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(payload or {})
+    action = str(normalized.get("action") or "").lower()
+    if "approved" not in normalized:
+        normalized["approved"] = action in {"approve", "approved", "confirm", "confirmed", "yes", "true"}
+    approval_id = (
+        normalized.get("approval_id")
+        or normalized.get("approvalId")
+        or normalized.get("interaction_id")
+        or normalized.get("pair_id")
+        or normalized.get("call_id")
+    )
+    if approval_id:
+        normalized["approval_id"] = approval_id
+        normalized.setdefault("pair_id", approval_id)
+    normalized["action"] = "approve" if normalized.get("approved") else "reject"
+    normalized.setdefault("status", "approved" if normalized.get("approved") else "rejected")
+    return normalized
+
+
+def _apply_approval_whitelist_rule(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not payload.get("approved"):
+        return None
+    rule = payload.get("add_to_whitelist") or payload.get("whitelist_rule")
+    if not rule:
+        return None
+    try:
+        from zulong.config.approval_config import add_approval_whitelist_rule
+
+        result = add_approval_whitelist_rule(str(rule))
+        if result:
+            logger.info(
+                "[ZulongIDE] 审批白名单已更新: kind=%s value=%s changed=%s",
+                result.get("kind"),
+                result.get("value"),
+                result.get("changed"),
+            )
+        return result
+    except Exception as exc:
+        logger.warning("[ZulongIDE] 审批白名单更新失败: %s", exc)
+        return {"error": str(exc), "rule": str(rule)}
+
+
 async def _forward_ide_approval_result(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Forward a Web approval decision to the active VS Code bridge."""
+    payload = _normalize_approval_result_payload(payload)
     workspace_path = payload.get("workspace_path") or payload.get("cwd")
     session_id = payload.get("ide_session_id") or payload.get("target_session_id")
     session = _sessions.get(session_id) if session_id else None
@@ -603,6 +945,28 @@ async def _forward_ide_approval_result(payload: Dict[str, Any]) -> Dict[str, Any
         },
         source="web_chat",
     )
+    approved = bool(payload.get("approved"))
+    _notify_web_task_execution_status(
+        state="running" if approved else "blocked",
+        phase="approval_resolved",
+        message="审批已通过，任务继续执行。" if approved else "审批已拒绝，任务将按拒绝结果停止或重新规划。",
+        request_id=session.web_turn_id,
+        conversation_id=session.conversation_id,
+        session_id=session.conversation_id,
+        workspace_path=payload.get("workspace_path") or session.cwd,
+        project_id=session.project_id,
+        task_graph_id=session.task_graph_id,
+        tool_name=payload.get("tool_name") or "",
+        awaiting_approval=False,
+        approval=payload,
+        progress_items=[{
+            "label": "审批已通过" if approved else "审批已拒绝",
+            "status": "completed" if approved else "blocked",
+            "source": "tool",
+            "detail": payload.get("action_summary") or "",
+            "timestamp": time.time(),
+        }],
+    )
     await session.send_unified_msg(MessageType.IDE_APPROVAL_RESULT, payload)
     return {
         "ok": True,
@@ -614,12 +978,18 @@ async def _forward_ide_approval_result(payload: Dict[str, Any]) -> Dict[str, Any
 
 async def _request_ide_tool_execution(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Execute one VS Code-side tool through the connected IDE bridge."""
-    workspace_path = payload.get("workspace_path") or payload.get("cwd")
+    workspace_path = _resolve_active_task_workspace(
+        payload.get("workspace_path") or payload.get("cwd"),
+        payload.get("task_graph_id") or payload.get("graph_id"),
+    )
+    if workspace_path:
+        payload["workspace_path"] = workspace_path
+        payload["cwd"] = workspace_path
     ensured = await ensure_vscode_bridge(
         workspace_path,
         vscode_command=payload.get("vscode_command") or payload.get("vscode_path"),
         reason=payload.get("reason") or "L2 请求执行 IDE 工具",
-        timeout=float(payload.get("bridge_timeout", 25) or 25),
+        timeout=float(payload.get("bridge_timeout", 180) or 180),
     )
     session = ensured.get("session")
     if not ensured.get("ok") or not session:
@@ -653,7 +1023,26 @@ async def _request_ide_tool_execution(payload: Dict[str, Any]) -> Dict[str, Any]
         "source": payload.get("source", "web_l2_tool"),
     })
 
-    timeout = float(payload.get("timeout", 120) or 120)
+    timeout = float(payload.get("timeout", payload.get("bridge_timeout", 180)) or 180)
+    _notify_web_task_execution_status(
+        state="running",
+        phase="tool_call",
+        message=f"正在等待 VS Code 执行工具：{tool_name}",
+        request_id=session.web_turn_id,
+        conversation_id=session.conversation_id,
+        session_id=session.conversation_id,
+        workspace_path=session.cwd or workspace_path,
+        project_id=session.project_id,
+        task_graph_id=session.task_graph_id or payload.get("task_graph_id") or payload.get("graph_id"),
+        tool_name=tool_name,
+        awaiting_approval=False,
+        progress_items=[{
+            "label": f"VS Code 执行 {tool_name}",
+            "status": "running",
+            "source": "tool",
+            "timestamp": time.time(),
+        }],
+    )
     deadline = time.time() + timeout
     skipped = []
     while time.time() < deadline:
@@ -668,6 +1057,25 @@ async def _request_ide_tool_execution(payload: Dict[str, Any]) -> Dict[str, Any]
             for other in skipped:
                 await session.tool_result_queue.put(other)
             is_error = bool(item.get("is_error"))
+            _notify_web_task_execution_status(
+                state="failed" if is_error else "running",
+                phase="tool_result",
+                message=f"VS Code 工具返回：{tool_name}" if not is_error else f"VS Code 工具失败：{tool_name}",
+                request_id=session.web_turn_id,
+                conversation_id=session.conversation_id,
+                session_id=session.conversation_id,
+                workspace_path=session.cwd or workspace_path,
+                project_id=session.project_id,
+                task_graph_id=session.task_graph_id or payload.get("task_graph_id") or payload.get("graph_id"),
+                tool_name=tool_name,
+                awaiting_approval=False,
+                progress_items=[{
+                    "label": f"VS Code 执行 {tool_name}",
+                    "status": "failed" if is_error else "completed",
+                    "source": "tool",
+                    "timestamp": time.time(),
+                }],
+            )
             return {
                 "ok": not is_error,
                 "ide_session_id": session.session_id,
@@ -680,6 +1088,26 @@ async def _request_ide_tool_execution(payload: Dict[str, Any]) -> Dict[str, Any]
 
     for other in skipped:
         await session.tool_result_queue.put(other)
+    _notify_web_task_execution_status(
+        state="blocked",
+        phase="tool_timeout",
+        message=f"等待 VS Code 工具结果超时（{timeout:.0f}s）：{tool_name}",
+        request_id=session.web_turn_id,
+        conversation_id=session.conversation_id,
+        session_id=session.conversation_id,
+        workspace_path=session.cwd or workspace_path,
+        project_id=session.project_id,
+        task_graph_id=session.task_graph_id or payload.get("task_graph_id") or payload.get("graph_id"),
+        tool_name=tool_name,
+        awaiting_approval=False,
+        progress_items=[{
+            "label": f"等待 {tool_name} 返回",
+            "status": "blocked",
+            "source": "tool",
+            "detail": f"{timeout:.0f}s 超时",
+            "timestamp": time.time(),
+        }],
+    )
     return {
         "ok": False,
         "ide_session_id": session.session_id,
@@ -692,71 +1120,65 @@ async def _request_ide_tool_execution(payload: Dict[str, Any]) -> Dict[str, Any]
 def _resolve_vscode_command(override: Optional[str] = None) -> Dict[str, Any]:
     """Resolve the VS Code command without hardcoding an install path."""
     try:
-        import shutil
+        from zulong.workspace.vscode_launcher import resolve_vscode_command
 
-        candidates = []
-        if override:
-            candidates.append(override)
-        try:
-            from zulong.config.config_manager import get_config
-            configured = (
-                get_config("workspace.vscode_command", None)
-                or get_config("ide.vscode_command", None)
-            )
-            if configured:
-                candidates.append(configured)
-        except Exception:
-            pass
-        candidates.extend([
-            os.environ.get("ZULONG_VSCODE_COMMAND", ""),
-            "code",
-            "code.cmd",
-        ])
-
-        seen = set()
-        for candidate in candidates:
-            candidate = str(candidate or "").strip().strip('"')
-            if not candidate or candidate in seen:
-                continue
-            seen.add(candidate)
-            if os.path.isabs(candidate) and os.path.exists(candidate):
-                return {"ok": True, "command": candidate, "source": "path"}
-            found = shutil.which(candidate)
-            if found:
-                return {"ok": True, "command": found, "source": candidate}
-        return {
-            "ok": False,
-            "error": "未找到 VS Code 命令。请确认 code 命令在 PATH 中，或在 Web/配置中指定 vscode_command。",
-        }
+        return resolve_vscode_command(override)
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
 
-def _launch_vscode_workspace(workspace_path: str, vscode_command: Optional[str] = None) -> Dict[str, Any]:
+def _launch_vscode_workspace(
+    workspace_path: str,
+    vscode_command: Optional[str] = None,
+    *,
+    active_file: Optional[str] = None,
+    line: Optional[Any] = None,
+    column: Optional[Any] = None,
+) -> Dict[str, Any]:
     """Open VS Code from the backend when the extension bridge is not connected."""
     try:
-        import subprocess
+        from zulong.workspace.vscode_launcher import launch_vscode_workspace
 
-        target = os.path.abspath(workspace_path or os.getcwd())
+        target = os.path.abspath(workspace_path) if workspace_path else ""
+        if not target:
+            return {
+                "ok": False,
+                "status": "workspace_required",
+                "error": "缺少当前任务工作目录，拒绝回退打开祖龙项目目录。",
+            }
         if not os.path.exists(target):
-            target = os.getcwd()
-        resolved = _resolve_vscode_command(vscode_command)
-        if not resolved.get("ok"):
-            return resolved
-        code_cmd = resolved["command"]
-        subprocess.Popen(
-            [code_cmd, target],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            return {
+                "ok": False,
+                "status": "workspace_not_found",
+                "error": f"工作目录不存在: {target}",
+            }
+
+        file_target = ""
+        if active_file:
+            try:
+                candidate = os.path.expanduser(os.path.expandvars(str(active_file)))
+                if not os.path.isabs(candidate):
+                    candidate = os.path.join(target, candidate)
+                candidate = os.path.abspath(candidate)
+                if os.path.commonpath([target, candidate]) == target and os.path.isfile(candidate):
+                    file_target = candidate
+            except Exception:
+                file_target = ""
+
+        logger.info(
+            "[ZulongIDE] launch_vscode_workspace workspace=%s active_file=%s line=%s column=%s",
+            target,
+            file_target,
+            line,
+            column,
         )
-        return {
-            "ok": True,
-            "workspace_path": target,
-            "launcher": code_cmd,
-            "launcher_source": resolved.get("source"),
-        }
+        return launch_vscode_workspace(
+            target,
+            vscode_command,
+            file_path=file_target or None,
+            line=line,
+            column=column,
+        )
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -768,31 +1190,38 @@ async def _handle_session_start(session: IDESession, payload: Dict) -> None:
     task_text = payload.get("task", "")
     cwd = payload.get("cwd", ".")
     ide_system_prompt = payload.get("ide_system_prompt", "")
+    approval_mode = payload.get("approval_mode")
     conversation_id = payload.get("conversation_id") or payload.get("session_id")
     turn_id = payload.get("turn_id") or payload.get("request_id")
     if not task_text:
         await session.send_msg("task_error", {"error": "task 不能为空"})
         return
 
-    logger.info(f"[ZulongIDE] session_start: task={task_text[:100]}, cwd={cwd}")
+    if approval_mode:
+        try:
+            from zulong.config.approval_config import set_runtime_approval_mode
 
-    # 检测项目模式：如果 cwd 下存在 .zulong/project.json，更新项目状态为 executing
+            approval_mode = set_runtime_approval_mode(str(approval_mode))
+        except Exception as exc:
+            logger.debug("[ZulongIDE] 审批模式更新失败，使用后端默认值: %s", exc)
+    logger.info(f"[ZulongIDE] session_start: task={task_text[:100]}, cwd={cwd}, approval_mode={approval_mode or 'default'}")
+
+    # 检测项目模式：从 ProjectRegistry 查找 cwd 绑定。旧版 .zulong/project.json
+    # 仅作为兼容提示，不再要求用户工作区存在运行态元数据目录。
     _detected_project_id = None
     _detected_task_graph_id = None
-    _project_json_path = os.path.join(cwd, ".zulong", "project.json")
-    if os.path.isfile(_project_json_path):
-        try:
-            from zulong.workspace.project_registry import get_project_registry
-            _registry = get_project_registry()
-            _proj = _registry.get_project_by_path(cwd)
-            if _proj:
-                _detected_project_id = _proj.project_id
-                _detected_task_graph_id = _proj.task_graph_id
-                if _proj.status == "pending_execution":
-                    _registry.update_project_status(_proj.project_id, "executing")
-                    logger.info(f"[ZulongIDE] 项目 {_proj.project_id} 状态更新为 executing")
-        except Exception as _e:
-            logger.debug(f"[ZulongIDE] 项目状态更新跳过: {_e}")
+    try:
+        from zulong.workspace.project_registry import get_project_registry
+        _registry = get_project_registry()
+        _proj = _registry.get_project_by_path(cwd)
+        if _proj:
+            _detected_project_id = _proj.project_id
+            _detected_task_graph_id = _proj.task_graph_id
+            if _proj.status == "pending_execution":
+                _registry.update_project_status(_proj.project_id, "executing")
+                logger.info(f"[ZulongIDE] 项目 {_proj.project_id} 状态更新为 executing")
+    except Exception as _e:
+        logger.debug(f"[ZulongIDE] 项目状态更新跳过: {_e}")
 
     # 设置会话元数据（供 Web 监控和 REST API 使用）
     session.cwd = cwd
@@ -860,6 +1289,14 @@ async def _handle_tool_result(session: IDESession, payload: Dict) -> None:
 
 async def _handle_ide_context(session: IDESession, payload: Dict) -> None:
     session.cwd = payload.get("workspace_path") or payload.get("cwd") or session.cwd
+    if "workspace_trusted" in payload:
+        session.workspace_trusted = bool(payload.get("workspace_trusted"))
+        session.trust_required = not session.workspace_trusted
+        if session.workspace_trusted:
+            _notify_workspace_trusted(session.cwd)
+    elif "trust_required" in payload:
+        session.trust_required = bool(payload.get("trust_required"))
+        session.workspace_trusted = not session.trust_required
     await broadcast_monitor_event("IDE_CONTEXT", {
         "session_id": session.session_id,
         **_conversation_payload(session),
@@ -877,6 +1314,14 @@ async def _handle_ide_file_changed(session: IDESession, payload: Dict) -> None:
 
 
 async def _handle_ide_terminal_status(session: IDESession, payload: Dict) -> None:
+    if "workspace_trusted" in payload:
+        session.workspace_trusted = bool(payload.get("workspace_trusted"))
+        session.trust_required = not session.workspace_trusted
+        if session.workspace_trusted:
+            _notify_workspace_trusted(payload.get("workspace_path") or session.cwd)
+    elif "trust_required" in payload:
+        session.trust_required = bool(payload.get("trust_required"))
+        session.workspace_trusted = not session.trust_required
     await broadcast_monitor_event(MessageType.IDE_TERMINAL_STATUS, {
         "session_id": session.session_id,
         **_conversation_payload(session),
@@ -885,13 +1330,180 @@ async def _handle_ide_terminal_status(session: IDESession, payload: Dict) -> Non
     _record_runtime_event(session, MessageType.IDE_TERMINAL_STATUS, payload, source="ide_plugin")
 
 
+def _approval_tool_args_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    args = payload.get("arguments") or payload.get("tool_args") or payload.get("args") or {}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
+    for src_key, dst_key in (
+        ("path", "path"),
+        ("file_path", "path"),
+        ("workspace_path", "path"),
+        ("cwd", "path"),
+        ("command", "command"),
+    ):
+        if payload.get(src_key) and not args.get(dst_key):
+            args[dst_key] = payload.get(src_key)
+    return args
+
+
+def _should_auto_approve_ide_payload(payload: Dict[str, Any]) -> bool:
+    try:
+        from zulong.config.approval_config import should_runtime_auto_approve
+
+        tool_name = (
+            payload.get("tool_name")
+            or payload.get("tool")
+            or payload.get("name")
+            or ""
+        )
+        return should_runtime_auto_approve(
+            str(tool_name),
+            _approval_tool_args_from_payload(payload),
+            risk_level=str(payload.get("risk_level") or payload.get("risk") or ""),
+        )
+    except Exception as exc:
+        logger.debug("[ZulongIDE] 自动审批判断失败: %s", exc)
+        return False
+
+
 async def _handle_ide_approval_status(session: IDESession, payload: Dict) -> None:
     await broadcast_monitor_event(MessageType.IDE_APPROVAL_STATUS, {
         "session_id": session.session_id,
         **_conversation_payload(session),
         **payload,
     })
+    status = str(payload.get("status") or payload.get("confirmation_state") or "").lower()
+    approved = payload.get("approved")
+    is_resolved = status in {"approved", "rejected", "confirmed"} or approved is not None
+    is_approved = status in {"approved", "confirmed"} or approved is True
+    action_summary = payload.get("action_summary") or payload.get("summary") or payload.get("message") or "需要确认操作"
+    if is_resolved:
+        _notify_web_task_execution_status(
+            state="running" if is_approved else "blocked",
+            phase="approval_resolved",
+            message="审批已通过，任务继续执行。" if is_approved else "审批已拒绝，任务将按拒绝结果停止或重新规划。",
+            request_id=session.web_turn_id,
+            conversation_id=session.conversation_id,
+            session_id=session.conversation_id,
+            workspace_path=payload.get("workspace_path") or session.cwd,
+            project_id=session.project_id,
+            task_graph_id=session.task_graph_id,
+            tool_name=payload.get("tool_name") or "",
+            awaiting_approval=False,
+            approval=payload,
+            progress_items=[{
+                "label": "审批已通过" if is_approved else "审批已拒绝",
+                "status": "completed" if is_approved else "blocked",
+                "source": "tool",
+                "detail": action_summary,
+                "timestamp": time.time(),
+            }],
+        )
+        _record_runtime_event(session, "approval_result", payload, source="ide_plugin")
+        return
+    if _should_auto_approve_ide_payload(payload):
+        try:
+            from zulong.config.approval_config import get_runtime_approval_mode
+            approval_mode = get_runtime_approval_mode()
+        except Exception:
+            approval_mode = "full_auto"
+        normalized = _normalize_approval_result_payload({
+            **payload,
+            "approved": True,
+            "status": "approved",
+            "workspace_path": payload.get("workspace_path") or session.cwd,
+            "cwd": payload.get("cwd") or session.cwd,
+            "ide_session_id": session.session_id,
+        })
+        logger.info(
+            "[ZulongIDE] 自动审批通过: tool=%s approval_id=%s workspace=%s",
+            normalized.get("tool_name") or payload.get("tool_name"),
+            normalized.get("approval_id"),
+            normalized.get("workspace_path"),
+        )
+        await _forward_ide_approval_result(normalized)
+        _record_runtime_event(
+            session,
+            "approval_auto_approved",
+            {
+                **payload,
+                "approved": True,
+                "status": "approved",
+                "message": "已按 Web 审批模式自动允许该操作",
+                "interaction": {
+                    "interaction_id": f"approval_auto:{normalized.get('approval_id') or time.time()}",
+                    "pair_id": normalized.get("approval_id") or payload.get("approval_id"),
+                    "kind": "approval",
+                    "status": "approved",
+                    "title": "自动审批已允许",
+                    "detail": action_summary,
+                    "tool_name": payload.get("tool_name") or "",
+                    "confirmation_state": "confirmed",
+                    "approval_mode": approval_mode,
+                },
+            },
+            source="ide_server",
+        )
+        return
+    _notify_web_task_execution_status(
+        state="waiting_approval",
+        phase="approval_required",
+        message=f"任务已暂停，等待用户审批：{action_summary}",
+        request_id=session.web_turn_id,
+        conversation_id=session.conversation_id,
+        session_id=session.conversation_id,
+        workspace_path=payload.get("workspace_path") or session.cwd,
+        project_id=session.project_id,
+        task_graph_id=session.task_graph_id,
+        tool_name=payload.get("tool_name") or "",
+        awaiting_approval=True,
+        approval=payload,
+        progress_items=[{
+            "label": "等待用户审批",
+            "status": "running",
+            "source": "tool",
+            "detail": action_summary,
+            "timestamp": time.time(),
+        }],
+    )
     _record_runtime_event(session, "approval_required", payload, source="ide_plugin")
+
+
+async def _handle_ide_approval_result(session: IDESession, payload: Dict) -> None:
+    normalized = _normalize_approval_result_payload(payload)
+    normalized.setdefault("workspace_path", session.cwd)
+    normalized.setdefault("cwd", session.cwd)
+    whitelist_update = _apply_approval_whitelist_rule(normalized)
+    if whitelist_update is not None:
+        normalized["whitelist_update"] = whitelist_update
+    await session.tool_result_queue.put({
+        **normalized,
+        "type": "approval_result",
+        "result": "用户已允许该操作" if normalized.get("approved") else "用户已拒绝该操作",
+        "is_error": not bool(normalized.get("approved")),
+    })
+    await session.send_unified_msg(MessageType.APPROVAL_RESULT, {
+        **normalized,
+        "message": "用户已允许该操作" if normalized.get("approved") else "用户已拒绝该操作",
+        "interaction": {
+            "interaction_id": f"approval_result:{normalized.get('approval_id') or time.time()}",
+            "pair_id": normalized.get("pair_id") or normalized.get("approval_id"),
+            "approval_id": normalized.get("approval_id"),
+            "kind": "approval",
+            "status": "approved" if normalized.get("approved") else "rejected",
+            "title": "审批已通过" if normalized.get("approved") else "审批已拒绝",
+            "detail": normalized.get("action_summary") or "",
+            "tool_name": normalized.get("tool_name") or "",
+            "risk_level": normalized.get("risk_level") or "",
+            "confirmation_state": "approved" if normalized.get("approved") else "rejected",
+        },
+    })
+    await _forward_ide_approval_result(normalized)
 
 
 async def _handle_ide_diff_status(session: IDESession, payload: Dict) -> None:
@@ -1025,6 +1637,8 @@ async def _handle_handshake(session: IDESession, payload: Dict) -> None:
             {"session_id": session.session_id, **ack_payload},
             session_id=session.session_id,
         ))
+    if client_type == "ide_plugin":
+        await _send_runtime_settings_to_session(session)
 
 
 async def _handle_ping(session: IDESession, _payload: Dict) -> None:
@@ -1089,40 +1703,17 @@ def _load_graph_deterministic(graph_id: str, workspace_dir: str = None) -> bool:
 
     Returns: True 表示加载成功并已设置为活跃图
     """
-    from zulong.tools.task_tools import (
-        get_active_task_graph, set_active_task_graph, load_graph_from_backup,
-    )
-
-    # Level 1: 内存匹配
-    tg = get_active_task_graph()
-    if tg and getattr(tg, 'id', '') == graph_id:
-        logger.info(f"[ZulongIDE] 确定性恢复 Level 1 (内存): {graph_id}")
-        return True
-
-    # Level 2: 磁盘备份
-    tg = load_graph_from_backup(graph_id)
-    if tg:
-        set_active_task_graph(tg, graph_id, workspace_dir=workspace_dir)
-        logger.info(f"[ZulongIDE] 确定性恢复 Level 2 (磁盘): {graph_id}")
-        return True
-
-    # Level 3: MemoryGraph 重建
     try:
-        from zulong.memory.memory_graph import get_memory_graph
-        from zulong.memory.graph_adapters import rebuild_task_graph_from_memory
-        mg = get_memory_graph()
-        if mg:
-            tg = rebuild_task_graph_from_memory(mg, graph_id)
-            if tg:
-                set_active_task_graph(tg, graph_id, workspace_dir=workspace_dir)
-                logger.info(
-                    f"[ZulongIDE] 确定性恢复 Level 3 (MemoryGraph): {graph_id}")
-                return True
-    except Exception as e:
-        logger.debug(f"[ZulongIDE] Level 3 MemoryGraph 重建失败: {e}")
+        from zulong.tools.task_tools import (
+            load_task_graph_deterministic,
+            normalize_task_graph_id,
+        )
 
-    logger.warning(f"[ZulongIDE] 确定性恢复失败: 三级加载均未找到 {graph_id}")
-    return False
+        graph_id = normalize_task_graph_id(graph_id)
+        return load_task_graph_deterministic(graph_id, workspace_dir=workspace_dir)
+    except Exception as e:
+        logger.warning(f"[ZulongIDE] 确定性恢复失败: {graph_id}: {e}")
+        return False
 
 
 async def _handle_session_resume(session: IDESession, payload: Dict) -> None:
@@ -1130,7 +1721,11 @@ async def _handle_session_resume(session: IDESession, payload: Dict) -> None:
     task_text = payload.get("task", "")
     cwd = payload.get("cwd", ".")
     ide_system_prompt = payload.get("ide_system_prompt", "")
-    graph_id = payload.get("graph_id", "")
+    try:
+        from zulong.tools.task_tools import normalize_task_graph_id
+        graph_id = normalize_task_graph_id(payload.get("graph_id") or payload.get("task_graph_id"))
+    except Exception:
+        graph_id = payload.get("graph_id", "") or payload.get("task_graph_id", "")
     session.conversation_id = payload.get("conversation_id") or payload.get("session_id") or session.conversation_id
     session.web_turn_id = payload.get("turn_id") or payload.get("request_id") or session.web_turn_id
 
@@ -1174,20 +1769,32 @@ async def _handle_session_resume(session: IDESession, payload: Dict) -> None:
         # 确定性恢复路径
         _load_graph_deterministic(graph_id, workspace_dir=cwd)
     else:
-        # 兼容旧逻辑: 从磁盘备份加载最近的图谱
-        try:
-            from zulong.tools.task_tools import (
-                get_active_task_graph, load_latest_backup,
-                set_active_task_graph,
-            )
-            if get_active_task_graph() is None:
-                backup_tg, backup_gid = load_latest_backup()
-                if backup_tg and backup_gid:
-                    set_active_task_graph(backup_tg, backup_gid, workspace_dir=cwd)
-                    logger.info(
-                        f"[ZulongIDE] session_resume: 从备份恢复活跃图 {backup_gid}, workspace={cwd}")
-        except Exception as e:
-            logger.debug(f"[ZulongIDE] session_resume: 备份恢复尝试失败: {e}")
+        message = (
+            "已收到显式恢复请求，但没有明确的 task_graph_id。"
+            "为避免把旧任务误接到当前对话，请先选择要恢复的旧任务图，"
+            "或明确回复「删除旧任务并重新创建」。"
+        )
+        logger.warning("[ZulongIDE] session_resume 拒绝无 graph_id 的自动恢复")
+        _notify_web_task_execution_status(
+            state="blocked",
+            phase="resume_needs_task_graph_id",
+            message=message,
+            request_id=session.web_turn_id,
+            conversation_id=session.conversation_id,
+            session_id=session.conversation_id,
+            workspace_path=cwd,
+            task_graph_id="",
+            awaiting_approval=False,
+            progress_items=[{
+                "label": "恢复需要明确任务图",
+                "status": "blocked",
+                "source": "task_graph",
+                "detail": message,
+                "timestamp": time.time(),
+            }],
+        )
+        await session.send_msg("task_error", {"error": message})
+        return
 
     # 恢复模式：通过 force_graph_id 触发任务图复用策略
     resume_text = f"继续之前的任务：{task_text}"
@@ -1206,6 +1813,7 @@ _MESSAGE_HANDLERS = {
     "ide:file_changed": _handle_ide_file_changed,
     "ide:terminal_status": _handle_ide_terminal_status,
     "ide:approval_status": _handle_ide_approval_status,
+    MessageType.IDE_APPROVAL_RESULT: _handle_ide_approval_result,
     "ide:diff_status": _handle_ide_diff_status,
     "ide:checkpoint_status": _handle_ide_checkpoint_status,
     "user_cancel": _handle_user_cancel,
@@ -1401,6 +2009,17 @@ async def _run_fc_loop(
 
         await session.send_msg("status_update", {"turn": 0, "phase": "running"})
 
+        # 启动心跳：每30秒发送 status_update 确保前端显示任务仍在运行
+        async def _heartbeat_status():
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    await session.send_msg("status_update", {"turn": 0, "phase": "running"})
+                except Exception:
+                    break
+
+        heartbeat_task = asyncio.create_task(_heartbeat_status())
+
         try:
             from zulong.core.state_manager import state_manager
             state_manager.touch_activity()
@@ -1415,18 +2034,36 @@ async def _run_fc_loop(
             cancel_event=session.cancel_event,
         )
 
+        # 取消心跳
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+
         # FC 循环完成 — 根据终止原因发送 task_complete 或 task_error
         _reason = getattr(result, "reason", None) or "done"
         _completion_result = (result.text_response if result and result.text_response
                               else "(任务完成，无输出)")
-        _is_error = _reason not in ("done", None)
+
+        # CB相关reason不应视为错误（对齐TSD §23.3.6: blocked→progress归一化）
+        _cb_reasons = {"cb_pattern_loop", "cb_context_pressure", "cb_no_progress", "cb_consecutive_yellow"}
+        _is_error = _reason not in ("done", None) and _reason not in _cb_reasons
         _msg_type = "task_error" if _is_error else "task_complete"
         _msg_payload = ({"error": _completion_result} if _is_error
-                        else {"result": _completion_result})
-        
+                        else {"result": _completion_result, "status": "succeeded", "phase": "succeeded"})
+
+        # 发送任务完成状态更新（对齐TSD phase值）
+        if _reason in _cb_reasons:
+            await session.send_msg("status_update", {"turn": 0, "phase": "blocked"})
+        elif _is_error:
+            await session.send_msg("status_update", {"turn": 0, "phase": "failed"})
+        else:
+            await session.send_msg("status_update", {"turn": 0, "phase": "succeeded"})
+
         # 等待短暂时间确保 display_text 被前端消费，避免 WebSocket 提前断开
         await asyncio.sleep(0.5)
-        
+
         try:
             await session.send_msg(_msg_type, _msg_payload)
         except Exception:
@@ -1444,6 +2081,13 @@ async def _run_fc_loop(
 
     except asyncio.CancelledError:
         logger.info(f"[ZulongIDE] FC 循环被取消: session={session.session_id[:12]}")
+        # 取消心跳
+        if 'heartbeat_task' in locals():
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
         try:
             await session.send_msg("task_error", {"error": "任务已取消"})
         except Exception:
@@ -1875,7 +2519,7 @@ async def get_active_ide_sessions():
 
 # 静态前端文件路径
 _STATIC_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "openclaw_bridge", "web", "static"
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "zulong_web", "static"
 )
 
 
@@ -2453,24 +3097,184 @@ async def delete_chat_message(session_id: str, message_id: str):
 
 
 @ide_router.get("/api/task-graph/active")
-async def get_active_task_graph_snapshot():
+async def get_active_task_graph_snapshot(task_graph_id: Optional[str] = None, workspace_path: Optional[str] = None):
     """获取当前活跃任务图谱快照（前端按需拉取/重建用）"""
     try:
-        from zulong.tools.task_tools import get_active_task_graph, _active_graph_id
-        tg = get_active_task_graph()
+        from zulong.tools.task_tools import (
+            get_active_task_graph,
+            load_task_graph_deterministic,
+            normalize_task_graph_id,
+            _active_graph_id,
+        )
+
+        requested_graph_id = normalize_task_graph_id(task_graph_id)
+        if not requested_graph_id:
+            try:
+                from zulong.launcher.web_chat_router import _task_execution_status
+
+                requested_graph_id = normalize_task_graph_id(
+                    _task_execution_status.get("task_graph_id")
+                )
+                workspace_path = workspace_path or _task_execution_status.get("workspace_path")
+            except Exception:
+                requested_graph_id = ""
+
+        tg = get_active_task_graph(workspace_dir=workspace_path) if workspace_path else get_active_task_graph()
+        if requested_graph_id and (
+            not tg or normalize_task_graph_id(getattr(tg, "id", "")) != requested_graph_id
+        ):
+            if load_task_graph_deterministic(requested_graph_id, workspace_dir=workspace_path):
+                tg = get_active_task_graph(workspace_dir=workspace_path) if workspace_path else get_active_task_graph()
+
         if not tg:
             return {"status": "ok", "graph": None, "graph_id": None}
         graph_data = tg.to_frontend_dict()
+        graph_id = normalize_task_graph_id(getattr(tg, "id", "") or _active_graph_id)
         return {
             "status": "ok",
             "graph": graph_data,
-            "graph_id": _active_graph_id,
+            "graph_id": graph_id,
             "node_count": len(tg._nodes),
             "edge_count": len(tg._h_edges) + len(tg._d_edges),
         }
     except Exception as e:
         logger.error(f"[TaskGraph] 获取活跃图谱快照失败: {e}")
         return {"status": "error", "message": str(e), "graph": None}
+
+
+@ide_router.post("/api/task-graph/bind-file")
+async def bind_task_graph_file(body: Dict[str, Any]):
+    """空会话入口：按用户指定的 JSON 文件创建/绑定任务图谱。"""
+    try:
+        file_path_raw = str(
+            body.get("file_path")
+            or body.get("path")
+            or body.get("task_graph_file_path")
+            or ""
+        ).strip().strip('"').strip("'")
+        if not file_path_raw:
+            return JSONResponse(
+                {"status": "error", "message": "请先填写任务图谱文件地址。"},
+                status_code=400,
+            )
+
+        file_path = os.path.abspath(
+            os.path.normpath(os.path.expanduser(os.path.expandvars(file_path_raw)))
+        )
+        if os.path.isdir(file_path):
+            return JSONResponse(
+                {"status": "error", "message": "请填写具体 JSON 文件地址，而不是文件夹。"},
+                status_code=400,
+            )
+        if os.path.splitext(file_path)[1].lower() != ".json":
+            return JSONResponse(
+                {"status": "error", "message": "任务图谱文件需要使用 .json 后缀。"},
+                status_code=400,
+            )
+
+        parent_dir = os.path.dirname(file_path)
+        if not parent_dir:
+            return JSONResponse(
+                {"status": "error", "message": "任务图谱文件地址无效。"},
+                status_code=400,
+            )
+        os.makedirs(parent_dir, exist_ok=True)
+
+        from zulong.l2.task_graph import TaskGraph
+        from zulong.tools.task_tools import (
+            normalize_task_graph_id,
+            set_active_task_graph,
+            _backup_graph_to_disk,
+        )
+
+        created = False
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+            with open(file_path, "r", encoding="utf-8") as f:
+                raw_data = json.load(f)
+            tg = TaskGraph.deserialize(raw_data)
+            graph_id = normalize_task_graph_id(getattr(tg, "id", "") or raw_data.get("id"))
+        else:
+            graph_id = f"tg_{int(time.time())}"
+            title = str(body.get("title") or "").strip() or os.path.splitext(os.path.basename(file_path))[0] or "新任务图谱"
+            tg = TaskGraph(title=title, graph_id=graph_id)
+            tg.add_node(
+                id="req",
+                label=title,
+                type="requirement",
+                status="pending",
+                desc="空会话预建任务图谱，等待用户输入任务。",
+            )
+            created = True
+
+        if not graph_id:
+            graph_id = f"tg_{int(time.time())}"
+            tg.id = graph_id
+            tg.graph_id = graph_id
+
+        workspace_dir = str(body.get("workspace_path") or body.get("cwd") or "").strip()
+        if not workspace_dir:
+            workspace_dir = parent_dir
+        workspace_dir = os.path.abspath(
+            os.path.normpath(os.path.expanduser(os.path.expandvars(workspace_dir)))
+        )
+        os.makedirs(workspace_dir, exist_ok=True)
+
+        tg.metadata["workspace_dir"] = workspace_dir
+        tg.metadata["task_graph_file_path"] = file_path
+        tg.metadata["user_seeded_empty_graph"] = bool(
+            body.get("empty_graph", True)
+            and len(getattr(tg, "_nodes", {}) or {}) <= 1
+        )
+        tg.metadata["conversation_id"] = body.get("session_id") or body.get("conversation_id") or ""
+
+        set_active_task_graph(tg, graph_id, workspace_dir=workspace_dir)
+        _backup_graph_to_disk(tg, graph_id)
+
+        conversation_id = str(body.get("session_id") or body.get("conversation_id") or "").strip()
+        if conversation_id:
+            try:
+                from zulong.launcher.interaction_store import get_interaction_store
+                get_interaction_store().upsert_conversation(
+                    conversation_id,
+                    title=str(body.get("conversation_title") or body.get("title") or tg.title or "新会话"),
+                    source="web_chat",
+                    workspace_path=workspace_dir,
+                    task_graph_id=graph_id,
+                    metadata={"task_graph_file_path": file_path},
+                    active=True,
+                )
+            except Exception as exc:
+                logger.debug("[TaskGraph] 会话绑定写入跳过: %s", exc)
+
+        graph_data = tg.to_frontend_dict()
+        payload = {
+            "event": "bind_file",
+            "created": created,
+            "graph": graph_data,
+            "graph_id": graph_id,
+            "task_graph_id": graph_id,
+            "workspace_path": workspace_dir,
+            "task_graph_file_path": file_path,
+            "conversation_id": conversation_id,
+            "session_id": conversation_id,
+        }
+        _broadcast_sync("TASK_GRAPH_UPDATE", payload)
+
+        return {
+            "status": "ok",
+            "created": created,
+            "graph": graph_data,
+            "graph_id": graph_id,
+            "task_graph_id": graph_id,
+            "workspace_path": workspace_dir,
+            "task_graph_file_path": file_path,
+        }
+    except Exception as e:
+        logger.error(f"[TaskGraph] 绑定图谱文件失败: {e}", exc_info=True)
+        return JSONResponse(
+            {"status": "error", "message": f"任务图谱文件处理失败: {e}"},
+            status_code=500,
+        )
 
 
 @ide_router.delete("/api/task-graph/{graph_id}")
@@ -2481,11 +3285,12 @@ async def delete_task_graph(graph_id: str):
     try:
         from zulong.tools.task_tools import (
             get_active_task_graph, set_active_task_graph,
-            _GRAPH_BACKUP_DIR, _active_graph_id
+            normalize_task_graph_id, _GRAPH_BACKUP_DIR, _active_graph_id
         )
+        graph_id = normalize_task_graph_id(graph_id)
         # 如果要删除的是当前活跃图，清除它
         tg = get_active_task_graph()
-        if tg and _active_graph_id == graph_id:
+        if tg and normalize_task_graph_id(_active_graph_id) == graph_id:
             set_active_task_graph(None, None)
             cleared_active = True
             logger.info(f"[TaskGraph] 已清除活跃图: {graph_id}")

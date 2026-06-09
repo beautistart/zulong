@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>祖龙系统架构图</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f6f8fb;
+        --ink: #18212f;
+        --muted: #536171;
+        --line: #cfd8e3;
+        --panel: #ffffff;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font-family:
+          "Microsoft YaHei",
+          "PingFang SC",
+          "Noto Sans CJK SC",
+          Arial,
+          sans-serif;
+      }
+
+      .page {
+        width: 2400px;
+        min-height: 1500px;
+        padding: 44px 52px 56px;
+        background:
+          linear-gradient(180deg, rgba(255, 255, 255, 0.85), rgba(246, 248, 251, 0.98)),
+          var(--bg);
+      }
+
+      header {
+        margin-bottom: 22px;
+      }
+
+      h1 {
+        margin: 0 0 8px;
+        font-size: 42px;
+        font-weight: 750;
+        letter-spacing: 0;
+      }
+
+      .subtitle {
+        margin: 0;
+        color: var(--muted);
+        font-size: 20px;
+        line-height: 1.5;
+      }
+
+      .diagram-shell {
+        padding: 28px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        box-shadow: 0 18px 48px rgba(31, 45, 61, 0.08);
+      }
+
+      .mermaid {
+        width: 100%;
+      }
+
+      .mermaid svg {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page" id="capture">
+      <header>
+        <h1>祖龙 ZULONG 系统架构图</h1>
+        <p class="subtitle">按 TSD v2.7/v2.8 主链路梳理：L0 设备层、L1 感知调度层、L2 认知推理层、L3 专家技能池，以及 Web/IDE 交互与 MemoryGraph 闭环。</p>
+      </header>
+
+      <section class="diagram-shell">
+        <pre class="mermaid">
+flowchart TB
+    User["用户 / 开发者"]
+
+    subgraph Frontend["前端交互层"]
+        Web["Web 主交互<br/>聊天 / 任务 / 图谱 / 审批"]
+        VSCode["Zulong IDE / VS Code 扩展<br/>纯执行桥 / 工具回传"]
+    end
+
+    subgraph Comm["通信与协议"]
+        WS["WebSocket<br/>ws://127.0.0.1:8090/ide"]
+        Protocol["统一交互协议<br/>session_start / tool_request / task_complete<br/>approval / attention / memory diff"]
+    end
+
+    subgraph CoreBus["系统总线与共享状态"]
+        EventBus["EventBus<br/>优先级队列<br/>CRITICAL &gt; HIGH &gt; NORMAL &gt; LOW"]
+        SharedMemory["SharedMemory / SensorFusionData<br/>视听状态快照 / 最近上下文"]
+        StateManager["StateManager<br/>PowerState / L2Status"]
+    end
+
+    subgraph L0["L0 设备与驱动层"]
+        Camera["摄像头"]
+        Mic["麦克风"]
+        Speaker["扬声器"]
+        Motor["电机 / 运动控制"]
+        Sensor["传感器<br/>MQ-2 / IMU / 外设"]
+    end
+
+    subgraph L1["L1 感知、反射与调度层"]
+        L1A["L1-A 受控反射层<br/>ReflexController<br/>障碍 / 急停 / 运动安全"]
+        L1B["L1-B 调度与意图守门层<br/>Gatekeeper + ToolPredictor<br/>工具预判 / 上下文打包 / 中断 / 唤醒"]
+        L1C["L1-C 视觉静默注意层<br/>YOLO + MediaPipe + MobileNetV4-TSM<br/>挥手 / 靠近 / 注视 / 静止"]
+        L1D["L1-D 听觉层<br/>YAMNet + VAD + SenseVoice<br/>唤醒词 / 事件 / ASR / 情感"]
+        L1E["L1-E 安全层<br/>MQ-2 气体检测<br/>CRITICAL 穿透"]
+    end
+
+    subgraph L2["L2 认知推理层"]
+        Inference["InferenceEngine<br/>L2 单次决策 + FC 工具循环"]
+        TaskGraph["TaskGraph<br/>递归 DAG / 任务冻结恢复"]
+        Circuit["CircuitBreaker<br/>6 信号死循环检测"]
+        OutputGateway["OutputGateway / L1-B 流式代理<br/>输出归一化 / 中断切断"]
+    end
+
+    subgraph Memory["记忆与经验系统"]
+        MemoryGraph["MemoryGraph<br/>异构图 / BFS 扩散 / 赫布学习 / 衰减"]
+        InteractionStore["InteractionStore<br/>原始交互流水"]
+        ExperienceStore["ExperienceStore<br/>经验沉淀 / 后续召回"]
+        Vector["FAISS + BM25 + bge-small-zh<br/>热路径 BFS + 冷路径向量检索"]
+    end
+
+    subgraph L3["L3 专家技能池"]
+        DualBrain["DualBrainContainer<br/>双脑热备"]
+        Experts["专家模型池<br/>导航 / 视觉 / 操作 / TTS / 工具专家"]
+        TTS["输出模型<br/>Kokoro / edge-tts / CosyVoice"]
+    end
+
+    User --> Web
+    User --> VSCode
+    Web --> WS
+    VSCode --> WS
+    WS --> Protocol
+    Protocol --> L1B
+
+    Camera --> L1C
+    Mic --> L1D
+    Sensor --> L1E
+    Sensor --> L1A
+
+    L1C --> SharedMemory
+    L1D --> SharedMemory
+    L1A --> EventBus
+    L1C --> EventBus
+    L1D --> EventBus
+    L1E --> EventBus
+
+    EventBus --> L1A
+    EventBus --> L1B
+    EventBus --> StateManager
+    SharedMemory --> L1B
+    StateManager --> L1B
+
+    L1A --> Motor
+    L1E --> Speaker
+
+    L1B -->|完整任务包<br/>用户原文 + 工具预判 + 记忆 + 视听快照| Inference
+    Inference --> TaskGraph
+    Inference --> Circuit
+    Inference --> MemoryGraph
+    Inference --> DualBrain
+    DualBrain --> Experts
+    Experts --> TTS
+
+    InteractionStore --> MemoryGraph
+    MemoryGraph --> Vector
+    MemoryGraph --> ExperienceStore
+    ExperienceStore --> MemoryGraph
+    MemoryGraph --> L1B
+    MemoryGraph --> Inference
+
+    Inference --> OutputGateway
+    TTS --> OutputGateway
+    OutputGateway --> L1B
+    L1B --> Protocol
+    Protocol --> WS
+    WS --> Web
+    WS --> VSCode
+    OutputGateway --> Speaker
+        </pre>
+      </section>
+    </main>
+
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.esm.min.mjs";
+
+      mermaid.initialize({
+        startOnLoad: true,
+        securityLevel: "loose",
+        theme: "base",
+        flowchart: {
+          htmlLabels: true,
+          curve: "basis",
+          nodeSpacing: 48,
+          rankSpacing: 62,
+        },
+        themeVariables: {
+          fontFamily: "Microsoft YaHei, PingFang SC, Noto Sans CJK SC, Arial, sans-serif",
+          background: "#ffffff",
+          primaryColor: "#f7fbff",
+          primaryTextColor: "#18212f",
+          primaryBorderColor: "#6783a3",
+          lineColor: "#66798f",
+          secondaryColor: "#eef8f3",
+          tertiaryColor: "#fff8e8",
+          clusterBkg: "#f8fafc",
+          clusterBorder: "#b8c4d2",
+          edgeLabelBackground: "#ffffff",
+        },
+      });
+    </script>
+  </body>
+</html>

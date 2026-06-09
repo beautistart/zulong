@@ -151,7 +151,7 @@ class RequestToolSupplementTool(BaseTool):
         self.description = (
             "请求补充当前未注入但任务需要的工具。"
             "当你发现当前工具不足以完成任务时调用，说明缺什么能力、为什么需要、风险等级。"
-            "系统会从工具袋匹配工具，并在下一轮把可用工具补充进来。"
+            "系统会从工具袋匹配工具，并在后续工具循环中补充可用工具。"
         )
         self._registry = registry
 
@@ -213,7 +213,7 @@ class RequestToolSupplementTool(BaseTool):
             "properties": {
                 "missing_capability": {
                     "type": "string",
-                    "description": "缺少的能力，例如'读取项目文件'、'联网搜索'、'运行测试'、'创建任务图'",
+                    "description": "缺少的能力，例如“读取项目文件”、“运行测试”、“创建任务图”。首轮已常驻记忆检索和 web_search，通常不需要为这些能力请求补充。",
                 },
                 "reason": {
                     "type": "string",
@@ -223,23 +223,28 @@ class RequestToolSupplementTool(BaseTool):
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "希望补充的工具名，可以为空；不确定时只描述 missing_capability",
+                    "default": [],
                 },
                 "risk_level": {
                     "type": "string",
                     "enum": ["low", "medium", "high"],
                     "description": "补充能力可能带来的风险等级",
+                    "default": "low",
                 },
                 "user_visible_message": {
                     "type": "string",
-                    "description": "给用户看的简短说明，例如'我需要补充联网搜索工具来查询实时天气'",
+                    "description": "给用户看的简短说明，例如“我需要补充读取项目文件的工具来查看代码”。",
                 },
                 "max_results": {
                     "type": "integer",
                     "description": "可选：最多返回几个匹配工具。不填则返回全部匹配工具。",
+                    "minimum": 1,
+                    "maximum": 20,
                 },
                 "list_all_tools": {
                     "type": "boolean",
                     "description": "为 true 时返回工具袋里的全部工具清单和 schema，不做匹配过滤。",
+                    "default": False,
                 },
             },
             "required": ["missing_capability", "reason"],

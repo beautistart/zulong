@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "project_id": "proj_ef42b465",
+  "name": "星尘接球 Web 小游戏 — 祖龙 IDE/VSCode 链路测试",
+  "description": "星尘接球 Web 小游戏 — 祖龙 IDE/VSCode 链路测试",
+  "task_graph_id": "tg_1780131945",
+  "status": "pending_execution",
+  "created_at": 1780131945.6195164,
+  "updated_at": 1780131945.6195164,
+  "backend_url": "ws://127.0.0.1:8090/ide",
+  "metadata": {
+    "source": "web"
+  }
+}

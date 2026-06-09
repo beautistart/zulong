@@ -1,5 +1,6 @@
 import { ApiFormat } from "./proto/zulong/models"
 import type { ApiHandlerSettings } from "./storage/state-keys"
+import type { ApprovalMode } from "./ApprovalWhitelist"
 
 export type ApiProvider =
 	| "anthropic"
@@ -46,10 +47,11 @@ export type ApiProvider =
 	| "wandb"
 	| "zulong"
 
-export const DEFAULT_API_PROVIDER = "openrouter" as ApiProvider
+export const DEFAULT_API_PROVIDER = "zulong" as ApiProvider
 
 export interface ApiHandlerOptions extends Partial<ApiHandlerSettings> {
 	ulid?: string // Used to identify the task in API requests
+	zulongApprovalMode?: ApprovalMode
 	onRetryAttempt?: (attempt: number, maxRetries: number, delay: number, error: any) => void // Callback function
 }
 

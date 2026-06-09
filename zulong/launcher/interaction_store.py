@@ -216,6 +216,78 @@ class InteractionStore:
             ).fetchone()
         return dict(row) if row else None
 
+    def find_conversation_by_session_node(self, session_node_id: str) -> Optional[Dict[str, Any]]:
+        session_node_id = (session_node_id or "").strip()
+        if not session_node_id:
+            return None
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM conversation
+                WHERE session_node_id = ?
+                ORDER BY last_active_at DESC
+                LIMIT 1
+                """,
+                (session_node_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def delete_conversation(self, conversation_id: str, *, delete_events: bool = True) -> bool:
+        """Delete one conversation row and its local Web restore records."""
+        conversation_id = (conversation_id or "").strip()
+        if not conversation_id:
+            return False
+        with self._lock, self._connect() as conn:
+            if delete_events:
+                conn.execute(
+                    "DELETE FROM interaction_event WHERE conversation_id = ?",
+                    (conversation_id,),
+                )
+            conn.execute(
+                "DELETE FROM conversation_link WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            conn.execute(
+                "UPDATE voice_record SET linked_conversation_id = NULL WHERE linked_conversation_id = ?",
+                (conversation_id,),
+            )
+            cursor = conn.execute(
+                "DELETE FROM conversation WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            return cursor.rowcount > 0
+
+    def get_event(self, event_id: str) -> Optional[Dict[str, Any]]:
+        event_id = (event_id or "").strip()
+        if not event_id:
+            return None
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM interaction_event WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        try:
+            item["payload"] = json.loads(item.get("payload_json") or "{}")
+        except Exception:
+            item["payload"] = {}
+        item["content"] = item.get("text") or ""
+        item["node_id"] = item.get("event_id")
+        return item
+
+    def delete_event(self, event_id: str) -> bool:
+        event_id = (event_id or "").strip()
+        if not event_id:
+            return False
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM interaction_event WHERE event_id = ?",
+                (event_id,),
+            )
+            return cursor.rowcount > 0
+
     def find_active_conversation(self, max_age_seconds: float = 1800.0) -> Optional[Dict[str, Any]]:
         cutoff = time.time() - max_age_seconds
         with self._lock, self._connect() as conn:

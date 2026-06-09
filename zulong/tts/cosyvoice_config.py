@@ -3,6 +3,7 @@
 # TSD v1.7 规范：TTS 运行在 CPU 上，使用 safetensors 格式
 
 import os
+import sys
 from pathlib import Path
 from typing import Dict, Any
 
@@ -11,6 +12,9 @@ _PROJECT_ROOT = Path(os.environ.get("ZULONG_HOME", Path(__file__).resolve().pare
 MODEL_BASE_DIR = Path(os.environ.get("ZULONG_MODEL_BASE_DIR", str(_PROJECT_ROOT / "models")))
 COSYVOICE3_PATH = MODEL_BASE_DIR / "CosyVoice3-0.5B" / "FunAudioLLM" / "Fun-CosyVoice3-0___5B-2512"
 TTSFRD_PATH = MODEL_BASE_DIR / "iic" / "CosyVoice-ttsfrd"
+COSYVOICE2_PATH = MODEL_BASE_DIR / "iic" / "CosyVoice2-0.5B"
+COSYVOICE_CODE_PATH = MODEL_BASE_DIR / "CosyVoice"
+COSYVOICE_PROMPT_AUDIO = COSYVOICE_CODE_PATH / "asset" / "zero_shot_prompt.wav"
 
 
 class CosyVoiceConfig:
@@ -89,6 +93,74 @@ def get_model_path() -> Path:
     return COSYVOICE3_PATH
 
 
+def _config_value(key: str, default: str | None = None) -> str | None:
+    try:
+        from zulong.config.config_manager import ConfigManager
+
+        value = ConfigManager().get(key, default)
+        return str(value) if value not in (None, "") else default
+    except Exception:
+        return default
+
+
+def _path_from_env_or_config(env_key: str, config_key: str, default: Path | str | None) -> str:
+    value = os.environ.get(env_key)
+    if value:
+        return str(Path(os.path.expandvars(os.path.expanduser(value))))
+    configured = _config_value(config_key)
+    if configured:
+        return str(Path(os.path.expandvars(os.path.expanduser(configured))))
+    if default is None:
+        return ""
+    return str(Path(os.path.expandvars(os.path.expanduser(str(default)))))
+
+
+def get_external_runtime_config() -> Dict[str, str]:
+    """Return CosyVoice external runtime paths without host-specific defaults."""
+    return {
+        "integrated_python_path": _path_from_env_or_config(
+            "ZULONG_COSYVOICE_PYTHON",
+            "audio.tts.cosyvoice.integrated_python_path",
+            sys.executable,
+        ),
+        "code_path": _path_from_env_or_config(
+            "ZULONG_COSYVOICE_CODE_PATH",
+            "audio.tts.cosyvoice.code_path",
+            COSYVOICE_CODE_PATH,
+        ),
+        "model_dir": _path_from_env_or_config(
+            "ZULONG_COSYVOICE_MODEL_DIR",
+            "audio.tts.cosyvoice.model_dir",
+            COSYVOICE2_PATH,
+        ),
+        "prompt_audio": _path_from_env_or_config(
+            "ZULONG_COSYVOICE_PROMPT_AUDIO",
+            "audio.tts.cosyvoice.prompt_audio",
+            COSYVOICE_PROMPT_AUDIO,
+        ),
+        "server_url": os.environ.get(
+            "ZULONG_COSYVOICE_GRADIO_URL",
+            _config_value("audio.tts.cosyvoice.server_url", "http://localhost:50000") or "http://localhost:50000",
+        ),
+    }
+
+
+def get_cosyvoice3_model_path() -> Path:
+    """Get the in-process CosyVoice3 model path."""
+    configured = _config_value("audio.tts.cosyvoice.model_path")
+    if configured:
+        return Path(os.path.expandvars(os.path.expanduser(configured)))
+    return COSYVOICE3_PATH
+
+
+def get_cosyvoice_ttsfrd_path() -> Path:
+    """Get the optional CosyVoice ttsfrd path."""
+    configured = _config_value("audio.tts.cosyvoice.ttsfrd_path")
+    if configured:
+        return Path(os.path.expandvars(os.path.expanduser(configured)))
+    return TTSFRD_PATH
+
+
 def verify_model_files() -> bool:
     """验证模型文件完整性"""
     print("🔍 验证 CosyVoice3 模型文件...")
@@ -140,6 +212,9 @@ __all__ = [
     "CosyVoiceConfig",
     "TTSContainerConfig",
     "get_model_path",
+    "get_cosyvoice3_model_path",
+    "get_cosyvoice_ttsfrd_path",
+    "get_external_runtime_config",
     "verify_model_files",
     "check_cpu_memory",
 ]

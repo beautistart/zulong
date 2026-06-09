@@ -1,4 +1,5 @@
 import type { ApiConfiguration, ModelInfo } from "@shared/api"
+import type { ApprovalMode } from "@shared/ApprovalWhitelist"
 import {
 	ApiHandlerSettingsKeys,
 	type GlobalState,
@@ -32,6 +33,23 @@ import { filterAllowedRemoteConfigFields } from "./remote-config/utils"
 import { readGlobalStateFromStorage, readSecretsFromStorage, readWorkspaceStateFromStorage } from "./utils/state-helpers"
 export interface PersistenceErrorEvent {
 	error: Error
+}
+
+function normalizeZulongApprovalMode(mode: unknown): ApprovalMode {
+	switch (mode) {
+		case "full_auto":
+		case "full":
+			return "full_auto"
+		case "whitelist":
+		case "read_only":
+			return "whitelist"
+		case "popup":
+			return "popup"
+		case "manual":
+		case "off":
+		default:
+			return "manual"
+	}
 }
 
 /**
@@ -935,10 +953,12 @@ export class StateManager {
 
 		// Build API handler settings object with task override support
 		const settings = Object.fromEntries(ApiHandlerSettingsKeys.map((key) => [key, this.getSettingWithOverride(key)]))
+		const autoApprovalSettings = this.getSettingWithOverride("autoApprovalSettings")
 
 		return {
 			...secrets,
 			...settings,
+			zulongApprovalMode: normalizeZulongApprovalMode(autoApprovalSettings?.zulongAutoApproveMode),
 		} satisfies ApiConfiguration
 	}
 

@@ -194,8 +194,13 @@ def preload_model_from_config(config_manager) -> Optional[ModelPreloader]:
     """
     global _active_preloader
 
-    backend = config_manager.get("llm.backend", "ollama")
-    backend_cfg = config_manager.get(f"llm.{backend}", {})
+    from zulong.adapters.backend_resolver import resolve_llm_backend
+
+    resolution = resolve_llm_backend(config_manager.config)
+    backend = resolution.backend
+    backend_cfg = resolution.config
+    for warning in resolution.warnings:
+        logger.warning(f"⚠️ [ModelPreloader] {warning}")
     if not backend_cfg:
         logger.warning("⚠️ [ModelPreloader] 未找到 LLM 后端配置，跳过预热")
         return None

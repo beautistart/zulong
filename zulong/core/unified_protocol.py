@@ -77,6 +77,7 @@ class MessageType:
     TASK_RESUME = "task:resume"
     TASK_CANCEL = "task:cancel"
     TURN_ACCEPTED = "turn:accepted"
+    TASK_EXECUTION_STATUS = "task:execution_status"
     TASK_ACK = "task:ack"
     TASK_COMPLETE = "task:complete"
     TASK_ERROR = "task:error"
@@ -119,6 +120,7 @@ class MessageType:
     IDE_APPROVAL_RESULT = "ide:approval_result"
     IDE_DIFF_STATUS = "ide:diff_status"
     IDE_CHECKPOINT_STATUS = "ide:checkpoint_status"
+    IDE_ACTION_RESULT = "ide:action_result"
     IDE_CONTEXT = "ide:context"
 
     # 语音记录
@@ -156,6 +158,7 @@ _WEB_TO_UNIFIED: Dict[str, str] = {
     "STOP_GENERATION": MessageType.TASK_CANCEL,
     "STOP_TASK": MessageType.TASK_CANCEL,
     "TURN_ACCEPTED": MessageType.TURN_ACCEPTED,
+    "TASK_EXECUTION_STATUS": MessageType.TASK_EXECUTION_STATUS,
     "REQUEST_MEMORY_GRAPH": MessageType.GRAPH_MEMORY_UPDATE,  # 上行请求
     "EXPAND_NODE": MessageType.GRAPH_MEMORY_EXPAND,
     "LIST_DIALOGUE_SESSIONS": MessageType.SESSION_LIST,
@@ -177,7 +180,7 @@ _WEB_TO_UNIFIED: Dict[str, str] = {
     "IDE_APPROVAL_STATUS": MessageType.IDE_APPROVAL_STATUS,
     "IDE_DIFF_STATUS": MessageType.IDE_DIFF_STATUS,
     "IDE_CHECKPOINT_STATUS": MessageType.IDE_CHECKPOINT_STATUS,
-    "ide_action_result": MessageType.IDE_APPROVAL_RESULT,
+    "ide_action_result": MessageType.IDE_ACTION_RESULT,
     "ping": MessageType.PING,
     "pong": MessageType.PONG,
     "audio_start": MessageType.AUDIO_START,
@@ -188,6 +191,7 @@ _WEB_TO_UNIFIED: Dict[str, str] = {
     "voice:delete": MessageType.VOICE_DELETE,
     "ide_approval_result": MessageType.IDE_APPROVAL_RESULT,
     "ide:approval_result": MessageType.IDE_APPROVAL_RESULT,
+    "ide:action_result": MessageType.IDE_ACTION_RESULT,
 }
 
 # IDE(/ide) 旧类型 → 统一类型
@@ -226,6 +230,7 @@ _UNIFIED_TO_WEB_UPLINK: Dict[str, str] = {
     MessageType.TASK_START: "CHAT_MESSAGE",
     MessageType.TASK_CANCEL: "STOP_GENERATION",
     MessageType.TURN_ACCEPTED: "TURN_ACCEPTED",
+    MessageType.TASK_EXECUTION_STATUS: "TASK_EXECUTION_STATUS",
     MessageType.GRAPH_MEMORY_UPDATE: "REQUEST_MEMORY_GRAPH",
     MessageType.GRAPH_MEMORY_EXPAND: "EXPAND_NODE",
     MessageType.SESSION_LIST: "LIST_DIALOGUE_SESSIONS",
@@ -241,9 +246,11 @@ _UNIFIED_TO_WEB_UPLINK: Dict[str, str] = {
     MessageType.VOICE_DELETE: "voice:delete",
     "chat:visible_message": "CHAT_VISIBLE_MESSAGE",
     MessageType.IDE_APPROVAL_RESULT: "ide_approval_result",
+    MessageType.IDE_ACTION_RESULT: "ide_action_result",
 }
 
 _UNIFIED_TO_WEB_DOWNLINK: Dict[str, str] = {
+    MessageType.TASK_EXECUTION_STATUS: "TASK_EXECUTION_STATUS",
     MessageType.GRAPH_MEMORY_UPDATE: "MEMORY_GRAPH_UPDATE",
     MessageType.GRAPH_MEMORY_EXPAND: "MEMORY_GRAPH_EXPAND_RESULT",
     MessageType.GRAPH_TASK_UPDATE: "TASK_GRAPH_UPDATE",
@@ -256,6 +263,7 @@ _UNIFIED_TO_WEB_DOWNLINK: Dict[str, str] = {
     MessageType.IDE_APPROVAL_STATUS: "IDE_APPROVAL_STATUS",
     MessageType.IDE_DIFF_STATUS: "IDE_DIFF_STATUS",
     MessageType.IDE_CHECKPOINT_STATUS: "IDE_CHECKPOINT_STATUS",
+    MessageType.IDE_ACTION_RESULT: "ide_action_result",
 }
 
 

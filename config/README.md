@@ -29,11 +29,11 @@
 ## 📁 文件结构
 
 ```
-zulong_beta4/
+zulong_beta5/
 ├── config/
 │   ├── zulong_config.yaml    # 主配置文件 ⭐
 │   ├── .env.example          # 环境变量示例
-│   └── load_env.bat          # Windows 环境变量加载脚本
+│   └── profiles/             # Windows/Linux/macOS 平台配置
 ├── zulong/
 │   ├── config/
 │   │   └── config_manager.py # 配置管理器核心
@@ -236,7 +236,7 @@ ZULONG_L2_TEMPERATURE=0.3
 ZULONG_CAMERA_ENABLED=false
 ZULONG_MICROPHONE_ENABLED=true
 ZULONG_RAG_ENABLED=true
-ZULONG_OPENCLAW_ENABLED=true
+ZULONG_WEB_SEARCH_ENABLED=true
 ```
 
 ## 🧪 测试配置系统

@@ -29,10 +29,8 @@ cd zulong-ide
 
 # 安装依赖
 npm install
-cd webview-ui && npm install && cd ..
 
 # 构建
-npm run build:webview
 node esbuild.mjs --production
 
 # 打包 VSIX
@@ -82,13 +80,13 @@ npx @vscode/vsce package --no-dependencies --allow-missing-repository --skip-lic
 #### 步骤 1：启动祖龙 Python 后端
 
 ```bash
-cd d:\AI\project\zulong_beta4
+cd /path/to/zulong_beta5
 
-# 方式一
-python -m zulong.cline.cline_ide_server
+# 方式一：使用当前平台配置启动
+python -m zulong.ide.ide_server
 
 # 方式二
-uvicorn zulong.cline.cline_ide_server:app --host 127.0.0.1 --port 8090
+uvicorn zulong.ide.ide_server:app --host 127.0.0.1 --port 8090
 ```
 
 验证后端是否就绪：
@@ -101,7 +99,7 @@ curl http://127.0.0.1:8090/health
 
 1. 打开设置 → API 配置
 2. 选择提供商为 **Zulong**
-3. 服务器 URL 默认为 `ws://127.0.0.1:8090`（可自定义）
+3. 服务器 URL 默认为 `ws://127.0.0.1:8090/ide`（可自定义）
 
 #### 步骤 3：正常使用
 

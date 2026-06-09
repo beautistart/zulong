@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,52 @@ def _node_type_value(node: Any) -> str:
 
 def _node_id_of(node: Any) -> str:
     return getattr(node, "node_id", "") or ""
+
+
+def _node_type_for_delta(node_type: Any) -> str:
+    return str(getattr(node_type, "value", node_type) or "")
+
+
+def _node_delta_payload(
+    *,
+    node_id: str,
+    node_type: Any,
+    label: str,
+    metadata: Optional[Dict[str, Any]] = None,
+    backend_ref: str = "",
+    activation: float = 0.0,
+) -> Dict[str, Any]:
+    metadata = dict(metadata or {})
+    return {
+        "id": node_id,
+        "type": _node_type_for_delta(node_type),
+        "label": label,
+        "activation": activation,
+        "metadata": metadata,
+        "backend_ref": backend_ref,
+        "children_count": 0,
+        "graph_memory_id": node_id,
+        "full_path": metadata.get("full_path") or metadata.get("graph_address") or node_id,
+    }
+
+
+def _edge_delta_payload(
+    source: str,
+    target: str,
+    edge_type: Any,
+    *,
+    weight: float = 1.0,
+    protected: bool = False,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return {
+        "source": source,
+        "target": target,
+        "type": _node_type_for_delta(edge_type),
+        "weight": weight,
+        "protected": protected,
+        "metadata": dict(metadata or {}),
+    }
 
 
 def _get_payload_interaction(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -191,7 +237,14 @@ def _find_execution_node_by_pair(mg: Any, node_type: Any, round_id: str, pair_id
     return ""
 
 
-def _add_file_references(mg: Any, source_node_id: str, files: List[str], metadata: Dict[str, Any]) -> None:
+def _add_file_references(
+    mg: Any,
+    source_node_id: str,
+    files: List[str],
+    metadata: Dict[str, Any],
+    record_node_change: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    record_edge_change: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+) -> None:
     if not files:
         return
     try:
@@ -202,30 +255,48 @@ def _add_file_references(mg: Any, source_node_id: str, files: List[str], metadat
         safe_path = path.replace("\\", "/")
         file_id = f"file:{_compact_id(safe_path)}"
         if not mg.has_node(file_id):
+            file_metadata = {
+                "path": path,
+                "content": path,
+                "source": "execution_event",
+            }
             try:
                 mg.add_node(GraphNode(
                     node_id=file_id,
                     node_type=NodeType.FILE,
                     label=os.path.basename(path) or path[-80:],
                     backend_ref=f"file:{path}",
-                    metadata={
-                        "path": path,
-                        "content": path,
-                        "source": "execution_event",
-                    },
+                    metadata=file_metadata,
                 ))
+                if record_node_change:
+                    record_node_change("add_node", _node_delta_payload(
+                        node_id=file_id,
+                        node_type=NodeType.FILE,
+                        label=os.path.basename(path) or path[-80:],
+                        backend_ref=f"file:{path}",
+                        metadata=file_metadata,
+                    ))
             except Exception:
                 continue
         if mg.has_node(file_id) and not _edge_exists(mg, source_node_id, file_id):
             try:
-                mg.add_edge(
+                edge_metadata = {**metadata, "link_type": "execution_file_reference"}
+                if mg.add_edge(
                     source_node_id,
                     file_id,
                     EdgeType.REFERENCE,
                     weight=0.8,
                     protected=True,
-                    metadata={**metadata, "link_type": "execution_file_reference"},
-                )
+                    metadata=edge_metadata,
+                ) and record_edge_change:
+                    record_edge_change("add_edge", _edge_delta_payload(
+                        source_node_id,
+                        file_id,
+                        EdgeType.REFERENCE,
+                        weight=0.8,
+                        protected=True,
+                        metadata=edge_metadata,
+                    ))
             except Exception:
                 pass
 
@@ -264,26 +335,51 @@ def mirror_interaction_to_memory_graph(
         session_id = f"dialogue:session_{safe_conversation_id}"
         round_id = f"{session_id}/round_{safe_turn_id}"
         message_id = f"{round_id}/{safe_role}_{safe_event_type}"
+        changes: List[Dict[str, Any]] = []
+        changed_node_ids: Set[str] = set()
+        changed_edge_ids: Set[str] = set()
+
+        def add_node_change(action: str, data: Dict[str, Any]) -> None:
+            node_id = str(data.get("id") or "")
+            if node_id:
+                changed_node_ids.add(node_id)
+            changes.append({"action": action, "data": data})
+
+        def add_edge_change(action: str, data: Dict[str, Any]) -> None:
+            source = str(data.get("source") or "")
+            target = str(data.get("target") or "")
+            edge_type = str(data.get("type") or "")
+            if source or target:
+                changed_edge_ids.add(f"{source}|{target}|{edge_type}")
+            changes.append({"action": action, "data": data})
 
         if not mg.has_node(session_id):
+            session_metadata = {
+                "sub_type": "session",
+                "conversation_id": conversation_id,
+                "source": source,
+                "full_path": session_id,
+                "topic_summary": text[:200],
+                "bound_window_id": conversation_id,
+                "window_binding": "web_chat",
+                "is_root_node": True,
+                "graph_level": 0,
+                "node_role": "session_root",
+                "round_count": 0,
+            }
             mg.add_node(GraphNode(
                 node_id=session_id,
                 node_type=NodeType.DIALOGUE,
                 label=f"Web 会话 {conversation_id[-8:]}",
                 backend_ref=f"interaction:{conversation_id}",
-                metadata={
-                    "sub_type": "session",
-                    "conversation_id": conversation_id,
-                    "source": source,
-                    "full_path": session_id,
-                    "topic_summary": text[:200],
-                    "bound_window_id": conversation_id,
-                    "window_binding": "web_chat",
-                    "is_root_node": True,
-                    "graph_level": 0,
-                    "node_role": "session_root",
-                    "round_count": 0,
-                },
+                metadata=session_metadata,
+            ))
+            add_node_change("add_node", _node_delta_payload(
+                node_id=session_id,
+                node_type=NodeType.DIALOGUE,
+                label=f"Web 会话 {conversation_id[-8:]}",
+                backend_ref=f"interaction:{conversation_id}",
+                metadata=session_metadata,
             ))
             # TSD §23.11.6: 回写 session_node_id 到 InteractionStore
             try:
@@ -298,41 +394,72 @@ def mirror_interaction_to_memory_graph(
             except Exception:
                 pass  # best-effort, 不阻塞主流程
 
-        if not mg.has_node(round_id):
-            prev_round_id = _LAST_ROUND_BY_CONVERSATION.get(conversation_id)
+        round_exists = mg.has_node(round_id)
+        prev_round_id = _LAST_ROUND_BY_CONVERSATION.get(conversation_id) or ""
+        if not round_exists:
             if not prev_round_id:
                 prev_round_id = _find_latest_round_for_conversation(mg, conversation_id)
+            round_metadata = {
+                "sub_type": "round",
+                "conversation_id": conversation_id,
+                "request_id": turn_id,
+                "goal": text[:500],
+                "user_text": text if role == "user" else "",
+                "created_from": "interaction_store_mirror",
+                "full_path": round_id,
+                "parent_session": session_id,
+                "session_id": session_id,
+                "prev_round_id": prev_round_id or "",
+                "is_root_node": False,
+                "graph_level": 1,
+                "node_role": "dialogue_round",
+            }
             mg.add_node(GraphNode(
                 node_id=round_id,
                 node_type=NodeType.DIALOGUE,
                 label=text[:80],
                 backend_ref=f"interaction:{conversation_id}/{turn_id}",
-                metadata={
-                    "sub_type": "round",
-                    "conversation_id": conversation_id,
-                    "request_id": turn_id,
-                    "goal": text[:500],
-                    "user_text": text if role == "user" else "",
-                    "created_from": "interaction_store_mirror",
-                    "full_path": round_id,
-                    "parent_session": session_id,
-                    "session_id": session_id,
-                    "prev_round_id": prev_round_id or "",
-                    "is_root_node": False,
-                    "graph_level": 1,
-                    "node_role": "dialogue_round",
-                },
+                metadata=round_metadata,
             ))
-            if not _edge_exists(mg, session_id, round_id):
-                mg.add_edge(session_id, round_id, EdgeType.HIERARCHY, weight=1.0, protected=True)
-            if prev_round_id and mg.has_node(prev_round_id) and not _edge_exists(mg, prev_round_id, round_id):
-                mg.add_edge(prev_round_id, round_id, EdgeType.TEMPORAL, weight=1.0, protected=True)
-            sess_node = mg.get_node(session_id)
-            if sess_node:
-                sess_node.metadata["round_count"] = _count_round_children(mg, session_id)
-                sess_node.metadata["last_round_id"] = round_id
-                sess_node.metadata["last_active_at"] = now
-                _persist_node_update(mg, sess_node)
+            add_node_change("add_node", _node_delta_payload(
+                node_id=round_id,
+                node_type=NodeType.DIALOGUE,
+                label=text[:80],
+                backend_ref=f"interaction:{conversation_id}/{turn_id}",
+                metadata=round_metadata,
+            ))
+        if not _edge_exists(mg, session_id, round_id):
+            if mg.add_edge(session_id, round_id, EdgeType.HIERARCHY, weight=1.0, protected=True):
+                add_edge_change("add_edge", _edge_delta_payload(
+                    session_id,
+                    round_id,
+                    EdgeType.HIERARCHY,
+                    weight=1.0,
+                    protected=True,
+                ))
+        if prev_round_id and mg.has_node(prev_round_id) and not _edge_exists(mg, prev_round_id, round_id):
+            if mg.add_edge(prev_round_id, round_id, EdgeType.TEMPORAL, weight=1.0, protected=True):
+                add_edge_change("add_edge", _edge_delta_payload(
+                    prev_round_id,
+                    round_id,
+                    EdgeType.TEMPORAL,
+                    weight=1.0,
+                    protected=True,
+                ))
+        sess_node = mg.get_node(session_id)
+        if sess_node:
+            sess_node.metadata["round_count"] = _count_round_children(mg, session_id)
+            sess_node.metadata["last_round_id"] = round_id
+            sess_node.metadata["last_active_at"] = now
+            _persist_node_update(mg, sess_node)
+            add_node_change("update_node", _node_delta_payload(
+                node_id=session_id,
+                node_type=NodeType.DIALOGUE,
+                label=getattr(sess_node, "label", f"Web 会话 {conversation_id[-8:]}"),
+                backend_ref=getattr(sess_node, "backend_ref", f"interaction:{conversation_id}"),
+                metadata=getattr(sess_node, "metadata", {}) or {},
+                activation=float(getattr(sess_node, "activation", 0.0) or 0.0),
+            ))
         elif role == "user":
             node = mg.get_node(round_id)
             if node:
@@ -344,34 +471,58 @@ def mirror_interaction_to_memory_graph(
                 node.metadata["node_role"] = "dialogue_round"
                 node.metadata["graph_level"] = 1
                 _persist_node_update(mg, node)
+                add_node_change("update_node", _node_delta_payload(
+                    node_id=round_id,
+                    node_type=NodeType.DIALOGUE,
+                    label=getattr(node, "label", text[:80]),
+                    backend_ref=getattr(node, "backend_ref", f"interaction:{conversation_id}/{turn_id}"),
+                    metadata=getattr(node, "metadata", {}) or {},
+                    activation=float(getattr(node, "activation", 0.0) or 0.0),
+                ))
 
         _LAST_ROUND_BY_CONVERSATION[conversation_id] = round_id
 
+        message_metadata = {
+            "sub_type": "agent_turn" if role != "user" else "user_turn",
+            "conversation_id": conversation_id,
+            "request_id": turn_id,
+            "event_type": event_type,
+            "role": role,
+            "source": source,
+            "content": text,
+            "payload": payload or {},
+            "created_at": now,
+            "parent_round": round_id,
+            "parent_session": session_id,
+            "full_path": message_id,
+            "is_root_node": False,
+            "graph_level": 2,
+            "node_role": "message",
+        }
+        message_exists = mg.has_node(message_id)
         mg.add_node(GraphNode(
             node_id=message_id,
             node_type=NodeType.DIALOGUE,
             label=(role or "message")[:20],
             backend_ref=f"interaction:{conversation_id}/{turn_id}/{event_type}/{role}",
-            metadata={
-                "sub_type": "agent_turn" if role != "user" else "user_turn",
-                "conversation_id": conversation_id,
-                "request_id": turn_id,
-                "event_type": event_type,
-                "role": role,
-                "source": source,
-                "content": text,
-                "payload": payload or {},
-                "created_at": now,
-                "parent_round": round_id,
-                "parent_session": session_id,
-                "full_path": message_id,
-                "is_root_node": False,
-                "graph_level": 2,
-                "node_role": "message",
-            },
+            metadata=message_metadata,
+        ))
+        add_node_change("update_node" if message_exists else "add_node", _node_delta_payload(
+            node_id=message_id,
+            node_type=NodeType.DIALOGUE,
+            label=(role or "message")[:20],
+            backend_ref=f"interaction:{conversation_id}/{turn_id}/{event_type}/{role}",
+            metadata=message_metadata,
         ))
         if not _edge_exists(mg, round_id, message_id):
-            mg.add_edge(round_id, message_id, EdgeType.HIERARCHY, weight=1.0, protected=True)
+            if mg.add_edge(round_id, message_id, EdgeType.HIERARCHY, weight=1.0, protected=True):
+                add_edge_change("add_edge", _edge_delta_payload(
+                    round_id,
+                    message_id,
+                    EdgeType.HIERARCHY,
+                    weight=1.0,
+                    protected=True,
+                ))
         if role == "assistant":
             node = mg.get_node(round_id)
             if node:
@@ -379,11 +530,18 @@ def mirror_interaction_to_memory_graph(
                 node.metadata["status"] = "completed"
                 node.metadata["completed_at"] = now
                 _persist_node_update(mg, node)
+                add_node_change("update_node", _node_delta_payload(
+                    node_id=round_id,
+                    node_type=NodeType.DIALOGUE,
+                    label=getattr(node, "label", text[:80]),
+                    backend_ref=getattr(node, "backend_ref", f"interaction:{conversation_id}/{turn_id}"),
+                    metadata=getattr(node, "metadata", {}) or {},
+                    activation=float(getattr(node, "activation", 0.0) or 0.0),
+                ))
             try:
                 mg.index_summary(round_id, f"{node.metadata.get('goal', '') if node else ''} {text}"[:500])
             except Exception:
                 pass
-        _attach_task_if_present(mg, session_id, round_id, payload or {})
         execution_node_id = _mirror_execution_event(
             mg=mg,
             session_id=session_id,
@@ -395,6 +553,8 @@ def mirror_interaction_to_memory_graph(
             event_type=event_type,
             source=source,
             payload=payload or {},
+            record_node_change=add_node_change,
+            record_edge_change=add_edge_change,
         )
         if event_type in {"approval_required", "checkpoint_created", "ide:file_changed"}:
             try:
@@ -414,6 +574,14 @@ def mirror_interaction_to_memory_graph(
                         f"{round_node.metadata.get('goal', '')}\n{text}"
                     ).strip()[:1000]
                     _persist_node_update(mg, round_node)
+                    add_node_change("update_node", _node_delta_payload(
+                        node_id=round_id,
+                        node_type=NodeType.DIALOGUE,
+                        label=getattr(round_node, "label", text[:80]),
+                        backend_ref=getattr(round_node, "backend_ref", f"interaction:{conversation_id}/{turn_id}"),
+                        metadata=getattr(round_node, "metadata", {}) or {},
+                        activation=float(getattr(round_node, "activation", 0.0) or 0.0),
+                    ))
         except Exception:
             pass
         try:
@@ -433,7 +601,21 @@ def mirror_interaction_to_memory_graph(
                 type=EventType.MEMORY_GRAPH_UPDATED,
                 priority=EventPriority.LOW,
                 source="MemoryMirror",
-                payload=mg.to_frontend_dict(depth=0),
+                payload={
+                    "update_type": "delta",
+                    "ts": time.time(),
+                    "nodes": [],
+                    "edges": [],
+                    "changes": changes,
+                    "changed_node_ids": sorted(changed_node_ids),
+                    "changed_edge_ids": sorted(changed_edge_ids),
+                    "active_node_ids": list(getattr(mg, "_active_node_ids", []) or []),
+                    "stats": {
+                        "transport": "delta",
+                        "changed_nodes": len(changed_node_ids),
+                        "changed_edges": len(changed_edge_ids),
+                    },
+                },
             ))
         except Exception:
             pass
@@ -470,78 +652,6 @@ def _count_round_children(mg: Any, session_id: str) -> int:
         return 0
 
 
-def _attach_task_if_present(mg: Any, session_id: str, round_id: str, payload: Dict[str, Any]) -> None:
-    try:
-        from zulong.memory.memory_graph import EdgeType, NodeType
-    except Exception:
-        return
-
-    task_graph_id = (
-        payload.get("task_graph_id")
-        or payload.get("graph_id")
-        or payload.get("task_id")
-        or ""
-    )
-    if not task_graph_id:
-        return
-    if hasattr(mg, "get_task_node_id_for_graph"):
-        try:
-            task_node_id = mg.get_task_node_id_for_graph(task_graph_id) or ""
-        except Exception:
-            task_node_id = ""
-        if task_node_id:
-            if not _edge_exists(mg, round_id, task_node_id):
-                mg.add_edge(
-                    round_id,
-                    task_node_id,
-                    EdgeType.REFERENCE,
-                    weight=0.9,
-                    protected=True,
-                    metadata={"link_type": "dialogue_round_task"},
-                )
-            task_node = mg.get_node(task_node_id)
-            if task_node:
-                task_node.metadata.setdefault("parent_session", session_id)
-                task_node.metadata.setdefault("parent_round", round_id)
-                task_node.metadata.setdefault("full_path", f"{session_id}/{task_node.node_id}")
-                _persist_node_update(mg, task_node)
-            return
-    task_candidates = [
-        f"task:{task_graph_id}",
-        f"{session_id}/task:{task_graph_id}",
-    ]
-    task_node_id = ""
-    for candidate in task_candidates:
-        if mg.has_node(candidate):
-            task_node_id = candidate
-            break
-    if not task_node_id:
-        try:
-            for nid, node in getattr(mg, "_nodes", {}).items():
-                if node.node_type == NodeType.TASK and node.metadata.get("graph_id") == task_graph_id:
-                    task_node_id = nid
-                    break
-        except Exception:
-            pass
-    if not task_node_id:
-        return
-    if not _edge_exists(mg, round_id, task_node_id):
-        mg.add_edge(
-            round_id,
-            task_node_id,
-            EdgeType.REFERENCE,
-            weight=0.9,
-            protected=True,
-            metadata={"link_type": "dialogue_round_task"},
-        )
-    task_node = mg.get_node(task_node_id)
-    if task_node:
-        task_node.metadata.setdefault("parent_session", session_id)
-        task_node.metadata.setdefault("parent_round", round_id)
-        task_node.metadata.setdefault("full_path", f"{session_id}/{task_node.node_id}")
-        _persist_node_update(mg, task_node)
-
-
 def _mirror_execution_event(
     *,
     mg: Any,
@@ -554,6 +664,8 @@ def _mirror_execution_event(
     event_type: str,
     source: str,
     payload: Dict[str, Any],
+    record_node_change: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    record_edge_change: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> str:
     """Project tool/approval cards into dedicated MemoryGraph execution nodes."""
     interaction = _get_payload_interaction(payload)
@@ -655,71 +767,141 @@ def _mirror_execution_event(
     }
     common_metadata.update({k: v for k, v in metadata.items() if v is not None})
 
+    backend_ref = f"interaction:{conversation_id}/{turn_id}/{event_type}/{source_event_id or pair_id}"
+    execution_exists = mg.has_node(node_id)
     mg.add_node(GraphNode(
         node_id=node_id,
         node_type=node_type,
         label=str(title)[:120],
-        backend_ref=f"interaction:{conversation_id}/{turn_id}/{event_type}/{source_event_id or pair_id}",
+        backend_ref=backend_ref,
         metadata=common_metadata,
     ))
+    if record_node_change:
+        record_node_change("update_node" if execution_exists else "add_node", _node_delta_payload(
+            node_id=node_id,
+            node_type=node_type,
+            label=str(title)[:120],
+            backend_ref=backend_ref,
+            metadata=common_metadata,
+        ))
     if not _edge_exists(mg, round_id, node_id):
-        mg.add_edge(
+        edge_metadata = {"link_type": "round_execution_event"}
+        if mg.add_edge(
             round_id,
             node_id,
             EdgeType.HIERARCHY,
             weight=1.0,
             protected=True,
-            metadata={"link_type": "round_execution_event"},
-        )
+            metadata=edge_metadata,
+        ) and record_edge_change:
+            record_edge_change("add_edge", _edge_delta_payload(
+                round_id,
+                node_id,
+                EdgeType.HIERARCHY,
+                weight=1.0,
+                protected=True,
+                metadata=edge_metadata,
+            ))
 
-    _attach_execution_task_edges(mg, session_id, round_id, node_id, node_type_value, payload)
+    _attach_execution_task_edges(
+        mg,
+        session_id,
+        round_id,
+        node_id,
+        node_type_value,
+        payload,
+        record_edge_change=record_edge_change,
+    )
     if node_type_value == "tool_call":
         previous_tool_call = _LAST_TOOL_CALL_BY_ROUND.get(round_id)
         if previous_tool_call and previous_tool_call != node_id and mg.has_node(previous_tool_call):
             if not _edge_exists(mg, previous_tool_call, node_id):
-                mg.add_edge(
+                edge_metadata = {"link_type": "tool_chain_order"}
+                if mg.add_edge(
                     previous_tool_call,
                     node_id,
                     EdgeType.TEMPORAL,
                     weight=0.8,
                     protected=True,
-                    metadata={"link_type": "tool_chain_order"},
-                )
+                    metadata=edge_metadata,
+                ) and record_edge_change:
+                    record_edge_change("add_edge", _edge_delta_payload(
+                        previous_tool_call,
+                        node_id,
+                        EdgeType.TEMPORAL,
+                        weight=0.8,
+                        protected=True,
+                        metadata=edge_metadata,
+                    ))
         _LAST_TOOL_CALL_BY_ROUND[round_id] = node_id
     elif node_type_value == "tool_result":
         call_node_id = _find_execution_node_by_pair(mg, node_type.__class__.TOOL_CALL, round_id, pair_id)
         if call_node_id and not _edge_exists(mg, call_node_id, node_id):
-            mg.add_edge(
+            edge_metadata = {"link_type": "tool_call_result", "pair_id": pair_id}
+            if mg.add_edge(
                 call_node_id,
                 node_id,
                 EdgeType.CAUSAL,
                 weight=1.0,
                 protected=True,
-                metadata={"link_type": "tool_call_result", "pair_id": pair_id},
-            )
-        _add_file_references(mg, node_id, _payload_files(payload, interaction), {"pair_id": pair_id})
+                metadata=edge_metadata,
+            ) and record_edge_change:
+                record_edge_change("add_edge", _edge_delta_payload(
+                    call_node_id,
+                    node_id,
+                    EdgeType.CAUSAL,
+                    weight=1.0,
+                    protected=True,
+                    metadata=edge_metadata,
+                ))
+        _add_file_references(
+            mg,
+            node_id,
+            _payload_files(payload, interaction),
+            {"pair_id": pair_id},
+            record_node_change=record_node_change,
+            record_edge_change=record_edge_change,
+        )
     elif node_type_value == "approval":
         if status in {"approved", "rejected", "denied"} or common_metadata.get("decision"):
             request_node_id = _find_matching_approval_request(mg, round_id, pair_id, node_id)
             if request_node_id and not _edge_exists(mg, request_node_id, node_id):
-                mg.add_edge(
+                edge_metadata = {"link_type": "approval_request_decision", "pair_id": pair_id}
+                if mg.add_edge(
                     request_node_id,
                     node_id,
                     EdgeType.CAUSAL,
                     weight=1.0,
                     protected=True,
-                    metadata={"link_type": "approval_request_decision", "pair_id": pair_id},
-                )
+                    metadata=edge_metadata,
+                ) and record_edge_change:
+                    record_edge_change("add_edge", _edge_delta_payload(
+                        request_node_id,
+                        node_id,
+                        EdgeType.CAUSAL,
+                        weight=1.0,
+                        protected=True,
+                        metadata=edge_metadata,
+                    ))
             call_node_id = _find_execution_node_by_pair(mg, node_type.__class__.TOOL_CALL, round_id, pair_id)
             if call_node_id and not _edge_exists(mg, node_id, call_node_id):
-                mg.add_edge(
+                edge_metadata = {"link_type": "approval_decision_tool_call", "pair_id": pair_id}
+                if mg.add_edge(
                     node_id,
                     call_node_id,
                     EdgeType.CAUSAL,
                     weight=0.9,
                     protected=True,
-                    metadata={"link_type": "approval_decision_tool_call", "pair_id": pair_id},
-                )
+                    metadata=edge_metadata,
+                ) and record_edge_change:
+                    record_edge_change("add_edge", _edge_delta_payload(
+                        node_id,
+                        call_node_id,
+                        EdgeType.CAUSAL,
+                        weight=0.9,
+                        protected=True,
+                        metadata=edge_metadata,
+                    ))
     return node_id
 
 
@@ -766,6 +948,7 @@ def _attach_execution_task_edges(
     execution_node_id: str,
     execution_type: str,
     payload: Dict[str, Any],
+    record_edge_change: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> None:
     task_graph_id = _payload_task_graph_id(payload)
     task_node_id = _find_task_node_id(mg, session_id, task_graph_id)
@@ -773,31 +956,31 @@ def _attach_execution_task_edges(
         return
     try:
         from zulong.memory.memory_graph import EdgeType
-        if not _edge_exists(mg, round_id, task_node_id):
-            mg.add_edge(
-                round_id,
-                task_node_id,
-                EdgeType.REFERENCE,
-                weight=0.9,
-                protected=True,
-                metadata={"link_type": "dialogue_round_task"},
-            )
         edge_type = EdgeType.DEPENDENCY if execution_type == "tool_call" else EdgeType.REFERENCE
         source_id = task_node_id if execution_type == "tool_call" else execution_node_id
         target_id = execution_node_id if execution_type == "tool_call" else task_node_id
         if not _edge_exists(mg, source_id, target_id):
-            mg.add_edge(
+            edge_metadata = {
+                "link_type": "task_execution_event",
+                "task_graph_id": task_graph_id,
+                "execution_type": execution_type,
+            }
+            if mg.add_edge(
                 source_id,
                 target_id,
                 edge_type,
                 weight=0.9,
                 protected=True,
-                metadata={
-                    "link_type": "task_execution_event",
-                    "task_graph_id": task_graph_id,
-                    "execution_type": execution_type,
-                },
-            )
+                metadata=edge_metadata,
+            ) and record_edge_change:
+                record_edge_change("add_edge", _edge_delta_payload(
+                    source_id,
+                    target_id,
+                    edge_type,
+                    weight=0.9,
+                    protected=True,
+                    metadata=edge_metadata,
+                ))
     except Exception:
         pass
 

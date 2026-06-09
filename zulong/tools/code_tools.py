@@ -9,34 +9,54 @@
 import logging
 import time
 import threading
-from typing import Any, Dict, List
+import sys
+import importlib.util
+from typing import Any, Dict, List, Optional, Tuple
 
 from .base import BaseTool, ToolRequest, ToolResult, ToolCategory
 
 logger = logging.getLogger(__name__)
 
 
-def _iter_code_symbol_nodes(memory_graph, node_type_enum) -> List[tuple]:
-    """兼容单体/分片 MemoryGraph，返回 [(node_id, node_like)]。"""
+CODE_SYMBOL_TYPE = "code_symbol"
+FILE_TYPE = "file"
+MODULE_TYPE = "module"
+HIERARCHY_EDGE = "hierarchy"
+REFERENCE_EDGE = "reference"
+DEPENDENCY_EDGE = "dependency"
+# 代码图谱需要在任务图面板中可视化，但前端会将 crg_ 分支默认折叠，
+# 并且任务完成度/归档逻辑会继续排除这些节点。
+INJECT_CRG_TO_TASK_GRAPH = True
+
+_CODE_EDGE_MAP = {
+    "contains": (HIERARCHY_EDGE, 0.9, True),
+    "calls": (REFERENCE_EDGE, 0.7, False),
+    "inherits": (HIERARCHY_EDGE, 0.9, True),
+    "imports": (DEPENDENCY_EDGE, 0.9, True),
+}
+
+
+def _type_value(value) -> str:
+    return str(getattr(value, "value", value) or "")
+
+
+def _node_type(node) -> str:
+    return _type_value(getattr(node, "node_type", ""))
+
+
+def _is_node_type(node, node_type: str) -> bool:
+    return _node_type(node) == node_type
+
+
+def _iter_nodes_by_type(memory_graph, node_type: str) -> List[tuple]:
+    """分片 MemoryGraph 原生节点遍历，返回 [(node_id, node_like)]。"""
     results = []
     if memory_graph is None:
         return results
 
-    if hasattr(memory_graph, "_nodes"):
-        expected = getattr(node_type_enum, "value", node_type_enum)
-        for node_id, node in memory_graph._nodes.items():
-            node_type = getattr(node, "node_type", None)
-            node_type_value = getattr(node_type, "value", node_type)
-            if node_type_value == expected:
-                results.append((node_id, node))
-        return results
-
     get_nodes_by_type = getattr(memory_graph, "get_nodes_by_type", None)
     if callable(get_nodes_by_type):
-        try:
-            nodes = get_nodes_by_type(getattr(node_type_enum, "value", node_type_enum))
-        except TypeError:
-            nodes = get_nodes_by_type(node_type_enum)
+        nodes = get_nodes_by_type(node_type)
         for node in nodes or []:
             node_id = getattr(node, "node_id", None) or getattr(node, "id", None)
             if node_id:
@@ -44,9 +64,42 @@ def _iter_code_symbol_nodes(memory_graph, node_type_enum) -> List[tuple]:
     return results
 
 
+def _iter_code_symbol_nodes(memory_graph) -> List[tuple]:
+    return _iter_nodes_by_type(memory_graph, CODE_SYMBOL_TYPE)
+
+
 def _node_metadata(node) -> Dict[str, Any]:
     meta = getattr(node, "metadata", None)
     return meta if isinstance(meta, dict) else {}
+
+
+def _edge_metadata(edge: Any) -> Dict[str, Any]:
+    if edge is None:
+        return {}
+    if isinstance(edge, dict):
+        meta = edge.get("metadata", {})
+        return meta if isinstance(meta, dict) else {}
+    meta = getattr(edge, "metadata", None)
+    return meta if isinstance(meta, dict) else {}
+
+
+def _edge_type(edge: Any) -> str:
+    if edge is None:
+        return ""
+    if isinstance(edge, dict):
+        return _type_value(edge.get("edge_type") or edge.get("type"))
+    return _type_value(getattr(edge, "edge_type", ""))
+
+
+def _edge_relation(edge: Any) -> str:
+    return str(_edge_metadata(edge).get("code_relation", "") or "")
+
+
+def _get_edge(memory_graph, source_id: str, target_id: str):
+    get_edge = getattr(memory_graph, "get_edge", None)
+    if callable(get_edge):
+        return get_edge(source_id, target_id)
+    return None
 
 
 def _required_tree_sitter_packages(lang: str) -> List[str]:
@@ -57,6 +110,427 @@ def _required_tree_sitter_packages(lang: str) -> List[str]:
         "tsx": ["tree_sitter", "tree_sitter_typescript"],
     }
     return mapping.get(lang, ["tree_sitter"])
+
+
+def _missing_tree_sitter_packages(lang: str) -> List[str]:
+    return [
+        pkg for pkg in _required_tree_sitter_packages(lang)
+        if importlib.util.find_spec(pkg) is None
+    ]
+
+
+def _broadcast_crg_index_failed(project_name: str, error: str, payload: Dict[str, Any] = None) -> None:
+    event_payload = {
+        "error": error,
+        "project_name": project_name,
+    }
+    if payload:
+        event_payload.update(payload)
+    ide_server = sys.modules.get("zulong.ide.ide_server")
+    if ide_server is not None:
+        try:
+            broadcast_sync = getattr(ide_server, "_broadcast_sync", None)
+            if callable(broadcast_sync):
+                broadcast_sync("CRG_INDEX_FAILED", event_payload)
+        except Exception:
+            pass
+    web_router = sys.modules.get("zulong.launcher.web_chat_router")
+    if web_router is not None:
+        try:
+            schedule_broadcast = getattr(web_router, "_schedule_broadcast", None)
+            if callable(schedule_broadcast):
+                schedule_broadcast({
+                    "type": "CRG_INDEX_FAILED",
+                    "payload": event_payload,
+                })
+        except Exception:
+            pass
+
+
+def _code_graph_symbol_count(code_graph) -> int:
+    value = getattr(code_graph, "symbol_count", None)
+    if isinstance(value, int):
+        return value
+    symbols = getattr(code_graph, "symbols", None)
+    return len(symbols) if isinstance(symbols, dict) else 0
+
+
+def _sync_code_graph_to_memory(
+    memory_graph,
+    code_graph,
+    *,
+    context: str,
+) -> Tuple[int, str, Optional[str]]:
+    """Native sync from CodeGraph into the sharded MemoryGraph backend."""
+    fallback_count = _code_graph_symbol_count(code_graph)
+    if memory_graph is None:
+        return fallback_count, "skipped", "MemoryGraph 未初始化"
+
+    try:
+        _sync_code_graph_native(memory_graph, code_graph)
+        return fallback_count, "synced", None
+    except Exception as exc:
+        logger.warning(
+            "[%s] CodeGraph 原生同步到分片 MemoryGraph 失败: %s",
+            context,
+            exc,
+            exc_info=True,
+        )
+        return fallback_count, "failed", str(exc)
+
+
+def _incremental_sync_code_file_to_memory(
+    memory_graph,
+    payload: Dict[str, Any],
+    *,
+    context: str,
+) -> Tuple[str, Optional[str]]:
+    if memory_graph is None:
+        return "skipped", "MemoryGraph 未初始化"
+    try:
+        _sync_code_file_native(memory_graph, payload)
+        return "synced", None
+    except Exception as exc:
+        logger.warning(
+            "[%s] CodeGraph 文件增量原生同步失败: %s",
+            context,
+            exc,
+            exc_info=True,
+        )
+        return "failed", str(exc)
+
+
+def _upsert_memory_node(
+    memory_graph,
+    *,
+    node_id: str,
+    node_type: str,
+    label: str,
+    backend_ref: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+    content: Optional[str] = None,
+) -> None:
+    metadata = metadata or {}
+    existing = memory_graph.get_node(node_id) if memory_graph.has_node(node_id) else None
+    if existing:
+        existing.label = label or getattr(existing, "label", "")
+        if backend_ref:
+            existing.backend_ref = backend_ref
+        if content is not None:
+            existing.content = content
+        node_meta = getattr(existing, "metadata", None)
+        if not isinstance(node_meta, dict):
+            node_meta = {}
+        node_meta.update(metadata)
+        existing.metadata = node_meta
+        update_node = getattr(memory_graph, "update_node", None)
+        if callable(update_node):
+            update_node(existing)
+        return
+
+    memory_graph.add_node(
+        node_id=node_id,
+        node_type=node_type,
+        label=label,
+        backend_ref=backend_ref,
+        metadata=metadata,
+        content=content,
+    )
+
+
+def _add_memory_edge(
+    memory_graph,
+    source_id: str,
+    target_id: str,
+    edge_type: str,
+    *,
+    weight: float = 1.0,
+    protected: bool = False,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not source_id or not target_id:
+        return
+    if not memory_graph.has_node(source_id) or not memory_graph.has_node(target_id):
+        return
+    memory_graph.add_edge(
+        source_id,
+        target_id,
+        edge_type=edge_type,
+        weight=weight,
+        protected=protected,
+        metadata=metadata or {},
+    )
+
+
+def _ensure_code_file_node(memory_graph, code_graph, file_path: str) -> str:
+    file_node_id = f"file:{file_path}"
+    file_result = getattr(code_graph, "file_results", {}).get(file_path)
+    content_hash = getattr(file_result, "content_hash", "") if file_result else ""
+    project_root = getattr(code_graph, "root_dir", "")
+    _upsert_memory_node(
+        memory_graph,
+        node_id=file_node_id,
+        node_type=FILE_TYPE,
+        label=file_path.split("/")[-1],
+        backend_ref=f"file:{file_path}",
+        metadata={
+            "path": file_path,
+            "content_hash": content_hash,
+            "project_root": project_root,
+        },
+    )
+    return file_node_id
+
+
+def _sync_code_graph_native(memory_graph, code_graph) -> None:
+    project_root = getattr(code_graph, "root_dir", "")
+    project_name = getattr(code_graph, "project_name", "") or "project"
+    project_node_id = f"module:/{project_name}"
+
+    _upsert_memory_node(
+        memory_graph,
+        node_id=project_node_id,
+        node_type=MODULE_TYPE,
+        label=project_name,
+        backend_ref=f"project:{project_name}",
+        metadata={"kind": "project", "path": "", "project_root": project_root},
+    )
+
+    directories = getattr(code_graph, "directories", {}) or {}
+    for dir_path in sorted(d for d in directories.keys() if d):
+        dir_label = dir_path.split("/")[-1]
+        mod_node_id = f"module:{dir_path}"
+        _upsert_memory_node(
+            memory_graph,
+            node_id=mod_node_id,
+            node_type=MODULE_TYPE,
+            label=dir_label,
+            backend_ref=f"module:{dir_path}",
+            metadata={
+                "kind": "directory",
+                "path": dir_path,
+                "project_root": project_root,
+                "is_package": any(
+                    f.endswith("__init__.py") for f in directories.get(dir_path, [])
+                ),
+            },
+        )
+        parent_path = dir_path.rsplit("/", 1)[0] if "/" in dir_path else ""
+        parent_id = f"module:{parent_path}" if parent_path else project_node_id
+        _add_memory_edge(
+            memory_graph,
+            parent_id,
+            mod_node_id,
+            HIERARCHY_EDGE,
+            weight=0.9,
+            protected=True,
+            metadata={"relation": "contains_dir"},
+        )
+
+    for file_path in sorted(getattr(code_graph, "file_results", {}).keys()):
+        file_node_id = _ensure_code_file_node(memory_graph, code_graph, file_path)
+        file_dir = "/".join(file_path.split("/")[:-1])
+        parent_mod_id = f"module:{file_dir}" if file_dir else project_node_id
+        _add_memory_edge(
+            memory_graph,
+            parent_mod_id,
+            file_node_id,
+            HIERARCHY_EDGE,
+            weight=0.8,
+            protected=True,
+            metadata={"relation": "contains_file"},
+        )
+
+    for node_id, sym in getattr(code_graph, "symbols", {}).items():
+        file_node_id = _ensure_code_file_node(memory_graph, code_graph, sym.file_path)
+        _upsert_memory_node(
+            memory_graph,
+            node_id=node_id,
+            node_type=CODE_SYMBOL_TYPE,
+            label=sym.qualified_name,
+            backend_ref=f"code:{sym.file_path}:{sym.start_line}",
+            metadata={
+                "kind": sym.kind,
+                "file_path": sym.file_path,
+                "start_line": sym.start_line,
+                "end_line": sym.end_line,
+                "parameters": sym.parameters,
+                "bases": sym.bases,
+                "docstring": sym.docstring or "",
+                "parent_class": sym.parent_class or "",
+                "project_root": project_root,
+            },
+        )
+        _add_memory_edge(
+            memory_graph,
+            file_node_id,
+            node_id,
+            HIERARCHY_EDGE,
+            weight=0.8,
+            protected=True,
+            metadata={"relation": "defines"},
+        )
+
+    symbols = getattr(code_graph, "symbols", {})
+    for edge in getattr(code_graph, "edges", []):
+        source_id = edge.source_id
+        target_id = edge.target_id
+        if edge.edge_type != "imports":
+            if source_id not in symbols or target_id not in symbols:
+                continue
+        edge_type, weight, protected = _CODE_EDGE_MAP.get(
+            edge.edge_type,
+            (REFERENCE_EDGE, 0.7, False),
+        )
+        _add_memory_edge(
+            memory_graph,
+            source_id,
+            target_id,
+            edge_type,
+            weight=weight,
+            protected=protected,
+            metadata={"code_relation": edge.edge_type, **(edge.metadata or {})},
+        )
+
+    logger.info(
+        "[CodeGraphNative] 同步完成: %s 符号, %s 边, %s 目录/模块",
+        _code_graph_symbol_count(code_graph),
+        len(getattr(code_graph, "edges", []) or []),
+        len(directories),
+    )
+
+
+def _remove_code_file_nodes(memory_graph, file_path: str) -> int:
+    stale_ids = [
+        node_id for node_id, node in _iter_code_symbol_nodes(memory_graph)
+        if _node_metadata(node).get("file_path") == file_path
+    ]
+    for node_id in stale_ids:
+        memory_graph.remove_node(node_id)
+    return len(stale_ids)
+
+
+def _project_anchor_edges_native(memory_graph, file_path: str, sym_ids: set) -> None:
+    try:
+        from zulong.memory.code_anchor import get_code_anchor_store
+    except ImportError:
+        return
+    store = get_code_anchor_store()
+    anchors = store.get_anchors_by_file(file_path)
+    if not anchors:
+        return
+
+    for anchor in anchors:
+        owner_ref = getattr(anchor, "owner_ref", "")
+        task_node = None
+        if owner_ref.startswith("mg:"):
+            task_node = memory_graph.get_node(owner_ref[3:])
+        elif owner_ref:
+            resolve_address = getattr(memory_graph, "resolve_address", None)
+            if callable(resolve_address):
+                task_node = resolve_address(owner_ref)
+            if task_node is None and owner_ref.startswith("tg:"):
+                task_node = memory_graph.get_node("task:" + owner_ref[3:])
+
+        task_mg_id = getattr(task_node, "node_id", None)
+        if not task_mg_id:
+            continue
+
+        target_code_id = None
+        symbol = getattr(anchor, "symbol", "")
+        if symbol:
+            for sym_id in sym_ids:
+                if sym_id.endswith(f":{symbol}") or sym_id.endswith(f":{file_path}:{symbol}"):
+                    target_code_id = sym_id
+                    break
+        if not target_code_id:
+            continue
+
+        _add_memory_edge(
+            memory_graph,
+            task_mg_id,
+            target_code_id,
+            REFERENCE_EDGE,
+            weight=0.9,
+            metadata={
+                "relation": "anchored_to",
+                "anchor_type": getattr(anchor, "anchor_type", ""),
+                "anchor_id": getattr(anchor, "id", ""),
+            },
+        )
+
+
+def _sync_code_file_native(memory_graph, payload: Dict[str, Any]) -> None:
+    file_path = payload.get("file_path", "")
+    if not file_path:
+        return
+
+    _remove_code_file_nodes(memory_graph, file_path)
+    project_root = payload.get("project_root", "")
+    file_node_id = f"file:{file_path}"
+    _upsert_memory_node(
+        memory_graph,
+        node_id=file_node_id,
+        node_type=FILE_TYPE,
+        label=file_path.split("/")[-1],
+        backend_ref=f"file:{file_path}",
+        metadata={
+            "path": file_path,
+            "content_hash": payload.get("content_hash", ""),
+            "project_root": project_root,
+        },
+    )
+
+    sym_ids = set()
+    for sym in payload.get("symbols", []) or []:
+        sym_ids.add(sym.node_id)
+        _upsert_memory_node(
+            memory_graph,
+            node_id=sym.node_id,
+            node_type=CODE_SYMBOL_TYPE,
+            label=sym.qualified_name,
+            backend_ref=f"code:{sym.file_path}:{sym.start_line}",
+            metadata={
+                "kind": sym.kind,
+                "file_path": sym.file_path,
+                "start_line": sym.start_line,
+                "end_line": sym.end_line,
+                "parameters": sym.parameters,
+                "bases": sym.bases,
+                "docstring": sym.docstring or "",
+                "parent_class": sym.parent_class or "",
+                "project_root": project_root,
+            },
+        )
+        _add_memory_edge(
+            memory_graph,
+            file_node_id,
+            sym.node_id,
+            HIERARCHY_EDGE,
+            weight=0.8,
+            protected=True,
+            metadata={"relation": "defines"},
+        )
+
+    for edge in payload.get("edges", []) or []:
+        edge_type, weight, protected = _CODE_EDGE_MAP.get(
+            edge.edge_type,
+            (REFERENCE_EDGE, 0.7, False),
+        )
+        source_exists = edge.source_id in sym_ids or memory_graph.has_node(edge.source_id)
+        target_exists = edge.target_id in sym_ids or memory_graph.has_node(edge.target_id)
+        if source_exists and target_exists:
+            _add_memory_edge(
+                memory_graph,
+                edge.source_id,
+                edge.target_id,
+                edge_type,
+                weight=weight,
+                protected=protected,
+                metadata={"code_relation": edge.edge_type, **(edge.metadata or {})},
+            )
+
+    _project_anchor_edges_native(memory_graph, file_path, sym_ids)
 
 
 class SearchCodeSymbolsTool(BaseTool):
@@ -118,9 +592,7 @@ class SearchCodeSymbolsTool(BaseTool):
             )
 
         try:
-            from zulong.memory.memory_graph import (
-                get_memory_graph, NodeType,
-            )
+            from zulong.memory.memory_graph import get_memory_graph
             mg = get_memory_graph()
             if mg is None:
                 return self._create_result(
@@ -133,7 +605,7 @@ class SearchCodeSymbolsTool(BaseTool):
             # 搜索匹配节点
             results = []
             query_lower = query.lower()
-            for node_id, node in _iter_code_symbol_nodes(mg, NodeType.CODE_SYMBOL):
+            for node_id, node in _iter_code_symbol_nodes(mg):
                 meta = _node_metadata(node)
 
                 # kind 过滤
@@ -233,9 +705,7 @@ class GetSymbolContextTool(BaseTool):
             )
 
         try:
-            from zulong.memory.memory_graph import (
-                get_memory_graph, NodeType, EdgeType,
-            )
+            from zulong.memory.memory_graph import get_memory_graph
             mg = get_memory_graph()
             if mg is None:
                 return self._create_result(
@@ -250,7 +720,7 @@ class GetSymbolContextTool(BaseTool):
             target_id = None
             name_lower = symbol_name.lower()
 
-            for nid, node in _iter_code_symbol_nodes(mg, NodeType.CODE_SYMBOL):
+            for nid, node in _iter_code_symbol_nodes(mg):
                 label = getattr(node, "label", "") or ""
                 if label.lower() == name_lower:
                     meta = _node_metadata(node)
@@ -276,34 +746,27 @@ class GetSymbolContextTool(BaseTool):
             contains = []  # 这个符号包含的子元素
             parent = None  # 这个符号的父元素
 
-            # 入边（指向 target 的边）
-            for src_id, _, data in mg._graph.in_edges(target_id, data=True):
-                edge_type = data.get("edge_type", "")
-                code_rel = data.get("metadata", {}).get("code_relation", "")
-                src_node = mg.get_node(src_id)
-                if src_node is None:
+            for neighbor in mg.get_neighbors(target_id, max_depth=1):
+                neighbor_id = getattr(neighbor, "node_id", "")
+                if not neighbor_id:
                     continue
 
-                if code_rel == "calls":
-                    callers.append(src_node.label)
-                elif code_rel == "contains" or (
-                    edge_type == EdgeType.HIERARCHY.value
-                    and src_node.node_type == NodeType.CODE_SYMBOL
+                incoming_edge = _get_edge(mg, neighbor_id, target_id)
+                incoming_rel = _edge_relation(incoming_edge)
+                if incoming_rel == "calls":
+                    callers.append(neighbor.label)
+                elif incoming_rel == "contains" or (
+                    _edge_type(incoming_edge) == HIERARCHY_EDGE
+                    and _is_node_type(neighbor, CODE_SYMBOL_TYPE)
                 ):
-                    parent = src_node.label
+                    parent = neighbor.label
 
-            # 出边（从 target 出发的边）
-            for _, dst_id, data in mg._graph.out_edges(target_id, data=True):
-                edge_type = data.get("edge_type", "")
-                code_rel = data.get("metadata", {}).get("code_relation", "")
-                dst_node = mg.get_node(dst_id)
-                if dst_node is None:
-                    continue
-
-                if code_rel == "calls":
-                    callees.append(dst_node.label)
-                elif code_rel == "contains":
-                    contains.append(dst_node.label)
+                outgoing_edge = _get_edge(mg, target_id, neighbor_id)
+                outgoing_rel = _edge_relation(outgoing_edge)
+                if outgoing_rel == "calls":
+                    callees.append(neighbor.label)
+                elif outgoing_rel == "contains":
+                    contains.append(neighbor.label)
 
             context = {
                 "name": target_node.label,
@@ -399,9 +862,7 @@ class GetImpactAnalysisTool(BaseTool):
             )
 
         try:
-            from zulong.memory.memory_graph import (
-                get_memory_graph, NodeType,
-            )
+            from zulong.memory.memory_graph import get_memory_graph
             mg = get_memory_graph()
             if mg is None:
                 return self._create_result(
@@ -414,7 +875,7 @@ class GetImpactAnalysisTool(BaseTool):
             # 查找目标节点
             target_id = None
             name_lower = symbol_name.lower()
-            for nid, node in _iter_code_symbol_nodes(mg, NodeType.CODE_SYMBOL):
+            for nid, node in _iter_code_symbol_nodes(mg):
                 label = getattr(node, "label", "") or ""
                 if label.lower() == name_lower:
                     meta = _node_metadata(node)
@@ -461,11 +922,13 @@ class GetImpactAnalysisTool(BaseTool):
                     continue
 
                 # 反向边: 谁调用/依赖了 current
-                for src_id, _, data in mg._graph.in_edges(current_id, data=True):
-                    code_rel = data.get("metadata", {}).get("code_relation", "")
-                    if code_rel in ("calls", "inherits", "imports"):
-                        if src_id not in visited:
-                            queue.append((src_id, depth + 1))
+                for neighbor in mg.get_neighbors(current_id, max_depth=1):
+                    neighbor_id = getattr(neighbor, "node_id", "")
+                    if not neighbor_id or neighbor_id in visited:
+                        continue
+                    incoming_edge = _get_edge(mg, neighbor_id, current_id)
+                    if _edge_relation(incoming_edge) in ("calls", "inherits", "imports"):
+                        queue.append((neighbor_id, depth + 1))
 
             # 统计影响的文件
             affected_files = sorted(set(
@@ -508,6 +971,7 @@ class IndexCodeFileTool(BaseTool):
         )
         self.description = (
             "对代码文件执行 AST 解析并构建代码图谱（符号、调用关系、继承等）。"
+            "索引结果同步到 MemoryGraph 代码记忆；"
             "索引后可使用 search_code_symbols 和 get_symbol_context 查询。"
         )
         # 内容哈希缓存：避免未变更文件重复索引
@@ -631,7 +1095,7 @@ class IndexCodeFileTool(BaseTool):
         try:
             from zulong.code.ast_parser import ASTParser
             from zulong.code.graph_builder import CodeGraphBuilder, CodeEdge
-            from zulong.memory.memory_graph import get_memory_graph, NodeType
+            from zulong.memory.memory_graph import get_memory_graph
         except ImportError as ie:
             return self._create_result(
                 success=False,
@@ -688,12 +1152,11 @@ class IndexCodeFileTool(BaseTool):
         local_node_ids = {s.node_id for s in result.symbols}
 
         global_sym_index = {}
-        for nid, node in _iter_code_symbol_nodes(mg, NodeType.CODE_SYMBOL):
-            if node.node_type == NodeType.CODE_SYMBOL:
-                global_sym_index[node.label] = nid
-                short = node.label.rsplit(".", 1)[-1]
-                if short not in global_sym_index:
-                    global_sym_index[short] = nid
+        for nid, node in _iter_code_symbol_nodes(mg):
+            global_sym_index[node.label] = nid
+            short = node.label.rsplit(".", 1)[-1]
+            if short not in global_sym_index:
+                global_sym_index[short] = nid
 
         # import 边
         file_node_id = f"file:{file_path}"
@@ -729,27 +1192,12 @@ class IndexCodeFileTool(BaseTool):
                     ))
 
         # 增量同步
-        adapter = mg._adapters.get("code_graph")
-        if adapter is None:
-            # 防御性回退：自动注册 CodeGraphAdapter
-            try:
-                from zulong.memory.graph_adapters import CodeGraphAdapter, register_all_adapters
-                register_all_adapters(mg)
-                adapter = mg._adapters.get("code_graph")
-                logger.info("[IndexCodeFileTool] CodeGraphAdapter 自动补注册成功")
-            except Exception as reg_err:
-                return self._create_result(
-                    success=False,
-                    error=f"CodeGraphAdapter 注册失败: {reg_err}",
-                    execution_time=time.time() - start,
-                    request_id=request.request_id,
-                )
-
-        adapter.incremental_sync(mg, "file_updated", {
+        memory_sync_status, memory_sync_error = _incremental_sync_code_file_to_memory(mg, {
             "file_path": file_path,
             "symbols": result.symbols,
             "edges": edges,
-        })
+            "content_hash": content_hash,
+        }, context="IndexCodeFileTool")
 
         # 记录哈希
         self._indexed_hashes[file_path] = content_hash
@@ -767,6 +1215,8 @@ class IndexCodeFileTool(BaseTool):
                 "symbols_count": len(result.symbols),
                 "edges_count": len(edges),
                 "cross_file_edges": cross_count,
+                "memory_sync_status": memory_sync_status,
+                "memory_sync_error": memory_sync_error,
                 "symbols": [
                     {"name": s.qualified_name, "kind": s.kind,
                      "lines": f"{s.start_line}-{s.end_line}"}
@@ -797,6 +1247,8 @@ class IndexProjectTool(BaseTool):
             "对项目目录执行全量代码扫描和索引。"
             "构建完整的项目结构记忆（目录→文件→类→方法），"
             "扫描后可通过 search_code_symbols 搜索任何符号。"
+            "索引结果进入 MemoryGraph/代码记忆，并在 Web 任务图中显示为默认折叠的代码分支。"
+            "如需任务进度，请用 task_add_node 单独创建分析阶段节点。"
             "首次理解新项目时调用此工具。"
         )
 
@@ -842,6 +1294,11 @@ class IndexProjectTool(BaseTool):
         languages = params.get("languages", ["python"])
         max_files = params.get("max_files", 300)
         summary_only = params.get("summary_only", False)
+        if isinstance(languages, str):
+            languages = [languages]
+        languages = [str(lang).strip().lower() for lang in (languages or []) if str(lang).strip()]
+        if not languages:
+            languages = ["python"]
 
         if not root_dir:
             try:
@@ -874,6 +1331,76 @@ class IndexProjectTool(BaseTool):
                 request_id=request.request_id,
             )
 
+        # summary_only 模式：只扫描目录结构，不做 AST 解析
+        if summary_only:
+            return self._summary_only(root_path, languages, start, request)
+
+        try:
+            from zulong.code.ast_parser import ASTParser
+        except ImportError as ie:
+            return self._create_result(
+                success=False,
+                error=f"AST 解析器依赖模块不可用: {ie}",
+                execution_time=time.time() - start,
+                request_id=request.request_id,
+            )
+
+        # 全量构建 CodeGraph + 同步到 MemoryGraph 放入后台线程
+        # 避免阻塞 FC 循环（大型项目可能耗时 60~90 秒）
+        resolved_root = str(root_path.resolve())
+        available_languages = []
+        skipped_languages: Dict[str, str] = {}
+        for lang in languages:
+            missing_pkgs = _missing_tree_sitter_packages(lang)
+            parser = ASTParser(lang)
+            if parser.available:
+                available_languages.append(lang)
+                continue
+            if missing_pkgs:
+                reason = f"缺少依赖包: {', '.join(missing_pkgs)}"
+            else:
+                reason = "tree-sitter 解析器初始化失败，可能是语言包版本/API 不兼容"
+            skipped_languages[lang] = reason
+            logger.warning(
+                "[IndexProjectTool] 跳过语言 %s：%s (python=%s)",
+                lang,
+                reason,
+                sys.executable,
+            )
+
+        if not available_languages:
+            required_packages = {
+                lang: _required_tree_sitter_packages(lang)
+                for lang in languages
+            }
+            error = (
+                "代码图谱索引未启动：当前运行环境没有可用的 tree-sitter 语言解析器。"
+                f" 当前 Python: {sys.executable}"
+            )
+            fail_payload = {
+                "root_dir": resolved_root,
+                "requested_languages": languages,
+                "skipped_languages": skipped_languages,
+                "required_packages": required_packages,
+                "python_executable": sys.executable,
+                "python_prefix": sys.prefix,
+            }
+            logger.error("[IndexProjectTool] %s; detail=%s", error, fail_payload)
+            _broadcast_crg_index_failed(root_path.name, error, fail_payload)
+            return self._create_result(
+                success=False,
+                data={
+                    "project_name": root_path.name,
+                    "root_dir": resolved_root,
+                    "status": "indexing_failed",
+                    **fail_payload,
+                },
+                error=error,
+                status_code=500,
+                execution_time=time.time() - start,
+                request_id=request.request_id,
+            )
+
         try:
             from zulong.code.graph_builder import CodeGraphBuilder
             from zulong.memory.memory_graph import get_memory_graph
@@ -885,10 +1412,6 @@ class IndexProjectTool(BaseTool):
                 request_id=request.request_id,
             )
 
-        # summary_only 模式：只扫描目录结构，不做 AST 解析
-        if summary_only:
-            return self._summary_only(root_path, languages, start, request)
-
         mg = get_memory_graph()
         if mg is None:
             return self._create_result(
@@ -897,10 +1420,6 @@ class IndexProjectTool(BaseTool):
                 execution_time=time.time() - start,
                 request_id=request.request_id,
             )
-
-        # 全量构建 CodeGraph + 同步到 MemoryGraph 放入后台线程
-        # 避免阻塞 FC 循环（大型项目可能耗时 60~90 秒）
-        resolved_root = str(root_path.resolve())
 
         def _inject_symbols_to_tg(tg, code_graph, proj_name, file_rel_path, file_node_id):
             """将文件中的类/函数/方法符号注入到TaskGraph中"""
@@ -965,26 +1484,8 @@ class IndexProjectTool(BaseTool):
                     tg.add_h_edge(cls_node_id, meth_node_id)
 
         def _background_index():
-            """后台执行 AST 解析 + MemoryGraph 同步 + 注入任务图"""
+            """后台执行 AST 解析 + MemoryGraph 同步"""
             try:
-                from zulong.code.graph_builder import CodeGraphBuilder
-                from zulong.code.ast_parser import ASTParser
-                
-                # 🔥 修复：检查语言包可用性，过滤掉不支持的语言
-                available_languages = []
-                for lang in languages:
-                    parser = ASTParser(lang)
-                    if parser.available:
-                        available_languages.append(lang)
-                    else:
-                        logger.warning(
-                            f"[IndexProjectTool] 跳过语言 {lang}：tree-sitter 语言包未安装"
-                        )
-                
-                if not available_languages:
-                    logger.error("[IndexProjectTool] 没有可用的语言包，索引终止")
-                    return
-                
                 if len(available_languages) < len(languages):
                     logger.info(
                         f"[IndexProjectTool] 语言包检查："
@@ -999,29 +1500,53 @@ class IndexProjectTool(BaseTool):
                     max_files=max_files,
                 )
 
-                # 同步到 MemoryGraph（后端存储）
-                adapter = mg._adapters.get("code_graph")
-                if adapter is None:
-                    try:
-                        from zulong.memory.graph_adapters import register_all_adapters
-                        register_all_adapters(mg)
-                        adapter = mg._adapters.get("code_graph")
-                        logger.info("[IndexProjectTool] CodeGraphAdapter 自动补注册成功(bg)")
-                    except Exception as reg_err:
-                        logger.error(f"[IndexProjectTool] 后台索引注册失败: {reg_err}")
-                        return
+                # 同步到 MemoryGraph（后端存储）。同步失败不应阻断索引完成事件。
+                sym_count, memory_sync_status, memory_sync_error = _sync_code_graph_to_memory(
+                    mg,
+                    code_graph,
+                    context="IndexProjectTool",
+                )
 
-                if adapter is None:
-                    logger.error("[IndexProjectTool] 后台索引: adapter 为空")
-                    return
-
-                sym_count = adapter.sync(mg, code_graph)
-
-                # ── 直接从 CodeGraph 数据注入任务图（不依赖 on_batch）──
+                # ── 代码图谱同步到 MemoryGraph，同时在 TaskGraph 保留可折叠可视化分支 ──
                 try:
-                    from zulong.tools.task_tools import get_active_task_graph
+                    from zulong.tools.task_tools import get_active_task_graph, _save_active_backup
                     tg = get_active_task_graph()
-                    if tg and tg.get_node("req"):
+                    if tg and hasattr(tg, "metadata"):
+                        code_graph_meta = {
+                            "project_name": code_graph.project_name,
+                            "root_dir": code_graph.root_dir,
+                            "module_count": len(code_graph.directories),
+                            "file_count": len(code_graph.file_results),
+                            "symbol_count": sym_count,
+                            "edge_count": code_graph.edge_count,
+                            "memory_sync_status": memory_sync_status,
+                            "memory_sync_error": memory_sync_error,
+                            "source": "index_project",
+                        }
+                        tg.metadata["code_graph_summary"] = code_graph_meta
+                        _save_active_backup()
+                        if tg.on_change_callback:
+                            tg.on_change_callback("code_graph_indexed", code_graph_meta)
+                        logger.info(
+                            "[IndexProjectTool] 代码图谱已同步到 MemoryGraph，并准备写入 TaskGraph 折叠分支: "
+                            "modules=%s files=%s symbols=%s edges=%s",
+                            len(code_graph.directories),
+                            len(code_graph.file_results),
+                            sym_count,
+                            code_graph.edge_count,
+                        )
+                except Exception as tg_meta_err:
+                    logger.warning(
+                        "[IndexProjectTool] 写入任务图代码摘要失败(非致命): %s",
+                        tg_meta_err,
+                    )
+
+                # 将 CRG 结构写入 TaskGraph 供前端可视化；前端默认折叠 crg_ 分支，
+                # 任务进度/归档逻辑继续排除这些代码节点。
+                try:
+                    from zulong.tools.task_tools import get_active_task_graph, _save_active_backup
+                    tg = get_active_task_graph()
+                    if INJECT_CRG_TO_TASK_GRAPH and tg and tg.get_node("req"):
                         proj_name = code_graph.project_name or "project"
                         struct_id = f"crg_{proj_name}"
 
@@ -1231,6 +1756,10 @@ class IndexProjectTool(BaseTool):
                                         dep_count += 1
 
                         logger.info(f"[IndexProjectTool] 已注入任务图: {created_dirs} 模块, {len(code_graph.file_results)} 文件, {len(code_graph.symbols)} 符号, {dep_count} 依赖边")
+                        try:
+                            _save_active_backup()
+                        except Exception:
+                            pass
 
                         # 推送完整任务图更新到前端
                         if tg.on_change_callback:
@@ -1239,9 +1768,11 @@ class IndexProjectTool(BaseTool):
                                 "module_count": created_dirs,
                                 "file_count": len(code_graph.file_results),
                                 "symbol_count": sym_count,
+                                "memory_sync_status": memory_sync_status,
+                                "memory_sync_error": memory_sync_error,
                             })
                 except Exception as tg_err:
-                    logger.warning(f"[IndexProjectTool] 注入任务图失败(非致命): {tg_err}")
+                    logger.warning(f"[IndexProjectTool] 兼容任务图注入失败(非致命): {tg_err}")
 
                 # 广播 CRG 全量索引完成事件
                 crg_payload = {
@@ -1251,6 +1782,8 @@ class IndexProjectTool(BaseTool):
                     "edge_count": code_graph.edge_count,
                     "file_count": len(code_graph.file_results),
                     "dir_count": len(code_graph.directories),
+                    "memory_sync_status": memory_sync_status,
+                    "memory_sync_error": memory_sync_error,
                 }
                 try:
                     from zulong.ide.ide_server import _broadcast_sync
@@ -1271,26 +1804,16 @@ class IndexProjectTool(BaseTool):
                 )
             except Exception as bg_err:
                 logger.error(f"[IndexProjectTool] 后台索引异常: {bg_err}")
-                # 🔥 修复：广播失败事件到前端
-                try:
-                    from zulong.ide.ide_server import _broadcast_sync
-                    _broadcast_sync("CRG_INDEX_FAILED", {
-                        "error": str(bg_err),
-                        "project_name": root_path.name,
-                    })
-                except Exception:
-                    pass
-                try:
-                    from zulong.launcher.web_chat_router import _schedule_broadcast
-                    _schedule_broadcast({
-                        "type": "CRG_INDEX_FAILED",
-                        "payload": {
-                            "error": str(bg_err),
-                            "project_name": root_path.name,
-                        },
-                    })
-                except Exception:
-                    pass
+                _broadcast_crg_index_failed(
+                    root_path.name,
+                    str(bg_err),
+                    {
+                        "root_dir": resolved_root,
+                        "requested_languages": languages,
+                        "available_languages": available_languages,
+                        "python_executable": sys.executable,
+                    },
+                )
 
         # 启动后台线程
         t = threading.Thread(target=_background_index, daemon=True, name="CRG-IndexProject")
@@ -1302,9 +1825,22 @@ class IndexProjectTool(BaseTool):
                 "project_name": root_path.name,
                 "root_dir": resolved_root,
                 "status": "indexing_started",
+                "requested_languages": languages,
+                "available_languages": available_languages,
+                "skipped_languages": skipped_languages,
+                "python_executable": sys.executable,
+                "task_graph_precondition": (
+                    "代码图谱会同步到 MemoryGraph/代码记忆；"
+                    "Web 任务图会以默认折叠的 crg_ 分支展示代码结构。"
+                ),
+                "task_graph_note": (
+                    "代码图谱节点不参与任务完成度、归档或执行调度统计，"
+                    "需要任务进度时请用 task_add_node 创建少量分析阶段节点。"
+                ),
                 "message": (
-                    f"后台索引已启动（languages={languages}, max_files={max_files}）。"
+                    f"后台索引已启动（languages={available_languages}, max_files={max_files}）。"
                     "索引完成后将自动同步到 MemoryGraph 并广播通知。"
+                    "若当前已绑定任务图，Web 任务图会显示一个默认折叠的代码图谱分支。"
                     "你可以继续进行任务规划，无需等待索引完成。"
                 ),
             },
@@ -1352,7 +1888,10 @@ class IndexProjectTool(BaseTool):
                     {"path": d or "(root)", "files": files[:10], "file_count": len(files)}
                     for d, files in top_dirs
                 ],
-                "hint": "使用 index_project(summary_only=false) 全量索引，或用 analyze_module 逐模块深入",
+                "hint": (
+                    "创建代码图谱前先调用 task_create_plan 创建/绑定任务节点；"
+                    "然后使用 index_project(summary_only=false) 全量索引，或用 analyze_module 逐模块深入"
+                ),
             },
             execution_time=time.time() - start,
             request_id=request.request_id,
@@ -1503,20 +2042,20 @@ class AnalyzeModuleTool(BaseTool):
 
         # 可选：同步到 MemoryGraph
         synced = 0
+        memory_sync_status = None
+        memory_sync_error = None
         if index_to_memory:
             from zulong.memory.memory_graph import get_memory_graph
             mg = get_memory_graph()
             if mg:
-                adapter = mg._adapters.get("code_graph")
-                if adapter is None:
-                    try:
-                        from zulong.memory.graph_adapters import register_all_adapters
-                        register_all_adapters(mg)
-                        adapter = mg._adapters.get("code_graph")
-                    except Exception:
-                        pass
-                if adapter:
-                    synced = adapter.sync(mg, code_graph)
+                synced, memory_sync_status, memory_sync_error = _sync_code_graph_to_memory(
+                    mg,
+                    code_graph,
+                    context="AnalyzeModuleTool",
+                )
+            else:
+                memory_sync_status = "skipped"
+                memory_sync_error = "MemoryGraph 未初始化"
 
         return self._create_result(
             success=True,
@@ -1533,6 +2072,8 @@ class AnalyzeModuleTool(BaseTool):
                 "top_functions": functions[:30],
                 "imports": all_imports[:20],
                 "indexed_to_memory": synced if index_to_memory else None,
+                "memory_sync_status": memory_sync_status,
+                "memory_sync_error": memory_sync_error,
             },
             execution_time=time.time() - start,
             request_id=request.request_id,

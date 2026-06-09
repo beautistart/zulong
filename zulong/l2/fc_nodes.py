@@ -27,8 +27,96 @@ if TYPE_CHECKING:
 from zulong.l2.circuit_breaker import CircuitBreakerState
 from zulong.l2.attention_window import MAX_TOOL_RESULT_CHARS
 from zulong.l2.smart_degradation_handler import TimeoutPhase
+from zulong.l2.tool_budget import (
+    engine_tool_budget_exhausted,
+    get_engine_tool_budget,
+    get_engine_tool_calls_used,
+)
 
 logger = logging.getLogger(__name__)
+
+
+_PROTECTED_MUTATION_TOOLS = {
+    "ide_write_file",
+    "write_to_file",
+    "replace_in_file",
+    "delete_file",
+    "execute_command",
+    "create_directory",
+}
+
+_LOCAL_MUTATION_TOOLS = {
+    "exec_write_file",
+    "exec_run_command",
+}
+
+_APPROVAL_DENIAL_MARKERS = (
+    "用户未",
+    "用户拒绝",
+    "审批拒绝",
+    "审批超时",
+    "审批未通过",
+    "审批未完成",
+    "未允许",
+    "未应用",
+    "未真实存在",
+    "尚未受信任",
+    "workspace_trust",
+    "approval_blocked",
+)
+
+
+def _tool_result_failed(result_text: str) -> bool:
+    """Return True when a tool result is structurally or textually failed."""
+    raw = str(result_text or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = _json.loads(raw)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, dict):
+        if parsed.get("ok") is True or parsed.get("success") is True:
+            return False
+        if parsed.get("ok") is False or parsed.get("success") is False:
+            return True
+        if parsed.get("error"):
+            return True
+    head = raw[:240].lower()
+    return (
+        '"error"' in head
+        or " error" in head
+        or head.startswith("error")
+        or "失败" in head
+        or "异常" in head
+    )
+
+
+def _is_protected_mutation_block(tool_name: str, result_text: str) -> bool:
+    """Detect write/command approval denials that must stop the FC loop.
+
+    TSD §23.4 requires approval to be an execution gate. If VS Code rejects or
+    times out while a mutation is pending, L2 must not switch to an internal
+    write/command tool to bypass the user's decision. A normal non-zero command
+    result is only an observation; it should remain recoverable by later nodes.
+    """
+    if tool_name not in _PROTECTED_MUTATION_TOOLS:
+        return False
+    raw = str(result_text or "")
+    if not raw:
+        return False
+    lowered = raw.lower()
+    return any(marker.lower() in lowered for marker in _APPROVAL_DENIAL_MARKERS)
+
+
+def _approval_block_response(tool_name: str, result_text: str) -> str:
+    preview = " ".join(str(result_text or "").split())[:260]
+    return (
+        "任务已暂停并标记为 blocked：受保护的写入/命令操作未获得用户审批"
+        f"（工具：{tool_name}）。"
+        "为遵循审批边界，祖龙不会改用内部写文件或命令工具绕过本次拒绝。"
+        + (f"\n结果摘要：{preview}" if preview else "")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -90,8 +178,12 @@ def _make_check_node(engine: "InferenceEngine"):
             return {"fc_turn": fc_turn, "should_terminate": "hard_limit"}
 
         # 中断信号检查
-        with engine._lock:
-            interrupted = engine._interrupt_flag
+        is_interrupt_requested = getattr(engine, "_is_interrupt_requested", None)
+        if callable(is_interrupt_requested):
+            interrupted = bool(is_interrupt_requested())
+        else:
+            with engine._lock:
+                interrupted = engine._interrupt_flag
         if interrupted:
             logger.info(f"[FC][Graph] Turn {fc_turn}: 检测到中断信号，终止 FC 循环")
             # 保留最后一个有效回复而非空字符串
@@ -140,8 +232,29 @@ def _make_call_model_node(engine: "InferenceEngine"):
         }
 
         # 传入工具定义
-        if cb_force_no_tools:
+        tool_budget = get_engine_tool_budget(engine)
+        tool_used = get_engine_tool_calls_used(engine)
+        if tool_budget is not None and tool_used >= tool_budget:
+            logger.info(
+                "[FC][Graph] 工具预算已用尽: used=%s budget=%s，移除工具定义",
+                tool_used,
+                tool_budget,
+            )
+        elif cb_force_no_tools:
             logger.info("[FC][Graph][CB] Circuit Breaker RED: 强制文本回复，移除所有工具定义")
+            try:
+                _has_uncompleted, _next_node = _task_graph_uncompleted_context()
+                if _has_uncompleted and not engine_tool_budget_exhausted(engine):
+                    cb_force_no_tools = False
+                    state["cb_force_no_tools"] = False
+                    api_kwargs["tools"] = tool_definitions
+                    api_kwargs["tool_choice"] = "auto"
+                    logger.warning(
+                        "[FC][Graph][CB] 任务图仍有未完成节点，恢复工具定义供模型继续执行: %s",
+                        getattr(_next_node, "id", ""),
+                    )
+            except Exception as cb_restore_err:
+                logger.debug("[FC][Graph][CB] 恢复工具定义检查失败: %s", cb_restore_err)
         elif tool_definitions:
             api_kwargs["tools"] = tool_definitions
             if forced_first_tool_name and fc_turn == 1:
@@ -174,7 +287,23 @@ def _make_call_model_node(engine: "InferenceEngine"):
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
             future = executor.submit(_call)
-            api_response = future.result(timeout=engine._fc_loop_timeout)
+            wait_with_interrupt = getattr(engine, "_wait_future_with_interrupt", None)
+            if callable(wait_with_interrupt):
+                api_response = wait_with_interrupt(
+                    future,
+                    engine._fc_loop_timeout,
+                    label=f"[FC][Graph] Turn {fc_turn}",
+                )
+            else:
+                api_response = future.result(timeout=engine._fc_loop_timeout)
+        except InterruptedError:
+            logger.info(f"[FC][Graph] Turn {fc_turn}: 模型调用被用户停止")
+            return {
+                "response": state.get("response") or state.get("response_content") or "",
+                "should_terminate": "interrupt",
+                "tool_calls_data": None,
+                "response_content": None,
+            }
         except concurrent.futures.TimeoutError:
             logger.warning(
                 f"⚠️ [FC][Graph] Turn {fc_turn} 超时 (>{engine._fc_loop_timeout}s)，继续尝试..."
@@ -416,6 +545,7 @@ def _make_exec_tools_node(engine: "InferenceEngine"):
             logger.info(f"[FC][Graph] 工具 {tool_name} 结果: {result_text[:200]}")
             tool_results_buffer.append({
                 "tool_name": tool_name,
+                "reason": _extract_tool_call_reason(response_content, tool_name),
                 "result": result_text,
             })
 
@@ -423,6 +553,25 @@ def _make_exec_tools_node(engine: "InferenceEngine"):
             engine._publish_task_graph_event(
                 "agent_tool_call", fc_turn, tool_name, result_text, tc_data.get("id", ""),
             )
+
+            if _is_protected_mutation_block(tool_name, result_text):
+                block_response = _approval_block_response(tool_name, result_text)
+                logger.warning(
+                    "[FC][Graph] 受保护变更工具被拒绝/失败，硬阻断后续工具: %s",
+                    tool_name,
+                )
+                setattr(engine, "_approval_block_active", True)
+                setattr(engine, "_last_fc_terminate_reason", "approval_blocked")
+                return {
+                    "response": block_response,
+                    "cb_force_no_tools": True,
+                    "tool_calls_data": None,
+                    "response_content": None,
+                    "should_terminate": "approval_blocked",
+                    "_bfs_first_run": True,
+                    "_bfs_memory_triggered": False,
+                    "_bfs_attention_triggered": False,
+                }
 
         # Circuit Breaker: 本轮所有工具执行完毕，评估状态
         cb_state, cb_reason = engine._circuit_breaker.evaluate(fc_turn, messages)
@@ -647,57 +796,77 @@ def _make_eval_response_node(engine: "InferenceEngine"):
 
         # CB 强制收敛：接受回复，跳过 Rule A 和 InfoGap
         if cb_force_no_tools:
+            synthesized = _synthesize_cleanup_report_from_tool_results(
+                tool_results_buffer,
+                state.get("user_input_text", ""),
+            )
+            if response and _looks_like_incomplete_result(response) and synthesized:
+                logger.info(
+                    "[FC][Graph][CB] 用已完成工具结果替换失败式收敛回复，长度=%s",
+                    len(synthesized),
+                )
+                response = synthesized
             # 空回复保护：CB RED 后模型可能返回空字符串，此时使用降级回复
             if not response or len(response.strip()) < 10:
                 logger.warning(
                     f"[FC][Graph][CB] Circuit Breaker 强制回复为空(len={len(response)})，生成降级回复"
                 )
-                # 优先利用工具结果缓冲区中的内容生成回复
-                fallback = ""
-                if tool_results_buffer:
-                    useful_results = [
-                        r["result"][:300] for r in tool_results_buffer
-                        if r.get("result") and len(r.get("result", "")) > 20
-                        and "error" not in r.get("result", "").lower()[:50]
-                        # 过滤 JSON 结构化工具输出（task_view_overview 等返回的 JSON）
-                        and not r.get("result", "").lstrip().startswith(("{", "["))
-                    ]
-                    if useful_results:
-                        fallback = (
-                            "系统当前出问题了，LLM 触发循环保护后没有生成有效回复，"
-                            "因此无法正常回复。\n已收集到的工具信息如下，仅供排查：\n"
-                            + "\n".join(useful_results[:3])
-                        )
-                # 其次利用任务图生成进度报告
-                if not fallback:
-                    try:
-                        from zulong.tools.task_tools import get_active_task_graph as _get_tg_fb
-                        _fb_tg = _get_tg_fb()
-                        if _fb_tg:
-                            _fb_title = _fb_tg.title or "当前任务"
-                            _fb_leaves = _fb_tg.get_leaf_nodes()
-                            _fb_completed = [n for n in _fb_leaves if n.status == "completed"]
-                            _fb_uncompleted = [n for n in _fb_leaves if n.status not in ("completed", "skipped")]
-                            fallback = (
-                                "系统当前出问题了，LLM 触发循环保护后没有生成有效回复，"
-                                "因此无法正常回复。\n"
-                                f"当前任务「{_fb_title}」进度：{len(_fb_completed)}/{len(_fb_leaves)} 完成。"
-                            )
-                            if _fb_uncompleted:
-                                fallback += f"\n下一步需要执行：{_fb_uncompleted[0].label}。"
-                    except Exception:
-                        pass
-                # 最后使用引擎降级
-                if not fallback:
-                    fallback = engine._get_fallback_response(
-                        state.get("user_input_text", "")
+                if synthesized:
+                    response = synthesized
+                    logger.info(
+                        "[FC][Graph][CB] 已根据工具结果生成收敛汇报，长度=%s",
+                        len(response),
                     )
-                response = fallback
+                else:
+                    # 优先利用工具结果缓冲区中的内容生成回复
+                    fallback = ""
+                    if tool_results_buffer:
+                        useful_results = [
+                            r["result"][:300] for r in tool_results_buffer
+                            if r.get("result") and len(r.get("result", "")) > 20
+                            and "error" not in r.get("result", "").lower()[:50]
+                            # 过滤 JSON 结构化工具输出（task_view_overview 等返回的 JSON）
+                            and not r.get("result", "").lstrip().startswith(("{", "["))
+                        ]
+                        if useful_results:
+                            fallback = (
+                                "已停止继续调用工具。我根据已经拿到的工具结果整理如下：\n"
+                                + "\n".join(useful_results[:3])
+                            )
+                    # 其次利用任务图生成进度报告
+                    if not fallback:
+                        try:
+                            from zulong.tools.task_tools import get_active_task_graph as _get_tg_fb
+                            _fb_tg = _get_tg_fb()
+                            if _fb_tg:
+                                _fb_title = _fb_tg.title or "当前任务"
+                                _fb_leaves = _fb_tg.get_leaf_nodes()
+                                _fb_completed = [n for n in _fb_leaves if n.status == "completed"]
+                                _fb_uncompleted = [n for n in _fb_leaves if n.status not in ("completed", "skipped")]
+                                fallback = (
+                                    "已停止继续调用工具。我根据当前任务图整理进度：\n"
+                                    f"当前任务「{_fb_title}」进度：{len(_fb_completed)}/{len(_fb_leaves)} 完成。"
+                                )
+                                if _fb_uncompleted:
+                                    fallback += f"\n下一步需要执行：{_fb_uncompleted[0].label}。"
+                        except Exception:
+                            pass
+                    # 最后使用引擎降级
+                    if not fallback:
+                        fallback = engine._get_fallback_response(
+                            state.get("user_input_text", "")
+                        )
+                    response = fallback
             # CB 路径下也执行 Backfill：回填任务图节点内容
             # 质量检查：如果回复主要是 JSON/结构化工具输出，跳过 Backfill 防止数据污染
             _json_chars = sum(1 for c in response if c in '{}[]":,')
             _is_structured = (_json_chars / max(len(response), 1)) > 0.12
-            if response and len(response) > 100 and not _is_structured:
+            if (
+                response
+                and len(response) > 100
+                and not _is_structured
+                and not _looks_like_incomplete_result(response)
+            ):
                 try:
                     from zulong.tools.task_tools import get_active_task_graph as _get_tg_cb
                     from zulong.tools.task_tools import _save_active_backup
@@ -715,6 +884,12 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                                     _cb_content = _extract_node_content(
                                         response, _cb_node.label, max_len=500,
                                     )
+                                    if _looks_like_incomplete_result(_cb_content):
+                                        logger.info(
+                                            "[FC][Graph][CB][Backfill] 跳过未完成片段: "
+                                            f"{_cb_node.id}({_cb_node.label})"
+                                        )
+                                        continue
                                     _cb_tg.update_node_status(
                                         _cb_node.id, "completed", result=_cb_content,
                                     )
@@ -923,6 +1098,7 @@ def _make_eval_response_node(engine: "InferenceEngine"):
             and resume_automark_count < _MAX_CONTINUE_AUTOMARKS
             and not response.rstrip().endswith(("?", "\uff1f"))
             and not _is_filler_content(response)
+            and not _looks_like_incomplete_result(response)
         ):
             try:
                 from zulong.tools.task_tools import get_active_task_graph as _get_tg_am
@@ -943,6 +1119,11 @@ def _make_eval_response_node(engine: "InferenceEngine"):
 
                         # 自动标记完成
                         result_text = response[:500]
+                        if _looks_like_incomplete_result(result_text):
+                            return {
+                                "response": response,
+                                "should_terminate": "done",
+                            }
                         tg.update_node_status(target.id, "completed", result=result_text)
                         try:
                             _save_active_backup()
@@ -993,12 +1174,8 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                                 "resume_automark_count": resume_automark_count + 1,
                                 "should_terminate": "",
                                 "null_response_count": new_null_count,
+                                "cb_force_no_tools": False,
                             }
-                            if new_null_count >= 2:
-                                result["cb_force_no_tools"] = True
-                                logger.info(
-                                    f"[FC][ContinueTaskGraph][AutoMark] 拦截次数达 {new_null_count}，注入 CB 强制收敛"
-                                )
                             return result
                         else:
                             logger.info(
@@ -1059,6 +1236,7 @@ def _make_eval_response_node(engine: "InferenceEngine"):
             and len(response) > 100
             and not response.rstrip().endswith(("?", "\uff1f"))
             and not _is_filler_content(response)
+            and not _looks_like_incomplete_result(response)
         ):
             try:
                 from zulong.tools.task_tools import get_active_task_graph as _get_tg_bf
@@ -1079,7 +1257,10 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                                 response, node.label, max_len=500,
                             )
                             # 只有在回复中确实找到匹配内容时才标记完成
-                            if _has_content_match(response, node.label):
+                            if (
+                                _has_content_match(response, node.label)
+                                and not _looks_like_incomplete_result(node_content)
+                            ):
                                 tg.update_node_status(
                                     node.id, "completed", result=node_content,
                                 )
@@ -1163,10 +1344,9 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                         }
                         # 多次空回复后强制收敛，避免无限循环
                         if new_null_count >= 2:
-                            result["cb_force_no_tools"] = True
                             logger.info(
                                 f"[FC][Graph][EmptyGuard] 空回复拦截次数达 "
-                                f"{new_null_count}，注入 CB 强制收敛"
+                                f"{new_null_count}，任务图未完成，继续保留工具执行能力"
                             )
                         return result
             except Exception as eg_err:
@@ -1203,12 +1383,17 @@ def _make_eval_response_node(engine: "InferenceEngine"):
 
         # ── 未完成任务拦截 ─────────────────────────────────────
         # IDE runner 已有这层防护。补入核心节点后，普通 L2 FC 循环在
-        # 大量叶子任务仍未完成时不会过早接受最终文本。
-        if response and len(response.strip()) >= 10 and not _is_filler_content(response):
+        # 叶子任务仍未完成时不会过早接受最终文本。短进度句/填充句也
+        # 必须拦截，避免 “继续编写...” 被当成最终回复。
+        if (
+            response
+            and len(response.strip()) >= 6
+            and not _looks_like_incomplete_result(response)
+        ):
             try:
                 from zulong.tools.task_tools import get_active_task_graph as _get_tg_uc
                 tg_uc = _get_tg_uc()
-                if tg_uc and state.get("null_response_count", 0) < 4:
+                if tg_uc:
                     leaves_uc = tg_uc.get_leaf_nodes()
                     user_leaves_uc = [
                         n for n in leaves_uc
@@ -1256,9 +1441,8 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                             "response": None,
                             "should_terminate": "",
                             "null_response_count": new_null_count,
+                            "cb_force_no_tools": False,
                         }
-                        if new_null_count >= 2:
-                            result["cb_force_no_tools"] = True
                         return result
             except Exception as uc_err:
                 logger.warning(f"[FC][Graph][UncompletedGuard] 异常: {uc_err}")
@@ -1378,6 +1562,332 @@ def _is_filler_content(text: str) -> bool:
     if filler_count >= 2:
         return True
     return False
+
+
+def _looks_like_audit_or_cleanup_report(text: str) -> bool:
+    stripped = str(text or "").strip()
+    if len(stripped) < 40:
+        return False
+    report_shape = ("汇报", "报告", "清单", "列表", "总览", "如下")
+    cleanup_context = (
+        "记忆",
+        "节点",
+        "挂起任务",
+        "历史任务",
+        "未完成任务",
+        "经验",
+        "清理",
+        "删除",
+        "候选",
+        "blocked",
+    )
+    return (
+        any(marker in stripped for marker in report_shape)
+        and sum(1 for marker in cleanup_context if marker.lower() in stripped.lower()) >= 2
+    )
+
+
+def _looks_like_incomplete_result(text: str) -> bool:
+    """Detect blockage/status prose that must not be backfilled as completed."""
+    raw = str(text or "")
+    if not raw:
+        return False
+    lowered = raw.lower()
+    hard_system_markers = (
+        "任务执行中断",
+        "强制收敛",
+        "无法正常回复",
+        "系统当前出问题",
+        "安全防护触发",
+        "触发循环保护",
+    )
+    if any(marker.lower() in lowered for marker in hard_system_markers):
+        return True
+    if _looks_like_audit_or_cleanup_report(raw):
+        return False
+    hard_blockers = (
+        "阻塞",
+        "被阻塞",
+        "无法运行测试",
+        "无法验证",
+        "无法完成",
+        "不能完成",
+        "审批拒绝",
+        "审批超时",
+        "用户未应用",
+        "用户拒绝",
+        "未应用写入",
+        "未真实存在",
+        "workspace_trust",
+        "approval_blocked",
+        "blocked",
+        "timed out",
+        "timeout",
+        "interrupted",
+    )
+    if any(marker.lower() in lowered for marker in hard_blockers):
+        return True
+
+    success_markers = (
+        "全部通过",
+        "测试通过",
+        "全部测试通过",
+        "ran ",
+        "\nok",
+        " ok",
+        "无失败",
+        "0 failed",
+        '"failed_count": 0',
+        "'failed_count': 0",
+    )
+    has_success = any(marker.lower() in lowered for marker in success_markers)
+    soft_failures = (
+        "工具执行失败",
+        "命令执行失败",
+        "测试失败",
+        "语法错误",
+        "returncode=1",
+        "returncode\": 1",
+        "syntaxerror",
+        "traceback",
+        "failed (",
+        "failed=",
+        "error:",
+        " errors=",
+    )
+    if not has_success and any(marker.lower() in lowered for marker in soft_failures):
+        return True
+
+    positive_markers = (
+        "已创建",
+        "已生成",
+        "已写入",
+        "已完成",
+        "已实现",
+        "创建成功",
+        "写入成功",
+        "生成成功",
+    )
+    if any(marker in raw for marker in positive_markers):
+        return False
+    markers = (
+        "任务执行中断",
+        "强制收敛",
+        "未产出",
+        "进行中但未产出",
+        "尚未完成",
+        "还未完成",
+        "未完成节点",
+        "未生成",
+        "未创建",
+        "没有产出",
+        "触发循环保护",
+        "系统当前出问题",
+        "stalled",
+    )
+    return any(marker.lower() in lowered for marker in markers)
+
+
+def _synthesize_cleanup_report_from_tool_results(
+    tool_results_buffer: List[Dict],
+    user_input: str = "",
+) -> str:
+    """Build a user-facing cleanup summary from completed structured tools."""
+    if not tool_results_buffer:
+        return ""
+
+    deleted_memory_count = 0
+    protected_memory_count = 0
+    not_found_memory_count = 0
+    preview_count = 0
+    preview_keywords: List[str] = []
+    deleted_samples: List[str] = []
+    task_list_count: Optional[int] = None
+    task_samples: List[str] = []
+    removed_task_count = 0
+    removed_task_samples: List[str] = []
+    deleted_edge_count = 0
+    errors: List[str] = []
+    reasons: List[str] = []
+
+    for item in tool_results_buffer or []:
+        tool_name = str(item.get("tool_name") or "")
+        reason = str(item.get("reason") or "").strip()
+        if reason:
+            reasons.append(_compact_line(reason, 96))
+        result_text = str(item.get("result") or "").strip()
+        if not tool_name or not result_text:
+            continue
+        payload: Any
+        try:
+            payload = _json.loads(result_text)
+        except Exception:
+            payload = {"message": result_text}
+        if not isinstance(payload, dict):
+            payload = {"data": payload}
+
+        if payload.get("error"):
+            errors.append(f"{tool_name}: {str(payload.get('error'))[:120]}")
+            continue
+
+        if tool_name == "delete_memory_node":
+            if payload.get("action") == "preview":
+                candidates = payload.get("candidates") or []
+                preview_count += len(candidates) if isinstance(candidates, list) else 0
+                keyword = payload.get("keyword")
+                if keyword:
+                    preview_keywords.append(str(keyword))
+                continue
+            deleted = payload.get("deleted") or []
+            deleted_memory_count += int(payload.get("deleted_count") or 0)
+            protected_memory_count += int(payload.get("protected_count") or 0)
+            not_found = payload.get("not_found") or []
+            if isinstance(not_found, list):
+                not_found_memory_count += len(not_found)
+            if isinstance(deleted, list):
+                for node in deleted[:5]:
+                    if isinstance(node, dict):
+                        label = str(node.get("label") or node.get("node_id") or "")
+                        if label:
+                            deleted_samples.append(_compact_line(label, 48))
+
+        elif tool_name == "delete_memory_edge":
+            deleted_edge_count += int(payload.get("deleted_count") or 0)
+
+        elif tool_name == "task_list_suspended":
+            if "count" in payload:
+                task_list_count = int(payload.get("count") or 0)
+            tasks = payload.get("tasks") or []
+            if isinstance(tasks, list):
+                task_list_count = len(tasks) if task_list_count is None else task_list_count
+                for task in tasks[:5]:
+                    if isinstance(task, dict):
+                        label = (
+                            task.get("description")
+                            or task.get("title")
+                            or task.get("task_id")
+                        )
+                        if label:
+                            task_samples.append(_compact_line(str(label), 48))
+
+        elif tool_name == "task_remove_node":
+            removed = payload.get("removed_ids") or []
+            removed_count = int(payload.get("removed_count") or 0)
+            removed_task_count += removed_count
+            if isinstance(removed, list):
+                removed_task_samples.extend(str(x) for x in removed[:5])
+
+    has_cleanup_signal = any((
+        deleted_memory_count,
+        protected_memory_count,
+        not_found_memory_count,
+        preview_count,
+        task_list_count is not None,
+        removed_task_count,
+        deleted_edge_count,
+        errors,
+    ))
+    if not has_cleanup_signal:
+        return ""
+
+    lines = ["我已停止继续调用工具，并根据已经返回的结果整理清理汇报："]
+    if reasons:
+        lines.append(f"- 执行意图：{'；'.join(dict.fromkeys(reasons[:3]))}。")
+    if deleted_memory_count:
+        lines.append(f"- 已删除记忆节点：{deleted_memory_count} 个。")
+    if deleted_edge_count:
+        lines.append(f"- 已删除记忆边：{deleted_edge_count} 条。")
+    if removed_task_count:
+        lines.append(f"- 已从任务图移除节点：{removed_task_count} 个。")
+    if task_list_count is not None:
+        lines.append(f"- 已查询挂起任务：{task_list_count} 个。")
+    if preview_count:
+        kws = "、".join(dict.fromkeys(preview_keywords[:6]))
+        suffix = f"（关键词：{kws}）" if kws else ""
+        lines.append(f"- 已预览待删除候选：{preview_count} 个{suffix}，尚未确认删除。")
+    if protected_memory_count:
+        lines.append(f"- 受保护未删除：{protected_memory_count} 个核心记忆。")
+    if not_found_memory_count:
+        lines.append(f"- 未找到：{not_found_memory_count} 个节点。")
+    if deleted_samples:
+        samples = "；".join(dict.fromkeys(deleted_samples[:5]))
+        lines.append(f"- 删除样例：{samples}。")
+    if task_samples:
+        samples = "；".join(dict.fromkeys(task_samples[:5]))
+        lines.append(f"- 挂起任务样例：{samples}。")
+    if removed_task_samples:
+        samples = "、".join(dict.fromkeys(removed_task_samples[:8]))
+        lines.append(f"- 移除节点样例：{samples}。")
+    if errors:
+        lines.append("- 工具错误：" + "；".join(errors[:3]) + "。")
+    if "不要删除经验" in str(user_input or ""):
+        lines.append("- 已按要求保留经验类记忆；未把经验清理计入删除目标。")
+    if not (deleted_memory_count or deleted_edge_count or removed_task_count):
+        lines.append("- 当前只拿到了查询/预览结果，未看到确认删除已经完成。")
+    lines.append("后续若继续清理，应基于上述候选分批确认，避免误删。")
+    return "\n".join(lines)
+
+
+def _compact_line(text: str, max_len: int = 64) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= max_len:
+        return compact
+    return compact[: max_len - 3].rstrip() + "..."
+
+
+def _extract_tool_call_reason(text: str, tool_name: str, max_len: int = 160) -> str:
+    """Extract the model's own short explanation for a tool call when present."""
+    raw = " ".join(str(text or "").split())
+    if not raw:
+        return ""
+    tool = str(tool_name or "")
+    candidates: List[str] = []
+    for marker in [m for m in (tool, "调用", "工具", "为了", "因为", "用于", "需要") if m]:
+        idx = raw.find(marker)
+        if idx >= 0:
+            start = max(0, idx - 50)
+            end = min(len(raw), idx + max_len)
+            candidates.append(raw[start:end].strip(" ，。；;:："))
+    if not candidates:
+        return ""
+    best = min(candidates, key=len)
+    if len(best) <= max_len:
+        return best
+    return best[: max_len - 3].rstrip() + "..."
+
+
+def _task_graph_uncompleted_context():
+    """Return (has_uncompleted, next_node) for the active user task graph."""
+    try:
+        from zulong.tools.task_tools import get_active_task_graph
+        tg = get_active_task_graph()
+    except Exception:
+        return False, None
+    if not tg:
+        return False, None
+    try:
+        leaves = [
+            n for n in tg.get_leaf_nodes()
+            if not getattr(n, "id", "").startswith("crg_")
+        ]
+    except Exception:
+        leaves = []
+    if not leaves:
+        req_node = tg.get_node("req") if hasattr(tg, "get_node") else None
+        if req_node and getattr(req_node, "status", "") not in ("completed", "skipped"):
+            return True, req_node
+        return False, None
+    uncompleted = [
+        n for n in leaves
+        if getattr(n, "status", "") not in ("completed", "skipped")
+    ]
+    if not uncompleted:
+        return False, None
+    current = next(
+        (n for n in uncompleted if getattr(n, "status", "") == "in_progress"),
+        uncompleted[0],
+    )
+    return True, current
 
 
 def _check_file_operation_truth(

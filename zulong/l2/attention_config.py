@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 class AttentionConfig:
     """注意力选择配置类"""
     enabled: bool = True                          # 功能开关
-    pressure_threshold_high: float = 0.9          # 高压阈值
-    pressure_threshold_medium: float = 0.75       # 中压阈值
+    pressure_threshold_high: float = 0.6          # 高压阈值
+    pressure_threshold_medium: float = 0.5        # 中压阈值
     cooldown_base_seconds: float = 30.0           # 基础冷却时间(秒)
     fallback_mode: str = "FOCUS"                  # Fallback模式
     decision_timeout_ms: int = 500                # 决策超时(毫秒)

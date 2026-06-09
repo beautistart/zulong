@@ -243,7 +243,7 @@ def test_cloud_tts():
     
     client = CloudTTSClient(provider="edge", voice="zh-CN-XiaoxiaoNeural")
     
-    output_dir = r"d:\AI\project\zulong_beta5\tests\tts_output"
+    output_dir = os.path.join(os.getcwd(), "tests", "tts_output")
     os.makedirs(output_dir, exist_ok=True)
     
     test_cases = [

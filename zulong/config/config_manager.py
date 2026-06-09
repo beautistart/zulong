@@ -3,6 +3,7 @@
 # 支持多环境、多后端配置，环境变量覆盖
 
 import os
+import platform
 import re
 import yaml
 from pathlib import Path
@@ -11,6 +12,51 @@ from functools import lru_cache
 
 import logging
 logger = logging.getLogger(__name__)
+
+_local_env_loaded = False
+
+
+def _load_local_env_files_once() -> None:
+    """Load ignored local env files before YAML variable substitution."""
+    global _local_env_loaded
+    if _local_env_loaded:
+        return
+    _local_env_loaded = True
+
+    if os.environ.get("ZULONG_SKIP_LOCAL_ENV", "false").lower() in {"1", "true", "yes"}:
+        return
+
+    candidates: List[Path] = []
+    explicit_env = os.environ.get("ZULONG_ENV_FILE")
+    if explicit_env:
+        candidates.append(Path(explicit_env))
+    project_root = Path(__file__).resolve().parent.parent.parent
+    candidates.append(project_root / "config" / ".env")
+
+    for env_path in candidates:
+        if not env_path.exists():
+            continue
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("export "):
+                        line = line[len("export "):].strip()
+                    if "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    if not key or re.search(r"\s", key):
+                        continue
+                    value = value.strip()
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                        value = value[1:-1]
+                    os.environ.setdefault(key, os.path.expandvars(value))
+            logger.info(f"📄 已加载本地环境变量文件：{env_path}")
+        except Exception as e:
+            logger.warning(f"⚠️ 本地环境变量文件加载失败 [{env_path}]: {e}")
 
 
 class ConfigManager:
@@ -43,15 +89,19 @@ class ConfigManager:
         """
         if hasattr(self, '_initialized') and self._initialized:
             return
+
+        _load_local_env_files_once()
         
         self.config_path = config_path or self._find_config_file()
         self.config: Dict[str, Any] = {}
         self.environment = os.environ.get("ZULONG_ENV", "production")
+        self.platform_profile = os.environ.get("ZULONG_PLATFORM_PROFILE") or self._detect_platform_profile()
         self._load_config()
         self._initialized = True
         
         logger.info(f"✅ ConfigManager 已初始化: {self.config_path}")
         logger.info(f"   环境：{self.environment}")
+        logger.info(f"   平台Profile：{self.platform_profile}")
     
     def _find_config_file(self) -> str:
         """查找配置文件"""
@@ -73,6 +123,27 @@ class ConfigManager:
         
         # 如果都没找到，返回默认路径
         return "config/zulong_config.yaml"
+
+    def _detect_platform_profile(self) -> str:
+        """检测当前平台 profile 名称。"""
+        system = platform.system().lower()
+        if system.startswith("win"):
+            return "windows"
+        if system == "darwin":
+            return "macos"
+        if system == "linux":
+            return "linux"
+        return "default"
+
+    def _profile_path(self) -> Optional[Path]:
+        """返回当前平台 profile 路径；不存在则返回 None。"""
+        if not self.platform_profile or self.platform_profile == "default":
+            return None
+        config_dir = Path(self.config_path).resolve().parent
+        profile_path = config_dir / "profiles" / f"{self.platform_profile}.yaml"
+        if profile_path.exists():
+            return profile_path
+        return None
     
     def _load_config(self) -> None:
         """加载配置文件"""
@@ -85,6 +156,9 @@ class ConfigManager:
             
             # 应用环境特定配置覆盖
             self._apply_environment_overrides()
+
+            # 应用平台配置覆盖
+            self._apply_platform_profile()
             
             # 缓存配置
             ConfigManager._config_cache = self.config
@@ -128,7 +202,8 @@ class ConfigManager:
                     return match.group(0)  # 保留原样
                 return value
             
-            return re.sub(pattern, replace, config)
+            substituted = re.sub(pattern, replace, config)
+            return os.path.expanduser(os.path.expandvars(substituted))
         else:
             return config
     
@@ -141,6 +216,23 @@ class ConfigManager:
         self._merge_config(self.config, env_config)
         
         logger.info(f"🔧 已应用 [{self.environment}] 环境配置覆盖")
+
+    def _apply_platform_profile(self) -> None:
+        """应用 Windows/Linux/macOS 平台 profile 覆盖。"""
+        profile_path = self._profile_path()
+        if not profile_path:
+            logger.info(f"ℹ️ 未找到平台 profile，跳过: {self.platform_profile}")
+            return
+
+        try:
+            with open(profile_path, 'r', encoding='utf-8') as f:
+                raw_profile = yaml.safe_load(f) or {}
+            profile_config = self._substitute_env_variables(raw_profile)
+            self._merge_config(self.config, profile_config)
+            logger.info(f"🔧 已应用平台 profile [{self.platform_profile}]: {profile_path}")
+        except Exception as e:
+            logger.error(f"❌ 平台 profile 加载失败 [{profile_path}]: {e}")
+            raise
     
     def _merge_config(self, base: Dict[str, Any], override: Dict[str, Any]) -> None:
         """
@@ -301,24 +393,12 @@ def get_llm_config(backend: Optional[str] = None) -> Dict[str, Any]:
         LLM 配置字典
     """
     config_manager = get_config_manager()
-    
-    if backend is None:
-        backend = config_manager.get('llm.backend', 'ollama')
-    
-    backend_config = config_manager.get_dict(f'llm.{backend}', {})
-    
-    # 合并通用配置
-    llm_config = {
-        'backend': backend,
-        'base_url': backend_config.get('base_url', 'http://localhost:11434/v1'),
-        'api_key': backend_config.get('api_key', 'EMPTY'),
-        'model_id': backend_config.get('model_id', 'qwen3.5:4b'),
-    }
-    
-    # 添加后端特定配置
-    llm_config.update(backend_config)
-    
-    return llm_config
+    from zulong.adapters.backend_resolver import resolve_llm_backend
+
+    resolution = resolve_llm_backend(config_manager.config, backend)
+    for warning in resolution.warnings:
+        logger.warning(f"⚠️ [LLM] {warning}")
+    return resolution.to_config()
 
 
 def get_l2_inference_config() -> Dict[str, Any]:

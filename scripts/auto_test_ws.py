@@ -10,7 +10,7 @@ import time
 from typing import Dict, Any
 
 # 配置
-WEBSOCKET_URL = "ws://localhost:5555"
+WEBSOCKET_URL = "ws://127.0.0.1:8090/ws"
 
 class ZulongWebSocketTester:
     """祖龙系统 WebSocket 自动化测试器"""
@@ -33,12 +33,9 @@ class ZulongWebSocketTester:
     async def send_message(self, message: str) -> str:
         """发送消息并等待回复"""
         try:
-            # 发送消息到 WebSocket（使用正确的事件格式）
+            # 发送消息到祖龙 Web 主通道
             event = {
-                "id": str(time.time()),
-                "type": "USER_TEXT",
-                "priority": 1,
-                "source": "openclaw/web_ui",
+                "type": "CHAT_MESSAGE",
                 "payload": {
                     "text": message
                 },

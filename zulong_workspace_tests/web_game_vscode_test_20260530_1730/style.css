@@ -1,0 +1,136 @@
+/* ===== 星尘接球 — 样式表 ===== */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    background: linear-gradient(135deg, #0a0a2e 0%, #1a1a4e 50%, #0d0d35 100%);
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+    color: #e0e0ff;
+}
+
+#game-container {
+    text-align: center;
+    background: rgba(20, 20, 60, 0.85);
+    border-radius: 20px;
+    padding: 24px 32px;
+    box-shadow: 0 0 40px rgba(100, 100, 255, 0.3), 0 0 80px rgba(80, 80, 200, 0.15);
+    border: 1px solid rgba(120, 120, 255, 0.25);
+}
+
+h1 {
+    font-size: 2rem;
+    margin-bottom: 12px;
+    background: linear-gradient(90deg, #ffd700, #ffaa00, #ffd700);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    text-shadow: none;
+    letter-spacing: 2px;
+}
+
+#hud {
+    display: flex;
+    justify-content: center;
+    gap: 28px;
+    margin-bottom: 14px;
+    font-size: 1.1rem;
+}
+
+#hud span {
+    background: rgba(30, 30, 70, 0.7);
+    padding: 6px 16px;
+    border-radius: 20px;
+    border: 1px solid rgba(100, 100, 200, 0.3);
+}
+
+#hud strong {
+    color: #ffd700;
+    font-size: 1.2rem;
+}
+
+#game-canvas {
+    display: block;
+    margin: 0 auto;
+    border-radius: 12px;
+    background: radial-gradient(ellipse at center, #0a0a2e 0%, #050520 100%);
+    border: 2px solid rgba(100, 120, 255, 0.4);
+    box-shadow: 0 0 30px rgba(60, 60, 180, 0.4), inset 0 0 60px rgba(0, 0, 0, 0.5);
+    cursor: none;
+}
+
+#controls {
+    margin-top: 16px;
+    display: flex;
+    justify-content: center;
+    gap: 14px;
+}
+
+#controls button {
+    padding: 10px 24px;
+    font-size: 1rem;
+    font-weight: 600;
+    border: none;
+    border-radius: 25px;
+    cursor: pointer;
+    transition: all 0.25s ease;
+    letter-spacing: 1px;
+    background: linear-gradient(135deg, #3a3a8a, #2a2a6a);
+    color: #d0d0ff;
+    border: 1px solid rgba(120, 120, 255, 0.4);
+    box-shadow: 0 4px 15px rgba(40, 40, 120, 0.4);
+}
+
+#controls button:hover {
+    background: linear-gradient(135deg, #4a4aaa, #3a3a8a);
+    box-shadow: 0 6px 22px rgba(60, 60, 180, 0.6);
+    transform: translateY(-2px);
+    color: #ffffff;
+}
+
+#controls button:active {
+    transform: translateY(0);
+    box-shadow: 0 2px 8px rgba(40, 40, 120, 0.4);
+}
+
+#btn-start {
+    background: linear-gradient(135deg, #2a8a4a, #1a6a3a) !important;
+    border-color: rgba(80, 220, 120, 0.5) !important;
+}
+
+#btn-start:hover {
+    background: linear-gradient(135deg, #3aaa5a, #2a8a4a) !important;
+}
+
+#btn-pause {
+    background: linear-gradient(135deg, #8a6a2a, #6a4a1a) !important;
+    border-color: rgba(220, 180, 80, 0.5) !important;
+}
+
+#btn-pause:hover {
+    background: linear-gradient(135deg, #aa8a3a, #8a6a2a) !important;
+}
+
+#btn-restart {
+    background: linear-gradient(135deg, #8a2a3a, #6a1a2a) !important;
+    border-color: rgba(220, 80, 100, 0.5) !important;
+}
+
+#btn-restart:hover {
+    background: linear-gradient(135deg, #aa3a4a, #8a2a3a) !important;
+}
+
+#message {
+    margin-top: 12px;
+    font-size: 1.05rem;
+    min-height: 28px;
+    color: #ffcc80;
+    text-shadow: 0 0 8px rgba(255, 180, 80, 0.5);
+}

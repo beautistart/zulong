@@ -113,6 +113,8 @@ export interface ExtensionState {
 	banners?: BannerCardData[]
 	welcomeBanners?: BannerCardData[]
 	openAiCodexIsAuthenticated?: boolean
+	/** 当前任务阶段: idle | initializing | running | blocked | completed | failed */
+	taskPhase?: string
 }
 
 export interface InteractionPayload {
@@ -136,6 +138,8 @@ export interface InteractionPayload {
 	/** 启动说明中的规划步骤 (kind=plan) */
 	plan_steps?: string[]
 	tool_name?: string
+	approval_id?: string
+	action_summary?: string
 	/** 工具参数摘要 */
 	tool_args?: Record<string, any>
 	risk_level?: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"
@@ -146,6 +150,15 @@ export interface InteractionPayload {
 	progress?: number
 	current_step?: number
 	total_steps?: number
+	progress_items?: Array<{
+		id?: string
+		label: string
+		status: "pending" | "running" | "completed" | "blocked" | "failed"
+		detail?: string
+		source?: "plan" | "tool" | "task_graph" | "heartbeat" | "summary"
+		pair_id?: string
+		timestamp?: number
+	}>
 	next_step?: string
 	timestamp?: number
 	/** FC 循环轮次 */

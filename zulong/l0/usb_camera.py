@@ -22,6 +22,8 @@ from collections import deque
 from datetime import datetime
 import logging
 
+from zulong.l0.devices.camera_backend import open_camera, safe_set_camera_property
+
 logger = logging.getLogger("USBCamera")
 
 
@@ -101,7 +103,9 @@ class USBCamera:
         
         # 尝试前 10 个设备 ID
         for device_id in range(10):
-            cap = cv2.VideoCapture(device_id, cv2.CAP_DSHOW)  # Windows 使用 DirectShow
+            cap, _backend_name = open_camera(device_id)
+            if cap is None:
+                continue
             
             if cap.isOpened():
                 logger.info(f"✅ [USBCamera] 检测到摄像头：device_id={device_id}")
@@ -128,12 +132,13 @@ class USBCamera:
         logger.info(f"🔌 [USBCamera] 尝试连接摄像头 (device={self.device_id})...")
         
         try:
-            # 创建捕获器 (使用 DirectShow 后端)
-            self.cap = cv2.VideoCapture(self.device_id, cv2.CAP_DSHOW)
+            # 创建捕获器 (按平台自动选择后端)
+            self.cap, backend_name = open_camera(self.device_id)
             
-            if not self.cap.isOpened():
+            if self.cap is None or not self.cap.isOpened():
                 logger.error(f"❌ [USBCamera] 无法打开摄像头 {self.device_id}")
                 return False
+            logger.info(f"✅ [USBCamera] 摄像头后端: {backend_name}")
             
             # 配置硬件参数
             self._configure_hardware()
@@ -154,11 +159,11 @@ class USBCamera:
         logger.info("⚙️ [USBCamera] 配置硬件参数...")
         
         # 设置分辨率
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        safe_set_camera_property(self.cap, cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        safe_set_camera_property(self.cap, cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         
         # 设置帧率
-        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+        safe_set_camera_property(self.cap, cv2.CAP_PROP_FPS, self.fps)
         
         # 获取实际参数
         actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -170,16 +175,16 @@ class USBCamera:
         
         # 优化参数 (根据摄像头驱动调整)
         # 自动曝光
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # 1=手动，3=自动
+        safe_set_camera_property(self.cap, cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # 1=手动，3=自动
         
         # 曝光值 (手动模式)
-        self.cap.set(cv2.CAP_PROP_EXPOSURE, -6)  # 值越小越亮
+        safe_set_camera_property(self.cap, cv2.CAP_PROP_EXPOSURE, -6)  # 值越小越亮
         
         # 增益
-        self.cap.set(cv2.CAP_PROP_GAIN, 0)
+        safe_set_camera_property(self.cap, cv2.CAP_PROP_GAIN, 0)
         
         # 白平衡 (自动)
-        self.cap.set(cv2.CAP_PROP_AUTO_WB, 1)
+        safe_set_camera_property(self.cap, cv2.CAP_PROP_AUTO_WB, 1)
         
         logger.info("✅ [USBCamera] 硬件配置完成")
     

@@ -31,16 +31,19 @@ class CosyVoiceServer:
         self,
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
-        model_dir: str = r"D:\BaiduNetdiskDownload\CosyVoiceV2\CosyVoice\iic\CosyVoice2-0.5B",
-        code_path: str = r"D:\BaiduNetdiskDownload\CosyVoiceV2\CosyVoice",
-        default_prompt_audio: str = r"D:\BaiduNetdiskDownload\CosyVoiceV2\CosyVoice\asset\zero_shot_prompt.wav",
+        model_dir: str = None,
+        code_path: str = None,
+        default_prompt_audio: str = None,
         default_prompt_text: str = "希望你以后能够做的比我还好呦。"
     ):
+        from zulong.tts.cosyvoice_config import get_external_runtime_config
+
+        runtime = get_external_runtime_config()
         self.host = host
         self.port = port
-        self.model_dir = model_dir
-        self.code_path = code_path
-        self.default_prompt_audio = default_prompt_audio
+        self.model_dir = model_dir or runtime["model_dir"]
+        self.code_path = code_path or runtime["code_path"]
+        self.default_prompt_audio = default_prompt_audio or runtime["prompt_audio"]
         self.default_prompt_text = default_prompt_text
         
         self.cosy = None
@@ -290,7 +293,9 @@ class CosyVoiceClient:
 
 def run_server():
     """运行 TTS 服务"""
-    integrated_python = r"D:\BaiduNetdiskDownload\CosyVoiceV2\python\python.exe"
+    from zulong.tts.cosyvoice_config import get_external_runtime_config
+
+    integrated_python = get_external_runtime_config()["integrated_python_path"]
     
     if sys.executable != integrated_python:
         print(f"切换到整合包 Python 环境...")
@@ -318,7 +323,7 @@ def test_client():
     
     print("✓ 服务已运行")
     
-    output_path = r"d:\AI\project\zulong_beta5\tests\output_cosyvoice_server.wav"
+    output_path = os.path.join(os.getcwd(), "tests", "output_cosyvoice_server.wav")
     
     print("\n测试语音合成...")
     result = client.synthesize(

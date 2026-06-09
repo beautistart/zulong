@@ -1,8 +1,8 @@
 # 祖龙 (ZULONG) 系统 - 快速启动指南
 
-**版本**: v2.0  
-**更新日期**: 2026-05-12  
-**适用环境**: Windows + NVIDIA GPU (6GB 显存或更高)
+**版本**: v2.9  
+**更新日期**: 2026-05-29  
+**适用环境**: Windows / Linux / macOS
 
 ---
 
@@ -11,29 +11,49 @@
 ### 1. 环境准备
 
 #### 1.1 安装依赖
+Windows:
+
+```powershell
+.\scripts\setup_windows.ps1
+```
+
+Linux:
+
 ```bash
-cd d:\AI\project\zulong_beta4
-pip install -r requirements.txt
+bash scripts/setup_linux.sh
+```
+
+macOS:
+
+```bash
+bash scripts/setup_macos.sh
 ```
 
 #### 1.2 检查硬件
 确保以下硬件可用:
-- ✅ Windows 系统
-- ✅ NVIDIA GPU (6GB 显存或更高)
+- ✅ Windows / Linux / macOS
+- ✅ NVIDIA CUDA、Apple MPS 或 CPU/Ollama fallback
 - ✅ 麦克风设备
 - ✅ 扬声器/耳机设备
 
 #### 1.3 检查模型
 确保已下载以下模型:
 ```bash
-# 检查模型文件
-python scripts/verify_new_models.py
+# 基础运行诊断
+python scripts/doctor.py
+python scripts/doctor_models.py
+python scripts/doctor_audio.py
+python scripts/doctor_camera.py --scan-range 3 --no-read
+python scripts/smoke_platform.py
 ```
 
 所需模型:
-- `models/Qwen3.5-0.8B-Base` (L1-A VL 模型)
-- `models/Qwen3.5-0.8B` (L1-B 音频理解)
-- `models/CosyVoice3-0.5B` (TTS 专家)
+- Ollama 或云端 LLM
+- `models/OpenASR/sensevoice-small-onnx` (SenseVoice ASR，可选)
+- `models/hexgrad/Kokoro-82M` 或 Kokoro 在线下载缓存
+- `models/yolov10n.pt` (视觉，可选)
+- `models/albert-tiny-chinese` (L1-B，可选)
+- CosyVoice 资产 (可选)
 
 ---
 
@@ -223,7 +243,10 @@ python tests/test_l2_interrupt_resume.py
 
 **解决方案**:
 ```bash
-pip install -r requirements.txt
+# 按平台重新安装
+.\scripts\setup_windows.ps1      # Windows
+bash scripts/setup_linux.sh      # Linux
+bash scripts/setup_macos.sh      # macOS
 ```
 
 ---
@@ -234,10 +257,10 @@ pip install -r requirements.txt
 
 **解决方案**:
 1. 检查硬件连接
-2. 检查 Windows 音频驱动
+2. 检查系统音频权限和驱动
 3. 运行以下命令查看可用设备:
 ```bash
-python -c "from zulong.l0.devices.microphone_device import MicrophoneDevice; mic = MicrophoneDevice(); print(mic.list_devices())"
+python scripts/doctor_audio.py
 ```
 
 ---

@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>番茄钟</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+        }
+
+        .container {
+            text-align: center;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 24px;
+            padding: 48px 40px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+
+        .timer-display {
+            font-size: 96px;
+            font-weight: 700;
+            color: #e94560;
+            letter-spacing: 6px;
+            font-variant-numeric: tabular-nums;
+            text-shadow: 0 0 40px rgba(233, 69, 96, 0.4);
+            margin-bottom: 36px;
+            user-select: none;
+        }
+
+        .buttons {
+            display: flex;
+            gap: 16px;
+            justify-content: center;
+        }
+
+        button {
+            padding: 14px 36px;
+            font-size: 18px;
+            font-weight: 600;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.25s ease;
+            letter-spacing: 1px;
+            outline: none;
+        }
+
+        button:active {
+            transform: scale(0.96);
+        }
+
+        .btn-start {
+            background: #e94560;
+            color: #fff;
+            box-shadow: 0 6px 20px rgba(233, 69, 96, 0.4);
+        }
+
+        .btn-start:hover {
+            background: #d63851;
+            box-shadow: 0 8px 28px rgba(233, 69, 96, 0.55);
+        }
+
+        .btn-start.paused {
+            background: #0f3460;
+            box-shadow: 0 6px 20px rgba(15, 52, 96, 0.5);
+        }
+
+        .btn-start.paused:hover {
+            background: #1a4a7a;
+            box-shadow: 0 8px 28px rgba(15, 52, 96, 0.65);
+        }
+
+        .btn-reset {
+            background: rgba(255, 255, 255, 0.08);
+            color: #ccc;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+        }
+
+        .btn-reset:hover {
+            background: rgba(255, 255, 255, 0.15);
+            color: #fff;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="timer-display" id="timerDisplay">25:00</div>
+        <div class="buttons">
+            <button class="btn-start" id="btnStart" onclick="toggleTimer()">开始</button>
+            <button class="btn-reset" id="btnReset" onclick="resetTimer()">重置</button>
+        </div>
+    </div>
+
+    <script>
+        const INITIAL_MINUTES = 25;
+        const INITIAL_SECONDS = 0;
+        const TOTAL_SECONDS = INITIAL_MINUTES * 60 + INITIAL_SECONDS;
+
+        let remainingSeconds = TOTAL_SECONDS;
+        let timerInterval = null;
+        let isRunning = false;
+
+        const timerDisplay = document.getElementById('timerDisplay');
+        const btnStart = document.getElementById('btnStart');
+
+        function formatTime(totalSeconds) {
+            const mins = Math.floor(totalSeconds / 60);
+            const secs = totalSeconds % 60;
+            return String(mins).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
+        }
+
+        function updateDisplay() {
+            timerDisplay.textContent = formatTime(remainingSeconds);
+        }
+
+        function toggleTimer() {
+            if (isRunning) {
+                pauseTimer();
+            } else {
+                startTimer();
+            }
+        }
+
+        function startTimer() {
+            if (remainingSeconds <= 0) return;
+
+            isRunning = true;
+            btnStart.textContent = '暂停';
+            btnStart.classList.add('paused');
+
+            timerInterval = setInterval(function () {
+                remainingSeconds--;
+                updateDisplay();
+
+                if (remainingSeconds <= 0) {
+                    clearInterval(timerInterval);
+                    timerInterval = null;
+                    isRunning = false;
+                    btnStart.textContent = '开始';
+                    btnStart.classList.remove('paused');
+                }
+            }, 1000);
+        }
+
+        function pauseTimer() {
+            isRunning = false;
+            if (timerInterval) {
+                clearInterval(timerInterval);
+                timerInterval = null;
+            }
+            btnStart.textContent = '开始';
+            btnStart.classList.remove('paused');
+        }
+
+        function resetTimer() {
+            pauseTimer();
+            remainingSeconds = TOTAL_SECONDS;
+            updateDisplay();
+        }
+    </script>
+</body>
+</html>

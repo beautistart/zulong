@@ -37,22 +37,42 @@ export async function activate(context: vscode.ExtensionContext) {
 	const activationStartTime = performance.now()
 
 	setupHostProvider(context)
-	await cleanupLegacyVSCodeStorage(context)
-
-	const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
-	const storageContext = createStorageContext({ workspacePath })
-	await exportVSCodeStorageToSharedFiles(context, storageContext)
-	await initializeBackground(storageContext)
 
 	registerDiffContentProvider(context)
 	registerUriHandler(context)
-	registerBackgroundCommands(context)
 
 	executionBridge = new VscodeExecutionBridge(context)
 	context.subscriptions.push(executionBridge)
 
-	Logger.log(`[Zulong] background bridge activated in ${performance.now() - activationStartTime} ms`)
+	registerBackgroundCommands(context)
+
+	void initializeBackgroundServices(context, activationStartTime)
+
+	Logger.log(`[Zulong] IDE bridge activated in ${performance.now() - activationStartTime} ms`)
 	return createBackgroundApi()
+}
+
+async function initializeBackgroundServices(context: vscode.ExtensionContext, activationStartTime: number): Promise<void> {
+	try {
+		await cleanupLegacyVSCodeStorage(context)
+
+		const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+		const storageContext = createStorageContext({ workspacePath })
+		await exportVSCodeStorageToSharedFiles(context, storageContext)
+		await initializeBackground(storageContext)
+
+		Logger.log(`[Zulong] background services initialized in ${performance.now() - activationStartTime} ms`)
+	} catch (error) {
+		const message = `[Zulong] background services failed after bridge activation: ${
+			error instanceof Error ? error.message : String(error)
+		}`
+		try {
+			HostProvider.get().logToChannel(message)
+		} catch {
+			// Host logging is best-effort during early activation.
+		}
+		Logger.error(message, error)
+	}
 }
 
 function registerDiffContentProvider(context: vscode.ExtensionContext): void {

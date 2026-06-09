@@ -6,8 +6,10 @@
 # MemoryGraph 是后端的投影，可随时重建。
 
 import logging
+import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Optional, List, Dict, Tuple
 from abc import ABC, abstractmethod
 
@@ -77,14 +79,18 @@ class TaskGraphAdapter(BaseGraphAdapter):
 
         count = 0
         graph_id = getattr(source, 'id', '')
+        source_meta = getattr(source, 'metadata', {}) or {}
+        workspace_dir = source_meta.get("workspace_dir", "")
 
-        # 地址继承：查找任务根节点在 MemoryGraph 中的完整路径
-        # 根节点可能用完整路径作为 node_id（如 "dialogue:session_xxx/task:tg_xxx"）
-        # 也可能只用 "task:{graph_id}"（未分配 session 时）
+        def _is_task_node_visible(node_id: str) -> bool:
+            return not str(node_id or "").startswith("crg_")
+
+        # TaskGraph 始终保持独立命名空间；旧版本可能把任务地址继承到
+        # dialogue:session/... 下，这里同步时不再沿用会话路径。
         task_root_mg_id = f"task:{graph_id}"
         root_node = graph.get_node(task_root_mg_id)
         if root_node is None:
-            # 尝试查找完整路径格式（task_create_plan 已创建的情况）
+            # 尝试查找同 graph_id 的历史任务节点。
             for node in graph.get_nodes_by_type(NodeType.TASK):
                 if node.metadata.get("graph_id") == graph_id:
                     root_node = node
@@ -94,6 +100,8 @@ class TaskGraphAdapter(BaseGraphAdapter):
         parent_prefix = ""
         if root_node:
             parent_prefix = root_node.metadata.get("full_path", task_root_mg_id)
+            if str(parent_prefix).startswith("dialogue:"):
+                parent_prefix = f"task:{graph_id}" if graph_id else task_root_mg_id
 
         # 计算每个节点在 TaskGraph 中的深度，用于确定 sub_type
         _child_to_parent: Dict[str, str] = {}
@@ -113,45 +121,58 @@ class TaskGraphAdapter(BaseGraphAdapter):
 
         # 投射节点（使用完整路径地址）
         for node_id, task_node in source._nodes.items():
+            if not _is_task_node_visible(node_id):
+                continue
             if parent_prefix:
                 full_node_id = f"{parent_prefix}/{node_id}"
             else:
                 # 无父级路径时，用 graph_id 限定避免跨图碰撞
                 full_node_id = f"task:{graph_id}/{node_id}" if graph_id else f"task:{node_id}"
 
-            # 如果节点已存在，跳过（避免重复创建）
+            node_metadata = {
+                "type": task_node.type,
+                "status": task_node.status,
+                "desc": task_node.desc[:200] if task_node.desc else "",
+                "graph_id": graph_id,
+                "graph_address": f"tg:{graph_id}/task:{node_id}" if graph_id else "",
+                "full_path": full_node_id,
+                "parent_session": "",
+                "sub_type": (
+                    "task_root" if _node_depth(node_id) == 0
+                    else "subtask" if _node_depth(node_id) == 1
+                    else "sub_subtask"
+                ),
+            }
+            if workspace_dir:
+                node_metadata["workspace_dir"] = workspace_dir
+            if task_node.result is not None:
+                node_metadata["task_result"] = task_node.result
+            if task_node.semantic_summary:
+                node_metadata["semantic_summary"] = task_node.semantic_summary
+            if task_node.analysis_content:
+                node_metadata["analysis_content"] = task_node.analysis_content
+            if task_node.content_version:
+                node_metadata["content_version"] = task_node.content_version
+            if task_node.task_domain:
+                node_metadata["task_domain"] = task_node.task_domain
+
+            # 如果节点已存在，更新元数据后继续投射文件引用。
             if graph.has_node(full_node_id):
-                # 更新已有节点的 metadata
                 existing = graph.get_node(full_node_id)
                 if existing:
-                    existing.metadata["status"] = task_node.status
-                    existing.metadata["desc"] = task_node.desc[:200] if task_node.desc else ""
+                    existing.metadata.update(node_metadata)
                     # 注意：sync 不更新 last_accessed，保留原始时间戳
                 count += 1
-                continue
-
-            gnode = GraphNode(
-                node_id=full_node_id,
-                node_type=NodeType.TASK,
-                label=task_node.label,
-                backend_ref=f"task_graph:{graph_id}/{node_id}" if graph_id else f"task_graph:{node_id}",
-                metadata={
-                    "type": task_node.type,
-                    "status": task_node.status,
-                    "desc": task_node.desc[:200] if task_node.desc else "",
-                    "graph_id": graph_id,
-                    "graph_address": f"tg:{graph_id}/task:{node_id}" if graph_id else "",
-                    "full_path": full_node_id,
-                    "parent_session": parent_prefix.split("/")[0] if "/" in parent_prefix else "",
-                    "sub_type": (
-                        "task_root" if _node_depth(node_id) == 0
-                        else "subtask" if _node_depth(node_id) == 1
-                        else "sub_subtask"
-                    ),
-                },
-            )
-            graph.add_node(gnode, touch=False)
-            count += 1
+            else:
+                gnode = GraphNode(
+                    node_id=full_node_id,
+                    node_type=NodeType.TASK,
+                    label=task_node.label,
+                    backend_ref=f"task_graph:{graph_id}/{node_id}" if graph_id else f"task_graph:{node_id}",
+                    metadata=node_metadata,
+                )
+                graph.add_node(gnode, touch=False)
+                count += 1
 
             # 关联文件 -> FILE 节点 + REFERENCE 边
             for fref in task_node.files:
@@ -173,6 +194,8 @@ class TaskGraphAdapter(BaseGraphAdapter):
 
         # 投射层级边（使用完整路径地址）
         for parent_id, child_id in source._h_edges:
+            if not _is_task_node_visible(parent_id) or not _is_task_node_visible(child_id):
+                continue
             if parent_prefix:
                 p_full = f"{parent_prefix}/{parent_id}"
                 c_full = f"{parent_prefix}/{child_id}"
@@ -189,6 +212,8 @@ class TaskGraphAdapter(BaseGraphAdapter):
 
         # 投射依赖边
         for dep_edge in source._d_edges:
+            if not _is_task_node_visible(dep_edge.s) or not _is_task_node_visible(dep_edge.t):
+                continue
             if parent_prefix:
                 s_full = f"{parent_prefix}/{dep_edge.s}"
                 t_full = f"{parent_prefix}/{dep_edge.t}"
@@ -367,6 +392,12 @@ def rebuild_task_graph_from_memory(mg, graph_id: str):
         TaskGraph 实例，如果重建失败返回 None
     """
     from zulong.l2.task_graph import TaskGraph, TaskNode, DependencyEdge
+    try:
+        from zulong.tools.task_tools import normalize_task_graph_id
+
+        graph_id = normalize_task_graph_id(graph_id)
+    except Exception:
+        graph_id = str(graph_id or "").strip()
 
     # 1. 收集属于该 graph_id 的所有 TASK 节点
     task_nodes = []
@@ -401,8 +432,13 @@ def rebuild_task_graph_from_memory(mg, graph_id: str):
         # 无法确定根节点，降级
         return _fallback_load_from_disk(graph_id)
 
+    backup_tg = _load_backup_graph_for_merge(graph_id)
+
     # 3. 构建 TaskGraph
     tg = TaskGraph(title=root_label, graph_id=graph_id)
+    workspace_dir = _workspace_from_memory_task_nodes(task_nodes)
+    if workspace_dir:
+        tg.metadata["workspace_dir"] = workspace_dir
 
     # 从 GraphNode metadata 还原 TaskNode
     for gnode in task_nodes:
@@ -423,6 +459,8 @@ def rebuild_task_graph_from_memory(mg, graph_id: str):
             task_domain=meta.get("task_domain", "general"),
         )
         tg._nodes[local_id] = task_node
+
+    _restore_file_refs_from_memory(mg, tg, mg_id_to_local)
 
     # 4. 从 HIERARCHY 边重建 h_edges
     local_ids_set = set(mg_id_to_local.keys())
@@ -476,11 +514,160 @@ def rebuild_task_graph_from_memory(mg, graph_id: str):
     if root_local_id not in tg._nodes:
         return _fallback_load_from_disk(graph_id)
 
+    _merge_backup_task_graph(tg, backup_tg)
+    if not tg.metadata.get("workspace_dir"):
+        inferred_workspace = _infer_workspace_from_task_graph_files(tg)
+        if inferred_workspace:
+            tg.metadata["workspace_dir"] = inferred_workspace
+
     logger.info(
         f"[GraphAdapters] 从 MemoryGraph 重建 TaskGraph: "
         f"graph_id={graph_id}, nodes={len(tg._nodes)}, "
         f"h_edges={len(tg._h_edges)}, d_edges={len(tg._d_edges)}")
     return tg
+
+
+def _normalize_existing_dir(value: str) -> str:
+    if not value:
+        return ""
+    try:
+        path = os.path.abspath(os.path.normpath(os.path.expanduser(os.path.expandvars(str(value)))))
+        return path if os.path.isdir(path) else ""
+    except Exception:
+        return ""
+
+
+def _workspace_from_memory_task_nodes(task_nodes: List[Any]) -> str:
+    for gnode in task_nodes:
+        meta = getattr(gnode, "metadata", {}) or {}
+        for key in ("workspace_dir", "workspace_path"):
+            workspace = _normalize_existing_dir(meta.get(key, ""))
+            if workspace:
+                return workspace
+    return ""
+
+
+def _restore_file_refs_from_memory(mg, tg, mg_id_to_local: Dict[str, str]) -> None:
+    for mg_id, local_id in mg_id_to_local.items():
+        task_node = tg._nodes.get(local_id)
+        if task_node is None:
+            continue
+        try:
+            neighbors = mg.get_neighbors(
+                mg_id, edge_types={EdgeType.REFERENCE}, max_depth=1
+            )
+        except Exception:
+            continue
+        for neighbor in neighbors:
+            if getattr(neighbor, "node_type", None) != NodeType.FILE:
+                continue
+            meta = getattr(neighbor, "metadata", {}) or {}
+            file_path = meta.get("path") or str(getattr(neighbor, "backend_ref", "")).removeprefix("file:")
+            if not file_path:
+                continue
+            file_name = getattr(neighbor, "label", "") or os.path.basename(file_path)
+            try:
+                task_node.add_file(file_name, file_path)
+            except Exception:
+                pass
+
+
+def _load_backup_graph_for_merge(graph_id: str):
+    try:
+        from zulong.tools.task_tools import load_graph_from_backup
+        return load_graph_from_backup(graph_id)
+    except Exception:
+        return None
+
+
+_STATUS_RANK = {
+    "pending": 0,
+    "waiting_input": 1,
+    "needs_adjust": 1,
+    "in_progress": 2,
+    "blocked": 3,
+    "skipped": 4,
+    "completed": 5,
+}
+
+
+def _merge_backup_task_graph(tg, backup_tg) -> None:
+    if backup_tg is None or getattr(backup_tg, "id", "") != getattr(tg, "id", ""):
+        return
+
+    try:
+        merged_meta = dict(getattr(backup_tg, "metadata", {}) or {})
+        merged_meta.update(getattr(tg, "metadata", {}) or {})
+        tg.metadata.update(merged_meta)
+    except Exception:
+        pass
+
+    for node_id, backup_node in getattr(backup_tg, "_nodes", {}).items():
+        node = tg._nodes.get(node_id)
+        if node is None:
+            tg._nodes[node_id] = backup_node
+            continue
+
+        if _STATUS_RANK.get(getattr(backup_node, "status", ""), 0) > _STATUS_RANK.get(getattr(node, "status", ""), 0):
+            node.status = backup_node.status
+        for attr in ("result", "semantic_summary", "analysis_content", "task_domain"):
+            backup_value = getattr(backup_node, attr, None)
+            current_value = getattr(node, attr, None)
+            if backup_value and (not current_value or len(str(backup_value)) > len(str(current_value))):
+                setattr(node, attr, backup_value)
+        if getattr(backup_node, "content_version", 0) > getattr(node, "content_version", 0):
+            node.content_version = backup_node.content_version
+        try:
+            node.metadata.update(getattr(backup_node, "metadata", {}) or {})
+        except Exception:
+            pass
+        for ref in getattr(backup_node, "files", []) or []:
+            try:
+                node.add_file(ref.name, ref.path)
+            except Exception:
+                pass
+
+    for edge in getattr(backup_tg, "_h_edges", []) or []:
+        try:
+            edge_tuple = tuple(edge)
+            if edge_tuple[0] in tg._nodes and edge_tuple[1] in tg._nodes and edge_tuple not in tg._h_edge_set:
+                tg._h_edges.append(edge_tuple)
+                tg._h_edge_set.add(edge_tuple)
+        except Exception:
+            continue
+
+    existing_dep = {(getattr(e, "s", ""), getattr(e, "t", ""), getattr(e, "via", ""), getattr(e, "cross", False)) for e in tg._d_edges}
+    for dep in getattr(backup_tg, "_d_edges", []) or []:
+        key = (getattr(dep, "s", ""), getattr(dep, "t", ""), getattr(dep, "via", ""), getattr(dep, "cross", False))
+        if key not in existing_dep and key[0] in tg._nodes and key[1] in tg._nodes:
+            tg._d_edges.append(dep)
+            existing_dep.add(key)
+
+
+def _infer_workspace_from_task_graph_files(tg) -> str:
+    candidates: List[str] = []
+    for node in getattr(tg, "_nodes", {}).values():
+        for ref in getattr(node, "files", []) or []:
+            file_path = str(getattr(ref, "path", "") or "").strip()
+            if not file_path or not os.path.isabs(file_path):
+                continue
+            try:
+                target = Path(file_path)
+                parent = target if target.exists() and target.is_dir() else target.parent
+                if parent.exists() and parent.is_dir():
+                    candidates.append(str(parent.resolve()))
+            except Exception:
+                continue
+
+    if not candidates:
+        return ""
+    try:
+        common = os.path.commonpath(candidates)
+        if common and os.path.isdir(common):
+            return os.path.abspath(common)
+    except Exception:
+        pass
+    return candidates[0]
 
 
 def _extract_local_id(gnode, graph_id: str) -> str:
@@ -765,14 +952,13 @@ class DialogueAdapter(BaseGraphAdapter):
         """确保当前对话属于正确的 Session 节点
 
         话题边界检测策略:
-        1. 如果有 task_graph_id → 通过 TaskGraph ID 查找关联的 session
-        2. 如果与当前活跃 session 的最新 round 话题相关 → 沿用
-        3. 否则 → 创建新 session
+        1. 如果与当前活跃 session 的最新 round 话题相关 → 沿用
+        2. 否则 → 创建新 session
 
         Args:
             graph: MemoryGraph 实例
             text: 用户输入文本
-            task_graph_id: TaskGraph ID（用于定位关联的 session）
+            task_graph_id: 兼容旧调用；对话 session 不再通过任务图反向归属
 
         Returns:
             session_id: 当前应使用的 session 节点 ID
@@ -780,20 +966,7 @@ class DialogueAdapter(BaseGraphAdapter):
         # 收集所有 session 节点
         all_sessions = self._get_sessions(graph)
 
-        # 1) 通过 TaskGraph ID 查找关联的 session
-        if task_graph_id:
-            task_node_id = f"task:{task_graph_id}"
-            if graph.has_node(task_node_id):
-                # 查找引用该任务节点的对话会话
-                for sess in all_sessions:
-                    if graph.has_edge(sess.node_id, task_node_id):
-                        logger.debug(
-                            f"[DialogueAdapter] 通过 TaskGraph ID {task_graph_id} "
-                            f"找到 session {sess.node_id}"
-                        )
-                        return sess.node_id
-
-        # 2) 取最新的活跃 session
+        # 取最新的活跃 session
         current_session = self._get_latest_session(all_sessions)
 
         if current_session:
@@ -804,7 +977,7 @@ class DialogueAdapter(BaseGraphAdapter):
                 )
                 return current_session.node_id
 
-        # 4) 创建新 session
+        # 创建新 session
         session_id = self._create_session(
             graph, text, prev_session_id=current_session.node_id if current_session else None,
         )
@@ -891,7 +1064,7 @@ class DialogueAdapter(BaseGraphAdapter):
     def _link_round_to_session(
         self, graph: MemoryGraph, round_id: str, session_id: str,
     ):
-        """将 round 节点挂载到 session（HIERARCHY 边 + 元数据更新 + 地址继承）"""
+        """将 round 节点挂载到 session（HIERARCHY 边 + 元数据更新）。"""
         if not graph.has_node(session_id) or not graph.has_node(round_id):
             return
 
@@ -906,17 +1079,10 @@ class DialogueAdapter(BaseGraphAdapter):
         round_node = graph.get_node(round_id)
         if round_node:
             round_node.metadata["session_id"] = session_id
-            # 地址继承：更新 round 的完整路径
+            # 对话节点只继承会话路径，不继承任务图路径。
             # 格式：dialogue:session_xxx/dialogue:round_xxx
             round_node.metadata["full_path"] = f"{session_id}/{round_id}"
-            # 同步更新 task_graph_address 为完整路径（如果之前是相对路径）
-            old_tg_addr = round_node.metadata.get("task_graph_address", "")
-            if old_tg_addr and not old_tg_addr.startswith("dialogue:"):
-                round_node.metadata["task_graph_address"] = f"{session_id}/{old_tg_addr}"
-
-            # 地址传播：查找通过 REFERENCE 边关联到本 round 的任务图节点
-            # 将它们的前缀也更新为 session 路径
-            self._propagate_address_to_tasks(graph, round_id, session_id)
+            round_node.metadata["task_graph_address"] = ""
 
         # 更新 session 的 round_count 和 last_active_at
         sess_node = graph.get_node(session_id)
@@ -924,72 +1090,11 @@ class DialogueAdapter(BaseGraphAdapter):
             sess_node.metadata["round_count"] = sess_node.metadata.get("round_count", 0) + 1
             sess_node.metadata["last_active_at"] = time.time()
 
-    def _propagate_address_to_tasks(
-        self, graph: MemoryGraph, round_id: str, session_id: str,
-    ):
-        """将 session 地址传播到与 round 关联的所有任务图节点
-        
-        当 round 被分配到 session 后，通过 HIERARCHY/REFERENCE 边找到关联的任务节点，
-        将其地址前缀从 "task:tg_xxx" 更新为 "dialogue:session_xxx/task:tg_xxx"。
-        """
-        if not hasattr(graph, '_graph'):
-            return
-
-        # 查找所有通过 HIERARCHY 或 REFERENCE 边与本 round 相连的任务节点
-        linked_nodes = []
-        for neighbor_id in graph._graph.neighbors(round_id):
-            neighbor = graph.get_node(neighbor_id)
-            if neighbor and neighbor.node_type == NodeType.TASK:
-                edge_data = graph._graph[round_id].get(neighbor_id, {})
-                if edge_data.get("edge_type") in ("hierarchy", "reference"):
-                    linked_nodes.append(neighbor)
-
-        # 更新每个任务节点的地址（node_id 不变，只更新 metadata 中的 full_path）
-        for task_node in linked_nodes:
-            old_path = task_node.metadata.get("full_path", task_node.node_id)
-            # 如果任务节点地址还没携带 session 路径，则更新
-            if not old_path.startswith("dialogue:session_"):
-                new_path = f"{session_id}/{task_node.node_id}"
-                task_node.metadata["full_path"] = new_path
-                task_node.metadata["parent_session"] = session_id
-                logger.debug(
-                    f"[地址传播] {task_node.node_id} → full_path={new_path}"
-                )
-                # 递归传播到子任务节点
-                self._propagate_address_to_task_children(graph, task_node.node_id, session_id)
-
     def _propagate_address_to_task_children(
         self, graph: MemoryGraph, parent_node_id: str, session_id: str = "",
     ):
-        """将地址传播到任务节点的子节点（HIERARCHY 边下游）
-        
-        格式：parent_full_path/child_id
-        """
-        if not hasattr(graph, '_graph'):
-            return
-
-        # 查找所有子任务节点（HIERARCHY 边）
-        if parent_node_id not in graph._graph:
-            return
-
-        for child_id in graph._graph.successors(parent_node_id):
-            edge_data = graph._graph[parent_node_id].get(child_id, {})
-            if edge_data.get("edge_type") == "hierarchy":
-                child_node = graph.get_node(child_id)
-                if child_node and child_node.node_type == NodeType.TASK:
-                    # 子节点地址 = 父节点完整路径/子节点ID
-                    parent_node = graph.get_node(parent_node_id)
-                    if parent_node:
-                        parent_path = parent_node.metadata.get("full_path", parent_node_id)
-                        new_child_path = f"{parent_path}/{child_node.node_id}"
-                        child_node.metadata["full_path"] = new_child_path
-                        if session_id:
-                            child_node.metadata["parent_session"] = session_id
-                        logger.debug(
-                            f"[地址传播] 子节点 {child_node.node_id} → {new_child_path}"
-                        )
-                        # 递归传播到更深层
-                        self._propagate_address_to_task_children(graph, child_node.node_id, session_id)
+        """Legacy no-op: TaskGraph 地址不再继承 dialogue session 路径。"""
+        return
 
     def _latest_round_text(self, graph: MemoryGraph, session_id: str) -> Optional[str]:
         """获取 session 下最新 round 的用户输入文本（用于 Embedding 比较）"""
@@ -1056,17 +1161,14 @@ class DialogueAdapter(BaseGraphAdapter):
     ):
         """将 session 绑定到一个复杂任务 ID（挂起时回溯用）
 
-        除 metadata 记录外，同时创建 REFERENCE 边使图遍历可发现此关系，
-        并更新任务节点的地址前缀为 session 路径。
+        仅作为恢复线索记录，不把对话节点并入任务图，也不改写任务节点地址。
         """
         node = graph.get_node(session_id)
         if node:
             node.metadata["bound_task_id"] = task_id
-            # 地址继承：查找并更新任务根节点地址
             task_root_id = f"task:{task_id}"
             task_node = graph.get_node(task_root_id)
             if task_node is None:
-                # 尝试查找完整路径格式
                 for nid, nd in graph._nodes.items():
                     if (nd.node_type == NodeType.TASK
                             and nd.metadata.get("graph_id") == task_id):
@@ -1075,24 +1177,11 @@ class DialogueAdapter(BaseGraphAdapter):
                         break
 
             if task_node:
-                # 更新任务节点的地址和路径
-                if not task_node.node_id.startswith("dialogue:"):
-                    new_path = f"{session_id}/{task_node.node_id}"
-                    task_node.metadata["full_path"] = new_path
-                    task_node.metadata["parent_session"] = session_id
-                    logger.debug(
-                        f"[bind_session_to_task] 地址继承: {task_node.node_id} → {new_path}"
-                    )
-
-                # 创建 REFERENCE 边（使 BFS/遍历能发现此跨空间绑定）
                 if not graph.has_edge(session_id, task_node.node_id):
                     graph.add_edge(
                         session_id, task_node.node_id, EdgeType.REFERENCE,
                         weight=0.9, metadata={"binding_type": "session_task"},
                     )
-
-                # 传播地址到任务子节点
-                self._propagate_address_to_task_children(graph, task_node.node_id)
 
     def _is_same_topic(
         self, graph: MemoryGraph, session: GraphNode, new_text: str,
@@ -1165,7 +1254,7 @@ class DialogueAdapter(BaseGraphAdapter):
             request_id: 请求 ID
             goal: 用户输入文本
             prev_round_id: 上一轮对话节点 ID（用于建立 TEMPORAL 边）
-            task_graph_id: 关联的 TaskGraph ID（用于地址继承）
+            task_graph_id: 兼容旧调用；对话节点不再写入任务图地址
             session_id: 所属 session 节点 ID（用于建立 HIERARCHY 边）
 
         Returns:
@@ -1181,9 +1270,9 @@ class DialogueAdapter(BaseGraphAdapter):
                 "sub_type": "round",
                 "request_id": request_id,
                 "goal": goal,
-                "task_graph_address": f"tg:{task_graph_id}" if task_graph_id else "",
+                "task_graph_address": "",
                 "session_id": session_id or "",
-                "full_path": round_id,  # 完整地址路径（session 分配后更新）
+                "full_path": f"{session_id}/{round_id}" if session_id else round_id,
             },
         )
         graph.add_node(node)
@@ -1216,24 +1305,6 @@ class DialogueAdapter(BaseGraphAdapter):
                 sess_node.metadata["round_count"] = sess_node.metadata.get("round_count", 0) + 1
 
         logger.debug(f"[DialogueAdapter] 创建对话轮次: {round_id} (session={session_id})")
-
-        # 地址继承：对话 round → 任务图节点（REFERENCE 边）
-        # 当存在关联的 TaskGraph 时，建立双向关联边，使 BFS 扩散能跨类型传播
-        if task_graph_id:
-            task_node_id = f"task:{task_graph_id}"
-            if graph.has_node(task_node_id):
-                graph.add_edge(
-                    round_id, task_node_id,
-                    EdgeType.REFERENCE, weight=0.8,
-                    metadata={"link_type": "dialogue_to_task", "inherited_at": time.time()},
-                )
-                logger.debug(
-                    f"[DialogueAdapter] 地址继承: {round_id} ──REFERENCE──> {task_node_id}"
-                )
-            else:
-                logger.debug(
-                    f"[DialogueAdapter] 任务节点不存在，暂存地址: {task_node_id}"
-                )
 
         # 跨类型关联：对话 → KG 实体（KNOWLEDGE/PERSON）
         self._link_to_knowledge(graph, round_id, goal)
@@ -1321,22 +1392,6 @@ class DialogueAdapter(BaseGraphAdapter):
             round_id, sub_id,
             EdgeType.HIERARCHY, weight=1.0, protected=True,
         )
-
-        # REFERENCE: 子对话 → 关联任务节点（地址继承：子级细粒度关联）
-        # 子对话是 agent 推理的重要步骤，与具体任务节点关联使检索更精准
-        if task_node_id:
-            task_graph_id = f"task:{task_node_id}"
-            if graph.has_node(task_graph_id):
-                graph.add_edge(
-                    sub_id, task_graph_id,
-                    EdgeType.REFERENCE, weight=0.7,
-                    metadata={
-                        "link_type": "sub_dialogue_to_task",
-                        "linked_at": time.time(),
-                    },
-                )
-                # 同步更新子对话节点的 metadata 记录地址
-                node.metadata["task_graph_address"] = task_graph_id
 
         return sub_id
 

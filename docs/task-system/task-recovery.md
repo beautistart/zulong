@@ -316,7 +316,7 @@ private extractGraphId(messages: any[]): string {
 
 ### Step 5: Web 仪表盘 — 恢复按钮传递 graph_id
 
-**文件**: `openclaw_bridge/web/static/index.html`
+**文件**: `zulong_web/static/index.html`
 
 如果 Web 端也有恢复功能，确保 WebSocket 消息携带 graph_id:
 

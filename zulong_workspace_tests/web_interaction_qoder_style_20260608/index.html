@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>祖龙步骤卡测试</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+            background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 24px;
+            padding: 48px 40px;
+            width: 100%;
+            max-width: 420px;
+            box-shadow: 0 25px 60px rgba(0, 0, 0, 0.4), 0 0 80px rgba(120, 80, 255, 0.15);
+            text-align: center;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 30px 70px rgba(0, 0, 0, 0.5), 0 0 100px rgba(120, 80, 255, 0.25);
+        }
+
+        .card-title {
+            font-size: 28px;
+            font-weight: 700;
+            color: #e0d8ff;
+            margin-bottom: 8px;
+            letter-spacing: 2px;
+        }
+
+        .card-subtitle {
+            font-size: 13px;
+            color: rgba(200, 190, 240, 0.6);
+            margin-bottom: 36px;
+            letter-spacing: 1px;
+        }
+
+        .input-group {
+            margin-bottom: 24px;
+        }
+
+        .input-group input {
+            width: 100%;
+            padding: 14px 18px;
+            font-size: 16px;
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 14px;
+            color: #e0d8ff;
+            outline: none;
+            transition: all 0.3s ease;
+            letter-spacing: 0.5px;
+        }
+
+        .input-group input::placeholder {
+            color: rgba(200, 190, 240, 0.35);
+        }
+
+        .input-group input:focus {
+            border-color: rgba(140, 100, 255, 0.6);
+            background: rgba(255, 255, 255, 0.1);
+            box-shadow: 0 0 20px rgba(120, 80, 255, 0.2);
+        }
+
+        .btn {
+            width: 100%;
+            padding: 14px;
+            font-size: 17px;
+            font-weight: 600;
+            letter-spacing: 1px;
+            color: #fff;
+            background: linear-gradient(135deg, #6c3ce0, #8b5cf6);
+            border: none;
+            border-radius: 14px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 8px 25px rgba(108, 60, 224, 0.35);
+            margin-bottom: 28px;
+        }
+
+        .btn:hover {
+            background: linear-gradient(135deg, #7b4de8, #9b6ff8);
+            box-shadow: 0 12px 35px rgba(108, 60, 224, 0.5);
+            transform: translateY(-2px);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+            box-shadow: 0 4px 15px rgba(108, 60, 224, 0.3);
+        }
+
+        .counter-display {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        .counter-label {
+            font-size: 14px;
+            color: rgba(200, 190, 240, 0.55);
+            letter-spacing: 1px;
+        }
+
+        .counter-value {
+            font-size: 48px;
+            font-weight: 800;
+            color: #c4b5fd;
+            background: rgba(255, 255, 255, 0.04);
+            border-radius: 16px;
+            padding: 8px 28px;
+            min-width: 80px;
+            transition: all 0.2s ease;
+            text-shadow: 0 0 30px rgba(168, 140, 255, 0.5);
+        }
+
+        .counter-value.pulse {
+            animation: pulse 0.35s ease;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            40% { transform: scale(1.18); color: #e8d5ff; }
+            100% { transform: scale(1); }
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1 class="card-title">🐉 祖龙步骤卡测试</h1>
+        <p class="card-subtitle">ZULONG · STEP CARD</p>
+
+        <div class="input-group">
+            <input type="text" id="taskInput" placeholder="输入步骤名称…" autocomplete="off">
+        </div>
+
+        <button class="btn" id="addBtn">➕ 添加步骤</button>
+
+        <div class="counter-display">
+            <span class="counter-label">已完成步骤</span>
+            <span class="counter-value" id="counter">0</span>
+        </div>
+    </div>
+
+    <script>
+        (function() {
+            const input = document.getElementById('taskInput');
+            const button = document.getElementById('addBtn');
+            const counter = document.getElementById('counter');
+
+            let count = 0;
+
+            function updateCounter() {
+                counter.textContent = count;
+                // 脉冲动画
+                counter.classList.remove('pulse');
+                void counter.offsetWidth; // 强制回流
+                counter.classList.add('pulse');
+            }
+
+            button.addEventListener('click', function() {
+                count += 1;
+                updateCounter();
+                // 清空输入框，准备下一步
+                input.value = '';
+                input.focus();
+            });
+
+            // 回车也能触发
+            input.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter') {
+                    button.click();
+                }
+            });
+        })();
+    </script>
+</body>
+</html>

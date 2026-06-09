@@ -1,0 +1,13 @@
+# ZULONG macOS profile dependencies.
+# macOS must avoid CUDA-only packages such as onnxruntime-gpu and bitsandbytes.
+# PyTorch should use the official macOS wheel with MPS support where available.
+
+-r requirements-core.txt
+-r requirements-ml-common.txt
+-r requirements-audio.txt
+
+# SenseVoice runs through CPU ONNX on macOS; Whisper may use MPS if PyTorch supports it.
+onnxruntime>=1.15.0
+
+# Tests
+-r requirements-dev.txt

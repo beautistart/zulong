@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "project_id": "proj_c0ddc00e",
+  "name": "请执行一个真实的复杂开发任务，用来测试祖龙 IDE/VSCode 调用链路是否符合 TSD 设计预期。 工作区约束：当前工作区必须是 D:\\AI\\proj...",
+  "description": "请执行一个真实的复杂开发任务，用来测试祖龙 IDE/VSCode 调用链路是否符合 TSD 设计预期。\n\n工作区约束：当前工作区必须是 D:\\AI\\project\\zulong_beta5。请在该工作区内部创建新项目文件夹 zulong_workspace_tests/web_game_vscode_test_20260530_1730。最终项目目录必须正好是 D:\\AI\\project\\zulong_beta5\\zulong_workspace_tests\\web_game_vscode_test_20260530_1730，不要追加中文标题子目录，不要创建中文路径，不要创建 .zlong 文件夹，不要使用 C:\\Users\\HiWin11\\Zulong\\workspace 作为本任务目录。\n\n开发目标：写一个可以直接在 Web 端运行的小游戏，主题为“星尘接球”。要求至少包含 index.html、style.css、game.js 三个文件；玩家用方向键或 A/D 控制托盘接住下落星星；有分数、生命、开始/暂停/重新开始按钮；失败后显示最终分数；页面能用浏览器直接打开运行。\n\n链路测试要求：\n1. 请先创建 TaskGraph/任务计划，把任务拆成“创建项目目录、通过 IDE/VSCode 编辑文件、运行/检查文件、总结证据、等待恢复测试”几个阶段；\n2. 创建和修改代码时必须调用 IDE/VSCode 文件编辑能力或文件工具，不要只在回复里贴代码；\n3. 每完成一个阶段都输出 status_update/进度说明，让前端能判断任务仍在继续而不是卡死；\n4. 最后汇报实际创建的文件路径、使用过的工具/编辑动作、是否调用 VSCode/IDE 能力、是否有异常。\n\n请现在开始执行，不要把本消息当成普通聊天分析。",
+  "task_graph_id": "tg_1780133038",
+  "status": "pending_execution",
+  "created_at": 1780133038.0818233,
+  "updated_at": 1780133038.0818233,
+  "backend_url": "ws://127.0.0.1:8090/ide",
+  "metadata": {
+    "source": "web"
+  }
+}

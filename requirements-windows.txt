@@ -1,0 +1,13 @@
+# ZULONG Windows profile dependencies.
+
+-r requirements-core.txt
+-r requirements-ml-common.txt
+-r requirements-audio.txt
+
+# CUDA/Windows optional acceleration. CPU-only installs can skip these manually.
+onnxruntime-gpu>=1.15.0
+bitsandbytes>=0.40.0
+pynvml>=11.5.0
+
+# Tests
+-r requirements-dev.txt

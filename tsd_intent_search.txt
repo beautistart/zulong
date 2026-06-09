@@ -1,0 +1,232 @@
+=== Match: 意图识别 ===/n
+        pass
+```
+
+#### 8.2.2 第二阶段：事件触发与归档
+
+| 任务ID | 任务名称 | 任务描述 | 关键指标 |
+|--------|---------|---------|---------|
+| AT-07 | L1-B状态监听器开发 | 监听任务状态流转，检测COMPLETED或FAILED信号 | 延迟 < 10ms，无漏报 |
+| AT-08 | 隐式触发逻辑实现 | 实现自动标记逻辑：检测L0 ACTION_FAILED或L1-A TARGET_LOST | 能够区分"真失败"与"用户中断" |
+| AT-09 | 显式复盘指令解析 | 开发NLP意图识别，识别用户"复盘刚才..."等指令 | 支持模糊时间指代（如"刚才"、"上次"） |
+| AT-10 | 事件标记服务 | 将触发信号与环形缓冲区中的数据片段进行关联打标 | 生成唯一的Event_ID，并锁定相关日志数据 |
+
+**触发条件分类**:
+```python
+class ReplayTrigger(Enum):
+    TASK_COMPLETED = "task_completed"       # 任务成功完成
+    TASK_FAILED = "task_failed"             # 任务执行失败
+    USER_INTERRUPT = "user_int/n/n=== Match: 意图分类 ===/n节点作为结构分组
+
+**工具循环边界** (`zulong/l2/fc_runner.py`):
+- FC Runner 不是普通回答外壳，不负责“先问模型要不要调用工具”
+- FC Runner 只接收已经发生的真实 `tool_call`，执行工具、追加观察结果，并继续收敛
+- “工具清单存在”不等于“进入工具循环”；只有“模型调用了相应工具”才计入 FC 循环
+
+**主链决策来源**:
+- L1-B 输出工具预判、上下文/记忆包、任务图策略和输出模态辅助信号
+- L2 依据 L1-B 打包结果、任务图策略与工具调用结果进行推理
+- 恢复任务属于任务状态管理与任务图策略，不作为 L2 会话意图分类
+
+---
+
+### 19.2 数据模型
+
+#### 19.2.1 节点类型 (NodeType)
+
+9 种节点类型覆盖所有记忆子系统，定义于 `NodeType(Enum)`:
+
+| NodeType | 值 | 来源 | 说明 |
+|----------|----|------|------|
+| TASK | `"task"` | TaskGraph.TaskNode | 任务节点 |
+| DIALOGUE | `"dialogue"` | ShortTermMemory 对话轮次 | 对话节点 |
+| KNOWLEDGE | `"knowledge"` | KnowledgeGraph/n/n=== Match: 两阶段 ===/n特殊规则: `memorability="must_remember"` 或 `importance="must_learn"` 的记忆直接巩固。
+
+#### 19.7.3 MemoryForgetter — 记忆遗忘
+
+自动清理低价值记忆:
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| forget_threshold | 0.1 | 强度低于此值触发遗忘 |
+| check_interval_hours | 6.0 | 检查冷却间隔 |
+| protected_importance | `["must_learn"]` | 受保护的重要度等级 |
+
+**两阶段遗忘**:
+1. 标记阶段: 设置 `deleted=True, delete_reason="low_strength"`
+2. 清除阶段: `cleanup_deleted()` 物理删除已标记文档
+
+#### 19.7.4 MemoryEvolutionEngine — 进化引擎
+
+编排 30 分钟自动进化周期:
+
+```
+evolve() → 
+  1. consolidator.consolidate_memories()  — 巩固
+  2. forgetter.forget_memories()          — 遗忘
+  3. forgetter.cleanup_delet/n/n=== Match: 意图分类 ===/n文件差异
+    risk: LOW
+```
+
+**关键设计决策**:
+- **不分类**: 工具清单是扁平列表, 不按文件/命令/网络等分组传入 LLM prompt; 避免分组增加 LLM 推理步骤
+- **每个工具有简要说明**: 一行描述让 LLM 理解工具用途, 无需额外推理
+- **风险标注**: risk 字段供前端审批逻辑使用, 不传给 LLM (避免 LLM 基于风险自我审查)
+
+#### 23.2.3 L1-B 工具预判流程
+
+```python
+class L1BToolPredictor:
+    """L1-B 工具预判器
+
+    只输出工具与上下文信号，不输出会话意图分类标签。
+    L2 仍是唯一负责推理、回复生成与工具执行决策的层。
+    """
+
+    def predict_tools(self, prompt: str, conversation_history: list) -> dict:
+        """
+        分析用户 prompt + 对话历史，预判可能需要的工具与任务图策略。
+
+        返回:
+        {
+            "predicted_tools": ["read_file", "search_files", ...],
+            "tool_bag": TOOL_BAG/n/n=== Match: 意图分类 ===/nfidence(predicted_tools, prompt),
+            "reasons": explain_prediction(predicted_tools, context_bundle, task_graph_policy),
+            "risk_notes": collect_risk_notes(predicted_tools)
+        }
+```
+
+**约束**:
+- `turn_shape` 是轮次形态信号，只用于检索/工具包裁剪，不得作为 L2 会话分类分支。
+- `task_graph_policy` 是任务图处理策略，不是用户意图分类。
+- L1-B 不得直接生成正常回复文本；简单招呼也必须进入 L2 生成。
+- `request_tool_supplement` 由 L2 工具增强注入层按需暴露；L1-B 只预测业务工具，不把“补充工具”作为用户任务工具。
+- L2 若发现工具包不足，必须通过 `request_tool_supplement` 自主补充工具；但只有模型真实调用该工具时才计入 FC 工具循环。
+
+#### 23.2.4 L2 自主工具补充
+
+L1-B 预判只提供建议范围，L2 先进行一次模型决策；若该决策直接生成自然语言回复，则本轮结束，不进入工具循环。若该决策返回真实 `tool_call`，才进入 F/n/n=== Match: 进入插话流程 ===/n                                     │
+│ [展开全部记忆] [搜索记忆] [查看知识图谱]              │
+└──────────────────────────────────────────────────┘
+```
+
+---
+
+### 23.7 中途插话与任务调整 (Mid-Stream Interruption)
+
+#### 23.7.1 复用现有打断机制
+
+中途插话不是独立功能, 而是在现有打断机制上增强:
+
+```
+用户输入新消息 (任务进行中)
+  │
+  ├─→ 1. 前端: _isGenerating == true → 进入插话流程
+  │
+  ├─→ 2. 前端发送 STOP_GENERATION
+  │
+  ├─→ 3. 后端: cancel_flag → FC 循环中断 → 记录 user_interject 事件
+  │     └─ 当前 run 标记为 interrupted
+  │
+  ├─→ 4. 前端发送新 CHAT_MESSAGE (包含插话内容)
+  │
+  ├─→ 5. 后端: 新 turn 开始
+  │     ├─ InteractionStore 召回最近 60s interaction
+  │     ├─ MemoryGraph.bfs_spread() 召回关联记忆
+  │     └/n/n=== Match: CHAT ===/n话与任务调整 (Mid-Stream Interruption)
+
+#### 23.7.1 复用现有打断机制
+
+中途插话不是独立功能, 而是在现有打断机制上增强:
+
+```
+用户输入新消息 (任务进行中)
+  │
+  ├─→ 1. 前端: _isGenerating == true → 进入插话流程
+  │
+  ├─→ 2. 前端发送 STOP_GENERATION
+  │
+  ├─→ 3. 后端: cancel_flag → FC 循环中断 → 记录 user_interject 事件
+  │     └─ 当前 run 标记为 interrupted
+  │
+  ├─→ 4. 前端发送新 CHAT_MESSAGE (包含插话内容)
+  │
+  ├─→ 5. 后端: 新 turn 开始
+  │     ├─ InteractionStore 召回最近 60s interaction
+  │     ├─ MemoryGraph.bfs_spread() 召回关联记忆
+  │     └─ 构建上下文: 已完成+已中断+新指令 → 注入 L2
+  │
+  └─→ 6. 前端: 显示 "🔄 任务方向已调整" 分隔线
+         ├─ 插话前: 已完成项 (灰色, 可折叠)
+         ├─ 插话卡片: 用户插入的内容
+         └─ 插话后: 新方向执行
+```
+
+###/n/n=== Match: 进入更慢衰减或经验库确认流程 ===/n | 审批事件 | 审批请求、审批决策、审批模式和风险信息 |
+
+采用独立 NodeType 的原因：
+- 热路径 BFS 可通过 `get_nodes_by_type(NodeType.TOOL_CALL)` 直接定位工具调用节点，不需要在普通 `DIALOGUE` 中做 `metadata.sub_type` 二次过滤。
+- 赫布学习可以单独统计工具调用之间的共激活，避免与普通用户消息、助手消息混淆。
+- `decay_and_prune()` 可对 `TOOL_CALL` / `TOOL_RESULT` 使用比身份记忆、事实记忆更快的衰减策略；`APPROVAL` 中明确表达的用户偏好可进入更慢衰减或经验库确认流程。
+- TaskExecutionTrace 可直接从专用节点和边聚合，减少对前端卡片文本和普通对话文本的解析噪声。
+
+专用节点 metadata 要求：
+
+| NodeType | 必备/建议字段 |
+|---|---|
+| `TOOL_CALL` | `pair_id`, `tool_name`, `arguments_summary`, `fc_turn`, `task_graph_id`, `risk_level`, `source_event_id` |
+| `TOOL_RESULT` | `pair_id`, `tool_name`, `success`, `latency_ms`/n/n=== Match: CHAT ===/nsummary)
+        └─ 工具预判
+        → L2 system prompt = 完整上下文
+```
+
+**关键原则**:
+- **session_id 是唯一锚点**: 不需要 task_graph_id。session_id 绑定根节点，图谱通过 BFS 自然可达。
+- **BFS 深度 3** 足够: 根节点 → Turn 节点 → Sub-dialogue/TaskGraph → 子 TaskNode
+- **退化为全新上下文**: 如果 BFS 扩散无结果（新会话、无根节点），由 L1-B 构造新的上下文包并进入 L2 统一主链
+
+#### 23.11.4 CHAT_MESSAGE 协议字段规范
+
+Web Dashboard 发送的 `CHAT_MESSAGE` 消息必须包含以下字段：
+
+```typescript
+interface ChatMessagePayload {
+    type: "CHAT_MESSAGE";
+    text: string;                    // 用户输入文本
+    session_id: string;              // 会话 ID (必需, 绑定根节点)
+    conversation_id: string;         // 对话 ID (必需, 持久化锚点)
+   /n/n=== Match: CHAT ===/nstem prompt = 完整上下文
+```
+
+**关键原则**:
+- **session_id 是唯一锚点**: 不需要 task_graph_id。session_id 绑定根节点，图谱通过 BFS 自然可达。
+- **BFS 深度 3** 足够: 根节点 → Turn 节点 → Sub-dialogue/TaskGraph → 子 TaskNode
+- **退化为全新上下文**: 如果 BFS 扩散无结果（新会话、无根节点），由 L1-B 构造新的上下文包并进入 L2 统一主链
+
+#### 23.11.4 CHAT_MESSAGE 协议字段规范
+
+Web Dashboard 发送的 `CHAT_MESSAGE` 消息必须包含以下字段：
+
+```typescript
+interface ChatMessagePayload {
+    type: "CHAT_MESSAGE";
+    text: string;                    // 用户输入文本
+    session_id: string;              // 会话 ID (必需, 绑定根节点)
+    conversation_id: string;         // 对话 ID (必需, 持久化锚点)
+    request_id: string;              // 请求 /n/n=== Match: CHAT ===/nn_id 绑定根节点，图谱通过 BFS 自然可达。
+- **BFS 深度 3** 足够: 根节点 → Turn 节点 → Sub-dialogue/TaskGraph → 子 TaskNode
+- **退化为全新上下文**: 如果 BFS 扩散无结果（新会话、无根节点），由 L1-B 构造新的上下文包并进入 L2 统一主链
+
+#### 23.11.4 CHAT_MESSAGE 协议字段规范
+
+Web Dashboard 发送的 `CHAT_MESSAGE` 消息必须包含以下字段：
+
+```typescript
+interface ChatMessagePayload {
+    type: "CHAT_MESSAGE";
+    text: string;                    // 用户输入文本
+    session_id: string;              // 会话 ID (必需, 绑定根节点)
+    conversation_id: string;         // 对话 ID (必需, 持久化锚点)
+    request_id: string;              // 请求 ID (关联思考过程)
+    task_graph_id?: string;          // 可选: 已知的任务图谱 ID (兜底锚点)
+    refer/n/n

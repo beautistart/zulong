@@ -212,7 +212,7 @@ class ZulongTester:
             print(f"\n✅ 系统状态：在线 (HTTP {response.status_code})")
         except Exception as e:
             print(f"\n❌ 系统状态：离线 ({e})")
-            print("请确保祖龙系统和 OpenClaw Bridge 已启动")
+            print("请确保祖龙 Web 服务已启动")
             return
         
         # 运行测试

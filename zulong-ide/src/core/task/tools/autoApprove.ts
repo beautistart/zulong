@@ -18,22 +18,28 @@ export class AutoApprove {
 
 	/**
 	 * Check if the current provider is Zulong and the tool should be auto-approved
-	 * based on the zulongAutoApproveMode setting.
+	 * based on the TSD approval mode. Legacy full/read_only/off values are mapped
+	 * for users upgrading from older settings.
 	 */
 	private isZulongAutoApproved(toolName: ZulongDefaultTool): boolean {
 		const apiConfig = this.stateManager.getApiConfiguration()
 		if (apiConfig.planModeApiProvider !== "zulong" && apiConfig.actModeApiProvider !== "zulong") return false
 
 		const settings = this.stateManager.getGlobalSettingsKey("autoApprovalSettings")
-		const mode = settings.zulongAutoApproveMode ?? "full"
+		const mode = settings.zulongAutoApproveMode ?? "manual"
 
-		if (mode === "full") return true
+		if (mode === "full_auto" || mode === "full") return true
+		if (mode === "whitelist") {
+			return [ZulongDefaultTool.FILE_READ, ZulongDefaultTool.LIST_FILES, ZulongDefaultTool.LIST_CODE_DEF, ZulongDefaultTool.SEARCH].includes(
+				toolName,
+			)
+		}
 		if (mode === "read_only") {
 			return [ZulongDefaultTool.FILE_READ, ZulongDefaultTool.LIST_FILES, ZulongDefaultTool.LIST_CODE_DEF, ZulongDefaultTool.SEARCH].includes(
 				toolName,
 			)
 		}
-		return false // mode === "off"
+		return false // mode === "manual" | "popup" | "off"
 	}
 
 	/**

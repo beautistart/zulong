@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🐱 猫捉老鼠 - 像素风</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #1a1a2e;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    font-family: 'Press Start 2P', monospace;
+    overflow: hidden;
+    image-rendering: pixelated;
+  }
+
+  .game-wrapper {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .game-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    width: 640px;
+    padding: 8px 16px;
+    background: #16213e;
+    border: 4px solid #0f3460;
+    box-shadow: 0 0 0 4px #533483, 0 0 0 8px #16213e;
+    color: #e94560;
+    font-size: 11px;
+    letter-spacing: 1px;
+  }
+
+  .game-header .score-label { color: #f5c518; }
+  .game-header .lives-label { color: #e94560; }
+  .game-header .level-label { color: #0f9b8e; }
+
+  .game-header span {
+    display: inline-block;
+    min-width: 40px;
+    text-align: center;
+  }
+
+  canvas {
+    border: 4px solid #0f3460;
+    box-shadow: 0 0 0 4px #533483, 0 0 0 8px #16213e, 0 0 20px rgba(83, 52, 131, 0.5);
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    background: #2d2d44;
+  }
+
+  .game-footer {
+    width: 640px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 16px;
+    background: #16213e;
+    border: 4px solid #0f3460;
+    box-shadow: 0 0 0 4px #533483, 0 0 0 8px #16213e;
+    color: #aaa;
+    font-size: 8px;
+    letter-spacing: 1px;
+  }
+
+  .game-footer .key { color: #f5c518; }
+
+  .overlay {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    background: rgba(0,0,0,0.75);
+    z-index: 10;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+
+  .overlay.active {
+    opacity: 1;
+    pointer-events: all;
+  }
+
+  .overlay h2 {
+    color: #e94560;
+    font-size: 24px;
+    margin-bottom: 16px;
+    text-shadow: 4px 4px 0 #533483;
+    letter-spacing: 2px;
+  }
+
+  .overlay .subtitle {
+    color: #f5c518;
+    font-size: 10px;
+    margin-bottom: 24px;
+    letter-spacing: 1px;
+  }
+
+  .overlay .btn {
+    font-family: 'Press Start 2P', monospace;
+    font-size: 12px;
+    padding: 12px 24px;
+    background: #e94560;
+    color: #fff;
+    border: 4px solid #533483;
+    cursor: pointer;
+    letter-spacing: 2px;
+    transition: all 0.1s;
+    box-shadow: 4px 4px 0 #0f3460;
+  }
+
+  .overlay .btn:hover {
+    background: #f5c518;
+    color: #1a1a2e;
+    transform: translate(-2px, -2px);
+    box-shadow: 6px 6px 0 #0f3460;
+  }
+
+  .overlay .btn:active {
+    transform: translate(2px, 2px);
+    box-shadow: 2px 2px 0 #0f3460;
+  }
+
+  .overlay .final-score {
+    color: #f5c518;
+    font-size: 14px;
+    margin-bottom: 8px;
+  }
+
+  .overlay .high-score {
+    color: #0f9b8e;
+    font-size: 10px;
+    margin-bottom: 20px;
+  }
+</style>
+</head>
+<body>
+
+<div class="game-wrapper">
+  <div class="game-header">
+    <div>🍰 <span class="score-label">得分</span> <span id="score">0</span></div>
+    <div>❤️ <span class="lives-label">生命</span> <span id="lives">3</span></div>
+    <div>📊 <span class="level-label">关卡</span> <span id="level">1</span></div>
+  </div>
+
+  <canvas id="gameCanvas" width="640" height="480"></canvas>
+
+  <div class="game-footer">
+    <span><span class="key">WASD/方向键</span> 移动</span>
+    <span><span class="key">空格</span> 冲刺</span>
+    <span>收集 🧀 躲避 🐱</span>
+  </div>
+
+  <!-- 开始界面 -->
+  <div class="overlay active" id="startOverlay">
+    <h2>🐱 猫捉老鼠 🐭</h2>
+    <div class="subtitle">像素风街机游戏</div>
+    <button class="btn" id="startBtn">开始游戏</button>
+  </div>
+
+  <!-- 结束界面 -->
+  <div class="overlay" id="gameOverOverlay">
+    <h2>游戏结束</h2>
+    <div class="final-score">最终得分: <span id="finalScore">0</span></div>
+    <div class="high-score">最高分: <span id="highScore">0</span></div>
+    <button class="btn" id="restartBtn">再来一局</button>
+  </div>
+</div>
+
+<script>
+(function() {
+  const canvas = document.getElementById('gameCanvas');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width;
+  const H = canvas.height;
+
+  // UI elements
+  const scoreEl = document.getElementById('score');
+  const livesEl = document.getElementById('lives');
+  const levelEl = document.getElementById('level');
+  const startOverlay = document.getElementById('startOverlay');
+  const gameOverOverlay = document.getElementById('gameOverOverlay');
+  const finalScoreEl = document.getElementById('finalScore');
+  const highScoreEl = document.getElementById('highScore');
+
+  // --- Pixel art sprites (8x8 grid) ---
+  // Each sprite is an array of strings, '#' = filled, '.' = empty
+  const SPRITES = {
+    mouse_right: [
+      '....##..',
+      '...####.',
+      '..##.##.',
+      '.##..##.',
+      '.######.',
+      '.##..##.',
+      '.##..##.',
+      '..####..'
+    ],
+    mouse_left: [
+      '..##....',
+      '.####...',
+      '.##.##..',
+      '.##..##.',
+      '.######.',
+      '.##..##.',
+      '.##..##.',
+      '..####..'
+    ],
+    mouse_up: [
+      '..####..',
+      '.##..##.',
+      '.##..##.',
+      '.######.',
+      '.##..##.',
+      '.##..##.',
+      '..####..',
+      '..##....'
+    ],
+    mouse_down: [
+      '..##....',
+      '..####..',
+      '.##..##.',
+      '.##..##.',
+      '.######.',
+      '.##..##.',
+      '.##..##.',
+      '..####..'
+    ],
+    cat_right: [
+      '.##..##.',
+      '.##..##.',
+      '.###.##.',
+      '.#####..',
+      '.#####..',
+      '.##..##.',
+      '.##..##.',
+      '.##..##.'
+    ],
+    cat_left: [
+      '.##..##.',
+      '.##..##.',
+      '.##.###.',
+      '..#####.',
+      '..#####.',
+      '.##..##.',
+      '.##..##.',
+      '.##..##.'
+    ],
+    cat_up: [
+      '.##..##.',
+      '.##..##.',
+      '.#####..',
+      '.#####..',
+      '.#####..',
+      '.##..##.',
+      '.##..##.',
+      '.##..##.'
+    ],
+    cat_down: [
+      '.##..##.',
+      '.##..##.',
+      '.#####..',
+      '.#####..',
+      '.#####..',
+      '.##..##.',
+      '.##..##.',
+      '.##..##.'
+    ],
+    cheese: [
+      '........',
+      '...##...',
+      '..####..',
+      '.######.',
+      '.######.',
+      '..####..',
+      '...##...',
+      '........'
+    ],
+    wall: [
+      '########',
+      '########',
+      '########',
+      '########',
+      '########',
+      '########',
+      '########',
+      '########'
+    ],
+    hole: [
+      '........',
+      '..####..',
+      '.##..##.',
+      '.##..##.',
+      '.##..##.',
+      '.##..##.',
+      '..####..',
+      '........'
+    ]
+  };
+
+  // --- Game State ---
+  const TILE = 16; // tile size in pixels
+  const COLS = W / TILE;  // 40
+  const ROWS = H / TILE;  // 30
+
+  let score = 0;
+  let lives = 3;
+  let level = 1;
+  let highScore = parseInt(localStorage.getItem('catMouseHighScore') || '0');
+  let gameRunning = false;
+  let gamePaused = false;
+  let animFrameId = null;
+
+  // Entities
+  let mouse = { x: 5, y: 15, dir: 'right', speed: 0.12, sprinting: false, invincible: 0 };
+  let cat = { x: 35, y: 15, dir: 'left', speed: 0.07, targetX: 0, targetY: 0, aiTimer: 0, aiCooldown: 0 };
+  let cheeses = [];
+  let holes = [];
+  let walls = [];
+  let particles = [];
+
+  // Input
+  const keys = {};
+  let lastKeyTime = 0;
+
+  // --- Maze Generation ---
+  function generateMaze() {
+    walls = [];
+    holes = [];
+    cheeses = [];
+
+    // Border walls
+    for (let x = 0; x < COLS; x++) {
+      walls.push({ x, y: 0 });
+      walls.push({ x, y: ROWS - 1 });
+    }
+    for (let y = 0; y < ROWS; y++) {
+      walls.push({ x: 0, y });
+      walls.push({ x: COLS - 1, y });
+    }
+
+    // Generate random interior walls (pixel-style maze)
+    const numWalls = 30 + level * 5;
+    for (let i = 0; i < numWalls; i++) {
+      const wx = 2 + Math.floor(Math.random() * (COLS - 4));
+      const wy = 2 + Math.floor(Math.random() * (ROWS - 4));
+      // Don't place walls near start positions
+      if (Math.abs(wx - 5) < 3 && Math.abs(wy - 15) < 3) continue;
+      if (Math.abs(wx - 35) < 3 && Math.abs(wy - 15) < 3) continue;
+      // Don't duplicate
+      if (walls.some(w => w.x === wx && w.y === wy)) continue;
+      walls.push({ x: wx, y: wy });
+    }
+
+    // Generate holes (safe zones for mouse)
+    const numHoles = 2 + Math.floor(level / 2);
+    for (let i = 0; i < numHoles; i++) {
+      let hx, hy;
+      do {
+        hx = 3 + Math.floor(Math.random() * (COLS - 6));
+        hy = 3 + Math.floor(Math.random() * (ROWS - 6));
+      } while (walls.some(w => w.x === hx && w.y === hy) ||
+               holes.some(h => h.x === hx && h.y === hy));
+      holes.push({ x: hx, y: hy });
+    }
+
+    // Generate cheeses
+    const numCheeses = 5 + level * 2;
+    for (let i = 0; i < numCheeses; i++) {
+      let cx, cy;
+      do {
+        cx = 2 + Math.floor(Math.random() * (COLS - 4));
+        cy = 2 + Math.floor(Math.random() * (ROWS - 4));
+      } while (walls.some(w => w.x === cx && w.y === cy) ||
+               holes.some(h => h.x === cx && h.y === cy) ||
+               cheeses.some(c => c.x === cx && c.y === cy) ||
+               (Math.abs(cx - mouse.x) < 2 && Math.abs(cy - mouse.y) < 2));
+      cheeses.push({ x: cx, y: cy, collected: false });
+    }
+  }
+
+  // --- Reset Level ---
+  function resetLevel() {
+    mouse.x = 5;
+    mouse.y = 15;
+    mouse.dir = 'right';
+    mouse.sprinting = false;
+    mouse.invincible = 0;
+    cat.x = 35;
+    cat.y = 15;
+    cat.dir = 'left';
+    cat.aiTimer = 0;
+    cat.aiCooldown = 0;
+    particles = [];
+    generateMaze();
+  }
+
+  // --- Particle System ---
+  function spawnParticles(x, y, color, count) {
+    for (let i = 0; i < count; i++) {
+      particles.push({
+        x: x * TILE + TILE / 2,
+        y: y * TILE + TILE / 2,
+        vx: (Math.random() - 0.5) * 3,
+        vy: (Math.random() - 0.5) * 3,
+        life: 20 + Math.random() * 20,
+        color: color,
+        size: 2 + Math.random() * 3
+      });
+    }
+  }
+
+  function updateParticles() {
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.x += p.vx;
+      p.y += p.vy;
+      p.life--;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+  }
+
+  // --- Collision Detection ---
+  function isWall(x, y) {
+    return walls.some(w => w.x === Math.floor(x) && w.y === Math.floor(y));
+  }
+
+  function canMoveTo(x, y) {
+    const margin = 0.3;
+    // Check all four corners of the sprite bounding box
+    const cx = x + 0.5;
+    const cy = y + 0.5;
+    const checks = [
+      { x: cx - margin, y: cy - margin },
+      { x: cx + margin, y: cy - margin },
+      { x: cx - margin, y: cy + margin },
+      { x: cx + margin, y: cy + margin }
+    ];
+    return !checks.some(c => isWall(c.x, c.y));
+  }
+
+  function getDistance(a, b) {
+    return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+  }
+
+  // --- Cat AI ---
+  function updateCatAI() {
+    cat.aiTimer -= 1 / 60;
+    if (cat.aiTimer > 0) return;
+
+    // Recalculate path every 0.3 seconds
+    cat.aiTimer = 0.3;
+    cat.aiCooldown = Math.max(0, cat.aiCooldown - 0.3);
+
+    const dx = mouse.x - cat.x;
+    const dy = mouse.y - cat.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+
+    // Cat gets faster each level
+    const catSpeed = cat.speed + level * 0.01;
+
+    // Simple chase AI with some randomness
+    if (dist < 15) {
+      // Chase mouse directly
+      if (Math.abs(dx) > Math.abs(dy)) {
+        cat.targetX = cat.x + Math.sign(dx);
+        cat.targetY = cat.y;
+      } else {
+        cat.targetX = cat.x;
+        cat.targetY = cat.y + Math.sign(dy);
+      }
+    } else {
+      // Wander randomly
+      if (Math.random() < 0.3 || cat.aiCooldown > 0) {
+        const dirs = [
+          { dx: 1, dy: 0 }, { dx: -1, dy: 0 },
+          { dx: 0, dy: 1 }, { dx: 0, dy: -1 }
+        ];
+        // Prefer direction toward mouse
+        const preferred = { dx: Math.sign(dx), dy: Math.sign(dy) };
+        const choices = dirs.filter(d => canMoveTo(cat.x + d.dx * 0.5, cat.y + d.dy * 0.5));
+        if (choices.length > 0) {
+          const choice = choices[Math.floor(Math.random() * choices.length)];
+          cat.targetX = cat.x + choice.dx;
+          cat.targetY = cat.y + choice.dy;
+        }
+      }
+    }
+
+    // Move toward target
+    const tdx = cat.targetX - cat.x;
+    const tdy = cat.targetY - cat.y;
+    if (Math.abs(tdx) > 0.01 || Math.abs(tdy) > 0.01) {
+      const newX = cat.x + Math.sign(tdx) * catSpeed;
+      const newY = cat.y + Math.sign(tdy) * catSpeed;
+
+      if (canMoveTo(newX, cat.y)) cat.x = newX;
+      if (canMoveTo(cat.x, newY)) cat.y = newY;
+
+      // Update direction
+      if (Math.abs(tdx) > Math.abs(tdy)) {
+        cat.dir = tdx > 0 ? 'right' : 'left';
+      } else {
+        cat.dir = tdy > 0 ? 'down' : 'up';
+      }
+    }
+  }
+
+  // --- Update ---
+  function update() {
+    if (!gameRunning || gamePaused) return;
+
+    // Mouse movement
+    const mouseSpeed = mouse.sprinting ? mouse.speed * 1.8 : mouse.speed;
+    let mx = 0, my = 0;
+
+    if (keys['ArrowUp'] || keys['KeyW']) { my = -1; mouse.dir = 'up'; }
+    if (keys['ArrowDown'] || keys['KeyS']) { my = 1; mouse.dir = 'down'; }
+    if (keys['ArrowLeft'] || keys['KeyA']) { mx = -1; mouse.dir = 'left'; }
+    if (keys['ArrowRight'] || keys['KeyD']) { mx = 1; mouse.dir = 'right'; }
+
+    // Normalize diagonal movement
+    if (mx !== 0 && my !== 0) {
+      mx *= 0.707;
+      my *= 0.707;
+    }
+
+    const newMX = mouse.x + mx * mouseSpeed;
+    const newMY = mouse.y + my * mouseSpeed;
+
+    if (canMoveTo(newMX, mouse.y)) mouse.x = newMX;
+    if (canMoveTo(mouse.x, newMY)) mouse.y = newMY;
+
+    // Clamp to bounds
+    mouse.x = Math.max(0.5, Math.min(COLS - 1.5, mouse.x));
+    mouse.y = Math.max(0.5, Math.min(ROWS - 1.5, mouse.y));
+
+    // Sprint cooldown
+    mouse.sprinting = keys['Space'] && Date.now() - lastKeyTime < 2000;
+    if (mouse.sprinting && Math.random() < 0.1) {
+      spawnParticles(Math.floor(mouse.x), Math.floor(mouse.y), '#f5c518', 1);
+    }
+
+    // Invincibility timer
+    if (mouse.invincible > 0) mouse.invincible -= 1 / 60;
+
+    // Update cat AI
+    updateCatAI();
+
+    // Check cheese collection
+    for (const cheese of cheeses) {
+      if (cheese.collected) continue;
+      if (getDistance(mouse, cheese) < 0.8) {
+        cheese.collected = true;
+        score += 100 * level;
+        spawnParticles(cheese.x, cheese.y, '#f5c518', 8);
+        updateUI();
+      }
+    }
+
+    // Check hole safety
+    let inHole = false;
+    for (const hole of holes) {
+      if (getDistance(mouse, hole) < 0.8) {
+        inHole = true;
+        break;
+      }
+    }
+
+    // Cat catches mouse
+    if (!inHole && mouse.invincible <= 0 && getDistance(mouse, cat) < 0.8) {
+      lives--;
+      spawnParticles(Math.floor(mouse.x), Math.floor(mouse.y), '#e94560', 15);
+      mouse.invincible = 2.0; // 2 seconds invincibility
+      updateUI();
+
+      if (lives <= 0) {
+        gameOver();
+        return;
+      }
+
+      // Reset positions
+      mouse.x = 5;
+      mouse.y = 15;
+      cat.x = 35;
+      cat.y = 15;
+    }
+
+    // Check if all cheeses collected
+    const allCollected = cheeses.every(c => c.collected);
+    if (allCollected) {
+      level++;
+      score += 500 * (level - 1);
+      updateUI();
+      resetLevel();
+      spawnParticles(mouse.x, mouse.y, '#0f9b8e', 20);
+    }
+
+    // Update particles
+    updateParticles();
+
+    // Update UI
+    updateUI();
+  }
+
+  function updateUI() {
+    scoreEl.textContent = score;
+    livesEl.textContent = lives;
+    levelEl.textContent = level;
+  }
+
+  // --- Draw ---
+  function drawSprite(spriteName, x, y, alpha = 1) {
+    const sprite = SPRITES[spriteName];
+    if (!sprite) return;
+
+    const px = Math.floor(x * TILE);
+    const py = Math.floor(y * TILE);
+    const pixelSize = TILE / 8;
+
+    ctx.globalAlpha = alpha;
+
+    for (let row = 0; row < 8; row++) {
+      for (let col = 0; col < 8; col++) {
+        if (sprite[row][col] === '#') {
+          ctx.fillRect(
+            px + col * pixelSize,
+            py + row * pixelSize,
+            pixelSize,
+            pixelSize
+          );
+        }
+      }
+    }
+
+    ctx.globalAlpha = 1;
+  }
+
+  function draw() {
+    // Clear
+    ctx.fillStyle = '#2d2d44';
+    ctx.fillRect(0, 0, W, H);
+
+    // Draw grid (subtle)
+    ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+    ctx.lineWidth = 0.5;
+    for (let x = 0; x < COLS; x++) {
+      ctx.beginPath();
+      ctx.moveTo(x * TILE, 0);
+      ctx.lineTo(x * TILE, H);
+      ctx.stroke();
+    }
+    for (let y = 0; y < ROWS; y++) {
+      ctx.beginPath();
+      ctx.moveTo(0, y * TILE);
+      ctx.lineTo(W, y * TILE);
+      ctx.stroke();
+    }
+
+    // Draw holes
+    for (const hole of holes) {
+      ctx.fillStyle = '#1a3a2a';
+      ctx.fillRect(hole.x * TILE, hole.y * TILE, TILE, TILE);
+      ctx.fillStyle = '#0f9b8e';
+      drawSprite('hole', hole.x, hole.y, 0.6);
+    }
+
+    // Draw walls
+    for (const wall of walls) {
+      ctx.fillStyle = '#533483';
+      drawSprite('wall', wall.x, wall.y);
+      // Add highlight
+      ctx.fillStyle = 'rgba(255,255,255,0.1)';
+      ctx.fillRect(wall.x * TILE, wall.y * TILE, TILE, 2);
+    }
+
+    // Draw cheeses
+    for (const cheese of cheeses) {
+      if (cheese.collected) continue;
+      ctx.fillStyle = '#f5c518';
+      drawSprite('cheese', cheese.x, cheese.y);
+      // Glow effect
+      ctx.fillStyle = 'rgba(245, 197, 24, 0.2)';
+      ctx.fillRect(cheese.x * TILE - 2, cheese.y * TILE - 2, TILE + 4, TILE + 4);
+    }
+
+    // Draw mouse (with invincibility blink)
+    if (mouse.invincible <= 0 || Math.floor(mouse.invincible * 10) % 2 === 0) {
+      ctx.fillStyle = '#aaa';
+      drawSprite('mouse_' + mouse.dir, mouse.x, mouse.y);
+    }
+
+    // Draw cat
+    ctx.fillStyle = '#e94560';
+    drawSprite('cat_' + cat.dir, cat.x, cat.y);
+
+    // Draw particles
+    for (const p of particles) {
+      ctx.fillStyle = p.color;
+      ctx.globalAlpha = p.life / 40;
+      ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+    }
+    ctx.globalAlpha = 1;
+
+    // Draw sprint indicator
+    if (mouse.sprinting) {
+      ctx.fillStyle = 'rgba(245, 197, 24, 0.3)';
+      ctx.fillRect(
+        Math.floor(mouse.x) * TILE - 4,
+        Math.floor(mouse.y) * TILE - 4,
+        TILE + 8,
+        TILE + 8
+      );
+    }
+  }
+
+  // --- Game Loop ---
+  function gameLoop() {
+    update();
+    draw();
+    animFrameId = requestAnimationFrame(gameLoop);
+  }
+
+  // --- Game Over ---
+  function gameOver() {
+    gameRunning = false;
+    if (score > highScore) {
+      highScore = score;
+      localStorage.setItem('catMouseHighScore', highScore);
+    }
+    finalScoreEl.textContent = score;
+    highScoreEl.textContent = highScore;
+    gameOverOverlay.classList.add('active');
+  }
+
+  // --- Start Game ---
+  function startGame() {
+    score = 0;
+    lives = 3;
+    level = 1;
+    mouse.x = 5;
+    mouse.y = 15;
+    mouse.dir = 'right';
+    mouse.sprinting = false;
+    mouse.invincible = 0;
+    cat.x = 35;
+    cat.y = 15;
+    cat.dir = 'left';
+    cat.aiTimer = 0;
+    cat.aiCooldown = 0;
+    particles = [];
+    generateMaze();
+    updateUI();
+    gameRunning = true;
+    gamePaused = false;
+    startOverlay.classList.remove('active');
+    gameOverOverlay.classList.remove('active');
+    highScoreEl.textContent = highScore;
+
+    if (animFrameId) cancelAnimationFrame(animFrameId);
+    gameLoop();
+  }
+
+  // --- Event Listeners ---
+  document.addEventListener('keydown', (e) => {
+    keys[e.code] = true;
+    lastKeyTime = Date.now();
+
+    // Prevent scrolling with arrow keys / space
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) {
+      e.preventDefault();
+    }
+  });
+
+  document.addEventListener('keyup', (e) => {
+    keys[e.code] = false;
+  });
+
+  document.getElementById('startBtn').addEventListener('click', startGame);
+  document.getElementById('restartBtn').addEventListener('click', startGame);
+
+  // --- Initial Draw ---
+  generateMaze();
+  draw();
+  highScoreEl.textContent = highScore;
+})();
+</script>
+</body>
+</html>

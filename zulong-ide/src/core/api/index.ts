@@ -19,6 +19,7 @@ export interface ApiHandler {
 	 * where results flow via WebSocket rather than in the next API request).
 	 */
 	sendToolResult?(callId: string, toolName: string, result: string, isError?: boolean): void
+	sendIdeApprovalResult?(payload: Record<string, any>): void
 }
 
 export interface ApiHandlerModel {
@@ -46,6 +47,7 @@ function createHandlerForProvider(
 	return new ZulongHandler({
 		onRetryAttempt: options.onRetryAttempt,
 		zulongServerUrl: options.zulongServerUrl,
+		zulongApprovalMode: options.zulongApprovalMode,
 	})
 }
 

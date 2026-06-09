@@ -37,11 +37,5 @@ rm $TMP
 
 echo Wrote uses of the vscode SDK to $(realpath $SDK_DEST)
 
-{
-grep -rh -- --vscode- webview-ui/build/ |
-sed 's/--vscode/\n--vscode/g' | # One var per line
-grep -- --vscode | # Remove lines that don't have vars.
-sed 's/[),"\\].*$//' | # remove from the end of the var name to the end of the line.
-sort | uniq > $CSS_DEST
-}
-echo Wrote vscode vars used to $(realpath $CSS_DEST)
+: > $CSS_DEST
+echo "No embedded VS Code web UI build; wrote empty vscode CSS usage list to $(realpath $CSS_DEST)"

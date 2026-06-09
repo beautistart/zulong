@@ -20,15 +20,12 @@ fi
 echo "Building protos..."
 npm run protos || { echo "Protos build failed"; exit 1; }
 
-# Step 2: Build webview once
-echo "Building webview..."
-npm run build:webview || { echo "Webview build failed"; exit 1; }
 
-# Step 3: Kill existing session if one is running
+# Step 2: Kill existing session if one is running
 tmux kill-session -t "$SESSION" 2>/dev/null
 true
 
-# Step 4: Create tmux session with 4 vertical panes
+# Step 3: Create tmux session with 4 vertical panes
 #
 #   ┌────────────┬────────────┬────────────┬────────────┐
 #   │  esbuild   │    tsc     │  webview   │  ext host  │
@@ -45,9 +42,7 @@ tmux select-layout -t "$SESSION" even-horizontal
 tmux bind-key -T root C-c kill-session
 
 tmux send-keys -t "$SESSION:0.0" "npm run watch:esbuild" Enter
-tmux send-keys -t "$SESSION:0.1" "npm run watch:tsc" Enter
-tmux send-keys -t "$SESSION:0.2" "npm run dev:webview" Enter
-tmux send-keys -t "$SESSION:0.3" "while [ ! -f '$WORKSPACE/dist/extension.js' ]; do sleep 0.5; done && echo 'Launching Extension Host...' && code --extensionDevelopmentPath='$WORKSPACE' --disable-workspace-trust --disable-extension saoudrizwan.claude-dev --disable-extension saoudrizwan.cline-nightly '$WORKSPACE' && echo 'Extension Host launched.'" Enter
+tmux send-keys -t "$SESSION:0.1" "npm run watch:tsc" Entertmux send-keys -t "$SESSION:0.3" "while [ ! -f '$WORKSPACE/dist/extension.js' ]; do sleep 0.5; done && echo 'Launching Extension Host...' && code --extensionDevelopmentPath='$WORKSPACE' --disable-workspace-trust --disable-extension saoudrizwan.claude-dev --disable-extension saoudrizwan.cline-nightly '$WORKSPACE' && echo 'Extension Host launched.'" Enter
 
 # Attach to the session
 tmux attach-session -t "$SESSION"
@@ -55,10 +50,9 @@ tmux attach-session -t "$SESSION"
 # Session ended -- run full cleanup
 tmux unbind-key -T root C-c 2>/dev/null
 # Kill watcher processes and their node children
-pkill -f "watch:esbuild|watch:tsc|dev:webview" 2>/dev/null
+pkill -f "watch:esbuild|watch:tsc" 2>/dev/null
 pkill -f "esbuild.mjs --watch" 2>/dev/null
 pkill -f "tsc --noEmit --watch" 2>/dev/null
-pkill -f "vite.*/webview-ui" 2>/dev/null
 # Close the Extension Development Host window
 osascript -e '
 tell application "System Events"

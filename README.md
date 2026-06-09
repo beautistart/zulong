@@ -195,7 +195,7 @@ L0 设备层 (Device Layer)           - USB 摄像头/麦克风/扬声器驱动
 
 ```
 VS Code Extension (前端)  ←WebSocket→  Python Backend (后端)
-  ├─ React + Vite Webview                ├─ FastAPI + WebSocket
+  ├─ Zulong Web 主交互                ├─ FastAPI + WebSocket
   ├─ 交互卡片系统                        ├─ L2 推理引擎 (FC循环合并)
   ├─ 审批白名单 UI                       ├─ MemoryGraph 记忆系统
   ├─ 记忆图谱可视化                      ├─ 工具袋 (ToolBag)
@@ -220,17 +220,21 @@ VS Code Extension (前端)  ←WebSocket→  Python Backend (后端)
 git clone https://github.com/beautistart/zulong.git
 cd zulong
 
-# 2. 安装 Python 后端依赖
-python -m venv zulong_env
-source zulong_env/bin/activate  # Windows: zulong_env\Scripts\activate
-pip install -r requirements.txt
+# 2. 安装 Python 后端依赖（三端按平台选择）
+# Windows:
+.\scripts\setup_windows.ps1
 
-# 3. 安装前端依赖
+# Linux:
+bash scripts/setup_linux.sh
+
+# macOS:
+bash scripts/setup_macos.sh
+
+# 3. 安装 VS Code 后台桥依赖
 cd zulong-ide
 npm install
-cd webview-ui && npm install && cd ..
 
-# 4. 构建 VS Code 扩展
+# 4. 构建 VS Code 后台桥扩展
 npm run protos                      # 生成 TypeScript proto 文件
 node esbuild.mjs --production       # esbuild 打包
 npx @vscode/vsce package --no-dependencies --allow-missing-repository --skip-license
@@ -298,7 +302,7 @@ audio:
 
 ```
 zulong/
-├── zulong-ide/                 # VS Code 扩展前端 (React + TypeScript)
+├── zulong-ide/                 # VS Code 后台执行桥 (React + TypeScript)
 ├── zulong/                     # Python 后端核心
 │   ├── ide/                    # IDE 模式 (WebSocket 服务 + 工具注册)
 │   ├── l2/                     # L2 推理引擎 (FC循环 + 记忆 + 熔断 + 任务图)
@@ -336,7 +340,7 @@ zulong/
 
 ## 🛠️ 工具系统
 
-**内部工具**（后端执行）：`task_create_plan` | `task_add_node` | `task_mark_status` | `recall_memory` | `read_memory_node` | `save_memory_note` | `discover_related` | `focus_on_chain`
+**内部工具**（后端执行）：`task_create_plan` | `task_add_node` | `task_mark_status` | `recall_memory` | `read_memory_node` | `save_memory_note` | `discover_related` | `navigate_attention`
 
 **远程工具**（前端执行）：`read_file` | `write_to_file` | `execute_command` | `search_files` | `browser_action`
 

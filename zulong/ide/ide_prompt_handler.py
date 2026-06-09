@@ -175,26 +175,33 @@ class IDEPromptHandler:
             task_graph_policy: L1-B 任务图策略
             cwd: 当前工作目录
         """
-        # 检测终端环境
-        import os
-        shell = os.environ.get('SHELL', '')
-        term = os.environ.get('TERM', '')
-        
-        # 判断终端类型
-        if 'bash' in shell.lower() or 'git' in shell.lower():
-            terminal_type = "Git Bash (Unix-like)"
-            shell_hint = "使用Git Bash语法: ls, grep, find, chmod等Unix命令"
-        elif 'powershell' in shell.lower() or 'pwsh' in shell.lower():
-            terminal_type = "PowerShell"
-            shell_hint = "使用PowerShell语法: Get-ChildItem, Select-String, Get-Content等"
-        elif 'cmd' in shell.lower() or shell == '':
-            terminal_type = "CMD (Windows)"
-            shell_hint = "使用CMD语法: dir, findstr, type等, 路径使用反斜杠\\"
-        else:
-            terminal_type = f"Unknown ({shell})"
-            shell_hint = "根据环境变量判断命令语法"
-        
-        terminal_env = f"\n\n【工作环境】\n工作目录: {cwd}\n【重要】所有文件路径必须使用绝对路径（以工作目录为根）\n终端类型: {terminal_type}\n{shell_hint}\nSHELL={shell}, TERM={term}"
+        try:
+            from zulong.utils.runtime_env import get_runtime_context
+
+            runtime = get_runtime_context()
+        except Exception:
+            import os
+
+            runtime = {
+                "os_name": "Windows" if os.name == "nt" else os.name,
+                "shell": os.environ.get("SHELL") or os.environ.get("COMSPEC") or "unknown",
+                "shell_family": "cmd" if os.name == "nt" else "posix",
+                "path_style": "windows" if os.name == "nt" else "posix",
+                "preferred_commands": ["rg", "python", "npm", "git"],
+                "command_guidance": "运行命令必须符合当前操作系统和 Shell。",
+            }
+
+        preferred_commands = runtime.get("preferred_commands") or ["rg", "python", "npm", "git"]
+        terminal_env = (
+            "\n\n【工作环境】\n"
+            f"工作目录: {cwd}\n"
+            "【重要】所有文件路径必须使用绝对路径（以工作目录为根）\n"
+            f"操作系统: {runtime.get('os_name', 'unknown')}\n"
+            f"Shell: {runtime.get('shell', 'unknown')} ({runtime.get('shell_family', 'unknown')})\n"
+            f"路径风格: {runtime.get('path_style', 'unknown')}\n"
+            f"推荐命令: {', '.join(str(cmd) for cmd in preferred_commands)}\n"
+            f"命令提示: {runtime.get('command_guidance', '运行命令必须符合当前操作系统和 Shell。')}"
+        )
         
         return self._build_zulong_prompt_unified(
             ide_base, memory_context, task_context, experience_hints,
@@ -264,7 +271,7 @@ class IDEPromptHandler:
             "      - 修改现有文件 → 必须调用: replace_in_file(path='<工作目录>/src/main.py', diff='...')\n"
             "      - 查看代码 → 用 read_file(path='文件绝对路径')\n"
             "      - 运行命令 → 用 execute_command(command='命令', requires_approval=false)\n"
-            "      - 分析项目/代码 → 用 index_project(root_dir='项目根目录') 或 index_code_file(file_path='文件路径')\n"
+            "      - 分析项目/代码 → 先用 task_create_plan 创建/绑定任务节点，再用 index_project(root_dir='项目根目录') 或 index_code_file(file_path='文件路径')\n"
             "      - 查找代码结构 → 用 search_code_symbols / get_symbol_context\n"
             "      - VS Code 命令 → 用 vscode_run_command(command='editor.action.formatDocument') 执行格式化/重构/Git等\n"
             "      - 检查代码错误 → 用 get_diagnostics() 获取 lint/编译诊断\n"
@@ -292,7 +299,7 @@ class IDEPromptHandler:
             "你必须调用 index_project 或 index_code_file，而不是只用 read_file 手动阅读！\n"
             "\n"
             "强制规则：\n"
-            "- 分析新项目/架构 → 第一步必须调用 index_project(root_dir=项目根目录)\n"
+            "- 分析新项目/架构 → 第一步必须调用 task_create_plan 创建/绑定任务图根节点，再调用 index_project(root_dir=项目根目录)\n"
             "- 分析单个文件 → 调用 index_code_file(file_path=文件路径)\n"
             "- 查找函数/类 → 调用 search_code_symbols(query=关键词)\n"
             "- 了解调用关系 → 调用 get_symbol_context(symbol_id=符号ID)\n"

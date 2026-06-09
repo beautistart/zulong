@@ -107,7 +107,22 @@ class ToolRAG(BaseRAGLibrary):
             "indexed_tools": list(self._tool_index.keys()),
             "vector_store": self.vector_store.get_stats()
         }
-    
+
+    def load(self, path: str) -> bool:
+        """加载工具索引，并重建 tool_name -> doc_id 的快速映射。"""
+        loaded = super().load(path)
+        if not loaded:
+            return False
+
+        self._tool_index = {}
+        for doc_id, doc in self.documents.items():
+            tool_name = doc.metadata.get("tool_name")
+            if tool_name:
+                self._tool_index[str(tool_name)] = doc_id
+
+        logger.info("[ToolRAG] Rebuilt tool index: %d tools", len(self._tool_index))
+        return True
+
     # ==================== 工具专用便捷方法 ====================
     
     def add_tool(self, tool_name: str, description: str,

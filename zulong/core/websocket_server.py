@@ -1,15 +1,14 @@
 # File: zulong/core/websocket_server.py
 """
-WebSocket 服务器 - 用于 OpenClaw Bridge 连接 [已弃用 → ide/ide_server.py]
+WebSocket 服务器 - 远程 EventBus 桥接 [已弃用 → ide/ide_server.py]
 
-本文件原实现基于 websockets 库的 WebSocket 服务器，用于 OpenClaw Bridge 连接。
+本文件原实现基于 websockets 库的 WebSocket 服务器，用于远程事件桥接。
 现已被 zulong/ide/ide_server.py 中的 FastAPI WebSocket 端点替代，后者同时提供：
 1. IDE WebSocket 通信（/ws 端点）
 2. 监控事件广播（broadcast_monitor_event）
 3. HTTP API 端点
 
-本模块仅保留 EventBusBridge 远程桥接功能，如不再需要 OpenClaw Bridge，
-可安全删除本文件及对应导入。
+本模块仅保留 EventBusBridge 远程桥接功能。
 """
 
 import asyncio

@@ -14,9 +14,7 @@ from .base import (
     BaseTool, ToolRegistry, ToolRequest, ToolResult,
     ToolStatus, ToolCategory
 )
-from .openclaw_tool import OpenClawToolAdapter
 from .web_search import WebSearchTool
-from .openclaw_plugin import OpenClawPluginAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -483,27 +481,13 @@ class ToolEngine:
     def _register_builtin_tools(self):
         """注册内置工具"""
         try:
-            # 注册 OpenClaw 工具适配器
-            openclaw_tool = OpenClawToolAdapter()
-            if self.register_tool(openclaw_tool):
-                logger.info("[ToolEngine] 已注册 OpenClaw 工具适配器")
-            else:
-                logger.debug("[ToolEngine] OpenClaw 工具适配器已存在，跳过注册")
-            
             # 注册 Web 搜索工具（SearXNG 直连）
             web_search_tool = WebSearchTool()
             if self.register_tool(web_search_tool):
                 logger.info("[ToolEngine] 已注册 Web 搜索工具 (SearXNG)")
             else:
                 logger.debug("[ToolEngine] Web 搜索工具已存在，跳过注册")
-            
-            # 注册 OpenClaw 插件适配器
-            openclaw_plugin_tool = OpenClawPluginAdapter()
-            if self.register_tool(openclaw_plugin_tool):
-                logger.info("[ToolEngine] 已注册 OpenClaw 插件适配器")
-            else:
-                logger.debug("[ToolEngine] OpenClaw 插件适配器已存在，跳过注册")
-            
+
             # 注册 search_tools 元工具（Tool RAG 入口）
             try:
                 from zulong.tools.search_tools import SearchToolsTool, RequestToolSupplementTool

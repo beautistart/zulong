@@ -144,7 +144,7 @@ const API_HANDLER_SETTINGS_FIELDS = {
 	ocaMode: { default: "internal" as string },
 	aihubmixBaseUrl: { default: undefined as string | undefined },
 	aihubmixAppCode: { default: undefined as string | undefined },
-	zulongServerUrl: { default: "ws://127.0.0.1:8090" as string | undefined },
+	zulongServerUrl: { default: "ws://127.0.0.1:8090/ide" as string | undefined },
 	enableParallelToolCalling: { default: true as boolean },
 
 	// Plan mode configurations

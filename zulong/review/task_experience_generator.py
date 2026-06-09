@@ -53,6 +53,12 @@ class TaskExperienceCandidate:
     importance_score: float
     tags: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    if_condition: str = ""
+    then_action: str = ""
+    avoid_action: str = ""
+    evidence_summary: str = ""
+    source_graph_nodes: List[str] = field(default_factory=list)
+    source_task_nodes: List[str] = field(default_factory=list)
 
 
 class TaskExperienceGenerator:
@@ -71,11 +77,17 @@ class TaskExperienceGenerator:
             if procedure:
                 candidates.append(procedure)
         else:
-            failure = self._failure_candidate(trace)
-            if failure:
-                candidates.append(failure)
+            workspace_bootstrap = self._workspace_bootstrap_failure_candidate(trace)
+            if workspace_bootstrap:
+                candidates.append(workspace_bootstrap)
+            else:
+                failure = self._failure_candidate(trace)
+                if failure:
+                    candidates.append(failure)
 
-        candidates.extend(self._preference_candidates(trace))
+        # 用户偏好/审批偏好属于图记忆，不进入 ExperienceStore。
+        # 这里仅创建/更新 MemoryGraph 记忆节点，避免污染通用经验库。
+        self._project_preference_memories(trace)
         return [c for c in candidates if c.confidence >= self.min_confidence]
 
     def generate_and_save(
@@ -116,7 +128,7 @@ class TaskExperienceGenerator:
                 else:
                     candidate.metadata["candidate_key"] = candidate.candidate_key
                     exp_id = experience_store.add_experience(
-                        content=candidate.content,
+                        content=self._experience_store_summary(candidate),
                         experience_type=candidate.experience_type,
                         task_id=trace.get("task_graph_id") or trace.get("trace_id"),
                         success=candidate.success,
@@ -210,6 +222,12 @@ class TaskExperienceGenerator:
             importance_score=1.15 if verification else 1.05,
             tags=_dedupe(["task_execution", "procedure", "success", *tool_names[:5]]),
             metadata=self._metadata(trace, "procedure", confidence),
+            if_condition=f"遇到类似「{goal}」的任务",
+            then_action=f"优先采用工具链 {tool_part}",
+            avoid_action="不要跳过必要的任务记录、审批说明和验证步骤",
+            evidence_summary=result or tool_part,
+            source_graph_nodes=self._source_graph_nodes(trace),
+            source_task_nodes=self._source_task_nodes(trace, completed=True),
         )
 
     def _failure_candidate(self, trace: Dict[str, Any]) -> Optional[TaskExperienceCandidate]:
@@ -243,46 +261,105 @@ class TaskExperienceGenerator:
             importance_score=1.2,
             tags=_dedupe(["task_execution", "failure", *tool_names[:5], *_dedupe(failed_tools)[:3]]),
             metadata=self._metadata(trace, "failure", confidence),
+            if_condition=f"处理类似「{goal}」的任务且出现相同失败信号",
+            then_action="先检查前置路径、权限、事件循环和审批状态，再换用替代工具链",
+            avoid_action=f"避免重复调用失败工具：{', '.join(_dedupe(failed_tools)[:5])}" if failed_tools else "避免重复相同失败路径",
+            evidence_summary=failure_reason or "工具链失败",
+            source_graph_nodes=self._source_graph_nodes(trace),
+            source_task_nodes=self._source_task_nodes(trace, completed=False),
         )
 
-    def _preference_candidates(self, trace: Dict[str, Any]) -> List[TaskExperienceCandidate]:
-        candidates: List[TaskExperienceCandidate] = []
-        for approval in trace.get("approval_trace") or []:
-            decision = str(approval.get("decision") or approval.get("status") or "").lower()
-            if decision not in {"rejected", "denied", "refused", "blocked"}:
-                continue
-            approval_id = str(
-                approval.get("approval_id")
-                or approval.get("pair_id")
-                or approval.get("event_id")
-                or len(candidates)
-            )
-            tool_name = str(approval.get("tool_name") or "相关工具")
-            risk = _short(approval.get("risk_level") or approval.get("approval_mode"), 60)
-            action = _short(approval.get("action_summary"), 180)
-            goal = _short(trace.get("goal"), 140) or "类似任务"
-            risk_part = f"，风险等级 {risk}" if risk else ""
-            action_part = f"，动作摘要：{action}" if action else ""
-            content = (
-                f"审批偏好：在「{goal}」任务中，用户拒绝了 {tool_name} 的审批{risk_part}{action_part}。"
-                "后续类似高风险或写入类操作应先说明影响范围、目标路径和可回滚方式，再等待明确确认。"
-            )
-            confidence = 0.76
-            candidates.append(TaskExperienceCandidate(
-                candidate_key=f"preference:{trace.get('trace_id', '')}:{approval_id}",
-                experience_type="preference",
-                content=content,
-                success=False,
-                confidence=confidence,
-                importance_score=1.25,
-                tags=_dedupe(["task_execution", "preference", "approval", tool_name]),
-                metadata=self._metadata(trace, "preference", confidence, approval=approval),
-            ))
-        return candidates
+    def _workspace_bootstrap_failure_candidate(self, trace: Dict[str, Any]) -> Optional[TaskExperienceCandidate]:
+        """Specialize repeated new-project workspace bootstrapping failures."""
+        tool_chain = trace.get("tool_chain") or []
+        tool_names = self._tool_names(tool_chain)
+        haystack = " ".join([
+            str(trace.get("goal") or ""),
+            str(trace.get("result") or ""),
+            str(trace.get("failure_reason") or ""),
+            " ".join(tool_names),
+            " ".join(str(item.get("result_preview") or item.get("action_summary") or "") for item in tool_chain),
+        ]).lower()
+
+        has_ide_dir_tool = any(name in {"ide_write_file", "create_directory"} for name in tool_names) or (
+            "ide_write_file" in haystack or "create_directory" in haystack
+        )
+        missing_task_plan = "task_create_plan" not in tool_names
+        complex_project = any(k in haystack for k in (
+            "项目", "游戏", "web", "代码", "编写", "开发", "复杂", "多文件",
+            "project", "game", "workspace", "vscode",
+        ))
+        workspace_problem = any(k in haystack for k in (
+            "workspace_required", "workspace_not_found", "工作目录不存在",
+            "任务图未完成", "父目录", "尚不存在", "新项目工作区", "create_directory",
+        ))
+        if not (has_ide_dir_tool and missing_task_plan and complex_project and workspace_problem):
+            return None
+
+        goal = _short(trace.get("goal"), 160) or "新建项目并写代码"
+        content = (
+            f"失败经验：处理「{goal}」这类新建项目目录并开发代码/网页/小游戏的复杂任务时，"
+            "不能用 ide_write_file(create_directory=true) 代替 task_create_plan。"
+            "正确顺序是先检索历史经验，再调用 task_create_plan 创建任务图并绑定 workspace_dir，"
+            "由任务创建流程负责创建目标目录和打开 VS Code；之后再用 IDE/文件工具写入具体文件。"
+        )
+        confidence = 0.86
+        return TaskExperienceCandidate(
+            candidate_key="failure:workspace_bootstrap:ide_write_file_create_directory_without_task_graph",
+            experience_type="failure",
+            content=content,
+            success=False,
+            confidence=confidence,
+            importance_score=1.35,
+            tags=_dedupe([
+                "task_execution",
+                "failure",
+                "workspace_bootstrap",
+                "task_create_plan",
+                "ide_write_file",
+                "create_directory",
+                "vscode_workspace",
+            ]),
+            metadata=self._metadata(trace, "workspace_bootstrap_failure", confidence),
+            if_condition="新建项目根目录并开发代码、网页或小游戏",
+            then_action="先调用 task_create_plan 创建任务图并绑定 workspace_dir，再用 IDE/文件工具写入具体文件",
+            avoid_action="不要用 ide_write_file(create_directory=true) 代替项目工作区 bootstrap",
+            evidence_summary="新项目目录创建与 VS Code 工作区绑定失败",
+            source_graph_nodes=self._source_graph_nodes(trace),
+            source_task_nodes=self._source_task_nodes(trace, completed=False),
+        )
 
     @staticmethod
     def _tool_names(tool_chain: List[Dict[str, Any]]) -> List[str]:
         return _dedupe(str(item.get("tool_name") or item.get("pair_id") or "") for item in tool_chain)
+
+    @staticmethod
+    def _source_graph_nodes(trace: Dict[str, Any]) -> List[str]:
+        values = []
+        for event_id in trace.get("source_event_ids") or []:
+            if event_id:
+                values.append(str(event_id))
+        return _dedupe(values)[:20]
+
+    @staticmethod
+    def _source_task_nodes(trace: Dict[str, Any], *, completed: bool) -> List[str]:
+        completion = trace.get("task_completion") or {}
+        key = "completed_nodes" if completed else "pending_nodes"
+        nodes = completion.get(key) or []
+        if not nodes and not completed:
+            nodes = completion.get("blocked_nodes") or []
+        return _dedupe(str(item.get("id") or "") for item in nodes if isinstance(item, dict))[:20]
+
+    @staticmethod
+    def _experience_store_summary(candidate: TaskExperienceCandidate) -> str:
+        """Keep ExperienceStore as a compact index; full data lives on MemoryGraph nodes."""
+        parts = [
+            f"经验摘要：{_short(candidate.content, 260)}",
+            f"IF: {_short(candidate.if_condition, 120)}" if candidate.if_condition else "",
+            f"THEN: {_short(candidate.then_action, 160)}" if candidate.then_action else "",
+            f"AVOID: {_short(candidate.avoid_action, 120)}" if candidate.avoid_action else "",
+        ]
+        return "；".join(part for part in parts if part)
 
     def _metadata(
         self,
@@ -320,6 +397,8 @@ class TaskExperienceGenerator:
             "failure_reason": trace.get("failure_reason", ""),
             "verification": trace.get("verification", []),
             "generated_at": time.time(),
+            "llm_candidate_status": "rule_generated_pending_llm_review",
+            "llm_review_status": "pending",
         }
         if approval:
             metadata["approval_evidence"] = approval
@@ -373,6 +452,10 @@ class TaskExperienceGenerator:
             "sub_type": "task_execution_experience",
             "content": candidate.content,
             "summary": candidate.content[:300],
+            "if": candidate.if_condition,
+            "then": candidate.then_action,
+            "avoid": candidate.avoid_action,
+            "evidence_summary": candidate.evidence_summary,
             "experience_id": experience_id,
             "experience_type": candidate.experience_type,
             "candidate_key": candidate.candidate_key,
@@ -385,6 +468,8 @@ class TaskExperienceGenerator:
             "tags": candidate.tags,
             "confidence": candidate.confidence,
             "success": candidate.success,
+            "source_graph_nodes": candidate.source_graph_nodes,
+            "source_task_nodes": candidate.source_task_nodes,
             "created_from": "task_experience_generator",
             "experience_created": created,
         }
@@ -411,7 +496,85 @@ class TaskExperienceGenerator:
                 },
             )
             self._attach_experience_to_summary(memory_graph, summary_id, experience_id, node_id)
+        self._attach_experience_edges(memory_graph, trace, candidate, node_id, summary_id)
         return node_id
+
+    def _attach_experience_edges(
+        self,
+        memory_graph: Any,
+        trace: Dict[str, Any],
+        candidate: TaskExperienceCandidate,
+        experience_node_id: str,
+        summary_id: str = "",
+    ) -> None:
+        """Create graph edges that make an experience usable as part of a chain."""
+        try:
+            from zulong.memory.memory_graph import EdgeType
+        except Exception:
+            return
+
+        task_graph_id = str(trace.get("task_graph_id") or "")
+        task_node_id = self._find_task_node_id(memory_graph, task_graph_id)
+        if summary_id:
+            self._safe_add_edge(
+                memory_graph,
+                experience_node_id,
+                summary_id,
+                EdgeType.DERIVED_FROM,
+                {"link_type": "experience_derived_from_trace", "trace_id": trace.get("trace_id", "")},
+                weight=0.95,
+            )
+        if task_node_id:
+            self._safe_add_edge(
+                memory_graph,
+                experience_node_id,
+                task_node_id,
+                EdgeType.APPLIES_TO,
+                {"link_type": "experience_applies_to_task", "task_graph_id": task_graph_id},
+                weight=0.8,
+            )
+
+        for event_node_id in self._find_tool_event_nodes(memory_graph, trace):
+            self._safe_add_edge(
+                memory_graph,
+                experience_node_id,
+                event_node_id,
+                EdgeType.DERIVED_FROM,
+                {"link_type": "experience_derived_from_tool_event"},
+                weight=0.75,
+            )
+
+        failed_nodes = self._resolve_task_detail_nodes(memory_graph, trace, completed=False)
+        success_nodes = self._resolve_task_detail_nodes(memory_graph, trace, completed=True)
+        for failed_id in failed_nodes:
+            self._safe_add_edge(
+                memory_graph,
+                experience_node_id,
+                failed_id,
+                EdgeType.CORRECTS,
+                {"link_type": "experience_corrects_failed_task_node"},
+                weight=0.85,
+            )
+            for success_id in success_nodes:
+                self._safe_add_edge(
+                    memory_graph,
+                    failed_id,
+                    success_id,
+                    EdgeType.FAILED_THEN_SUCCEEDED,
+                    {
+                        "link_type": "failure_to_success_after_correction",
+                        "experience_node_id": experience_node_id,
+                    },
+                    weight=0.9,
+                )
+                self._safe_add_edge(
+                    memory_graph,
+                    experience_node_id,
+                    success_id,
+                    EdgeType.APPLIES_TO,
+                    {"link_type": "experience_success_target"},
+                    weight=0.75,
+                )
 
     @staticmethod
     def _experience_node_id(candidate: TaskExperienceCandidate) -> str:

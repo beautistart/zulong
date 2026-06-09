@@ -12,9 +12,20 @@ python diagnose_system.py
 """
 
 import asyncio
+import os
+import shutil
+import socket
+import subprocess
+import sys
 import time
 import logging
 from datetime import datetime
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 # 配置日志
 logging.basicConfig(
@@ -26,82 +37,86 @@ logger = logging.getLogger(__name__)
 
 def check_python_processes():
     """检查 Python 进程"""
-    import subprocess
-    
     logger.info("=" * 80)
     logger.info("📊 步骤 1: 检查 Python 进程")
     logger.info("=" * 80)
-    
+
     try:
-        result = subprocess.run(
-            ["powershell", "-Command", 
-             "Get-Process | Where-Object {$_.ProcessName -like '*python*'} | "
-             "Select-Object Id, ProcessName, StartTime, CPU | "
-             "Format-Table -AutoSize"],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        
-        if result.stdout:
-            logger.info("\n" + result.stdout)
-            
-            # 统计进程数
-            lines = [l.strip() for l in result.stdout.split('\n') if l.strip() and 'Id' not in l]
-            logger.info(f"✅ 发现 {len(lines)} 个 Python 进程")
-            
-            if len(lines) < 3:
-                logger.warning("⚠️ 警告：Python 进程数量少于 3 个，系统可能未完全启动")
-                return False
-            else:
-                return True
-        else:
+        processes = _list_python_processes()
+        if not processes:
             logger.warning("⚠️ 警告：未发现 Python 进程")
             return False
-            
+
+        for process in processes[:20]:
+            logger.info(process)
+        if len(processes) > 20:
+            logger.info(f"... 另有 {len(processes) - 20} 个 Python 进程未展示")
+        logger.info(f"✅ 发现 {len(processes)} 个 Python 进程")
+        if len(processes) < 3:
+            logger.warning("⚠️ Python 进程数量少于 3 个，系统可能只启动了部分组件")
+        return True
+
     except Exception as e:
         logger.error(f"❌ 检查失败：{e}")
         return False
 
 
+def _list_python_processes():
+    """跨平台列出 Python 进程，优先使用 psutil，降级到系统命令。"""
+    try:
+        import psutil  # type: ignore
+
+        rows = []
+        for proc in psutil.process_iter(["pid", "name", "cmdline", "cpu_percent"]):
+            info = proc.info
+            name = str(info.get("name") or "")
+            cmdline = " ".join(info.get("cmdline") or [])
+            if "python" in name.lower() or "python" in cmdline.lower():
+                rows.append(
+                    f"pid={info.get('pid')} name={name} cpu={info.get('cpu_percent')} cmd={cmdline[:180]}"
+                )
+        return rows
+    except Exception:
+        pass
+
+    if os.name == "nt":
+        command = ["tasklist", "/FO", "CSV", "/NH"]
+    else:
+        command = ["ps", "-eo", "pid=,comm=,pcpu=,args="]
+
+    if not shutil.which(command[0]):
+        return []
+
+    result = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False)
+    output = result.stdout or ""
+    return [line.strip() for line in output.splitlines() if "python" in line.lower()]
+
+
 def check_listening_ports():
     """检查关键端口是否监听"""
-    import subprocess
-    
     logger.info("=" * 80)
     logger.info("📊 步骤 2: 检查网络端口")
     logger.info("=" * 80)
-    
+
     ports_to_check = [
-        (5555, "EventBus"),
-        (8765, "Web Server"),
+        (8090, "IDE/WebSocket Backend"),
+        (5555, "EventBus 旧版/可选"),
+        (8765, "Web Server 旧版/可选"),
     ]
-    
-    try:
-        result = subprocess.run(
-            ["powershell", "-Command", 
-             "Get-NetTCPConnection | Where-Object {$_.State -eq 'Listen'} | "
-             "Select-Object LocalPort | Format-Table -AutoSize"],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        
-        if result.stdout:
-            logger.info("\n监听的端口:")
-            logger.info(result.stdout)
-            
-            # 检查关键端口
-            for port, name in ports_to_check:
-                if str(port) in result.stdout:
-                    logger.info(f"✅ {name} 端口 {port} 正在监听")
-                else:
-                    logger.warning(f"⚠️ {name} 端口 {port} 未监听")
+
+    for port, name in ports_to_check:
+        if _is_port_open("127.0.0.1", port):
+            logger.info(f"✅ {name} 端口 {port} 正在监听")
         else:
-            logger.warning("⚠️ 未发现监听的端口")
-            
-    except Exception as e:
-        logger.error(f"❌ 端口检查失败：{e}")
+            logger.warning(f"⚠️ {name} 端口 {port} 未监听")
+
+
+def _is_port_open(host: str, port: int, timeout: float = 0.8) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 async def test_event_bus():
@@ -236,8 +251,8 @@ async def main():
     logger.info("=" * 80)
     logger.info("✅ 诊断完成！请查看上方的日志输出")
     logger.info("\n💡 建议:")
-    logger.info("1. 如果发现进程数量不足，请运行 .\\start_all.bat 启动系统")
-    logger.info("2. 如果事件总线测试失败，请检查虚拟环境")
+    logger.info("1. 如果后端端口未监听，请按 docs/三端安装与诊断指南.md 启动对应平台服务")
+    logger.info("2. 如果事件总线测试失败，请检查当前 Python 虚拟环境和项目根目录")
     logger.info("3. 如果数数测试无响应，请查看详细诊断报告:")
     logger.info("   diagnostics\\Counting_No_Response_Deep_Diagnosis.md")
     logger.info("\n")

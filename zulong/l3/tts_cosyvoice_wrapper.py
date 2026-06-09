@@ -26,9 +26,9 @@ class CosyVoiceWrapper:
     
     def __init__(
         self,
-        integrated_python_path: str = r"D:\BaiduNetdiskDownload\CosyVoiceV2\python\python.exe",
-        cosyvoice_code_path: str = r"D:\BaiduNetdiskDownload\CosyVoiceV2\CosyVoice",
-        model_dir: str = r"D:\BaiduNetdiskDownload\CosyVoiceV2\CosyVoice\iic\CosyVoice2-0.5B",
+        integrated_python_path: str = None,
+        cosyvoice_code_path: str = None,
+        model_dir: str = None,
         device: str = "cpu"
     ):
         """
@@ -40,17 +40,33 @@ class CosyVoiceWrapper:
             model_dir: 模型目录
             device: 运行设备 (cpu/cuda)
         """
-        self.integrated_python_path = integrated_python_path
-        self.cosyvoice_code_path = cosyvoice_code_path
-        self.model_dir = model_dir
+        from zulong.tts.cosyvoice_config import get_external_runtime_config
+
+        runtime = get_external_runtime_config()
+        self.integrated_python_path = integrated_python_path or runtime["integrated_python_path"]
+        self.cosyvoice_code_path = cosyvoice_code_path or runtime["code_path"]
+        self.model_dir = model_dir or runtime["model_dir"]
         self.device = device
         
         self.sample_rate = 22050
         
         logger.info(f"🎤 CosyVoice 包装器初始化")
-        logger.info(f"   Python: {integrated_python_path}")
-        logger.info(f"   模型: {model_dir}")
+        logger.info(f"   Python: {self.integrated_python_path}")
+        logger.info(f"   模型: {self.model_dir}")
         logger.info(f"   设备: {device}")
+
+    def check_environment(self) -> bool:
+        """检查 CosyVoice 外部运行环境是否可用。"""
+        checks = {
+            "python": self.integrated_python_path,
+            "code_path": self.cosyvoice_code_path,
+            "model_dir": self.model_dir,
+        }
+        for name, path in checks.items():
+            if not path or not os.path.exists(path):
+                logger.warning(f"CosyVoice {name} 不可用: {path}")
+                return False
+        return True
     
     def synthesize(
         self,
@@ -73,6 +89,12 @@ class CosyVoiceWrapper:
         Returns:
             bool: 是否成功
         """
+        if not self.check_environment():
+            return False
+
+        from zulong.tts.cosyvoice_config import get_external_runtime_config
+
+        runtime = get_external_runtime_config()
         params = {
             "text": text,
             "output_path": output_path,
@@ -80,7 +102,7 @@ class CosyVoiceWrapper:
             "code_path": self.cosyvoice_code_path,
             "mode": mode,
             "prompt_text": prompt_text or "希望你以后能够做的比我还好呦。",
-            "prompt_audio": prompt_audio or os.path.join(self.cosyvoice_code_path, "asset", "zero_shot_prompt.wav")
+            "prompt_audio": prompt_audio or runtime["prompt_audio"]
         }
         
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8') as f:
@@ -171,7 +193,7 @@ def test_cosyvoice_wrapper():
     
     wrapper = CosyVoiceWrapper()
     
-    output_path = r"d:\AI\project\zulong_beta5\tests\output_cosyvoice_wrapper.wav"
+    output_path = os.path.join(os.getcwd(), "tests", "output_cosyvoice_wrapper.wav")
     
     success = wrapper.synthesize(
         text="你好，我是祖龙机器人。",

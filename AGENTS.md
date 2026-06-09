@@ -25,7 +25,6 @@ Key packages:
 ```bash
 # Full build sequence (run from zulong-ide/ directory):
 npm run protos                    # Generate TypeScript proto files
-cd webview-ui && npm install && npm run build && cd ..  # Build React webview
 node esbuild.mjs --production     # Build extension with esbuild
 npx @vscode/vsce package --no-dependencies --allow-missing-repository --skip-license  # Package VSIX
 code --install-extension zulong-ide-0.1.0.vsix --force  # Install
@@ -33,7 +32,7 @@ code --install-extension zulong-ide-0.1.0.vsix --force  # Install
 
 ## Key Architecture
 
-- **Frontend**: React + Vite (`webview-ui/`)
+- **Frontend**: Web 静态前端 (`zulong_web/static/`)
 - **Extension**: TypeScript + esbuild (`zulong-ide/src/`)
 - **Backend**: Python FastAPI + WebSocket (`zulong/ide/`)
 - **Communication**: WebSocket at `ws://127.0.0.1:8090/ide`
@@ -104,8 +103,8 @@ L0 设备层 ──── 摄像头/麦克风/扬声器/传感器驱动
 |------|------|
 | `zulong-ide/src/core/api/providers/zulong.ts` | ZulongHandler - WebSocket API provider |
 | `zulong-ide/src/core/api/transport/zulong-websocket.ts` | WebSocket transport layer |
-| `zulong-ide/webview-ui/src/components/settings/providers/ZulongProvider.tsx` | Zulong settings UI |
-| `zulong-ide/webview-ui/src/components/settings/ApiOptions.tsx` | Provider selection & conditional render |
+| `zulong_web/static/index.html` | Zulong Web 主交互页面 |
+| `zulong/launcher/web_chat_router.py` | Web 主通道与事件渲染数据源 |
 | `zulong-ide/src/shared/providers/providers.json` | Provider list (Zulong is first entry) |
 | `zulong/ide/ide_server.py` | Python backend entry (FastAPI + WebSocket) |
 | `zulong/ide/ide_fc_runner.py` | FC loop executor (3556行) |

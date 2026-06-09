@@ -7,6 +7,7 @@
 # - 跨分片关联发现
 # - 单分片50-200MB，总规模可达年级别
 
+import asyncio
 import logging
 import os
 import time
@@ -327,6 +328,41 @@ class ShardedMemoryGraph:
             os.replace(tmp_path, path)
         except Exception as exc:
             logger.debug(f"active skeleton 保存失败: {exc}")
+
+    def _drop_node_from_active_state(self, node_id: str) -> None:
+        self._active_node_ids.discard(node_id)
+        self._last_retrieved_node_ids = [
+            nid for nid in self._last_retrieved_node_ids if nid != node_id
+        ]
+        self._last_activated_edges = [
+            (src_id, dst_id)
+            for src_id, dst_id in self._last_activated_edges
+            if src_id != node_id and dst_id != node_id
+        ]
+
+        skeleton = dict(self._active_skeleton or {})
+        if not skeleton:
+            return
+        node_ids = [nid for nid in skeleton.get("node_ids", []) if nid != node_id]
+        center_ids = [nid for nid in skeleton.get("center_ids", []) if nid != node_id]
+        edges = [
+            edge for edge in skeleton.get("edges", [])
+            if edge.get("source") != node_id and edge.get("target") != node_id
+        ]
+        stats = dict(skeleton.get("stats") or {})
+        stats["node_count"] = len(node_ids)
+        stats["edge_count"] = len(edges)
+        stats["center_count"] = len(center_ids)
+
+        skeleton.update({
+            "updated_at": time.time(),
+            "node_ids": node_ids,
+            "edges": edges,
+            "center_ids": center_ids,
+            "stats": stats,
+        })
+        self._active_skeleton = skeleton
+        self._save_active_skeleton()
 
     def _score_active_skeleton_node(
         self,
@@ -1851,7 +1887,11 @@ class ShardedMemoryGraph:
         hot_window_minutes: int = 30,
         session_id: str = "",
     ) -> List[Dict[str, Any]]:
-        """双路并行检索上下文 — 热路径 (时间窗口扫描) + 冷路径 (BFS 扩散)
+        """检索上下文 — 检索热路径 + 摘要导航并行，热命中后做 historical BFS。
+
+        这里的“热路径”按 hot_window_minutes 时间窗口扫描近期节点；
+        historical BFS 表示从热命中继续跨分片发现关联历史节点，
+        不等同于存储生命周期里的 temperature=cold。
         
         Args:
             query_text: 查询文本
@@ -1867,105 +1907,45 @@ class ShardedMemoryGraph:
         results: Dict[str, Dict[str, Any]] = {}
         
         try:
-            current_shard = self.get_current_shard()
-            
-            # ── 热路径: 扫描当前分片的热节点 ──
-            if current_shard:
-                hot_nodes = []
-                try:
-                    for node in current_shard.properties.iter_nodes():
-                        if getattr(node, 'last_accessed', 0) >= hot_threshold:
-                            hot_nodes.append(node)
-                        if len(hot_nodes) >= 500:
-                            break
-                except Exception:
-                    pass
-                
-                for node in hot_nodes:
-                    text_parts = [
-                        getattr(node, 'label', '') or '',
-                        getattr(node, 'content', '') or '',
-                    ]
-                    combined = ' '.join(filter(None, text_parts))
-                    if not combined.strip():
-                        continue
-                    score = self._bigram_overlap_score(query_text, combined)
-                    if score <= 0:
-                        continue
-                    # Session 匹配加权
-                    if session_id and node.node_id.startswith(f"dialogue:session_{session_id}"):
-                        score *= 2.0
-                    # 重要度加权
-                    importance = getattr(node, 'importance', 'NORMAL')
-                    _importance_boost = {
-                        'MUST_REMEMBER': 2.0, 'IMPORTANT': 1.5,
-                        'IDENTITY': 1.8, 'FACT': 1.3,
-                    }
-                    score *= _importance_boost.get(importance, 1.0)
-                    
-                    results[node.node_id] = {
-                        'node_id': node.node_id,
-                        'graph_memory_id': node.node_id,
-                        'shard_id': getattr(node, "storage_shard", "") or self._find_node_shard_id(node.node_id) or "",
-                        'full_path': (getattr(node, "metadata", {}) or {}).get("full_path") or (getattr(node, "metadata", {}) or {}).get("graph_address") or node.node_id,
-                        'node_type': getattr(node, 'node_type', 'unknown'),
-                        'label': getattr(node, 'label', ''),
-                        'content': getattr(node, 'content', ''),
-                        'summary': getattr(node, 'content_summary', '') or (getattr(node, 'metadata', {}) or {}).get("content_summary", ""),
-                        'score': score,
-                        'source': 'hot',
-                        'importance': importance,
-                        'metadata': getattr(node, 'metadata', {}),
-                        'memory_address': self._build_memory_address(node, source='hot'),
-                        'recall_hint': "需要详情时，用 graph_memory_id 调用 read_memory_node 或 discover_related。",
-                    }
-            
-            # ── 冷路径: 从热节点做 BFS 扩散发现关联冷节点 ──
+            loop = asyncio.get_running_loop()
+            hot_task = loop.run_in_executor(
+                None,
+                self._retrieve_hot_path,
+                query_text,
+                hot_threshold,
+                session_id,
+            )
+            summary_task = loop.run_in_executor(
+                None,
+                self._retrieve_summary_navigation,
+                query_text,
+                top_k,
+            )
+
+            hot_results, summary_results = await asyncio.gather(hot_task, summary_task)
+            for item in hot_results:
+                node_id = item.get("node_id")
+                if node_id:
+                    results[node_id] = item
+
+            # ── 历史扩展: 从热命中做 BFS 扩散，发现关联但不在首屏热扫描里的节点 ──
             hot_node_ids = list(results.keys())[:20]
             if hot_node_ids:
-                discovered = self.discover_across_shards(
-                    seed_ids=hot_node_ids,
-                    seed_shard_id=self._get_shard_id(now),
-                    max_depth=2,
-                    max_nodes=200,
+                historical_results = await loop.run_in_executor(
+                    None,
+                    self._retrieve_historical_bfs_from_hot,
+                    query_text,
+                    hot_node_ids,
+                    now,
+                    set(results.keys()),
                 )
-                seen_ids = set(results.keys())
-                for node_id, distance, shard_id in discovered:
-                    if node_id in seen_ids:
-                        continue
-                    shard = self.get_shard(shard_id, load_if_missing=True)
-                    if not shard:
-                        continue
-                    node = shard.get_node(node_id)
-                    if node is None:
-                        continue
-                    combined = ' '.join(filter(None, [
-                        getattr(node, 'label', '') or '',
-                        getattr(node, 'content', '') or '',
-                    ]))
-                    score = self._bigram_overlap_score(query_text, combined) * 0.8  # cold path discount
-                    if score <= 0:
-                        continue
-                    results[node.node_id] = {
-                        'node_id': node_id,
-                        'graph_memory_id': node_id,
-                        'shard_id': shard_id,
-                        'full_path': (getattr(node, "metadata", {}) or {}).get("full_path") or (getattr(node, "metadata", {}) or {}).get("graph_address") or node_id,
-                        'node_type': getattr(node, 'node_type', 'unknown'),
-                        'label': getattr(node, 'label', ''),
-                        'content': getattr(node, 'content', ''),
-                        'summary': getattr(node, 'content_summary', '') or (getattr(node, 'metadata', {}) or {}).get("content_summary", ""),
-                        'score': score,
-                        'source': 'cold',
-                        'importance': getattr(node, 'importance', 'NORMAL'),
-                        'metadata': getattr(node, 'metadata', {}),
-                        'memory_address': self._build_memory_address(node, shard_id=shard_id, source='cold'),
-                        'recall_hint': "需要详情时，用 graph_memory_id 调用 read_memory_node 或 discover_related。",
-                    }
-                    seen_ids.add(node_id)
+                for item in historical_results:
+                    node_id = item.get("node_id")
+                    if node_id and node_id not in results:
+                        results[node_id] = item
 
             # ── 摘要导航: SQLite L1 摘要命中后带图地址回跳 ──
-            for item in self._retrieve_summary_navigation(query_text, top_k):
+            for item in summary_results:
                 node_id = item.get("node_id") or item.get("graph_memory_id")
                 if not node_id:
                     continue
@@ -1999,9 +1979,8 @@ class ShardedMemoryGraph:
     ) -> List[Dict[str, Any]]:
         """检索 L1 摘要导航层，并返回可回跳 MemoryGraph 的图地址。
 
-        该路径只读 SQLite 摘要导航，不扫描所有分片。命中后优先用
-        global_index 定位节点补充类型/标签；若节点暂不可读，也保留摘要
-        和 graph_memory_id，供 LLM 后续通过工具做增量回忆。
+        优先使用 DualIndexSummaryStore.hybrid_search()，即 SQL 过滤 +
+        FAISS 摘要向量并行检索；不可用时降级到 SQLite 摘要导航。
         """
         exclude_node_ids = exclude_node_ids or set()
         if not query_text:
@@ -2010,7 +1989,20 @@ class ShardedMemoryGraph:
         try:
             from ..summary_store import get_dual_index_summary_store
             store = get_dual_index_summary_store()
-            summary_hits = store.search_graph_summaries(query_text, top_k=max(top_k, 3))
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if hasattr(store, "hybrid_search") and not (running_loop and running_loop.is_running()):
+                summary_hits = asyncio.run(
+                    store.hybrid_search(
+                        query_text,
+                        top_k=max(top_k, 3),
+                        include_details=False,
+                    )
+                )
+            else:
+                summary_hits = store.search_graph_summaries(query_text, top_k=max(top_k, 3))
         except Exception as exc:
             logger.debug(f"[ShardedMemoryGraph] 摘要导航检索跳过: {exc}")
             return []
@@ -2303,14 +2295,199 @@ class ShardedMemoryGraph:
         分片存储模式下保存轻量焦点路径。
         """
         return self._last_focus_context
+
+    def _retrieve_hot_path(
+        self,
+        query_text: str,
+        hot_threshold: float,
+        session_id: str = "",
+    ) -> List[Dict[str, Any]]:
+        """热路径：当前分片热节点扫描 + 关键词打分。"""
+        current_shard = self.get_current_shard()
+        if not current_shard:
+            return []
+
+        hot_nodes = []
+        try:
+            for node in current_shard.properties.iter_nodes():
+                if getattr(node, "last_accessed", 0) >= hot_threshold:
+                    hot_nodes.append(node)
+                if len(hot_nodes) >= 500:
+                    break
+        except Exception:
+            return []
+
+        results: List[Dict[str, Any]] = []
+        for node in hot_nodes:
+            text_parts = [
+                getattr(node, "label", "") or "",
+                getattr(node, "content", "") or "",
+            ]
+            combined = " ".join(filter(None, text_parts))
+            if not combined.strip():
+                continue
+            score = self._bigram_overlap_score(query_text, combined)
+            if score <= 0:
+                continue
+            if session_id and node.node_id.startswith(f"dialogue:session_{session_id}"):
+                score *= 2.0
+
+            importance = getattr(node, "importance", "NORMAL")
+            importance_boost = {
+                "MUST_REMEMBER": 2.0,
+                "IMPORTANT": 1.5,
+                "IDENTITY": 1.8,
+                "FACT": 1.3,
+            }
+            score *= importance_boost.get(importance, 1.0)
+
+            metadata = getattr(node, "metadata", {}) or {}
+            results.append({
+                "node_id": node.node_id,
+                "graph_memory_id": node.node_id,
+                "shard_id": getattr(node, "storage_shard", "") or self._find_node_shard_id(node.node_id) or "",
+                "full_path": metadata.get("full_path") or metadata.get("graph_address") or node.node_id,
+                "node_type": getattr(node, "node_type", "unknown"),
+                "label": getattr(node, "label", ""),
+                "content": getattr(node, "content", ""),
+                "summary": getattr(node, "content_summary", "") or metadata.get("content_summary", ""),
+                "score": score,
+                "source": "hot",
+                "importance": importance,
+                "metadata": metadata,
+                "memory_address": self._build_memory_address(node, source="hot"),
+                "recall_hint": "需要详情时，用 graph_memory_id 调用 read_memory_node 或 discover_related。",
+            })
+        return results
+
+    def _retrieve_historical_bfs_from_hot(
+        self,
+        query_text: str,
+        hot_node_ids: List[str],
+        now: float,
+        seen_ids: Set[str],
+    ) -> List[Dict[str, Any]]:
+        """历史扩展：从热命中做跨分片 BFS，发现关联的历史节点。
+
+        这里的 historical 表示检索层面的“热命中之外的关联历史”，
+        不等同于存储生命周期里的 temperature=cold。
+        """
+        if not hot_node_ids:
+            return []
+
+        results: List[Dict[str, Any]] = []
+        discovered = self.discover_across_shards(
+            seed_ids=hot_node_ids[:20],
+            seed_shard_id=self._get_shard_id(now),
+            max_depth=2,
+            max_nodes=200,
+        )
+        for node_id, distance, shard_id in discovered:
+            if node_id in seen_ids:
+                continue
+            shard = self.get_shard(shard_id, load_if_missing=True)
+            if not shard:
+                continue
+            node = shard.get_node(node_id)
+            if node is None:
+                continue
+            combined = " ".join(filter(None, [
+                getattr(node, "label", "") or "",
+                getattr(node, "content", "") or "",
+            ]))
+            score = self._bigram_overlap_score(query_text, combined) * 0.8
+            if score <= 0:
+                continue
+            metadata = getattr(node, "metadata", {}) or {}
+            results.append({
+                "node_id": node_id,
+                "graph_memory_id": node_id,
+                "shard_id": shard_id,
+                "full_path": metadata.get("full_path") or metadata.get("graph_address") or node_id,
+                "node_type": getattr(node, "node_type", "unknown"),
+                "label": getattr(node, "label", ""),
+                "content": getattr(node, "content", ""),
+                "summary": getattr(node, "content_summary", "") or metadata.get("content_summary", ""),
+                "score": score,
+                "source": "historical_bfs",
+                "importance": getattr(node, "importance", "NORMAL"),
+                "metadata": metadata,
+                "memory_address": self._build_memory_address(node, shard_id=shard_id, source="historical_bfs"),
+                "recall_hint": "需要详情时，用 graph_memory_id 调用 read_memory_node 或 discover_related。",
+            })
+            seen_ids.add(node_id)
+        return results
     
     def remove_node(self, node_id: str) -> bool:
-        """删除节点（兼容 MemoryGraph 接口）
-        
-        当前为 stub，实际删除功能待实现。
-        """
-        logger.debug(f"[ShardedMemoryGraph] remove_node stub: {node_id}")
-        return False
+        """删除节点及其索引记录（兼容 MemoryGraph 接口）。"""
+        with self.shard_lock:
+            shard, shard_id, definitive_miss = self._get_indexed_shard_status(node_id)
+            if definitive_miss:
+                return False
+
+            if not shard or not shard_id:
+                shard_id = self._find_node_shard_id(node_id)
+                shard = self.get_shard(shard_id, load_if_missing=True) if shard_id else None
+
+            if not shard or not shard_id:
+                return False
+
+            removed_edge_count = 0
+            try:
+                removed_edge_count = int(shard.topology.get_node_degree(node_id, mode="all"))
+            except Exception:
+                try:
+                    removed_edge_count = (
+                        len(shard.get_topology_neighbors(node_id, mode="out"))
+                        + len(shard.get_topology_neighbors(node_id, mode="in"))
+                    )
+                except Exception:
+                    removed_edge_count = 0
+
+            if not shard.remove_node(node_id):
+                return False
+
+            try:
+                self.global_index.delete_node_location(node_id)
+            except Exception as exc:
+                logger.debug(f"全局索引删除跳过 node={node_id}: {exc}")
+
+            try:
+                local_index = self.get_local_index(shard_id, create=False)
+                if local_index:
+                    local_index.delete_node_header(node_id)
+                    self._record_local_index_update(shard_id)
+            except Exception as exc:
+                logger.debug(f"local_index 删除跳过 node={node_id}: {exc}")
+
+            shard_info = self.shard_index.setdefault("shards", {}).setdefault(shard_id, {})
+            shard_info["node_count"] = max(0, int(shard_info.get("node_count") or 0) - 1)
+            if removed_edge_count:
+                shard_info["edge_count"] = max(0, int(shard_info.get("edge_count") or 0) - removed_edge_count)
+
+            self._drop_node_from_active_state(node_id)
+            self._last_topology_write_at = time.time()
+            self._check_topology_delta_compaction(shard_id, shard)
+            self._save_shard_index()
+            logger.info(f"[ShardedMemoryGraph] 已删除节点: {node_id} (shard={shard_id})")
+            return True
+
+    def get_importance(self, node_id: str):
+        """读取节点重要度（兼容 MemoryGraph 接口）。"""
+        node = self.get_node(node_id)
+        if not node:
+            return None
+        raw = (
+            getattr(node, "importance", None)
+            or (getattr(node, "metadata", None) or {}).get("importance")
+            or "normal"
+        )
+        raw_value = str(getattr(raw, "value", raw) or "normal").lower()
+        try:
+            from zulong.memory.memory_graph import Importance
+            return Importance(raw_value)
+        except Exception:
+            return raw_value
     
     def set_importance(self, node_id: str, importance) -> None:
         """设置节点重要性（兼容 MemoryGraph 接口）"""
@@ -2552,6 +2729,152 @@ class ShardedMemoryGraph:
 
     def to_frontend_dict(self, depth: Optional[int] = None) -> Dict[str, Any]:
         """序列化为前端记忆图谱格式。"""
+        if depth == 0:
+            skeleton = self.get_active_skeleton()
+            skeleton_node_ids: List[str] = []
+            if isinstance(skeleton, dict):
+                seen_skeleton_ids: Set[str] = set()
+                for node_id in list(skeleton.get("center_ids") or []) + list(skeleton.get("node_ids") or []):
+                    node_id = str(node_id or "")
+                    if not node_id or node_id in seen_skeleton_ids:
+                        continue
+                    seen_skeleton_ids.add(node_id)
+                    skeleton_node_ids.append(node_id)
+
+            if skeleton_node_ids:
+                # TSD v2.9.16 / 21.9.5: 首屏显示活跃骨架的一跳邻接，而不是孤立根节点。
+                first_view_limit = 200
+                returned_node_ids = skeleton_node_ids[:first_view_limit]
+                visible_ids = set(returned_node_ids)
+                visible_child_counts: Dict[str, int] = {}
+                edges: List[Dict[str, Any]] = []
+                seen_edges: Set[Tuple[str, str, str]] = set()
+
+                for edge in skeleton.get("edges") or []:
+                    if not isinstance(edge, dict):
+                        continue
+                    src_id = str(edge.get("source") or edge.get("src_id") or "")
+                    dst_id = str(edge.get("target") or edge.get("dst_id") or "")
+                    edge_type = str(edge.get("type") or edge.get("edge_type") or "association")
+                    if not src_id or not dst_id or src_id not in visible_ids or dst_id not in visible_ids:
+                        continue
+                    if self._should_hide_frontend_edge(src_id, dst_id, edge_type, edge=edge):
+                        continue
+                    edge_key = (src_id, dst_id, edge_type)
+                    if edge_key in seen_edges:
+                        continue
+                    seen_edges.add(edge_key)
+                    metadata = dict(edge.get("metadata") or {})
+                    edges.append({
+                        "source": src_id,
+                        "target": dst_id,
+                        "type": edge_type,
+                        "weight": edge.get("weight", 1.0),
+                        "protected": edge.get("protected", False),
+                        "metadata": metadata,
+                    })
+                    if edge_type == "hierarchy":
+                        visible_child_counts[src_id] = visible_child_counts.get(src_id, 0) + 1
+
+                nodes: List[Dict[str, Any]] = []
+                for node_id in returned_node_ids:
+                    node = self.get_node(node_id)
+                    if not node:
+                        continue
+                    data = self._serialize_node_for_frontend(node, include_children_count=False)
+                    data["children_count"] = visible_child_counts.get(node_id, 0)
+                    nodes.append(data)
+
+                visible_node_ids = {str(node.get("id")) for node in nodes if node.get("id")}
+                edges = [
+                    edge for edge in edges
+                    if edge.get("source") in visible_node_ids and edge.get("target") in visible_node_ids
+                ]
+
+                stats = self.get_total_stats()
+                skeleton_stats = dict(skeleton.get("stats") or {}) if isinstance(skeleton, dict) else {}
+                stats["returned_nodes"] = len(nodes)
+                stats["returned_edges"] = len(edges)
+                stats["active_skeleton_nodes"] = skeleton_stats.get(
+                    "node_count",
+                    len(skeleton.get("node_ids") or []) if isinstance(skeleton, dict) else len(skeleton_node_ids),
+                )
+                stats["active_skeleton_edges"] = skeleton_stats.get(
+                    "edge_count",
+                    len(skeleton.get("edges") or []) if isinstance(skeleton, dict) else len(edges),
+                )
+                stats["view_limit"] = first_view_limit
+                stats["limited"] = len(skeleton_node_ids) > first_view_limit
+                stats["transport"] = "active_skeleton"
+
+                center_ids = list(skeleton.get("center_ids") or []) if isinstance(skeleton, dict) else list(self._active_node_ids)
+                return {
+                    "nodes": nodes,
+                    "edges": edges,
+                    "stats": stats,
+                    "active_node_ids": list(self._active_node_ids),
+                    "thought_view": {"nodes": nodes, "edges": edges, "center_ids": center_ids},
+                    "active_skeleton": skeleton,
+                }
+
+            hierarchy_children: Set[str] = set()
+            hierarchy_parents: Set[str] = set()
+            child_counts: Dict[str, int] = {}
+
+            for shard_id in self.list_all_shards():
+                shard = self.get_shard(shard_id, load_if_missing=True)
+                if not shard:
+                    continue
+                for edge in shard.topology.graph.es:
+                    edge_type = edge["type"] if "type" in edge.attributes() else "association"
+                    if edge_type != "hierarchy":
+                        continue
+                    src_id = self._vertex_node_id(shard.topology.graph.vs[edge.source])
+                    dst_id = self._vertex_node_id(shard.topology.graph.vs[edge.target])
+                    hierarchy_parents.add(src_id)
+                    hierarchy_children.add(dst_id)
+                    child_counts[src_id] = child_counts.get(src_id, 0) + 1
+
+            for edge in self._iter_cross_edges():
+                if edge.get("edge_type", "association") != "hierarchy":
+                    continue
+                src_id = edge.get("src_id")
+                dst_id = edge.get("dst_id")
+                if not src_id or not dst_id:
+                    continue
+                hierarchy_parents.add(src_id)
+                hierarchy_children.add(dst_id)
+                child_counts[src_id] = child_counts.get(src_id, 0) + 1
+
+            root_ids = sorted(hierarchy_parents - hierarchy_children)
+            root_limit = 200
+            returned_root_ids = root_ids[:root_limit]
+            nodes = []
+            for node_id in returned_root_ids:
+                node = self.get_node(node_id)
+                if not node:
+                    continue
+                data = self._serialize_node_for_frontend(node, include_children_count=False)
+                data["children_count"] = child_counts.get(node_id, 0)
+                nodes.append(data)
+
+            stats = self.get_total_stats()
+            stats["returned_nodes"] = len(nodes)
+            stats["returned_edges"] = 0
+            stats["root_count"] = len(root_ids)
+            stats["root_limit"] = root_limit
+            stats["limited"] = len(root_ids) > root_limit
+            stats["transport"] = "limited_root"
+
+            return {
+                "nodes": nodes,
+                "edges": [],
+                "stats": stats,
+                "active_node_ids": list(self._active_node_ids),
+                "thought_view": {"nodes": [], "edges": [], "center_ids": list(self._active_node_ids)},
+                "active_skeleton": self.get_active_skeleton(),
+            }
+
         nodes = []
         edges = []
         hierarchy_children: Set[str] = set()
@@ -2571,6 +2894,8 @@ class ShardedMemoryGraph:
                 dst_id = self._vertex_node_id(shard.topology.graph.vs[edge.target])
                 edge_type = edge["type"] if "type" in edge.attributes() else "association"
                 edge_props = shard.get_edge(src_id, dst_id)
+                if self._should_hide_frontend_edge(src_id, dst_id, edge_type, edge_props=edge_props):
+                    continue
                 edges.append(self._serialize_edge_for_frontend(src_id, dst_id, edge_type, edge_props))
                 if edge_type == "hierarchy":
                     hierarchy_parents.add(src_id)
@@ -2581,6 +2906,8 @@ class ShardedMemoryGraph:
             dst_id = edge.get("dst_id")
             edge_type = edge.get("edge_type", "association")
             if not src_id or not dst_id:
+                continue
+            if self._should_hide_frontend_edge(src_id, dst_id, edge_type, edge=edge):
                 continue
             edges.append(self._serialize_cross_edge_for_frontend(edge))
             if edge_type == "hierarchy":
@@ -2604,7 +2931,11 @@ class ShardedMemoryGraph:
         }
 
     def get_node_children_for_frontend(self, node_id: str) -> Dict[str, Any]:
-        children = self.get_children(node_id)
+        visible_child_ids = self._frontend_hierarchy_child_ids(node_id)
+        children = [
+            child for child in self.get_children(node_id)
+            if child.node_id in visible_child_ids
+        ]
         child_ids = {c.node_id for c in children}
         nodes = [self._serialize_node_for_frontend(c, include_children_count=True) for c in children]
         edges = []
@@ -2618,11 +2949,20 @@ class ShardedMemoryGraph:
                 if (src_id == node_id and dst_id in child_ids) or (src_id in child_ids and dst_id in child_ids):
                     edge_type = edge["type"] if "type" in edge.attributes() else "association"
                     edge_props = shard.get_edge(src_id, dst_id)
+                    if self._should_hide_frontend_edge(src_id, dst_id, edge_type, edge_props=edge_props):
+                        continue
                     edges.append(self._serialize_edge_for_frontend(src_id, dst_id, edge_type, edge_props))
         for edge in self._iter_cross_edges():
             src_id = edge.get("src_id")
             dst_id = edge.get("dst_id")
             if (src_id == node_id and dst_id in child_ids) or (src_id in child_ids and dst_id in child_ids):
+                if self._should_hide_frontend_edge(
+                    src_id,
+                    dst_id,
+                    edge.get("edge_type", "association"),
+                    edge=edge,
+                ):
+                    continue
                 edges.append(self._serialize_cross_edge_for_frontend(edge))
         return {"parent_id": node_id, "nodes": nodes, "edges": edges}
 
@@ -2634,6 +2974,12 @@ class ShardedMemoryGraph:
 
     def _serialize_node_for_frontend(self, node: NodeProperties, include_children_count: bool = False) -> Dict[str, Any]:
         metadata = dict(node.metadata or {})
+        node_type = str(getattr(getattr(node, "node_type", ""), "value", getattr(node, "node_type", "")) or "")
+        if node_type == "dialogue":
+            metadata["task_graph_address"] = ""
+            full_path = str(metadata.get("full_path") or "")
+            if full_path.startswith("task:") or "/task:" in full_path:
+                metadata["full_path"] = node.node_id
         metadata.setdefault("content", node.content or "")
         metadata.setdefault("importance", node.importance)
         metadata.setdefault("temperature", node.temperature)
@@ -2649,12 +2995,80 @@ class ShardedMemoryGraph:
             "access_count": node.access_count,
         }
         if include_children_count:
-            data["children_count"] = len(self.get_children(node.node_id))
+            data["children_count"] = len(self._frontend_hierarchy_child_ids(node.node_id))
         data["graph_memory_id"] = node.node_id
         data["shard_id"] = getattr(node, "storage_shard", "") or metadata.get("shard_id", "")
         data["full_path"] = metadata.get("full_path") or metadata.get("graph_address") or node.node_id
         data["memory_address"] = self._build_memory_address(node)
         return data
+
+    _LEGACY_DIALOGUE_TASK_LINK_TYPES = {
+        "dialogue_round_task",
+        "dialogue_to_task",
+        "sub_dialogue_to_task",
+    }
+
+    def _frontend_hierarchy_child_ids(self, node_id: str) -> Set[str]:
+        child_ids: Set[str] = set()
+        for shard_id in self.list_all_shards():
+            shard = self.get_shard(shard_id, load_if_missing=True)
+            if not shard:
+                continue
+            for edge in shard.topology.graph.es:
+                src_id = self._vertex_node_id(shard.topology.graph.vs[edge.source])
+                if src_id != node_id:
+                    continue
+                dst_id = self._vertex_node_id(shard.topology.graph.vs[edge.target])
+                edge_type = edge["type"] if "type" in edge.attributes() else "association"
+                if edge_type != "hierarchy":
+                    continue
+                edge_props = shard.get_edge(src_id, dst_id)
+                if self._should_hide_frontend_edge(src_id, dst_id, edge_type, edge_props=edge_props):
+                    continue
+                child_ids.add(dst_id)
+        for edge in self._iter_cross_edges():
+            if edge.get("src_id") != node_id or edge.get("edge_type", "association") != "hierarchy":
+                continue
+            dst_id = edge.get("dst_id")
+            if not dst_id:
+                continue
+            if self._should_hide_frontend_edge(node_id, dst_id, "hierarchy", edge=edge):
+                continue
+            child_ids.add(dst_id)
+        return child_ids
+
+    def _node_type_value_for_frontend_filter(self, node_id: str) -> str:
+        node = self.get_node(node_id)
+        if node:
+            node_type = getattr(node, "node_type", "") or ""
+            return str(getattr(node_type, "value", node_type) or "").lower()
+        if "/dialogue:" in str(node_id) or str(node_id).startswith("dialogue:"):
+            return "dialogue"
+        if "/task:" in str(node_id) or str(node_id).startswith("task:"):
+            return "task"
+        return ""
+
+    def _should_hide_frontend_edge(
+        self,
+        src_id: str,
+        dst_id: str,
+        edge_type: str,
+        *,
+        edge_props: Optional[EdgeProperties] = None,
+        edge: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        metadata = dict(edge.get("metadata") or {}) if edge else {}
+        if edge_props and getattr(edge_props, "metadata", None):
+            metadata.update(getattr(edge_props, "metadata", {}) or {})
+        link_type = str(metadata.get("link_type") or "").strip()
+        if link_type in self._LEGACY_DIALOGUE_TASK_LINK_TYPES:
+            return True
+        if str(edge_type).lower() != "hierarchy":
+            return False
+        return (
+            self._node_type_value_for_frontend_filter(src_id) == "dialogue"
+            and self._node_type_value_for_frontend_filter(dst_id) == "task"
+        )
 
     def _serialize_edge_for_frontend(self, src_id: str, dst_id: str, edge_type: str, edge_props: Optional[EdgeProperties]) -> Dict[str, Any]:
         return {
@@ -2689,6 +3103,12 @@ class ShardedMemoryGraph:
         """构造 RAG/工具可回跳的图记忆地址。"""
         metadata = dict(getattr(node, "metadata", {}) or {})
         node_id = node.node_id
+        node_type = str(getattr(getattr(node, "node_type", ""), "value", getattr(node, "node_type", "")) or "")
+        if node_type == "dialogue":
+            metadata["task_graph_address"] = ""
+            full_path_value = str(metadata.get("full_path") or "")
+            if full_path_value.startswith("task:") or "/task:" in full_path_value:
+                metadata["full_path"] = node_id
         resolved_shard_id = (
             shard_id
             or getattr(node, "storage_shard", "")

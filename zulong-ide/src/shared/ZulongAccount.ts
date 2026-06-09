@@ -94,5 +94,5 @@ export interface UserRemoteConfigDiscoveryResponse {
 	organizations?: UserRemoteConfigOrganization[]
 }
 
-// Used in zulong.ts provider and in webview-ui/src/components/chat/ChatRow.tsx to display the login button
+// Used in zulong.ts provider and in historical UI account display code
 export const ZULONG_ACCOUNT_AUTH_ERROR_MESSAGE = "Unauthorized: Please sign in to Zulong before trying again."

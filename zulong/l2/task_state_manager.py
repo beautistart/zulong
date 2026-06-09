@@ -38,20 +38,33 @@ class TaskStateManager:
             self._initialized = True
             logger.info("TaskStateManager initialized")
     
-    def create_task(self, task_id: str, context: List[Dict]) -> str:
+    def create_task(self, task_id: str, context: List[Dict], freeze_existing: bool = True) -> str:
         """创建新任务
         
         Args:
             task_id: 任务 ID
             context: 初始上下文
+            freeze_existing: 是否把当前活跃任务压入冻结栈。TaskGraph 运行态
+                绑定/恢复只是在切换活动图谱，不应污染用户可恢复任务栈。
             
         Returns:
             str: 任务 ID
         """
         with self._lock:
+            if task_id and task_id == self._active_task_id:
+                if self._active_snapshot:
+                    self._active_snapshot.last_updated = time.time()
+                return task_id
+
             # 如果已有活跃任务，先冻结
-            if self._active_task_id:
+            if self._active_task_id and freeze_existing:
                 self.freeze_current()
+            elif self._active_task_id and not freeze_existing:
+                logger.info(
+                    "Task %s replaced by %s without freezing",
+                    self._active_task_id,
+                    task_id,
+                )
             
             # 创建新任务
             snapshot = TaskSnapshot(
@@ -66,9 +79,30 @@ class TaskStateManager:
             # 设置为活跃任务
             self._active_task_id = task_id
             self._active_snapshot = snapshot
+            if task_id in self._task_stack:
+                self._task_stack = [tid for tid in self._task_stack if tid != task_id]
+            self._frozen_tasks.pop(task_id, None)
             
             logger.info(f"Task {task_id} created and set as active")
             return task_id
+
+    def clear_active_task(self, task_id: Optional[str] = None, clear_stack: bool = False):
+        """Clear the active task without auto-resuming another stack entry."""
+        with self._lock:
+            if task_id and self._active_task_id and self._active_task_id != task_id:
+                if clear_stack:
+                    self._task_stack = [tid for tid in self._task_stack if tid != task_id]
+                    self._frozen_tasks.pop(task_id, None)
+                return
+            cleared = self._active_task_id
+            self._active_task_id = None
+            self._active_snapshot = None
+            if clear_stack:
+                target = task_id or cleared
+                if target:
+                    self._task_stack = [tid for tid in self._task_stack if tid != target]
+                    self._frozen_tasks.pop(target, None)
+            logger.info("Task %s cleared from active state", cleared or task_id or "-")
     
     def update_task(self, task_id: str, new_token: str, vars_update: Dict[str, any]):
         """更新任务

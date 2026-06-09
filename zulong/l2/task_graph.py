@@ -781,9 +781,24 @@ class TaskGraph:
         每个节点附带完整层级地址和关联代码锚点。
         """
         with self._lock:
-            h_edges_snapshot = list(self._h_edges)
-            d_edges_snapshot = list(self._d_edges)
-            nodes_snapshot = list(self._nodes.values())
+            raw_h_edges = list(self._h_edges)
+            raw_d_edges = list(self._d_edges)
+            raw_nodes = list(self._nodes.values())
+
+        # 前端需要可视化代码图谱（crg_ 分支），但完成度/归档/状态聚合
+        # 仍由调用方排除 crg_ 节点，避免代码结构污染任务进度。
+        visible_node_ids = {n.id for n in raw_nodes}
+        h_edges_snapshot = [
+            e for e in raw_h_edges
+            if e[0] in visible_node_ids and e[1] in visible_node_ids
+        ]
+        d_edges_snapshot = [
+            e for e in raw_d_edges
+            if e.s in visible_node_ids and e.t in visible_node_ids
+        ]
+        nodes_snapshot = [
+            n for n in raw_nodes if n.id in visible_node_ids
+        ]
 
         # 批量获取 CodeAnchor 信息
         anchor_by_owner = {}
@@ -805,7 +820,7 @@ class TaskGraph:
 
         for n in nodes_snapshot:
             d = n.to_dict()
-            if n.id in parent_ids and n.id not in ("req", "analysis"):
+            if n.id in parent_ids and n.id != "analysis":
                 d["status"] = self._aggregate_status(n.id)
             d["address"] = self.get_node_address(n.id)
             # 注入该节点的代码锚点
@@ -820,6 +835,11 @@ class TaskGraph:
             "title": self.title,
             "graphAddress": self.address,
             "createdAt": int(self.created_at * 1000),
+            "workspace_dir": self.metadata.get("workspace_dir", ""),
+            "workspace_path": self.metadata.get("workspace_dir", ""),
+            "task_graph_file_path": self.metadata.get("task_graph_file_path", ""),
+            "graph_file_path": self.metadata.get("task_graph_file_path", ""),
+            "metadata": self.metadata,
             "nodes": aggregated_nodes,
             "hEdges": [list(e) for e in h_edges_snapshot],
             "dEdges": [e.to_dict() for e in d_edges_snapshot],
@@ -828,7 +848,10 @@ class TaskGraph:
 
     def _aggregate_status(self, node_id: str, _nodes_with_children: set = None) -> str:
         """从子节点状态聚合父节点的显示状态（递归）"""
-        children = self.get_children(node_id)
+        children = [
+            child for child in self.get_children(node_id)
+            if not str(getattr(child, "id", "")).startswith("crg_")
+        ]
         if not children:
             node = self._nodes.get(node_id)
             return node.status if node else "pending"
@@ -843,6 +866,12 @@ class TaskGraph:
             else:
                 statuses.add(child.status)
 
+        node = self._nodes.get(node_id)
+        own_status = node.status if node else "pending"
+        if own_status in ("blocked", "needs_adjust"):
+            return own_status
+        if own_status == "in_progress" and statuses <= {"pending", "skipped"}:
+            return "in_progress"
         if statuses == {"completed"}:
             return "completed"
         if "in_progress" in statuses:

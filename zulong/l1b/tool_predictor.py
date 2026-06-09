@@ -219,6 +219,17 @@ class L1BToolPredictor:
         "你好", "您好", "嗨", "hi", "hello", "早上好", "下午好",
         "晚上好", "谢谢", "多谢", "辛苦了",
     }
+    READ_ONLY_CUES = (
+        "只读", "仅分析", "只分析", "不要修改", "不要改", "不要写",
+        "read only", "read-only", "readonly", "do not edit", "do not modify",
+        "no changes", "no file changes", "analyze only", "inspect only",
+    )
+    WRITE_TOOL_NAMES = {"write_to_file", "replace_in_file", "delete_file"}
+
+    @classmethod
+    def _is_read_only_request(cls, prompt: str) -> bool:
+        text = (prompt or "").lower()
+        return any(cue in text for cue in cls.READ_ONLY_CUES)
 
     def predict_tools(
         self,
@@ -253,6 +264,9 @@ class L1BToolPredictor:
                 )
 
         turn_shape = self._detect_turn_shape(prompt)
+        if self._is_read_only_request(prompt):
+            suggested.difference_update(self.WRITE_TOOL_NAMES)
+            turn_shape = "tool_augmented" if suggested else "direct_reply"
         task_graph_policy = self._predict_task_graph_policy(prompt, suggested)
 
         # 轻量寒暄不主动注入工具；L2 如需工具可请求补充。
@@ -273,6 +287,8 @@ class L1BToolPredictor:
         text = (prompt or "").strip().lower()
         if text in self.SIMPLE_SOCIAL_PHRASES and len(text) <= 18:
             return "simple_social"
+        if self._is_read_only_request(prompt):
+            return "tool_augmented"
         if any(w in prompt for w in self.TOOL_AUGMENTED_INDICATORS):
             return "tool_augmented"
         return "direct_reply"
@@ -280,6 +296,8 @@ class L1BToolPredictor:
     def _predict_task_graph_policy(self, prompt: str, suggested: set) -> str:
         """根据工具需求判断是否建议 L2 检查/创建任务图。"""
         text = prompt or ""
+        if self._is_read_only_request(prompt):
+            return "inspect" if any(name.startswith("task_") for name in suggested) else "none"
         if any(w in text for w in self.TOOL_AUGMENTED_INDICATORS):
             return "inspect_or_create"
         if any(name.startswith("task_") for name in suggested):

@@ -18,8 +18,11 @@
 
 ```bash
 # 激活虚拟环境
-cd D:/AI/project/zulong_beta4
-./zulong_env/Scripts/activate
+cd /path/to/zulong_beta5
+# Windows PowerShell:
+./zulong_env/Scripts/Activate.ps1
+# Linux/macOS:
+source zulong_env/bin/activate
 
 # 安装混合存储依赖
 pip install python-igraph lmdb msgspec

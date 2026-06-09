@@ -46,6 +46,13 @@ class EdgeType(Enum):
     SEMANTIC = "semantic"
     CAUSAL = "causal"
     ASSOCIATION = "association"
+    DERIVED_FROM = "derived_from"
+    APPLIES_TO = "applies_to"
+    SIMILAR_TO = "similar_to"
+    CORRECTS = "corrects"
+    DEPENDS_ON = "depends_on"
+    CONTRADICTS = "contradicts"
+    FAILED_THEN_SUCCEEDED = "failed_then_succeeded"
 
 
 class Importance(Enum):

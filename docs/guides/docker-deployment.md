@@ -76,7 +76,7 @@ wsl --install
 
 ```bash
 git clone <repository-url>
-cd zulong_beta4
+cd zulong_beta5
 ```
 
 ### 2. 准备模型文件

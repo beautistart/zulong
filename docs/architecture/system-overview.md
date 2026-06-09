@@ -201,7 +201,7 @@ MemoryGraph 53 个公开方法，仅通过 4 个 FC 工具暴露给模型:
 | 1. 相同调用重复 | `_signal_repetition()`: name + params_hash 一致 | 连续 2 次 | 连续 3 次 |
 | 2. 模式循环 | `_signal_pattern_loop()`: 窗口内工具频次 + Jaccard 查询相似度 | 5/6 次 | 7/6 次 (或查询相似度 > 0.7) |
 | 3. 信息增益递减 | `_signal_info_gain()`: result hash 重叠检测 | 全空/极短 | 完全相同 |
-| 4. 上下文压力 | `_signal_context_pressure()`: token 估算 / 窗口比 | >= 75% | >= 90% |
+| 4. 上下文压力 | `_signal_context_pressure()`: token 估算 / 窗口比 | >= 50% | >= 60% |
 | 5. 经过时间 | `_signal_elapsed_time()`: **已禁用**，步数为主控 | - | - |
 | 6. 无进度空转 | `_signal_no_progress()`: 连续信息检索工具无行动工具 | 4 次 | 6 次 |
 
@@ -776,41 +776,6 @@ score = heading_weight(0.3) × heading_cost
 ```
 
 **与 L1 的协同**: 导航技能输出运动指令 → L1-B 调度层下发 → L1-A 电机插件安全约束 → L0 执行器执行。全程 L1-A 保持障碍物监测，可随时中断导航进行紧急停止。
-
----
-
-#### 3.9.0.8 OpenClaw Bridge (实体机器人桥接)
-
-**源文件**: `openclaw_bridge/` (16 个文件)
-**成熟度**: 基本可用
-
-OpenClaw Bridge 是祖龙系统与实体机器人硬件之间的**事件桥接层**，将祖龙的 EventBus 事件映射到 OpenClaw 机器人的执行器指令:
-
-**架构**:
-```
-祖龙 L1-B (EventBus)  ←→  OpenClaw Bridge  ←→  实体机器人
-                            ├─ MicAdapter: 麦克风 → USER_SPEECH 事件
-                            ├─ VisionReporter: 视觉 → SENSOR_VISION 事件
-                            ├─ ExecuteListener: TASK_EXECUTE → 机器人动作
-                            ├─ SpeakListener: ACTION_SPEAK → 语音播报
-                            └─ WebAdapter: HTTP API → Web UI
-```
-
-**事件类型映射** (OpenClawEventType):
-
-| 事件类型 | 方向 | 用途 |
-|----------|------|------|
-| `USER_SPEECH` | 机器人→祖龙 | 语音识别结果上送 L1-B |
-| `SENSOR_VISION` | 机器人→祖龙 | 视觉检测结果上送 |
-| `TASK_EXECUTE` | 祖龙→机器人 | 任务指令下发 (grasp/move_arm 等) |
-| `ACTION_SPEAK` | 祖龙→机器人 | 语音播报指令 |
-| `ACTION_RESULT` | 机器人→祖龙 | 执行结果反馈 |
-
-**设计原则**:
-- Bridge 自身**不加载任何模型**，只做事件转换
-- 所有智能逻辑保留在祖龙主系统中
-- 支持 Mock 模式用于无硬件环境下的开发测试
-- 通过 `bootstrap.py` 统一启动所有适配器和监听器
 
 ---
 

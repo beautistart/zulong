@@ -1,0 +1,59 @@
+# macOS platform profile for ZULONG.
+# macOS defaults avoid CUDA-only engines and prefer Ollama/llama.cpp/MPS-friendly paths.
+
+system:
+  data_dir: ${ZULONG_DATA_DIR:./data}
+  models_dir: ${ZULONG_MODEL_BASE_DIR:./models}
+  cache_dir: ${ZULONG_CACHE_DIR:./cache}
+
+llm:
+  backend: ${ZULONG_LLM_BACKEND:ollama}
+  ollama:
+    base_url: ${ZULONG_OLLAMA_BASE_URL:http://localhost:11434/v1}
+    model_id: ${ZULONG_OLLAMA_MODEL_ID:qwen3.5:4b}
+    backup_model_id: ${ZULONG_OLLAMA_BACKUP_MODEL_ID:qwen3.5:0.8b}
+  llamaccp:
+    base_url: ${ZULONG_LLAMACPP_BASE_URL:http://localhost:8080/v1}
+    model_id: ${ZULONG_LLAMACPP_MODEL_ID:qwen3.5-4b}
+    n_gpu_layers: -1
+  vllm:
+    base_url: ${ZULONG_VLLM_BASE_URL:http://localhost:8000/v1}
+    model_id: ${ZULONG_VLLM_MODEL_ID:./models/Qwen/Qwen3___5-0.8B-AWQ}
+  sglang:
+    base_url: ${ZULONG_SGLANG_BASE_URL:http://localhost:30000/v1}
+    model_id: ${ZULONG_SGLANG_MODEL_ID:./models/Qwen/Qwen3___5-0.8B-AWQ}
+  transformer:
+    device: auto
+    dtype: float16
+
+audio:
+  asr:
+    device: cpu
+  tts:
+    backend: kokoro
+    device: cpu
+    cosyvoice:
+      model_path: ${ZULONG_COSYVOICE3_MODEL_PATH:./models/CosyVoice3-0.5B/FunAudioLLM/Fun-CosyVoice3-0___5B-2512}
+      ttsfrd_path: ${ZULONG_COSYVOICE_TTSFRD_PATH:./models/iic/CosyVoice-ttsfrd}
+      integrated_python_path: ${ZULONG_COSYVOICE_PYTHON:python}
+      code_path: ${ZULONG_COSYVOICE_CODE_PATH:./models/CosyVoice}
+      model_dir: ${ZULONG_COSYVOICE_MODEL_DIR:./models/iic/CosyVoice2-0.5B}
+      prompt_audio: ${ZULONG_COSYVOICE_PROMPT_AUDIO:./models/CosyVoice/asset/zero_shot_prompt.wav}
+      server_url: ${ZULONG_COSYVOICE_GRADIO_URL:http://localhost:50000}
+
+vision:
+  camera:
+    backend: auto
+    device_index: 0
+  mediapipe:
+    device: cpu
+  yolo:
+    device: auto
+
+workspace:
+  root: ${ZULONG_WORKSPACE:~/Zulong/workspace}
+  vscode_command: ${ZULONG_VSCODE_COMMAND:code}
+  vscode_isolated_user_data: true
+  vscode_user_data_dir: ${ZULONG_VSCODE_USER_DATA_DIR:~/Library/Application Support/Zulong/vscode-user-data}
+  vscode_extensions_dir: ${ZULONG_VSCODE_EXTENSIONS_DIR:~/.vscode/extensions}
+  vscode_restore_windows: none

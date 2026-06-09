@@ -38,7 +38,14 @@
 		"autonomous",
 		"memory-graph"
 	],
+	"capabilities": {
+		"untrustedWorkspaces": {
+			"supported": "limited",
+			"description": "Zulong IDE can connect to the backend and report Workspace Trust status in restricted mode. File writes, terminals, commands, and task execution require the user to trust the workspace."
+		}
+	},
 	"activationEvents": [
+		"*",
 		"onLanguage",
 		"onUri",
 		"onStartupFinished",
@@ -222,8 +229,8 @@
 		"protos-python": "node scripts/build-python-proto.mjs",
 		"download-ripgrep": "node scripts/download-ripgrep.mjs",
 		"postprotos": "biome format src/shared/proto src/core/controller src/hosts/ src/generated --write --no-errors-on-unmatched",
-		"clean:build": "rimraf dist dist-standalone webview-ui/build src/generated out/",
-		"clean:deps": "rimraf node_modules webview-ui/node_modules",
+		"clean:build": "rimraf dist dist-standalone src/generated out/",
+		"clean:deps": "rimraf node_modules",
 		"clean:all": "npm run clean:build && npm run clean:deps",
 		"compile-tests": "node ./scripts/build-tests.js",
 		"watch-tests": "tsc -p . -w --outDir out",
@@ -250,10 +257,11 @@
 		"test:e2e:optimal": "npm run test:e2e:build && node src/test/e2e/utils/build.mjs && playwright test",
 		"test:e2e:cli:tui": "cd tests/e2e/cli && tui-test",
 		"test:e2e:ui": "npx tsx scripts/interactive-playwright.ts",
-		"install:all": "npm install && cd webview-ui && npm install",
-		"dev:webview": "echo 'VS Code 插件已后台化，Webview 开发入口已停用。'",
-		"build:webview": "echo 'VS Code 插件已后台化，生产构建跳过 Webview。'",
-		"test:webview": "echo 'VS Code 插件已后台化，跳过 Webview 测试。'",
+		"smoke:platform": "node scripts/smoke-platform.mjs",
+		"install:all": "npm install",
+		"dev:webview": "echo 'VS Code 插件已后台化，用户交互入口统一到 Zulong Web。'",
+		"build:webview": "echo 'VS Code 插件已后台化，用户交互入口统一到 Zulong Web。'",
+		"test:webview": "echo 'VS Code 插件已后台化，用户交互入口统一到 Zulong Web。'",
 		"publish:marketplace": "vsce publish --allow-package-secrets sendgrid && ovsx publish",
 		"publish:marketplace:prerelease": "vsce publish --allow-package-secrets sendgrid --pre-release && ovsx publish --pre-release",
 		"publish:marketplace:nightly": "node ./scripts/publish-nightly.mjs",
@@ -262,7 +270,7 @@
 		"docs:check-links": "cd docs && npm run check",
 		"docs:rename-file": "cd docs && npm run rename",
 		"report-issue": "node scripts/report-issue.js",
-		"storybook": "cd webview-ui && npm run storybook",
+		"storybook": "echo 'VS Code 插件已后台化，无独立交互 UI Storybook。'",
 		"cli:unlink": "cd cli && npm run unlink",
 		"eval:smoke:build": "npm run cli:build && npm run cli:link",
 		"eval:smoke:run": "npx tsx evals/smoke-tests/run-smoke-tests.ts",
@@ -440,7 +448,6 @@
 		],
 		"exclude": [
 			"**/testing-platform/**",
-			"**/webview-ui/**",
 			"**/.vscode-test/**",
 			"**/node_modules/**",
 			"node_modules",

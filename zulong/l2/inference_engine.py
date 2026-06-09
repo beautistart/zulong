@@ -8,7 +8,7 @@ import contextvars
 import os
 import re
 import numpy as np
-from typing import Optional, Callable, List, Any, Dict
+from typing import Optional, Callable, List, Any, Dict, Set
 
 from zulong.core.event_bus import event_bus
 from zulong.core.state_manager import state_manager
@@ -99,6 +99,8 @@ class InferenceEngine:
             self._running = False
             self._current_task_id: Optional[str] = None
             self._interrupt_flag = False
+            self._cancelled_request_ids: Set[str] = set()
+            self._cancelled_session_ids: Set[str] = set()
             self._lock = threading.Lock()
             self._processing_done = threading.Event()
             self._processing_done.set()  # 初始为"完成"状态
@@ -143,6 +145,11 @@ class InferenceEngine:
             
             # 活跃任务图 ID 跟踪（用于地址继承）
             self._active_task_graph_id: Optional[str] = None
+            self._current_user_input_for_feedback: str = ""
+            self._current_tool_prediction_for_feedback: Dict[str, Any] = {}
+            self._current_tool_bundle_for_feedback: List[str] = []
+            self._pipeline_tool_ledger: List[Dict[str, Any]] = []
+            self._pipeline_started_at: float = 0.0
             
             # 经验生成器
             self.experience_generator = ExperienceGenerator()
@@ -228,7 +235,8 @@ class InferenceEngine:
             _exp_tool = self.tool_engine.registry.get("search_experience")
             if _exp_tool and self.rag_manager:
                 _exp_tool.set_rag_manager(self.rag_manager)
-            
+            self._ensure_search_tools_tool_rag_bound()
+
             # 🔥 LLM 后端客户端（统一使用 OpenAI 兼容 API）
             if VLLM_AVAILABLE:
                 try:
@@ -359,6 +367,7 @@ class InferenceEngine:
         
         vLLM 支持 extra_body（如 repetition_penalty），
         Ollama 支持 extra_body.options（如 num_ctx 控制上下文长度 / GPU 显存占用）。
+        OpenRouter 支持 extra_headers（HTTP Referer / App Name）。
         Qwen3 系列默认开启思维链，通过 enable_thinking=False 禁用。
         
         Returns:
@@ -368,12 +377,133 @@ class InferenceEngine:
         import zulong.models.container as _mc
         backend = _mc.LLM_BACKEND
         num_ctx = _mc.LLM_NUM_CTX
+        extra_kw: dict = {}
+
+        # vLLM 后端：支持 repetition_penalty 和禁用思维链
         if backend == "vllm":
-            return {"extra_body": {"repetition_penalty": 1.2, "enable_thinking": False}}
-        if backend == "ollama" and num_ctx > 0:
-            return {"extra_body": {"options": {"num_ctx": num_ctx}}}
-        return {"extra_body": {"enable_thinking": False}}
-    
+            extra_body = {"repetition_penalty": 1.2, "enable_thinking": False}
+            extra_kw["extra_body"] = extra_body
+
+        # Ollama 后端：通过 options 控制 num_ctx, num_predict, keep_alive 等
+        elif backend == "ollama":
+            ollama_options = {}
+            if num_ctx > 0:
+                ollama_options["num_ctx"] = num_ctx
+            # 从配置读取 Ollama 特定参数
+            try:
+                from zulong.config.config_manager import get_config_manager
+                cm = get_config_manager()
+                ollama_cfg = cm.get_dict("llm.ollama", {})
+                num_predict = ollama_cfg.get("num_predict")
+                if num_predict:
+                    ollama_options["num_predict"] = int(num_predict)
+                keep_alive = ollama_cfg.get("keep_alive")
+                if keep_alive:
+                    ollama_options["mirostat"] = 0  # 默认关闭 mirostat
+            except Exception:
+                pass
+            if ollama_options:
+                extra_kw["extra_body"] = {"options": ollama_options}
+            else:
+                extra_kw["extra_body"] = {"enable_thinking": False}
+
+        # OpenRouter 后端：添加 HTTP Referer 和 App Name 头
+        elif backend == "openrouter":
+            try:
+                from zulong.config.config_manager import get_config_manager
+                cm = get_config_manager()
+                or_cfg = cm.get_dict("llm.openrouter", {})
+                or_headers = {}
+                app_name = or_cfg.get("app_name", "zulong")
+                http_referer = or_cfg.get("http_referer", "")
+                if app_name:
+                    or_headers["HTTP-Referer"] = http_referer or "http://localhost:8080"
+                    or_headers["X-Title"] = app_name
+                if or_headers:
+                    extra_kw["extra_headers"] = or_headers
+            except Exception:
+                pass
+            extra_kw["extra_body"] = {"enable_thinking": False}
+
+        # 中转站/代理后端：通用处理
+        elif backend in {"siliconflow", "oneapi", "custom", "openai_compatible"}:
+            extra_kw["extra_body"] = {"enable_thinking": False}
+
+        else:
+            extra_kw["extra_body"] = {"enable_thinking": False}
+
+        return extra_kw
+
+    def discover_ollama_models(self, base_url: str = None) -> Dict[str, Any]:
+        """发现 Ollama 实例上已安装的模型。
+
+        如果未指定 base_url，自动从当前 Ollama 配置推导。
+
+        Returns:
+            Dict 包含 healthy, model_count, models 等字段
+        """
+        from zulong.adapters.backend_resolver import (
+            detect_available_ollama_models,
+            _ollama_api_url,
+        )
+        import zulong.models.container as _mc
+
+        if base_url is None:
+            # 从当前 Ollama 配置推导原生 API 地址
+            ollama_v1 = _mc.LLM_BASE_URL or "http://localhost:11434/v1"
+            base_url = _ollama_api_url(ollama_v1)
+
+        result = detect_available_ollama_models(base_url)
+        logger.info(f"[Ollama] 模型发现完成: healthy={result['healthy']}, count={result['model_count']}")
+        return result
+
+    def pull_ollama_model(self, model_name: str, base_url: str = None) -> bool:
+        """从 Ollama 拉取模型。
+
+        Args:
+            model_name: 模型名称，如 "qwen3.5:4b"
+            base_url: Ollama 原生 API 地址（可选）
+
+        Returns:
+            True 表示拉取成功
+        """
+        from zulong.adapters.backend_resolver import pull_ollama_model, _ollama_api_url
+        import zulong.models.container as _mc
+
+        if base_url is None:
+            ollama_v1 = _mc.LLM_BASE_URL or "http://localhost:11434/v1"
+            base_url = _ollama_api_url(ollama_v1)
+
+        logger.info(f"[Ollama] 开始拉取模型: {model_name} @ {base_url}")
+        success = pull_ollama_model(model_name, base_url)
+        if success:
+            logger.info(f"[Ollama] 模型拉取成功: {model_name}")
+        else:
+            logger.warning(f"[Ollama] 模型拉取失败: {model_name}")
+        return success
+
+    def list_available_backends(self) -> List[Dict[str, Any]]:
+        """列出所有可用的 LLM 后端及其配置状态。
+
+        Returns:
+            后端列表，每个包含 name, configured, base_url, model_id 等字段
+        """
+        from zulong.adapters.backend_resolver import OPENAI_COMPATIBLE_BACKENDS, default_base_url, default_model_id
+        from zulong.config.config_manager import get_config_manager
+        cm = get_config_manager()
+
+        backends = []
+        for name in sorted(OPENAI_COMPATIBLE_BACKENDS):
+            cfg = cm.get_dict(f"llm.{name}", {})
+            backends.append({
+                "name": name,
+                "configured": bool(cfg),
+                "base_url": cfg.get("base_url", default_base_url(name)),
+                "model_id": cfg.get("model_id", default_model_id(name)),
+                "has_api_key": bool(cfg.get("api_key", "") and cfg.get("api_key") not in ("", "EMPTY")),
+            })
+        return backends
+
     def _collect_tool_definitions(self) -> List[Dict[str, Any]]:
         """收集所有已启用工具的 OpenAI FC 格式定义
         
@@ -515,6 +645,31 @@ class InferenceEngine:
         logger.info("[FC] 显式工具集 %s → %d 个定义", sorted(names), len(tool_definitions))
         return tool_definitions
 
+    def _ensure_search_tools_tool_rag_bound(self) -> bool:
+        """Bind ToolRAG to the search_tools meta tool when it is actually used."""
+        tool_engine = getattr(self, "tool_engine", None)
+        rag_manager = getattr(self, "rag_manager", None)
+        if not tool_engine or not rag_manager:
+            return False
+
+        search_tools_tool = tool_engine.registry.get("search_tools")
+        if not search_tools_tool or not hasattr(search_tools_tool, "set_tool_rag"):
+            return False
+
+        try:
+            tool_rag = rag_manager.get_tool_rag()
+        except Exception:
+            tool_rag = None
+        if not tool_rag:
+            return False
+
+        if getattr(search_tools_tool, "_tool_rag", None) is tool_rag:
+            return True
+
+        search_tools_tool.set_tool_rag(tool_rag)
+        logger.info("[ToolBundle] search_tools 已绑定 ToolRAG")
+        return True
+
     def _collect_tool_definitions_for_bundle(
         self,
         tool_bundle: Optional[List[str]],
@@ -524,8 +679,13 @@ class InferenceEngine:
         This is the new primary tool-injection path.
         """
         names = set(tool_bundle or [])
-        if not names:
-            return []
+        # 首轮始终暴露只读上下文补充工具，让纯对话也能在上下文不足时
+        # 直接通过真实 tool_call 增量补充记忆或联网信息；写入类记忆工具
+        # 和项目/任务操作工具仍需 L1-B 预判或工具补充后才暴露。
+        names.update({"recall_memory", "read_memory_node", "discover_related", "web_search"})
+        # 同时保留最小工具补充入口，不直接注入 ToolRAG/search_tools。
+        # 后续如果补充流程显式带出 search_tools，再在执行时按需绑定 ToolRAG。
+        names.discard("search_tools")
         names.add("request_tool_supplement")
         tools = self._collect_named_tool_definitions(names)
         if tools:
@@ -534,34 +694,43 @@ class InferenceEngine:
         logger.warning("[ToolBundle] 工具包为空或不可用，回退为无工具直接回复")
         return []
 
+    def _ensure_task_graph_for_policy(
+        self,
+        *,
+        task_graph_policy: Optional[str],
+        user_input: str,
+        request_id: Optional[str],
+        tool_bundle: Optional[List[str]] = None,
+        context_bundle: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Any]:
+        """Observe an active TaskGraph without executing L1-B's policy hint.
+
+        L1-B may predict that a task graph could be useful, but that prediction
+        is only a candidate signal. Creating or modifying a graph must happen
+        through a real L2 model tool_call such as task_create_plan/task_add_node.
+        """
+        policy = (task_graph_policy or "none").lower()
+        try:
+            from zulong.tools.task_tools import get_active_task_graph
+
+            tg = get_active_task_graph()
+            if tg is not None:
+                self._active_task_graph_id = getattr(tg, "id", None) or self._active_task_graph_id
+                return tg
+            if policy in {"create", "extend", "inspect_or_create"}:
+                logger.debug(
+                    "[TaskGraph] L1-B policy=%s 仅作为候选信号；等待 L2 模型真实 tool_call 后再创建任务图",
+                    policy,
+                )
+            return None
+        except Exception as exc:
+            logger.warning("[TaskGraph] 检查活跃任务图异常: %s", exc, exc_info=True)
+            return None
+
     @staticmethod
     def _inject_tool_bundle_context(messages: List[Dict[str, Any]], prediction: Optional[Dict[str, Any]]) -> None:
-        if not prediction:
-            return
-        context_bundle = prediction.get("context_bundle") or {}
-        predicted_tools = prediction.get("predicted_tools") or []
-        policy = prediction.get("task_graph_policy") or "none"
-        if (
-            context_bundle.get("turn_shape") == "simple_social"
-            and not predicted_tools
-            and policy in ("", "none", None)
-        ):
-            return
-        try:
-            from zulong.tools.tool_bag import summarize_tool_bundle
-            summary = summarize_tool_bundle(prediction)
-        except Exception:
-            names = prediction.get("predicted_tools", [])
-            summary = (
-                "【L1-B 工具预判】\n"
-                f"- 建议工具: {', '.join(names) if names else '无'}\n"
-                "- 如果工具不够，请调用 request_tool_supplement。"
-            )
-        msg = {"role": "system", "content": summary}
-        if len(messages) >= 2:
-            messages.insert(-1, msg)
-        else:
-            messages.append(msg)
+        # 工具 schema 自带完整说明；不再额外注入工具使用上下文，避免重复占用 prompt。
+        return
 
     def _requires_realtime_search(self, user_input: str) -> bool:
         """Detect chat-shaped questions that cannot be answered from static memory."""
@@ -576,6 +745,28 @@ class InferenceEngine:
             "weather", "forecast", "latest", "today", "tomorrow",
         )
         return any(term in text for term in realtime_terms)
+
+    @staticmethod
+    def _looks_like_approval_denial(result_text: str) -> bool:
+        raw = str(result_text or "")
+        if not raw:
+            return False
+        lowered = raw.lower()
+        markers = (
+            "用户未",
+            "用户拒绝",
+            "审批拒绝",
+            "审批超时",
+            "审批未通过",
+            "审批未完成",
+            "未允许",
+            "未应用",
+            "未真实存在",
+            "尚未受信任",
+            "workspace_trust",
+            "approval_blocked",
+        )
+        return any(marker.lower() in lowered for marker in markers)
     
     def _execute_tool_call(self, tool_call) -> str:
         """执行单个 FC 工具调用并返回结果文本
@@ -590,6 +781,18 @@ class InferenceEngine:
         import json
         
         func_name = tool_call.function.name
+        if (
+            getattr(self, "_approval_block_active", False)
+            and func_name in {"exec_write_file", "exec_run_command", "ide_write_file", "write_to_file", "replace_in_file", "delete_file", "execute_command", "create_directory"}
+        ):
+            return json.dumps({
+                "error": (
+                    "审批拒绝或审批超时后，本轮已进入 blocked；"
+                    f"拒绝继续执行受保护工具 {func_name}，防止绕过审批。"
+                ),
+                "blocked": True,
+                "reason": "approval_blocked",
+            }, ensure_ascii=False)
         try:
             arguments = json.loads(tool_call.function.arguments)
         except (json.JSONDecodeError, AttributeError) as e:
@@ -613,13 +816,83 @@ class InferenceEngine:
                 logger.debug(
                     f"[FC] 嵌套参数解包: {func_name} → {arguments}"
                 )
-            
+
+            locked_graph_id = str(getattr(self, "_locked_task_graph_id", "") or "")
+            if locked_graph_id:
+                if func_name in {"task_list_suspended", "task_suspend"}:
+                    return json.dumps({
+                        "locked_task_graph_id": locked_graph_id,
+                        "skipped": True,
+                        "message": (
+                            f"本轮已显式绑定任务图 {locked_graph_id}，"
+                            "禁止切换到挂起任务；请继续使用 task_view_overview/"
+                            "task_add_node/task_mark_status 推进当前图谱。"
+                        ),
+                    }, ensure_ascii=False)
+                if func_name == "task_create_plan":
+                    return json.dumps({
+                        "locked_task_graph_id": locked_graph_id,
+                        "skipped": True,
+                        "message": (
+                            f"本轮已显式绑定任务图 {locked_graph_id}，"
+                            "不能新建任务图谱；如果是扩展需求，请调用 task_add_node。"
+                        ),
+                    }, ensure_ascii=False)
+                if func_name == "task_resume_by_address":
+                    try:
+                        from zulong.tools.task_tools import normalize_task_graph_id
+
+                        target_graph_id = normalize_task_graph_id(arguments.get("address") or "")
+                    except Exception:
+                        target_graph_id = ""
+                    if target_graph_id and target_graph_id != locked_graph_id:
+                        return json.dumps({
+                            "locked_task_graph_id": locked_graph_id,
+                            "requested_graph_id": target_graph_id,
+                            "blocked": True,
+                            "error": (
+                                f"本轮已显式绑定任务图 {locked_graph_id}，"
+                                f"拒绝恢复其他任务图 {target_graph_id}。"
+                            ),
+                        }, ensure_ascii=False)
+
+            if func_name == "task_create_plan":
+                current_user_input = str(
+                    getattr(self, "_current_user_input_for_feedback", "") or ""
+                )
+                if current_user_input and not arguments.get("user_requirement"):
+                    arguments["user_requirement"] = current_user_input
+                if current_user_input:
+                    try:
+                        from zulong.tools.task_tools import infer_project_workspace_hint
+
+                        inferred_target, inferred_project = infer_project_workspace_hint(
+                            current_user_input
+                        )
+                        if inferred_target and inferred_project:
+                            arguments["target_path"] = inferred_target
+                            arguments["project_name"] = inferred_project
+                        elif inferred_target and not arguments.get("target_path"):
+                            arguments["target_path"] = inferred_target
+                        elif inferred_project and not arguments.get("project_name"):
+                            arguments["project_name"] = inferred_project
+                    except Exception as exc:
+                        logger.debug("[FC] task_create_plan 路径补全跳过: %s", exc)
+
+            if func_name == "search_tools":
+                self._ensure_search_tools_tool_rag_bound()
+
             result = self.tool_engine.call_tool(
                 tool_name=func_name,
                 action=action,
                 parameters=arguments,
                 timeout=30.0,
             )
+            if (
+                func_name in {"ide_write_file", "write_to_file", "replace_in_file", "delete_file", "execute_command", "create_directory"}
+                and self._looks_like_approval_denial(str(result.error or result.data or ""))
+            ):
+                self._approval_block_active = True
             
             if result.success:
                 data = result.data
@@ -638,9 +911,20 @@ class InferenceEngine:
                     return data
                 return json.dumps(data, ensure_ascii=False, default=str)
             else:
+                payload: Dict[str, Any] = {}
+                if isinstance(result.data, dict):
+                    payload.update(result.data)
+                elif result.data is not None:
+                    payload["data"] = result.data
+                payload["error"] = (
+                    result.error
+                    or payload.get("error")
+                    or "工具执行失败"
+                )
                 return json.dumps(
-                    {"error": result.error or "工具执行失败"},
+                    payload,
                     ensure_ascii=False,
+                    default=str,
                 )
         except Exception as e:
             logger.error(f"[FC] 工具 {func_name} 执行异常: {e}")
@@ -668,34 +952,73 @@ class InferenceEngine:
         try:
             from zulong.tools.task_tools import get_active_task_graph
             tg = get_active_task_graph()
-            if not tg:
-                logger.info(f"[图谱推送] 无活跃任务图，跳过 {pipeline_type}")
-                return
+            if tg:
+                node_count = len(getattr(tg, "_nodes", {}) or {})
+                h_edge_count = len(getattr(tg, "_h_edges", {}) or {})
+                d_edge_count = len(getattr(tg, "_d_edges", {}) or {})
+                logger.info(
+                    f"[图谱推送] 开始处理 {pipeline_type}, "
+                    f"图谱ID={tg.id}, 节点数={node_count}"
+                )
 
-            logger.info(f"[图谱推送] 开始处理 {pipeline_type}, 图谱ID={tg.id}, 节点数={len(tg._nodes)}")
+                # 转换为前端兼容格式
+                try:
+                    graph_data = self._task_graph_to_frontend(tg)
+                except Exception as serialize_err:
+                    logger.warning(f"[图谱推送] 图谱序列化失败(节点数={node_count}): {serialize_err}")
+                    graph_data = {
+                        "id": tg.id,
+                        "title": getattr(tg, 'title', ''),
+                        "nodes": [],
+                        "hEdges": [],
+                        "dEdges": [],
+                        "serialize_error": str(serialize_err),
+                    }
 
-            # 转换为前端兼容格式
-            try:
-                graph_data = self._task_graph_to_frontend(tg)
-            except Exception as serialize_err:
-                logger.warning(f"[图谱推送] 图谱序列化失败(节点数={len(tg._nodes)}): {serialize_err}")
+                progress = self._task_graph_progress(tg)
+                task_graph_id = getattr(tg, "id", "")
+                tool_count = node_count
+            else:
+                # TSD §23.3.6: 任务生命周期事件不应依赖任务图存在与否。
+                # Full Web 聊天路径可能没有显式创建 TaskGraph，但仍必须发布
+                # action/observation/summary，供前端形成开始-中途-总结的用户反馈。
+                request_key = (
+                    _current_request_id_var.get()
+                    or _current_user_turn_id_var.get()
+                    or getattr(self, "_current_user_turn_id", None)
+                    or "active"
+                )
+                task_graph_id = self._active_task_graph_id or f"pipeline-{request_key}"
                 graph_data = {
-                    "id": tg.id,
-                    "title": getattr(tg, 'title', ''),
+                    "id": task_graph_id,
+                    "title": "当前执行任务",
                     "nodes": [],
                     "hEdges": [],
                     "dEdges": [],
-                    "serialize_error": str(serialize_err),
+                    "activeNodeId": "",
+                    "fallback_reason": "no_active_task_graph",
                 }
+                progress = {
+                    "total": 0,
+                    "completed": 0,
+                    "running": 1 if pipeline_type not in ("agent_done", "agent_error") else 0,
+                    "blocked": 0,
+                    "percent": 100 if pipeline_type == "agent_done" else 0,
+                }
+                tool_count = 0
+                h_edge_count = 0
+                d_edge_count = 0
+                logger.info(
+                    f"[图谱推送] 无活跃任务图，使用事件 fallback 发布 {pipeline_type}"
+                )
 
-            progress = self._task_graph_progress(tg)
             event_data = {
                 "graph": graph_data,
                 "turn": fc_turn,
                 "tool": tool_name,
                 "tool_call_id": tool_call_id,
-                "task_graph_id": getattr(tg, "id", ""),
-                "tool_count": len(tg._nodes),
+                "task_graph_id": task_graph_id,
+                "tool_count": tool_count,
                 "progress": progress,
             }
 
@@ -704,6 +1027,13 @@ class InferenceEngine:
                 event_data["duration"] = 0  # 由调用方填充
             if tool_result:
                 event_data["tool_result"] = tool_result[:500]
+            if pipeline_type == "agent_tool_call":
+                self._record_pipeline_tool_event(
+                    fc_turn=fc_turn,
+                    tool_name=tool_name,
+                    tool_result=tool_result,
+                    tool_call_id=tool_call_id,
+                )
             event_data["interaction"] = self._build_pipeline_interaction(
                 pipeline_type=pipeline_type,
                 fc_turn=fc_turn,
@@ -718,7 +1048,7 @@ class InferenceEngine:
 
             logger.info(
                 f"[图谱推送] {pipeline_type} → {step_type}, "
-                f"节点数: {len(tg._nodes)}, 边数: {len(tg._h_edges) + len(tg._d_edges)}"
+                f"节点数: {tool_count}, 边数: {h_edge_count + d_edge_count}"
             )
         except Exception as e:
             import traceback
@@ -750,6 +1080,270 @@ class InferenceEngine:
         except Exception:
             return ""
 
+    @staticmethod
+    def _feedback_brief(text: str, max_len: int = 72) -> str:
+        text = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 3].rstrip() + "..."
+
+    @staticmethod
+    def _append_feedback_item(items: List[str], text: str, limit: int = 6) -> None:
+        text = re.sub(r"\s+", " ", str(text or "")).strip()
+        if text and text not in items and len(items) < limit:
+            items.append(text)
+
+    @staticmethod
+    def _feedback_progress_item(
+        label: str,
+        status: str,
+        *,
+        detail: str = "",
+        source: str = "",
+        pair_id: str = "",
+    ) -> Dict[str, Any]:
+        label = re.sub(r"\s+", " ", str(label or "")).strip()
+        if not label:
+            label = "继续推进当前事项"
+        if status not in {"pending", "running", "completed", "blocked", "failed"}:
+            status = "pending"
+        item: Dict[str, Any] = {
+            "id": pair_id or label[:48],
+            "label": label[:160],
+            "status": status,
+            "timestamp": time.time(),
+        }
+        if detail:
+            item["detail"] = re.sub(r"\s+", " ", str(detail)).strip()[:220]
+        if source:
+            item["source"] = source
+        if pair_id:
+            item["pair_id"] = pair_id
+        return item
+
+    def _pipeline_progress_items_for_feedback(self, pipeline_type: str) -> List[Dict[str, Any]]:
+        steps = self._pipeline_plan_steps_for_feedback()
+        if not steps:
+            return []
+        if pipeline_type == "pipeline_start":
+            active_index = 0
+        elif pipeline_type == "agent_tool_call":
+            active_index = min(2, len(steps) - 1)
+        elif pipeline_type == "agent_done":
+            active_index = len(steps)
+        elif pipeline_type == "agent_error":
+            active_index = len(steps) - 1
+        else:
+            active_index = min(1, len(steps) - 1)
+        items: List[Dict[str, Any]] = []
+        for idx, step in enumerate(steps):
+            if idx < active_index:
+                status = "completed"
+            elif idx == active_index and pipeline_type not in {"agent_done"}:
+                status = "failed" if pipeline_type == "agent_error" else "running"
+            else:
+                status = "completed" if pipeline_type == "agent_done" else "pending"
+            items.append(self._feedback_progress_item(
+                step,
+                status,
+                source="plan",
+                pair_id=f"pipeline-step-{idx}",
+            ))
+        return items
+
+    def _pipeline_tools_for_feedback(self) -> List[str]:
+        prediction = getattr(self, "_current_tool_prediction_for_feedback", {}) or {}
+        tools = (
+            getattr(self, "_current_tool_bundle_for_feedback", []) or
+            prediction.get("predicted_tools") or
+            prediction.get("suggested_tools") or
+            []
+        )
+        names: List[str] = []
+        for name in tools:
+            text = str(name or "").strip()
+            if text and text not in names:
+                names.append(text)
+        return names
+
+    def _pipeline_plan_steps_for_feedback(self) -> List[str]:
+        prediction = getattr(self, "_current_tool_prediction_for_feedback", {}) or {}
+        context = prediction.get("context_bundle") or {}
+        policy = prediction.get("task_graph_policy") or ""
+        tools = self._pipeline_tools_for_feedback()
+        steps: List[str] = []
+
+        if context.get("needs_memory") or any("memory" in t for t in tools):
+            steps.append("先取相关记忆，避免重复走弯路")
+        if context.get("needs_project_context") or any(t in tools for t in ("read_file", "search_code_symbols", "index_project", "analyze_module")):
+            steps.append("读取或检索项目代码，确认真实实现")
+        if policy in {"reuse", "inspect", "inspect_or_create", "continue"} or any(t.startswith("task_") for t in tools):
+            steps.append("同步任务图状态，避免和已有进度脱节")
+        if any(t in tools for t in ("exec_write_file", "ide_write_file", "replace_in_file", "exec_run_command", "execute_command")):
+            steps.append("遇到写入或命令执行时先处理风险与审批")
+        if tools:
+            steps.append("按模型真实选择执行工具，并把返回结果回填")
+        if not steps:
+            steps.append("先判断是否需要工具；不需要时直接组织回答")
+        steps.append("结束前整理完成项、验证项和仍需留意的地方")
+        return steps[:5]
+
+    def _tool_result_preview_for_feedback(self, tool_result: str, max_len: int = 260) -> str:
+        preview = re.sub(r"\s+", " ", str(tool_result or "")).strip()
+        if not preview:
+            return ""
+        try:
+            import json as _json
+            parsed = _json.loads(preview)
+            if isinstance(parsed, dict):
+                if parsed.get("error"):
+                    preview = f"错误: {parsed.get('error')}"
+                elif parsed.get("message"):
+                    preview = str(parsed.get("message"))
+                elif parsed.get("path") and parsed.get("content"):
+                    preview = f"{parsed.get('path')} 已读取，内容长度约 {len(str(parsed.get('content')))} 字符"
+                else:
+                    keys = ", ".join(list(parsed.keys())[:6])
+                    preview = f"返回字段: {keys}" if keys else preview
+            elif isinstance(parsed, list):
+                preview = f"返回 {len(parsed)} 条结果"
+        except Exception:
+            pass
+        if len(preview) > max_len:
+            return preview[: max_len - 3].rstrip() + "..."
+        return preview
+
+    def _record_pipeline_tool_event(
+        self,
+        *,
+        fc_turn: int,
+        tool_name: str,
+        tool_result: str,
+        tool_call_id: str,
+    ) -> None:
+        pair_id = tool_call_id or f"tool-{fc_turn}-{tool_name or 'unknown'}"
+        ledger = getattr(self, "_pipeline_tool_ledger", None)
+        if ledger is None:
+            ledger = []
+            self._pipeline_tool_ledger = ledger
+        existing = next((item for item in ledger if item.get("pair_id") == pair_id), None)
+        preview = self._tool_result_preview_for_feedback(tool_result)
+        failed = self._tool_result_failed(tool_result, preview) if tool_result else False
+        if existing is None:
+            ledger.append({
+                "pair_id": pair_id,
+                "tool_name": tool_name or "未知工具",
+                "fc_turn": fc_turn,
+                "started": True,
+                "finished": bool(tool_result),
+                "failed": failed,
+                "result_preview": preview,
+            })
+            return
+        existing["finished"] = existing.get("finished") or bool(tool_result)
+        existing["failed"] = existing.get("failed") or failed
+        if preview:
+            existing["result_preview"] = preview
+
+    @staticmethod
+    def _tool_result_failed(tool_result: str, preview: str = "") -> bool:
+        raw = str(tool_result or "").strip()
+        parsed = None
+        if raw:
+            try:
+                import json as _json
+                parsed = _json.loads(raw)
+            except Exception:
+                parsed = None
+        if isinstance(parsed, dict):
+            if parsed.get("is_error") is True or parsed.get("failed") is True:
+                return True
+            if parsed.get("is_error") is False or parsed.get("failed") is False:
+                return False
+            if parsed.get("ok") is True or parsed.get("success") is True:
+                return False
+            if parsed.get("ok") is False or parsed.get("success") is False:
+                return True
+            error_value = parsed.get("error")
+            if error_value not in (None, "", False):
+                return True
+        head = (preview or raw)[:180].lower()
+        return (
+            '"error": true' in head
+            or '"is_error": true' in head
+            or '"success": false' in head
+            or '"ok": false' in head
+            or head.startswith("error")
+            or "失败" in head
+            or "异常" in head
+        )
+
+    def _memory_changes_snapshot_for_feedback(self) -> Dict[str, int]:
+        changes = {"created": 0, "strengthened": 0, "pruned": 0}
+        try:
+            from zulong.memory.memory_graph import get_memory_graph
+            mg = get_memory_graph()
+            if not mg:
+                return changes
+            if hasattr(mg, "_last_activated_edges"):
+                changes["strengthened"] = len(getattr(mg, "_last_activated_edges", []) or [])
+            if hasattr(mg, "stats"):
+                stats = getattr(mg, "stats", {}) or {}
+                changes["created"] = int(stats.get("total_nodes", 0) or 0)
+        except Exception as exc:
+            logger.debug(f"[图谱推送] 记忆变化统计跳过: {exc}")
+        return changes
+
+    def _build_pipeline_summary_fields(
+        self,
+        *,
+        fc_turn: int,
+        progress: Dict[str, Any],
+        final_text: str,
+    ) -> Dict[str, Any]:
+        completed_items: List[str] = []
+        verified_items: List[str] = []
+        pending_items: List[str] = []
+        failed_tools: List[str] = []
+        ledger = getattr(self, "_pipeline_tool_ledger", []) or []
+
+        for item in ledger:
+            tool_name = item.get("tool_name") or "未知工具"
+            if item.get("failed"):
+                failed_tools.append(tool_name)
+                self._append_feedback_item(pending_items, f"{tool_name} 返回异常，需要复核")
+            elif item.get("finished"):
+                self._append_feedback_item(completed_items, f"{tool_name} 已完成")
+                self._append_feedback_item(verified_items, f"{tool_name} 已返回结果")
+            else:
+                self._append_feedback_item(pending_items, f"{tool_name} 已发起但尚未看到结果")
+
+        if final_text:
+            self._append_feedback_item(completed_items, "已形成本轮最终回复")
+        if fc_turn and not completed_items:
+            self._append_feedback_item(completed_items, f"完成 {fc_turn} 轮推理")
+        if progress.get("total"):
+            self._append_feedback_item(
+                verified_items,
+                f"任务图进度 {progress.get('completed', 0)}/{progress.get('total', 0)}",
+            )
+        if not completed_items:
+            self._append_feedback_item(completed_items, "已完成本轮处理链路")
+
+        risks: List[str] = []
+        if failed_tools:
+            risks.append("存在工具失败或异常: " + ", ".join(sorted(set(failed_tools))[:6]))
+        if pending_items:
+            risks.append("存在未完成或需复核事项")
+        return {
+            "completed_items": completed_items,
+            "verified_items": verified_items,
+            "pending_items": pending_items,
+            "risks_summary": "；".join(risks),
+            "memory_changes": self._memory_changes_snapshot_for_feedback(),
+            "next_step": "可以继续补充要求，我会沿着当前上下文接着处理。" if not pending_items else "建议先看未完成或异常项，再继续后续任务。",
+        }
+
     def _build_pipeline_interaction(
         self,
         *,
@@ -763,45 +1357,88 @@ class InferenceEngine:
         """Build the TSD v2.7 interaction payload rendered by the Web UI."""
         percent = progress.get("percent", 0)
         if pipeline_type == "pipeline_start":
+            brief = self._feedback_brief(getattr(self, "_current_user_input_for_feedback", ""))
+            tools = self._pipeline_tools_for_feedback()
+            prediction = getattr(self, "_current_tool_prediction_for_feedback", {}) or {}
+            reasons = prediction.get("reasons") or []
+            detail_lines = []
+            if brief:
+                detail_lines.append(f"我先看这件事的目标和上下文：{brief}")
+            if tools:
+                detail_lines.append("候选工具: " + ", ".join(tools[:6]))
+            if reasons:
+                detail_lines.append("依据: " + "；".join(str(r) for r in reasons[:2]))
             return {
                 "pair_id": f"pipeline-start-{fc_turn}",
                 "kind": "plan",
                 "status": "running",
-                "title": "任务已启动",
-                "detail": "L2 已收到 L1-B 打包的工具、上下文和记忆信息，开始规划与执行。",
+                "title": ("先梳理: " + brief) if brief else "先梳理任务上下文",
+                "detail": "\n".join(detail_lines) or "我会先确认目标、上下文和可用能力，再决定是否需要工具。",
                 "progress": percent,
-                "next_step": "等待模型选择是否调用工具",
+                "plan_steps": self._pipeline_plan_steps_for_feedback(),
+                "progress_items": self._pipeline_progress_items_for_feedback(pipeline_type),
+                "next_step": "",
             }
         if pipeline_type == "agent_tool_call":
-            preview = (tool_result or "").strip()
-            if len(preview) > 260:
-                preview = preview[:260] + "..."
-            failed = '"error"' in preview[:80].lower() or "失败" in preview[:80] or "error" in preview[:80].lower()
+            preview = self._tool_result_preview_for_feedback(tool_result)
+            failed = self._tool_result_failed(tool_result, preview) if tool_result else False
+            title = (
+                f"{tool_name or '工具'} 返回异常"
+                if tool_result and failed else
+                f"{tool_name or '工具'} 已返回"
+                if tool_result else
+                f"使用 {tool_name or '工具'}"
+            )
+            detail = ""
+            if not tool_result:
+                # TSD §23.3.6: 展示文案优先来自模型真实 thought/detail。
+                # 这里仅给出极简状态，避免把工具说明伪装成 LLM 的调用理由。
+                detail = f"等待 {tool_name or '工具'} 返回。"
             return {
                 "pair_id": tool_call_id or f"tool-{fc_turn}-{tool_name or 'unknown'}",
                 "kind": "observation" if tool_result else "action",
                 "status": "running" if not tool_result else ("failed" if failed else "succeeded"),
-                "title": f"工具调用: {tool_name or '未知工具'}",
-                "detail": (
-                    self._tool_description_for_frontend(tool_name)
-                    or "执行 L2 真实返回的 tool_call，并把结果回填到任务图。"
-                ),
+                "title": title,
+                "detail": detail,
+                "thought": "",
                 "tool_name": tool_name,
                 "progress": percent,
-                "next_step": "根据工具结果继续推理",
+                "progress_items": [
+                    self._feedback_progress_item(
+                        tool_name or "工具执行",
+                        "failed" if failed else ("completed" if tool_result else "running"),
+                        detail=preview,
+                        source="tool",
+                        pair_id=tool_call_id or f"tool-{fc_turn}-{tool_name or 'unknown'}",
+                    )
+                ],
+                "next_step": "" if tool_result else "等待工具返回",
                 "result_preview": preview,
             }
         if pipeline_type == "agent_done":
+            summary = self._build_pipeline_summary_fields(
+                fc_turn=fc_turn,
+                progress=progress,
+                final_text=tool_result,
+            )
             return {
                 "pair_id": f"pipeline-done-{fc_turn}",
                 "kind": "summary",
                 "status": "succeeded",
-                "title": "任务执行结束",
+                "title": "这轮处理完成",
                 "detail": (
-                    f"工具循环已结束，共 {fc_turn} 轮；"
+                    f"共推进 {fc_turn} 轮；"
                     f"任务图完成 {progress.get('completed', 0)}/{progress.get('total', 0)} 个节点。"
                 ),
                 "progress": percent,
+                "progress_items": [
+                    self._feedback_progress_item(item, "completed", source="summary")
+                    for item in summary.get("completed_items", [])
+                ] + [
+                    self._feedback_progress_item(item, "pending", source="summary")
+                    for item in summary.get("pending_items", [])
+                ],
+                **summary,
             }
         if pipeline_type == "agent_error":
             return {
@@ -811,6 +1448,14 @@ class InferenceEngine:
                 "title": "任务执行异常",
                 "detail": tool_result or "工具循环报告异常。",
                 "progress": percent,
+                "progress_items": [
+                    self._feedback_progress_item(
+                        tool_result or "任务执行异常",
+                        "failed",
+                        source="summary",
+                        pair_id=f"pipeline-error-{fc_turn}",
+                    )
+                ],
             }
         return {
             "pair_id": f"pipeline-{pipeline_type}-{fc_turn}",
@@ -819,6 +1464,7 @@ class InferenceEngine:
             "title": "任务进度更新",
             "detail": pipeline_type,
             "progress": percent,
+            "progress_items": self._pipeline_progress_items_for_feedback(pipeline_type),
         }
     
     def _task_graph_to_frontend(self, tg) -> Dict:
@@ -912,7 +1558,14 @@ class InferenceEngine:
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             future = executor.submit(call_vllm)
             try:
-                response = future.result(timeout=self._core_timeout)  # 从配置读取超时
+                response = self._wait_future_with_interrupt(
+                    future,
+                    self._core_timeout,
+                    label="[vLLM] CORE",
+                )
+            except InterruptedError:
+                logger.info("[vLLM] CORE 生成被用户停止")
+                return ""
             except concurrent.futures.TimeoutError:
                 logger.error(f"🚨 [vLLM] CORE 模型超时 (>{self._core_timeout} 秒)，尝试备用模型...")
                 # 🔥 降级路径：CORE 超时 → BACKUP 模型 → 静态降级
@@ -949,6 +1602,119 @@ class InferenceEngine:
             return get_memory_graph()
         except Exception:
             return None
+
+    def request_interrupt(self, request_id: Optional[str] = None, session_id: Optional[str] = None) -> None:
+        """Record a user stop request so it survives pre-generation pipeline hops."""
+        request_key = str(request_id or "").strip()
+        session_key = str(session_id or "").strip()
+        with self._lock:
+            self._interrupt_flag = True
+            if request_key:
+                self._cancelled_request_ids.add(request_key)
+            elif session_key:
+                self._cancelled_session_ids.add(session_key)
+        try:
+            if hasattr(state_manager, "request_interrupt"):
+                state_manager.request_interrupt(request_key or None, session_key or None)
+            else:
+                state_manager.set_interrupt_flag(True)
+        except Exception:
+            pass
+        logger.info(
+            "[L2] 用户停止请求已记录: request_id=%s session_id=%s",
+            request_key or "-",
+            session_key or "-",
+        )
+
+    def _is_cancelled_context(
+        self,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> bool:
+        request_key = str(
+            request_id
+            or _current_request_id_var.get()
+            or getattr(self, "_current_user_turn_id", "")
+            or ""
+        ).strip()
+        session_key = str(
+            session_id
+            or _current_session_id_var.get()
+            or getattr(self, "_current_session_id", "")
+            or ""
+        ).strip()
+        with self._lock:
+            local_cancelled = bool(
+                (request_key and request_key in self._cancelled_request_ids)
+                or (session_key and session_key in self._cancelled_session_ids)
+            )
+        if local_cancelled:
+            return True
+        try:
+            is_cancelled = getattr(state_manager, "is_cancelled_context", None)
+            if callable(is_cancelled):
+                return bool(is_cancelled(request_key or None, session_key or None))
+        except Exception:
+            pass
+        return False
+
+    def _clear_cancelled_context(
+        self,
+        request_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        request_key = str(request_id or "").strip()
+        session_key = str(session_id or "").strip()
+        with self._lock:
+            if request_key:
+                self._cancelled_request_ids.discard(request_key)
+            if session_key:
+                self._cancelled_session_ids.discard(session_key)
+        try:
+            clear_cancelled = getattr(state_manager, "clear_cancelled_context", None)
+            if callable(clear_cancelled):
+                clear_cancelled(request_key or None, session_key or None)
+        except Exception:
+            pass
+
+    def _is_interrupt_requested(self) -> bool:
+        with self._lock:
+            local_interrupt = bool(self._interrupt_flag)
+        if local_interrupt or self._is_cancelled_context():
+            return True
+        try:
+            return bool(state_manager.get_interrupt_flag())
+        except Exception:
+            return False
+
+    def _wait_future_with_interrupt(
+        self,
+        future,
+        timeout: float,
+        *,
+        label: str = "LLM request",
+        poll_interval: float = 0.5,
+    ):
+        """等待阻塞式模型请求，同时响应用户停止。"""
+        import concurrent.futures
+
+        started_at = time.time()
+        deadline = started_at + max(0.0, float(timeout or 0.0))
+        while True:
+            if self._is_interrupt_requested():
+                future.cancel()
+                logger.info("%s interrupted by user stop request", label)
+                raise InterruptedError("generation interrupted")
+
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                future.cancel()
+                raise concurrent.futures.TimeoutError()
+
+            try:
+                return future.result(timeout=min(poll_interval, remaining))
+            except concurrent.futures.TimeoutError:
+                continue
 
     def _get_fallback_response(self, user_input: str) -> str:
         """根据用户输入类型提供智能降级回复
@@ -1003,8 +1769,14 @@ class InferenceEngine:
         FC 工具执行循环。
         """
         import concurrent.futures
+        from zulong.l2.tool_budget import (
+            get_engine_tool_budget,
+            sync_engine_tool_budget,
+        )
 
         model_id = vllm_model_id or LLM_MODEL_ID
+        sync_engine_tool_budget(self, user_input)
+        tool_budget = get_engine_tool_budget(self)
         api_kwargs: Dict[str, Any] = {
             "model": model_id,
             "messages": (
@@ -1018,7 +1790,7 @@ class InferenceEngine:
             **self._get_llm_extra_kwargs(),
         }
 
-        if tool_definitions:
+        if tool_definitions and tool_budget != 0:
             api_kwargs["tools"] = tool_definitions
             if forced_first_tool_name:
                 api_kwargs["tool_choice"] = {
@@ -1032,6 +1804,8 @@ class InferenceEngine:
                 }
             else:
                 api_kwargs["tool_choice"] = "auto"
+        elif tool_budget == 0:
+            logger.info("[L2] 用户显式限制本轮不调用工具，单次决策移除工具定义")
 
         def call_core(kwargs=api_kwargs):
             return self.vllm_client.chat.completions.create(**kwargs)
@@ -1039,7 +1813,19 @@ class InferenceEngine:
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
             future = executor.submit(call_core)
-            api_response = future.result(timeout=self._core_timeout)
+            api_response = self._wait_future_with_interrupt(
+                future,
+                self._core_timeout,
+                label="[L2] CORE single decision",
+            )
+        except InterruptedError:
+            logger.info("[L2] CORE 单次推理被用户停止")
+            return {
+                "response_content": "",
+                "tool_calls_data": None,
+                "fallback_used": False,
+                "interrupted": True,
+            }
         except concurrent.futures.TimeoutError:
             self._last_timeout_phase = TimeoutPhase.CORE_TIMEOUT
             self._last_timeout_elapsed = self._core_timeout
@@ -1160,7 +1946,14 @@ class InferenceEngine:
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             future = executor.submit(call_backup)
             try:
-                response = future.result(timeout=self._backup_timeout)
+                response = self._wait_future_with_interrupt(
+                    future,
+                    self._backup_timeout,
+                    label="[BACKUP]",
+                )
+            except InterruptedError:
+                logger.info("[BACKUP] 备用模型生成被用户停止")
+                return ""
             except concurrent.futures.TimeoutError:
                 _elapsed = time.time() - _backup_start
                 self._last_timeout_phase = TimeoutPhase.BACKUP_TIMEOUT
@@ -1244,6 +2037,15 @@ class InferenceEngine:
         if session_id:
             _current_session_id_var.set(session_id)
             self._current_session_id = session_id
+
+        if self._is_cancelled_context(request_id, session_id):
+            logger.info(
+                "[L2] 请求已被用户停止，跳过 L2 推理: request_id=%s session_id=%s",
+                request_id or "-",
+                session_id or "-",
+            )
+            self._clear_cancelled_context(request_id, session_id)
+            return
         
         # 缓存 GK 传来的节点信息，供 _update_memory() 复用
         self._current_dialogue_round_id = event.payload.get("dialogue_round_id", None)
@@ -1300,16 +2102,136 @@ class InferenceEngine:
         logger.info(f"🎙️ [L2] Voice Mode: {voice_mode}")
         
         # 🎯 L1-B 工具预判（核心路由机制）
-        # 🎯 提取 L1-B 预检索的记忆上下文（如果存在则跳过重复检索）
+        # 🎯 提取 L1-B 已统一打包的上下文；L2 不再主动构建上下文
         pre_retrieved_memory = event.payload.get("pre_retrieved_memory")
+        l1b_context_pack = event.payload.get("l1b_context_pack") or ""
         if pre_retrieved_memory:
             logger.info(f"🧠 [L2] 使用 L1-B 预检索记忆上下文 ({len(pre_retrieved_memory)} 字符)")
         else:
-            logger.debug("[L2] 无预检索记忆，将执行 MemoryGraph 检索")
+            logger.debug("[L2] 未收到 L1-B 预检索记忆；仅在模型显式工具调用时增量补充")
+        if l1b_context_pack:
+            logger.info("[L2] 收到 L1-B 统一上下文包 (%d 字符)", len(l1b_context_pack))
 
         tool_prediction = event.payload.get("tool_prediction") or {}
         tool_bundle = event.payload.get("tool_bundle") or tool_prediction.get("predicted_tools") or []
         task_graph_policy = event.payload.get("task_graph_policy") or tool_prediction.get("task_graph_policy")
+        explicit_workspace_path = event.payload.get("workspace_path") or event.payload.get("cwd")
+        if explicit_workspace_path:
+            try:
+                explicit_workspace_path = os.path.abspath(os.path.expanduser(os.path.expandvars(str(explicit_workspace_path))))
+            except Exception:
+                explicit_workspace_path = event.payload.get("workspace_path") or event.payload.get("cwd")
+
+        explicit_task_graph_id = ""
+        explicit_graph_loaded = False
+        referenced_task_graph_id = ""
+        task_graph_reference_mode = str(event.payload.get("task_graph_reference_mode") or "none")
+        self._locked_task_graph_id = ""
+        try:
+            from zulong.tools.task_tools import (
+                normalize_task_graph_id,
+                load_task_graph_deterministic,
+            )
+            referenced_task_graph_id = normalize_task_graph_id(
+                event.payload.get("referenced_task_graph_id") or ""
+            )
+            explicit_task_graph_id = normalize_task_graph_id(
+                event.payload.get("task_graph_id") or event.payload.get("graph_id")
+            )
+            if explicit_task_graph_id:
+                explicit_graph_loaded = load_task_graph_deterministic(
+                    explicit_task_graph_id,
+                    workspace_dir=explicit_workspace_path,
+                )
+                if explicit_graph_loaded:
+                    self._active_task_graph_id = explicit_task_graph_id
+                    self._locked_task_graph_id = explicit_task_graph_id
+                    event.payload["task_graph_id"] = explicit_task_graph_id
+                    event.payload["graph_id"] = explicit_task_graph_id
+                    task_graph_policy = "continue"
+                    tool_bundle = [
+                        name for name in list(dict.fromkeys(tool_bundle or []))
+                        if name not in {
+                            "task_create_plan",
+                            "task_list_suspended",
+                            "task_resume_by_address",
+                            "task_suspend",
+                        }
+                    ]
+                    for required_tool in (
+                        "task_view_overview",
+                        "task_get_detail",
+                        "task_add_node",
+                        "task_update_node",
+                        "task_mark_status",
+                        "task_attach_file",
+                        "ide_write_file",
+                        "read_file",
+                        "exec_run_command",
+                        "submit_final_answer",
+                    ):
+                        if required_tool not in tool_bundle:
+                            tool_bundle.append(required_tool)
+                    context_bundle = tool_prediction.setdefault("context_bundle", {})
+                    context_bundle["locked_task_graph_id"] = explicit_task_graph_id
+                    context_bundle["explicit_workspace_path"] = explicit_workspace_path or ""
+                    logger.info(
+                        "[L2] 显式任务图锁定: graph_id=%s workspace=%s",
+                        explicit_task_graph_id,
+                        explicit_workspace_path or "-",
+                    )
+                else:
+                    logger.warning(
+                        "[L2] 显式 task_graph_id 未能加载: %s",
+                        explicit_task_graph_id,
+                    )
+            if referenced_task_graph_id and not explicit_task_graph_id:
+                context_bundle = tool_prediction.setdefault("context_bundle", {})
+                context_bundle["referenced_task_graph_id"] = referenced_task_graph_id
+                context_bundle["task_graph_reference_mode"] = task_graph_reference_mode
+                reference_tools = [
+                    "task_view_overview",
+                    "task_get_detail",
+                    "recall_memory",
+                    "read_memory_node",
+                    "discover_related",
+                    "search_experience",
+                    "submit_final_answer",
+                ]
+                if task_graph_reference_mode == "ambiguous_version":
+                    reference_tools.extend([
+                        "ask_user",
+                        "task_create_plan",
+                        "task_add_node",
+                        "task_update_node",
+                        "task_remove_node",
+                    ])
+                for required_tool in reference_tools:
+                    if required_tool not in tool_bundle:
+                        tool_bundle.append(required_tool)
+                if not task_graph_policy or task_graph_policy == "none":
+                    task_graph_policy = "inspect"
+                logger.info(
+                    "[L2] 任务图作为参考注入: graph_id=%s mode=%s",
+                    referenced_task_graph_id,
+                    task_graph_reference_mode,
+                )
+        except Exception as graph_lock_exc:
+            logger.warning("[L2] 显式任务图锁定失败: %s", graph_lock_exc)
+
+        if explicit_workspace_path and not explicit_graph_loaded:
+            try:
+                from zulong.tools.task_tools import get_active_workspace_dir, set_active_task_graph
+                active_workspace = get_active_workspace_dir()
+                if active_workspace and os.path.normcase(os.path.abspath(active_workspace)) != os.path.normcase(explicit_workspace_path):
+                    set_active_task_graph(None, None, workspace_dir=explicit_workspace_path)
+                    logger.info(
+                        "[L2] 显式工作区切换，清除旧活跃任务图: old=%s new=%s",
+                        active_workspace,
+                        explicit_workspace_path,
+                    )
+            except Exception as workspace_exc:
+                logger.debug("[L2] 显式工作区切换检查跳过: %s", workspace_exc)
         if tool_bundle:
             logger.info("[L2] 使用 L1-B 工具预判: tools=%s, policy=%s", tool_bundle, task_graph_policy)
         else:
@@ -1354,9 +2276,11 @@ class InferenceEngine:
                     voice_mode,
                     pre_retrieved_memory,
                     request_id,
+                    session_id,
                     tool_prediction,
                     tool_bundle,
                     task_graph_policy,
+                    l1b_context_pack,
                 ),
                 daemon=True,
                 name="L2-FC-Worker"
@@ -1494,9 +2418,11 @@ class InferenceEngine:
     
     def _process_with_memory(self, user_input: str, priority: EventPriority, voice_mode: str = "TEXT_ONLY",
                             pre_retrieved_memory: str = None,
-                            request_id: str = None, tool_prediction: Optional[Dict[str, Any]] = None,
+                            request_id: str = None, session_id: str = None,
+                            tool_prediction: Optional[Dict[str, Any]] = None,
                             tool_bundle: Optional[List[str]] = None,
-                            task_graph_policy: Optional[str] = None):
+                            task_graph_policy: Optional[str] = None,
+                            l1b_context_pack: str = ""):
         """带记忆的推理流程（非 Orchestrator 模式）
         
         Args:
@@ -1505,14 +2431,38 @@ class InferenceEngine:
             voice_mode: 语音模式 ("TEXT_ONLY", "AUTO_TTS", "FORCED_TTS")
             pre_retrieved_memory: L1-B 预检索的记忆上下文，如果提供则跳过重复检索
             request_id: 请求 ID（用于前端响应关联）
+            session_id: 会话 ID（用于停止/恢复关联）
             tool_prediction: L1-B 工具预判结果
             tool_bundle: L1-B 建议注入 L2 的工具名
             task_graph_policy: L1-B 建议的任务图策略
+            l1b_context_pack: L1-B 统一构建的上下文包；L2 只消费，不主动补建
         """
         import time
+
+        if request_id:
+            _current_request_id_var.set(request_id)
+            _current_user_turn_id_var.set(request_id)
+            self._current_user_turn_id = request_id
+        if session_id:
+            _current_session_id_var.set(session_id)
+            self._current_session_id = session_id
+
+        if self._is_cancelled_context(request_id, session_id):
+            logger.info(
+                "[L2] 请求已在推理启动前被用户停止，跳过执行: request_id=%s session_id=%s",
+                request_id or "-",
+                session_id or "-",
+            )
+            self._clear_cancelled_context(request_id, session_id)
+            return
         
         # Phase A1c: 标记推理开始，阻止并发
         self._processing_done.clear()
+        self._current_user_input_for_feedback = user_input or ""
+        self._current_tool_prediction_for_feedback = tool_prediction or {}
+        self._current_tool_bundle_for_feedback = list(tool_bundle or [])
+        self._pipeline_tool_ledger = []
+        self._pipeline_started_at = time.time()
         
         logger.info(f"\n{'='*80}")
         logger.info(f"🔍 [L2 推理] 收到用户输入：'{user_input}'")
@@ -1535,29 +2485,9 @@ class InferenceEngine:
             logger.warning("L2 is UNLOADED, cannot process")
             return
         
-        visual_keywords = [
-            "周围", "环境", "看到", "看见", "视觉", "图像", "图片",
-            "哪里", "外观", "样子", "颜色", "形状",
-            "刚才", "刚刚", "画面", "视频",
-            "屏幕", "摄像头", "镜头", "眼前", "显示", "呈现",
-            "场景", "物体", "物品", "动作", "手势",
-        ]
-        need_vision = any(kw in user_input for kw in visual_keywords)
-        
-        logger.info(f"🔧 [DEBUG] 关键词检测结果：need_vision={need_vision}, 用户输入：'{user_input}'")
-        
+        # L2 不再按用户文本主动构建视觉/上下文；视觉信息应由 L1-C/L1-B
+        # 写入 L1-B 统一上下文包，或由模型在工具不足时请求增量补充。
         visual_context = None
-        
-        if need_vision:
-            logger.info(f"👁️ 检测到视觉感知意图：'{user_input}'")
-            
-            if self._pending_visual_context:
-                logger.info("👁️ 使用 L1-C 传递的视觉上下文")
-                visual_context = self._pending_visual_context
-                self._pending_visual_context = None
-            else:
-                logger.info("👁️ 无 L1-C 视觉上下文，使用默认提示")
-                visual_context = "（当前没有实时视觉数据，请根据上下文回答）"
         
         state_manager.set_l2_status(L2Status.BUSY)
         logger.debug("[TRACE] set BUSY, entering try block")
@@ -1567,38 +2497,20 @@ class InferenceEngine:
             self._referenced_graph_lost = None  # 重置标记
             self._switch_graph_for_referenced_nodes()
             
-            # ── TSD v2.7: 统一执行主链，由 L1-B 工具预判驱动 ──
+            # ── TSD v2.9.12+: 统一执行主链，由 L1-B 工具预判与上下文包驱动 ──
             tool_bundle = list(tool_bundle or [])
             context_bundle = (tool_prediction or {}).get("context_bundle") or {}
             has_predicted_tools = bool(tool_bundle)
             has_task_graph_hint = task_graph_policy in {
                 "inspect", "reuse", "inspect_or_create", "create", "extend", "continue"
             }
-            is_simple_social = context_bundle.get("turn_shape") == "simple_social"
-            skip_rag_for_direct_reply = (
-                is_simple_social
-                and not has_predicted_tools
-                and not has_task_graph_hint
-            )
-
+            turn_shape = context_bundle.get("turn_shape", "")
             rag_context = None
-            if skip_rag_for_direct_reply:
-                logger.info("⚡ [UnifiedFlow] simple_social 命中轻量推理路径，跳过 RAG 预检索")
-            else:
-                logger.debug("[TRACE] calling _retrieve_from_rag...")
-                rag_context = self._retrieve_from_rag(user_input)
-                logger.debug(f"[TRACE] RAG done, has_context={bool(rag_context)}")
-                
-                if rag_context:
-                    logger.info(f"📚 [RAG 调试] 检索到的上下文:\n{rag_context[:500]}...")
-                else:
-                    logger.warning("⚠️ [RAG 调试] 未检索到任何 RAG 上下文")
+            logger.debug("[UnifiedFlow] L2 跳过主动 RAG/MemoryGraph 上下文构建，仅消费 L1-B 任务包")
 
             execution_mode = "reply_only"
             if has_predicted_tools or has_task_graph_hint:
                 execution_mode = "tool_augmented"
-            if is_simple_social and not has_predicted_tools:
-                execution_mode = "reply_only"
 
             scaffold_data = {
                 "tools": tool_bundle,
@@ -1606,12 +2518,14 @@ class InferenceEngine:
                 "policy": task_graph_policy,
                 "context_bundle": context_bundle,
                 "execution_mode": execution_mode,
+                "l1b_context_pack": l1b_context_pack,
             }
             logger.info(
-                "🎯 [UnifiedFlow] mode=%s tools=%s policy=%s context=%s",
+                "🎯 [UnifiedFlow] mode=%s tools=%s policy=%s turn_shape=%s context=%s",
                 execution_mode,
                 tool_bundle,
                 task_graph_policy,
+                turn_shape or "unknown",
                 context_bundle,
             )
 
@@ -1688,13 +2602,28 @@ class InferenceEngine:
                                        "创建", "搭建", "实现", "生成", "构建",
                                        "请帮", "请做")
                         )
-                        if _clear_all_done and _has_new_task_verb:
+                        _clear_workspace = ""
+                        try:
+                            _clear_workspace = (
+                                getattr(_clear_tg, "metadata", {}) or {}
+                            ).get("workspace_dir") or ""
+                        except Exception:
+                            _clear_workspace = ""
+                        _explicit_new_workspace = bool(explicit_workspace_path and (
+                            not _clear_workspace
+                            or os.path.normcase(os.path.abspath(_clear_workspace)) != os.path.normcase(os.path.abspath(explicit_workspace_path))
+                        ))
+                        if (
+                            (_clear_all_done or _explicit_new_workspace)
+                            and _has_new_task_verb
+                            and not getattr(self, "_locked_task_graph_id", "")
+                        ):
                             old_graph_id = getattr(_clear_tg, 'id', 'unknown')
                             old_title = _clear_tg.title
                             set_active_task_graph(None, None)
                             logger.info(
-                                f"[Fix-8] 清除已完成旧图谱: {old_graph_id}「{old_title}」"
-                                f"({len(_clear_leaves)} 节点全部完成)，"
+                                f"[Fix-8] 清除旧图谱: {old_graph_id}「{old_title}」"
+                                f"(all_done={bool(_clear_all_done)}, explicit_new_workspace={_explicit_new_workspace})，"
                                 f"准备创建新任务图谱"
                             )
                             # 在 scaffold 中记录清除信息，供提示词使用
@@ -1725,6 +2654,7 @@ class InferenceEngine:
                 # 继续已有任务需要逐节点处理，提升 CB 时间和步数预算
                 if hasattr(self, '_circuit_breaker'):
                     self._circuit_breaker.escalate_for_resume()
+            self._approval_block_active = False
 
             # 工具增强流程提前升级 CB（不依赖 task_create_plan 工具调用）
             if execution_mode == "tool_augmented" and scaffold_data.get("graph_id"):
@@ -1776,6 +2706,37 @@ class InferenceEngine:
                 else:
                     messages.append(_ref_msg)
                 logger.info(f"[L2] 已注入 {len(_ref_nodes)} 个引用节点到 messages")
+
+            _graph_ref_id = context_bundle.get("referenced_task_graph_id")
+            _graph_ref_mode = context_bundle.get("task_graph_reference_mode") or "none"
+            _locked_graph_id = getattr(self, "_locked_task_graph_id", "") or ""
+            if _graph_ref_id or _locked_graph_id:
+                _graph_lines = ["【任务图语义边界】"]
+                if _locked_graph_id:
+                    _graph_lines.append(
+                        f"- 当前任务图 {_locked_graph_id} 已作为编辑目标恢复。若用户要求增加内容，请在原图追加子节点；若用户要求删除内容，请直接在原图删除/移除对应节点，不要另建任务图。"
+                    )
+                if _graph_ref_id:
+                    _graph_lines.append(
+                        f"- 用户提到的任务图 {_graph_ref_id} 是参考对象，模式={_graph_ref_mode}。不要默认把它当作当前编辑目标。"
+                    )
+                    _graph_lines.append(
+                        "- 如果用户语义是分析、借鉴、参考、对比或复盘，请只读取/总结该图；如果用户语义是继续编辑，再选择恢复或编辑该图。"
+                    )
+                    _graph_lines.append(
+                        "- 如果用户要求重新做一版、另起版本、fork 或类似多方案语义，请先根据上下文判断；仍有多个合理选择时，调用 ask_user 让用户选择。"
+                    )
+                _graph_msg = {"role": "system", "content": "\n".join(_graph_lines)}
+                if len(messages) >= 2:
+                    messages.insert(-1, _graph_msg)
+                else:
+                    messages.append(_graph_msg)
+                logger.info(
+                    "[L2] 已注入任务图语义边界: locked=%s referenced=%s mode=%s",
+                    _locked_graph_id or "-",
+                    _graph_ref_id or "-",
+                    _graph_ref_mode,
+                )
             
             # 注入运行时上下文到 ToolEngine（供工具访问当前会话信息）
             self.tool_engine.set_context(
@@ -1785,10 +2746,20 @@ class InferenceEngine:
                 tool_prediction=tool_prediction or {},
                 tool_bundle=tool_bundle or [],
                 task_graph_policy=task_graph_policy or "",
+                task_graph_id=getattr(self, "_locked_task_graph_id", "") or self._active_task_graph_id or "",
+                locked_task_graph_id=getattr(self, "_locked_task_graph_id", "") or "",
                 workspace_root=runtime_context.get("workspace_root"),
                 os_name=runtime_context.get("os_name"),
                 shell=runtime_context.get("shell"),
                 preferred_commands=runtime_context.get("preferred_commands"),
+            )
+
+            self._ensure_task_graph_for_policy(
+                task_graph_policy=task_graph_policy,
+                user_input=user_input,
+                request_id=request_id,
+                tool_bundle=tool_bundle,
+                context_bundle=context_bundle,
             )
             
             # ── 按 L1-B 工具包收集工具定义 ──
@@ -1798,6 +2769,14 @@ class InferenceEngine:
             forced_first_tool_name = ""
             
             logger.info(f"🧠 开始推理：'{user_input[:50]}...' " if len(user_input) > 50 else f"🧠 开始推理：'{user_input}'")
+
+            if self._is_cancelled_context(request_id, session_id):
+                logger.info(
+                    "[L2] 请求已在模型调用前被用户停止，跳过生成: request_id=%s session_id=%s",
+                    request_id or "-",
+                    session_id or "-",
+                )
+                return
             
             generate_start = time.time()
             logger.info(f"🚀 [L2 推理] 开始调用模型生成... (时间：{time.strftime('%H:%M:%S')})")
@@ -1812,8 +2791,15 @@ class InferenceEngine:
                 # 初始化 FC 循环变量
                 response = None
                 fc_turn = 0
+                if self._is_cancelled_context(request_id, session_id):
+                    logger.info(
+                        "[L2] 请求已在远程模型初始化前被用户停止，跳过生成: request_id=%s session_id=%s",
+                        request_id or "-",
+                        session_id or "-",
+                    )
+                    return
                 with self._lock:
-                    self._interrupt_flag = False  # 重置中断标志
+                    self._interrupt_flag = False  # 重置上一轮残留中断标志
                 
                 # Phase B1: 注册推理到 InterruptHandler + SnapshotManager
                 import uuid as _uuid
@@ -1859,12 +2845,8 @@ class InferenceEngine:
                 except Exception:
                     pass
                 
-                # 统一主链：只有显式任务图复用/检查场景才强制先看概览
-                _force_first_tool = (
-                    task_graph_policy in {"reuse", "inspect"}
-                    and _task_graph is not None
-                    and "task_view_overview" in (tool_bundle or [])
-                )
+                # L1-B/task_graph_policy 只决定候选工具边界，不能强制 L2 调用工具。
+                _force_first_tool = False
                 
                 # Circuit Breaker: 重置状态（每次推理会话独立）
                 self._circuit_breaker.reset()
@@ -1880,8 +2862,11 @@ class InferenceEngine:
                         _init_msg, turn=0, pinned=True,
                     )
                 
-                # 🔥 发布 pipeline_start 事件（携带初始任务图谱）
-                self._publish_task_graph_event("pipeline_start", 0, "", "")
+                # 只有任务增强回合才发布任务图谱事件；普通对话属于会话树，
+                # 不应因为全局存在活跃任务图而挂到 TaskGraph 下。
+                _task_graph_events_enabled = execution_mode == "tool_augmented"
+                if _task_graph_events_enabled:
+                    self._publish_task_graph_event("pipeline_start", 0, "", "")
                 
                 # ★ LangGraph FC Loop（替换原 while 循环）
                 # 保存 messages 引用供 Rule C 自动挂起使用
@@ -1903,6 +2888,9 @@ class InferenceEngine:
                 response = decision.get("response_content") or ""
                 if decision.get("fallback_used"):
                     self._response_is_fallback = True
+                if decision.get("interrupted"):
+                    logger.info("[L2] 单次决策已被用户停止，跳过后续响应处理")
+                    return
 
                 if not initial_tool_calls:
                     fc_turn = 0
@@ -2058,29 +3046,39 @@ class InferenceEngine:
                 except Exception as _hebb_err:
                     logger.info(f"[FC] Hebbian 学习跳过: {_hebb_err}")
                 
-                # 🔥 发布 agent_done 事件（携带最终任务图谱）
-                self._publish_task_graph_event("agent_done", fc_turn, "", "")
+                # 🔥 发布 agent_done 事件（携带最终任务图谱与最终答复摘要）
+                if _task_graph_events_enabled:
+                    self._publish_task_graph_event("agent_done", fc_turn, "", response or "")
                 
                 # ── 归档后补丁：回填 final_answer / duration / total_turns ──
                 # _auto_archive_completed 在 task_mark_status 级联中触发，此时
                 # FC 循环尚未结束，final_answer 等字段无法获取。在此补丁回填。
-                try:
-                    from zulong.tools.task_tools import get_active_task_graph as _get_tg_patch
-                    from zulong.tools.task_tools import _active_graph_id as _patch_gid
-                    _patch_tg = _get_tg_patch()
-                    if _patch_tg and _patch_gid:
-                        _patch_root = _patch_tg.get_node("req")
-                        if _patch_root and _patch_root.status == "completed":
-                            from zulong.l2.task_archive import CompletedTaskArchiveManager
-                            _patch_mgr = CompletedTaskArchiveManager()
-                            _patch_mgr.patch_archive(
-                                _patch_gid,
-                                final_answer=(response or "")[:500],
-                                total_turns=fc_turn,
-                                duration=round(time.time() - generate_start, 1),
-                            )
-                except Exception as _patch_err:
-                    logger.warning(f"[L2] 归档补丁失败（非致命）: {_patch_err}")
+                if _task_graph_events_enabled:
+                    try:
+                        from zulong.tools.task_tools import get_active_task_graph as _get_tg_patch
+                        from zulong.tools.task_tools import _write_final_answer_to_task_graph as _write_final_graph
+                        from zulong.tools.task_tools import _active_graph_id as _patch_gid
+                        _patch_tg = _get_tg_patch()
+                        if _patch_tg and _patch_gid:
+                            if response:
+                                _write_final_graph(
+                                    _patch_tg,
+                                    response,
+                                    source="inference_engine",
+                                )
+                            _patch_root = _patch_tg.get_node("req")
+                            if _patch_root and _patch_root.status == "completed":
+                                from zulong.l2.task_archive import CompletedTaskArchiveManager
+                                _patch_mgr = CompletedTaskArchiveManager()
+                                _patch_mgr.patch_archive(
+                                    _patch_gid,
+                                    final_answer=response or "",
+                                    total_turns=fc_turn,
+                                    duration=round(time.time() - generate_start, 1),
+                                    task_graph_snapshot=_patch_tg.serialize(),
+                                )
+                    except Exception as _patch_err:
+                        logger.warning(f"[L2] 归档补丁失败（非致命）: {_patch_err}")
             else:
                 # ====== 本地模型：单轮推理（不支持 FC）======
                 prompt = self.l2_model.tokenizer.apply_chat_template(
@@ -2218,6 +3216,7 @@ class InferenceEngine:
                 _ih_final.stop_generation()
             except Exception:
                 pass
+            self._clear_cancelled_context(request_id, session_id)
             # Rule C: 自动挂起未完成的任务图（安全网）
             self._auto_suspend_if_needed()
             # Phase B4: 清理当前推理的快照引用
@@ -2623,7 +3622,7 @@ class InferenceEngine:
             "  → 不要只是口头说\"已暂停\"而不调用工具，否则任务状态会丢失",
             "  → 挂起后清除当前活跃任务图，可以正常回答其他问题",
             "",
-            "当用户说\"继续\"、\"接着做\"、\"上次那个任务\"、\"恢复之前的任务\"等意思时：",
+            "当你根据用户语义判断其意图是恢复旧任务时：",
             "  → 第一步：调用 task_list_suspended(query=\"相关描述\") 查找并恢复挂起的任务",
             "  → 第二步：如果返回 resumed=true，说明之前的任务图（含所有节点和状态）已自动恢复到内存",
             "  → 第三步：调用 task_view_overview() 查看恢复后的任务图当前进度",
@@ -2788,12 +3787,9 @@ class InferenceEngine:
         _attn_lines = ["\n【注意力状态】"]
         if _has_memory:
             _attn_lines.append(f"已注入 {_mem_count} 段记忆/上下文到当前对话。")
-            _attn_lines.append("如果这些信息不足以回答用户问题，请主动调用 recall_memory；若某条记忆带有图记忆ID，可用该 ID 调用 read_memory_node 或 discover_related 增量展开。")
         else:
             _attn_lines.append("当前对话未注入任何记忆上下文。")
-            _attn_lines.append("如果用户的问题涉及历史信息或个人偏好，请主动调用 recall_memory 工具进行检索。")
         _attn_lines.append("如果需要用户补充信息才能继续，请直接用自然语言向用户提问。")
-        _attn_lines.append("如果用户明确要求删除、移除、清除记忆，请调用 delete_memory_node 工具执行删除操作。\n")
         system_parts.append("\n".join(_attn_lines))
         
         system_parts.append("\n请开始回答用户的问题：")
@@ -3325,7 +4321,7 @@ class InferenceEngine:
             "  → 不要只是口头说\"已暂停\"而不调用工具，否则任务状态会丢失",
             "  → 挂起后清除当前活跃任务图，可以正常回答其他问题",
             "",
-            "当用户说\"继续\"、\"接着做\"、\"上次那个任务\"、\"恢复之前的任务\"等意思时：",
+            "当你根据用户语义判断其意图是恢复旧任务时：",
             "  → 第一步：调用 task_list_suspended(query=\"相关描述\") 查找并恢复挂起的任务",
             "  → 第二步：如果返回 resumed=true，说明之前的任务图（含所有节点和状态）已自动恢复到内存",
             "  → 第三步：调用 task_view_overview() 查看恢复后的任务图当前进度",
@@ -3488,12 +4484,9 @@ class InferenceEngine:
         _attn_lines = ["\n【注意力状态】"]
         if _has_memory:
             _attn_lines.append(f"已注入 {_mem_count} 段记忆/上下文到当前对话。")
-            _attn_lines.append("如果这些信息不足以回答用户问题，请主动调用 recall_memory；若某条记忆带有图记忆ID，可用该 ID 调用 read_memory_node 或 discover_related 增量展开。")
         else:
             _attn_lines.append("当前对话未注入任何记忆上下文。")
-            _attn_lines.append("如果用户的问题涉及历史信息或个人偏好，请主动调用 recall_memory 工具进行检索。")
         _attn_lines.append("如果需要用户补充信息才能继续，请直接用自然语言向用户提问。")
-        _attn_lines.append("如果用户明确要求删除、移除、清除记忆，请调用 delete_memory_node 工具执行删除操作。\n")
         system_parts.append("\n".join(_attn_lines))
         
         # 最后一句话引导

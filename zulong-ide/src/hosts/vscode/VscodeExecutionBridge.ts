@@ -1,11 +1,12 @@
 import fs from "node:fs/promises"
 import path from "node:path"
 import * as vscode from "vscode"
-import { ZulongWebSocket, ZulongToolRequest } from "@core/api/transport/zulong-websocket"
+import { DEFAULT_ZULONG_IDE_WS_URL, ZulongWebSocket, ZulongToolRequest } from "@core/api/transport/zulong-websocket"
 import CheckpointTracker from "@integrations/checkpoints/CheckpointTracker"
 import { DIFF_VIEW_URI_SCHEME } from "./VscodeDiffViewProvider"
 import { getLatestTerminalOutput } from "./terminal/get-latest-output"
 import { StateManager } from "@/core/storage/StateManager"
+import type { ApprovalMode } from "@/shared/ApprovalWhitelist"
 import { Logger } from "@/shared/services/Logger"
 
 type ToolResult = {
@@ -23,21 +24,34 @@ export class VscodeExecutionBridge {
 	private checkpointInitPromise: Promise<CheckpointTracker | undefined> | undefined
 	private pendingApprovals = new Map<string, (approved: boolean) => void>()
 	private workspaceOverride: string | undefined
+	private disposed = false
+	private runtimeApprovalMode: ApprovalMode | undefined
 
 	constructor(private readonly context: vscode.ExtensionContext) {
-		const serverUrl = process.env.ZULONG_SERVER_URL || "ws://127.0.0.1:8090/ide"
+		const serverUrl = process.env.ZULONG_SERVER_URL || DEFAULT_ZULONG_IDE_WS_URL
 		this.transport = new ZulongWebSocket(serverUrl)
 		this.registerHandlers()
+		this.context.subscriptions.push(
+			vscode.workspace.onDidGrantWorkspaceTrust(() => {
+				this.sendWorkspaceTrustStatus("granted")
+				this.sendIdeContext()
+			}),
+		)
 		void this.connect()
 	}
 
 	dispose(): void {
+		this.disposed = true
+		this.connected = false
 		this.transport.dispose()
 	}
 
 	private async connect(): Promise<void> {
 		try {
 			await this.transport.connect()
+			if (this.disposed) {
+				return
+			}
 			this.connected = true
 			Logger.info("[ZulongBridge] 后台执行桥已连接")
 		} catch (error) {
@@ -51,7 +65,7 @@ export class VscodeExecutionBridge {
 			void this.handleToolRequest(request)
 		})
 		this.transport.on("ide_open_workspace", (payload: Record<string, any>) => {
-			void this.openWorkspace(payload.workspace_path || payload.cwd || payload.path)
+			void this.openWorkspace(payload)
 		})
 		this.transport.on("ide_open_file", (payload: Record<string, any>) => {
 			void this.openFile(payload.path || payload.file_path, payload.line)
@@ -66,10 +80,27 @@ export class VscodeExecutionBridge {
 			this.sendIdeContext()
 		})
 		this.transport.on("connected", () => {
+			this.connected = true
+			Logger.info("[ZulongBridge] WebSocket 已打开，发送 IDE 上下文")
 			this.sendIdeContext()
+		})
+		this.transport.on("reconnecting", (attempt: number) => {
+			this.connected = false
+			Logger.info(`[ZulongBridge] 后台执行桥正在重连，第 ${attempt} 次`)
+		})
+		this.transport.on("disconnected", (code: number, reason: string) => {
+			this.connected = false
+			Logger.warn(`[ZulongBridge] 后台执行桥已断开: code=${code} reason=${reason || ""}`)
+		})
+		this.transport.on("error", (error: Error) => {
+			this.connected = false
+			Logger.warn(`[ZulongBridge] 后台执行桥事件错误: ${error.message}`)
 		})
 		this.transport.on("ide_approval_result", (payload: Record<string, any>) => {
 			this.handleApprovalResult(payload)
+		})
+		this.transport.on("ide_runtime_settings", (payload: Record<string, any>) => {
+			this.applyRuntimeSettings(payload)
 		})
 	}
 
@@ -105,6 +136,7 @@ export class VscodeExecutionBridge {
 	}
 
 	private async executeTool(toolName: string, args: Record<string, any>): Promise<string> {
+		this.ensureWorkspaceTrusted(toolName)
 		switch (toolName) {
 			case "read_file":
 				return this.readFile(args)
@@ -149,7 +181,14 @@ export class VscodeExecutionBridge {
 	}
 
 	private workspaceRoot(): string {
-		return this.workspaceOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd()
+		return this.workspaceOverride || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || ""
+	}
+
+	private ensureWorkspaceTrusted(toolName: string): void {
+		if (vscode.workspace.isTrusted) {
+			return
+		}
+		throw new Error(`当前 VS Code 工作区尚未受信任，已暂停 ${toolName}。请在 VS Code 信任当前任务目录后，祖龙会自动继续。`)
 	}
 
 	private resolvePath(inputPath: string): string {
@@ -179,6 +218,7 @@ export class VscodeExecutionBridge {
 
 	private async writeFile(args: Record<string, any>): Promise<string> {
 		const filePath = this.resolvePath(args.path)
+		this.ensureInsideWorkspace(filePath)
 		const content = args.content || ""
 		const existed = await this.fileExists(filePath)
 		const original = existed ? await fs.readFile(filePath, "utf-8") : ""
@@ -195,13 +235,14 @@ export class VscodeExecutionBridge {
 		await fs.mkdir(path.dirname(filePath), { recursive: true })
 		await fs.writeFile(filePath, content, "utf-8")
 		this.sendFileChanged(filePath, existed ? "updated" : "created")
-		await this.createCheckpoint(`${existed ? "更新" : "创建"} ${path.relative(this.workspaceRoot(), filePath)}`)
+		this.scheduleCheckpoint(`${existed ? "更新" : "创建"} ${path.relative(this.workspaceRoot(), filePath)}`)
 		void this.openFile(filePath)
 		return `已应用文件变更: ${filePath}`
 	}
 
 	private async createDirectory(args: Record<string, any>): Promise<string> {
 		const dirPath = this.resolvePath(args.path || args.file_path)
+		this.ensureInsideWorkspace(dirPath)
 		const relPath = this.describePath(dirPath)
 		const approved = await this.requestWebApproval(
 			"create_directory",
@@ -214,12 +255,13 @@ export class VscodeExecutionBridge {
 		}
 		await fs.mkdir(dirPath, { recursive: true })
 		this.sendFileChanged(dirPath, "created")
-		await this.createCheckpoint(`创建文件夹 ${relPath}`)
+		this.scheduleCheckpoint(`创建文件夹 ${relPath}`)
 		return `已创建文件夹: ${dirPath}`
 	}
 
 	private async replaceInFile(args: Record<string, any>): Promise<string> {
 		const filePath = this.resolvePath(args.path)
+		this.ensureInsideWorkspace(filePath)
 		const original = await fs.readFile(filePath, "utf-8")
 		const next = this.applySearchReplaceDiff(original, args.diff || "")
 		const approved = await this.confirmFileChange({
@@ -234,7 +276,7 @@ export class VscodeExecutionBridge {
 		}
 		await fs.writeFile(filePath, next, "utf-8")
 		this.sendFileChanged(filePath, "updated")
-		await this.createCheckpoint(`替换 ${path.relative(this.workspaceRoot(), filePath)}`)
+		this.scheduleCheckpoint(`替换 ${path.relative(this.workspaceRoot(), filePath)}`)
 		void this.openFile(filePath)
 		return `已应用文件替换: ${filePath}`
 	}
@@ -279,7 +321,7 @@ export class VscodeExecutionBridge {
 		}
 		await fs.rm(filePath, { force: true })
 		this.sendFileChanged(filePath, "deleted")
-		await this.createCheckpoint(`删除 ${relPath}`)
+		this.scheduleCheckpoint(`删除 ${relPath}`)
 		return `已删除文件: ${filePath}`
 	}
 
@@ -383,6 +425,9 @@ export class VscodeExecutionBridge {
 	}
 
 	private ensureInsideWorkspace(filePath: string): void {
+		if (!this.workspaceRoot()) {
+			throw new Error("当前 VS Code 窗口没有打开任务工作区")
+		}
 		const root = path.resolve(this.workspaceRoot())
 		const target = path.resolve(filePath)
 		const relative = path.relative(root, target)
@@ -392,6 +437,9 @@ export class VscodeExecutionBridge {
 	}
 
 	private describePath(filePath: string): string {
+		if (!this.workspaceRoot()) {
+			return path.resolve(filePath)
+		}
 		const root = path.resolve(this.workspaceRoot())
 		const target = path.resolve(filePath)
 		const relative = path.relative(root, target)
@@ -460,12 +508,20 @@ export class VscodeExecutionBridge {
 		this.ensureInsideWorkspace(filePath)
 		const relPath = path.relative(this.workspaceRoot(), filePath)
 		const actionSummary = `${summary}: ${relPath}`
-		await this.openDiffPreview(filePath, original, next, `祖龙差异预览: ${relPath}`)
-		const approved = await this.waitForWebApproval(actionSummary, "write_file", {
+		const approvalExtra = {
 			path: filePath,
 			operation,
 			pairId: `file_change:${relPath}`,
-		})
+		}
+		const autoApproved = this.tryAutoApprove("write_file", actionSummary, "medium", approvalExtra)
+		if (autoApproved !== undefined) {
+			if (autoApproved) {
+				this.sendDiffReady(filePath, operation, "approved")
+			}
+			return autoApproved
+		}
+		await this.openDiffPreview(filePath, original, next, `祖龙差异预览: ${relPath}`)
+		const approved = await this.waitForWebApproval(actionSummary, "write_file", approvalExtra)
 		if (!approved) {
 			this.sendDiffReady(filePath, operation, "rejected")
 			return false
@@ -524,19 +580,35 @@ export class VscodeExecutionBridge {
 		}
 	}
 
+	private scheduleCheckpoint(summary: string): void {
+		void this.createCheckpoint(summary)
+	}
+
 	private async createCheckpoint(summary: string): Promise<void> {
-		const tracker = await this.getCheckpointTracker()
+		const tracker = await this.withTimeout(this.getCheckpointTracker(), 8_000, `checkpoint tracker 初始化超时: ${summary}`)
 		if (!tracker) {
 			this.sendCheckpointStatus(summary, undefined, "skipped")
 			return
 		}
 		try {
-			const checkpointId = await tracker.commit()
+			const checkpointId = await this.withTimeout(tracker.commit(), 20_000, `checkpoint 创建超时: ${summary}`)
 			this.sendCheckpointStatus(summary, checkpointId, "created")
 		} catch (error) {
 			Logger.warn(`[ZulongBridge] Checkpoint 创建失败: ${error}`)
 			this.sendCheckpointStatus(summary, undefined, "failed", error instanceof Error ? error.message : String(error))
 		}
+	}
+
+	private withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+		let timer: NodeJS.Timeout | undefined
+		const timeout = new Promise<T>((_, reject) => {
+			timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs)
+		})
+		return Promise.race([promise, timeout]).finally(() => {
+			if (timer) {
+				clearTimeout(timer)
+			}
+		})
 	}
 
 	private sendApprovalRequired(
@@ -554,8 +626,10 @@ export class VscodeExecutionBridge {
 			action_summary: actionSummary,
 			risk_level: riskLevel,
 			risk_reason: riskReason,
+			approval_mode: this.currentApprovalMode(),
 			...(extra || {}),
 			interaction: {
+				approval_id: approvalId,
 				pair_id: extra?.pairId || approvalId,
 				kind: "approval",
 				status: "awaiting_approval",
@@ -564,6 +638,7 @@ export class VscodeExecutionBridge {
 				tool_name: toolName,
 				risk_level: riskLevel,
 				risk_reason: riskReason,
+				approval_mode: this.currentApprovalMode(),
 				confirmation_state: "awaiting_confirmation",
 			},
 		})
@@ -577,13 +652,20 @@ export class VscodeExecutionBridge {
 		extra?: Record<string, any>,
 	): Promise<boolean> {
 		const approvalId = `approval_${Date.now()}_${Math.random().toString(16).slice(2)}`
-		this.sendApprovalRequired(toolName, actionSummary, riskLevel, riskReason, approvalId, extra)
+		const autoApproved = this.tryAutoApprove(toolName, actionSummary, riskLevel, extra, approvalId)
+		if (autoApproved !== undefined) {
+			return Promise.resolve(autoApproved)
+		}
+		this.sendApprovalRequired(toolName, actionSummary, riskLevel, riskReason, approvalId, {
+			...(extra || {}),
+			approval_mode: this.currentApprovalMode(),
+		})
 		return new Promise<boolean>((resolve) => {
 			const timeout = setTimeout(() => {
 				this.pendingApprovals.delete(approvalId)
 				this.sendApprovalDecision(approvalId, toolName, actionSummary, false, extra)
 				resolve(false)
-			}, 120_000)
+			}, 60_000)
 			this.pendingApprovals.set(approvalId, (approved) => {
 				clearTimeout(timeout)
 				this.sendApprovalDecision(approvalId, toolName, actionSummary, approved, extra)
@@ -594,6 +676,10 @@ export class VscodeExecutionBridge {
 
 	private waitForWebApproval(actionSummary: string, toolName: string, extra?: Record<string, any>): Promise<boolean> {
 		const approvalId = `approval_${Date.now()}_${Math.random().toString(16).slice(2)}`
+		const autoApproved = this.tryAutoApprove(toolName, actionSummary, "medium", extra, approvalId)
+		if (autoApproved !== undefined) {
+			return Promise.resolve(autoApproved)
+		}
 		this.transport.sendIdeApprovalStatus({
 			workspace_path: this.workspaceRoot(),
 			approval_id: approvalId,
@@ -601,8 +687,10 @@ export class VscodeExecutionBridge {
 			action_summary: actionSummary,
 			risk_level: "medium",
 			risk_reason: "写入前会展示差异，只有 Web 页面确认后才保存",
+			approval_mode: this.currentApprovalMode(),
 			...(extra || {}),
 			interaction: {
+				approval_id: approvalId,
 				pair_id: extra?.pairId || approvalId,
 				kind: "approval",
 				status: "awaiting_approval",
@@ -611,6 +699,7 @@ export class VscodeExecutionBridge {
 				tool_name: toolName,
 				risk_level: "medium",
 				risk_reason: "写入前会展示差异，只有 Web 页面确认后才保存",
+				approval_mode: this.currentApprovalMode(),
 				confirmation_state: "awaiting_confirmation",
 			},
 		})
@@ -619,7 +708,7 @@ export class VscodeExecutionBridge {
 				this.pendingApprovals.delete(approvalId)
 				this.sendApprovalDecision(approvalId, toolName, actionSummary, false, extra)
 				resolve(false)
-			}, 120_000)
+			}, 60_000)
 			this.pendingApprovals.set(approvalId, (approved) => {
 				clearTimeout(timeout)
 				this.sendApprovalDecision(approvalId, toolName, actionSummary, approved, extra)
@@ -629,7 +718,7 @@ export class VscodeExecutionBridge {
 	}
 
 	private handleApprovalResult(payload: Record<string, any>): void {
-		const approvalId = payload.approval_id || payload.approvalId
+		const approvalId = payload.approval_id || payload.approvalId || payload.interaction_id || payload.pair_id
 		if (!approvalId) {
 			return
 		}
@@ -638,7 +727,7 @@ export class VscodeExecutionBridge {
 			return
 		}
 		this.pendingApprovals.delete(approvalId)
-		resolver(Boolean(payload.approved))
+		resolver(payload.approved === true || payload.action === "approve")
 	}
 
 	private sendApprovalDecision(
@@ -648,6 +737,7 @@ export class VscodeExecutionBridge {
 		approved: boolean,
 		extra?: Record<string, any>,
 	): void {
+		const autoApproved = extra?.auto_approved === true
 		this.transport.sendIdeApprovalStatus({
 			workspace_path: this.workspaceRoot(),
 			approval_id: approvalId,
@@ -660,12 +750,75 @@ export class VscodeExecutionBridge {
 				pair_id: extra?.pairId || approvalId,
 				kind: "approval",
 				status: approved ? "approved" : "rejected",
-				title: approved ? "用户已允许" : "用户已拒绝",
+				title: autoApproved ? "自动审批已允许" : approved ? "用户已允许" : "用户已拒绝",
 				detail: actionSummary,
 				tool_name: toolName,
+				approval_mode: extra?.approval_mode || this.currentApprovalMode(),
+				auto_approved: autoApproved,
 				confirmation_state: approved ? "confirmed" : "rejected",
 			},
 		})
+	}
+
+	private tryAutoApprove(
+		toolName: string,
+		actionSummary: string,
+		riskLevel: string,
+		extra?: Record<string, any>,
+		approvalId?: string,
+	): boolean | undefined {
+		const mode = this.currentApprovalMode()
+		if (mode !== "full_auto") {
+			return undefined
+		}
+		const resolvedApprovalId = approvalId || `approval_${Date.now()}_${Math.random().toString(16).slice(2)}`
+		Logger.info(`[ZulongBridge] 完全自动审批通过: tool=${toolName} risk=${riskLevel}`)
+		this.sendApprovalDecision(resolvedApprovalId, toolName, actionSummary, true, {
+			...(extra || {}),
+			approval_mode: mode,
+			auto_approved: true,
+			risk_level: riskLevel,
+		})
+		return true
+	}
+
+	private currentApprovalMode(): ApprovalMode {
+		if (this.runtimeApprovalMode) {
+			return this.runtimeApprovalMode
+		}
+		try {
+			const settings = StateManager.get().getGlobalSettingsKey("autoApprovalSettings")
+			return this.normalizeApprovalMode(settings?.zulongAutoApproveMode)
+		} catch {
+			return "manual"
+		}
+	}
+
+	private applyRuntimeSettings(payload: Record<string, any>): void {
+		const mode = this.normalizeApprovalMode(payload?.approval_mode)
+		this.runtimeApprovalMode = mode
+		Logger.info(`[ZulongBridge] 运行时审批模式已同步: ${mode}`)
+	}
+
+	private normalizeApprovalMode(mode: unknown): ApprovalMode {
+		switch (
+			String(mode || "")
+				.trim()
+				.toLowerCase()
+		) {
+			case "full":
+			case "full_auto":
+				return "full_auto"
+			case "read_only":
+			case "whitelist":
+				return "whitelist"
+			case "popup":
+				return "popup"
+			case "manual":
+			case "off":
+			default:
+				return "manual"
+		}
 	}
 
 	private sendDiffReady(filePath: string, operation: string, status: "approved" | "rejected"): void {
@@ -704,14 +857,27 @@ export class VscodeExecutionBridge {
 		})
 	}
 
-	async openWorkspace(workspacePath: string | undefined): Promise<void> {
+	async openWorkspace(payload: string | Record<string, any> | undefined): Promise<void> {
+		const workspacePath =
+			typeof payload === "string" ? payload : payload?.workspace_path || payload?.cwd || payload?.workspace
 		if (!workspacePath) {
 			return
 		}
 		this.workspaceOverride = path.resolve(workspacePath)
+		const activeFile = typeof payload === "string" ? undefined : payload?.active_file || payload?.file_path || payload?.path
+		const line = typeof payload === "string" ? undefined : Number(payload?.line || payload?.start_line || 0)
 		this.checkpointTracker = undefined
 		this.checkpointInitPromise = undefined
-		await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(this.workspaceOverride), false)
+		const currentWorkspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+		if (!currentWorkspace || path.resolve(currentWorkspace) !== this.workspaceOverride) {
+			await vscode.commands.executeCommand("vscode.openFolder", vscode.Uri.file(this.workspaceOverride), false)
+		}
+		setTimeout(() => this.sendWorkspaceTrustStatus("opened"), 300)
+		if (activeFile) {
+			setTimeout(() => {
+				void this.openFile(activeFile, line)
+			}, 1200)
+		}
 		setTimeout(() => this.sendIdeContext(), 1500)
 	}
 
@@ -719,7 +885,11 @@ export class VscodeExecutionBridge {
 		if (!filePath) {
 			return
 		}
-		const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(this.resolvePath(filePath)))
+		const resolvedPath = this.resolvePath(filePath)
+		if (this.workspaceRoot()) {
+			this.ensureInsideWorkspace(resolvedPath)
+		}
+		const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(resolvedPath))
 		const editor = await vscode.window.showTextDocument(doc, { preview: false })
 		if (line && line > 0) {
 			const position = new vscode.Position(line - 1, 0)
@@ -729,6 +899,14 @@ export class VscodeExecutionBridge {
 	}
 
 	async openTerminal(cwd?: string): Promise<void> {
+		if (!cwd && !this.workspaceRoot()) {
+			this.transport.sendIdeTerminalStatus({
+				workspace_path: "",
+				status: "workspace_required",
+				message: "当前 VS Code 窗口没有打开任务工作区。",
+			})
+			return
+		}
 		if (!this.terminal) {
 			this.terminal = vscode.window.createTerminal({ name: "Zulong", cwd: cwd || this.workspaceRoot() })
 		}
@@ -761,9 +939,13 @@ export class VscodeExecutionBridge {
 	}
 
 	sendIdeContext(): void {
+		const workspacePath = this.workspaceRoot()
+		if (!workspacePath) {
+			return
+		}
 		const activeEditor = vscode.window.activeTextEditor
 		const payload = {
-			workspace_path: this.workspaceRoot(),
+			workspace_path: workspacePath,
 			active_file: activeEditor?.document.uri.fsPath,
 			active_selection: activeEditor
 				? {
@@ -774,8 +956,31 @@ export class VscodeExecutionBridge {
 			open_tabs: vscode.window.tabGroups.all.flatMap((group) =>
 				group.tabs.map((tab) => (tab.input as any)?.uri?.fsPath).filter(Boolean),
 			),
+			workspace_trusted: vscode.workspace.isTrusted,
+			trust_required: !vscode.workspace.isTrusted,
 		}
 		this.transport.sendIdeContext(payload)
+	}
+
+	private sendWorkspaceTrustStatus(status: "opened" | "granted" | "context"): void {
+		this.transport.sendIdeTerminalStatus({
+			workspace_path: this.workspaceRoot(),
+			status: vscode.workspace.isTrusted ? "workspace_trusted" : "workspace_trust_required",
+			workspace_trusted: vscode.workspace.isTrusted,
+			trust_required: !vscode.workspace.isTrusted,
+			message: vscode.workspace.isTrusted ? "VS Code 已信任当前任务目录。" : "VS Code 正在等待用户信任当前任务目录。",
+			reason: status,
+			interaction: {
+				pair_id: `workspace_trust:${this.workspaceRoot()}`,
+				kind: "approval",
+				status: vscode.workspace.isTrusted ? "approved" : "pending",
+				title: vscode.workspace.isTrusted ? "VS Code 已信任当前任务目录" : "等待 VS Code 目录信任",
+				detail: vscode.workspace.isTrusted
+					? "祖龙会自动继续当前任务。"
+					: "请在 VS Code 的信任弹窗中确认该任务目录；确认后祖龙会自动继续。",
+				tool_name: "workspace_trust",
+			},
+		})
 	}
 
 	async getTerminalSnapshot(): Promise<string> {
@@ -850,6 +1055,14 @@ export class VscodeExecutionBridge {
 	}
 
 	private async confirmCommandExecution(command: string, args: string[]): Promise<boolean> {
+		const autoApproved = this.tryAutoApprove("vscode_run_command", `执行 VS Code 命令：${command}`, "high", {
+			command,
+			args,
+			pairId: `vscode_command:${command.slice(0, 120)}`,
+		})
+		if (autoApproved !== undefined) {
+			return autoApproved
+		}
 		const detail = args.length > 0 ? `参数: ${args.join(", ")}` : "无参数"
 		const choice = await vscode.window.showWarningMessage(
 			`Zulong 请求执行高风险 VS Code 命令`,

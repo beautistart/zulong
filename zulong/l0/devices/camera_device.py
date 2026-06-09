@@ -27,6 +27,11 @@ from datetime import datetime
 from zulong.core.types import ZulongEvent, EventType, EventPriority
 from zulong.core.event_bus import event_bus
 from zulong.ide.video_logger import logger
+from zulong.l0.devices.camera_backend import (
+    get_camera_backends,
+    open_camera,
+    safe_set_camera_property,
+)
 
 
 class CameraDevice:
@@ -115,7 +120,9 @@ class CameraDevice:
         # 尝试打开 0-9 号摄像头
         for i in range(10):
             try:
-                cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)  # Windows DirectShow
+                cap, _backend_name = open_camera(i)
+                if cap is None:
+                    continue
                 if cap.isOpened():
                     ret, frame = cap.read()
                     if ret:
@@ -143,20 +150,14 @@ class CameraDevice:
             bool: 初始化是否成功
         """
         try:
-            # 打开摄像头（尝试多种后端）
-            backends = [
-                (cv2.CAP_DSHOW, "DirectShow"),
-                (cv2.CAP_MSMF, "Media Foundation"),
-                (cv2.CAP_ANY, "Auto"),
-            ]
-            
-            for backend, name in backends:
-                self.camera = cv2.VideoCapture(self.device_index, backend)
+            # 打开摄像头（按平台尝试后端）
+            for backend in get_camera_backends():
+                self.camera = cv2.VideoCapture(self.device_index, backend.id)
                 if self.camera.isOpened():
-                    logger.info(f"✅ 摄像头已打开 (后端: {name}, 索引: {self.device_index})")
+                    logger.info(f"✅ 摄像头已打开 (后端: {backend.name}, 索引: {self.device_index})")
                     break
                 else:
-                    logger.warning(f"⚠️ 后端 {name} 无法打开摄像头 {self.device_index}")
+                    logger.warning(f"⚠️ 后端 {backend.name} 无法打开摄像头 {self.device_index}")
             
             if not self.camera or not self.camera.isOpened():
                 logger.error(f"❌ 无法打开摄像头 {self.device_index}")
@@ -195,18 +196,18 @@ class CameraDevice:
                 logger.warning(f"⚠️ 预热完成但亮度仍然过低 ({brightness:.2f}),将使用软件亮度补偿")
             
             # 设置参数
-            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.FRAME_WIDTH)
-            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.FRAME_HEIGHT)
-            self.camera.set(cv2.CAP_PROP_FPS, self.FPS)
+            safe_set_camera_property(self.camera, cv2.CAP_PROP_FRAME_WIDTH, self.FRAME_WIDTH)
+            safe_set_camera_property(self.camera, cv2.CAP_PROP_FRAME_HEIGHT, self.FRAME_HEIGHT)
+            safe_set_camera_property(self.camera, cv2.CAP_PROP_FPS, self.FPS)
             
             # 🎯 关键修改：启用自动曝光和亮度补偿
             if self.auto_exposure:
                 # Windows 摄像头自动曝光控制
-                self.camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)  # 启用自动曝光模式
-                self.camera.set(cv2.CAP_PROP_EXPOSURE, -6)      # 曝光值（负值减少曝光，正值增加）
-                self.camera.set(cv2.CAP_PROP_BRIGHTNESS, 128)   # 亮度（0-255）
-                self.camera.set(cv2.CAP_PROP_CONTRAST, 128)     # 对比度（0-255）
-                self.camera.set(cv2.CAP_PROP_SATURATION, 128)   # 饱和度（0-255）
+                safe_set_camera_property(self.camera, cv2.CAP_PROP_AUTO_EXPOSURE, 3)  # 启用自动曝光模式
+                safe_set_camera_property(self.camera, cv2.CAP_PROP_EXPOSURE, -6)      # 曝光值
+                safe_set_camera_property(self.camera, cv2.CAP_PROP_BRIGHTNESS, 128)   # 亮度
+                safe_set_camera_property(self.camera, cv2.CAP_PROP_CONTRAST, 128)     # 对比度
+                safe_set_camera_property(self.camera, cv2.CAP_PROP_SATURATION, 128)   # 饱和度
                 logger.info("📷 已启用自动曝光控制")
             
             # 获取实际参数

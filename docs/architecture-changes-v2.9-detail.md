@@ -654,7 +654,7 @@ has_only_root 检测:
 
 ### 6.2 修复方案
 
-**文件**: `openclaw_bridge/web/static/index.html`
+**文件**: `zulong_web/static/index.html`
 
 三个变更点：
 

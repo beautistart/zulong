@@ -8,7 +8,7 @@ import { Logger } from "@/shared/services/Logger"
 import { WebviewMessage } from "@/shared/WebviewMessage"
 
 /*
-https://github.com/microsoft/vscode-webview-ui-toolkit-samples/blob/main/default/weather-webview/src/providers/WeatherViewProvider.ts
+Historical VS Code webview host reference; production UI is Zulong Web.
 https://github.com/KumarVariable/vscode-extension-sidebar-html/blob/master/src/customSidebarViewProvider.ts
 */
 
@@ -169,6 +169,20 @@ export class VscodeWebviewProvider extends WebviewProvider implements vscode.Web
 			case "grpc_request_cancel": {
 				if (message.grpc_request_cancel) {
 					await handleGrpcRequestCancel(postMessageToWebview, message.grpc_request_cancel)
+				}
+				break
+			}
+			case "ide_approval_result": {
+				let payload: Record<string, any> | undefined = message.ide_approval_result
+				if (!payload && message.text) {
+					try {
+						payload = JSON.parse(message.text)
+					} catch (error) {
+						Logger.warn("Failed to parse ide_approval_result payload:", error)
+					}
+				}
+				if (payload) {
+					await this.controller.handleIdeApprovalResult(payload)
 				}
 				break
 			}

@@ -13,6 +13,19 @@
 import { EventEmitter } from "events"
 import { Logger } from "@/shared/services/Logger"
 import type { InteractionPayload } from "@/shared/ExtensionMessage"
+import type { ApprovalMode } from "@/shared/ApprovalWhitelist"
+
+export const DEFAULT_ZULONG_IDE_WS_URL = "ws://127.0.0.1:8090/ide"
+
+export function normalizeZulongWebSocketUrl(serverUrl?: string): string {
+	const raw = (serverUrl || DEFAULT_ZULONG_IDE_WS_URL).trim() || DEFAULT_ZULONG_IDE_WS_URL
+	const wsUrl = raw.replace(/^http/i, "ws")
+	const parsed = new URL(wsUrl.replace(/^ws/i, "http"))
+	if (parsed.pathname === "/" || parsed.pathname === "") {
+		parsed.pathname = "/ide"
+	}
+	return parsed.toString().replace(/^http/i, "ws")
+}
 
 // ── Message types ────────────────────────────────────
 
@@ -85,6 +98,8 @@ export class ZulongWebSocket extends EventEmitter {
 	private reconnectAttempts = 0
 	private readonly maxReconnectDelay = 30_000
 	private reconnectDelay = 1000
+	private reconnectTimer: NodeJS.Timeout | null = null
+	private connectingPromise: Promise<string> | null = null
 	private disposed = false
 	private pendingMessages: Array<Record<string, any>> = []
 
@@ -98,13 +113,7 @@ export class ZulongWebSocket extends EventEmitter {
 
 	constructor(serverUrl: string) {
 		super()
-		// Normalize URL: ensure ws:// or wss://
-		this.serverUrl = serverUrl.replace(/^http/, "ws")
-		const parsed = new URL(this.serverUrl.replace(/^ws/, "http"))
-		if (parsed.pathname !== "/" && parsed.pathname !== "/ide") {
-			parsed.pathname = "/"
-			this.serverUrl = parsed.toString().replace(/^http/, "ws")
-		}
+		this.serverUrl = normalizeZulongWebSocketUrl(serverUrl)
 	}
 
 	get isConnected(): boolean {
@@ -123,27 +132,53 @@ export class ZulongWebSocket extends EventEmitter {
 		if (this.disposed) {
 			throw new Error("Transport has been disposed")
 		}
+		if (this.isConnected && this.sessionId) {
+			return this.sessionId
+		}
+		if (this.connectingPromise) {
+			return this.connectingPromise
+		}
 
 		Logger.info(`[ZulongWS] Connecting to ${this.serverUrl}`)
 
-		return new Promise<string>((resolve, reject) => {
+		this.connectingPromise = new Promise<string>((resolve, reject) => {
+			let settled = false
+			const settleResolve = (sessionId: string) => {
+				if (settled) {
+					return
+				}
+				settled = true
+				this.connectingPromise = null
+				resolve(sessionId)
+			}
+			const settleReject = (error: Error) => {
+				if (settled) {
+					return
+				}
+				settled = true
+				this.connectingPromise = null
+				reject(error)
+			}
+
 			try {
 				this.ws = new WebSocket(this.serverUrl)
 			} catch (err) {
 				Logger.error(`[ZulongWS] Failed to create WebSocket: ${err}`)
-				reject(new Error(`Failed to create WebSocket: ${err}`))
+				const error = new Error(`Failed to create WebSocket: ${err}`)
+				settleReject(error)
+				this.scheduleReconnect("create_failed")
 				return
 			}
 
 			const timeout = setTimeout(() => {
 				Logger.error("[ZulongWS] Connection timeout (10s)")
-				reject(new Error("WebSocket connection timeout (10s)"))
+				settleReject(new Error("WebSocket connection timeout (10s)"))
+				this.scheduleReconnect("timeout")
 				this.ws?.close()
 			}, 10_000)
 
 			this.ws.onopen = () => {
 				Logger.info("[ZulongWS] WebSocket connected")
-				this.reconnectAttempts = 0
 				this.missedPongs = 0
 				this.startHeartbeat()
 				// 统一协议握手: 声明客户端类型
@@ -186,7 +221,8 @@ export class ZulongWebSocket extends EventEmitter {
 							this.sendRaw(pending)
 						}
 						this.pendingMessages = []
-						resolve(this.sessionId)
+						this.reconnectAttempts = 0
+						settleResolve(this.sessionId)
 					}
 				} catch (e) {
 					Logger.error(`[ZulongWS] Message parse error: ${e}`)
@@ -199,7 +235,8 @@ export class ZulongWebSocket extends EventEmitter {
 				const errMsg = `WebSocket error connecting to ${this.serverUrl}`
 				Logger.error(`[ZulongWS] ${errMsg}`)
 				this.emit("error", new Error(errMsg))
-				reject(new Error(errMsg))
+				settleReject(new Error(errMsg))
+				this.scheduleReconnect("error")
 			}
 
 			this.ws.onclose = (event: CloseEvent) => {
@@ -207,17 +244,19 @@ export class ZulongWebSocket extends EventEmitter {
 				this.stopHeartbeat()
 				Logger.warn(`[ZulongWS] WebSocket closed: code=${event.code} reason=${event.reason}`)
 				this.emit("disconnected", event.code, event.reason)
+				settleReject(new Error(`WebSocket closed: code=${event.code} reason=${event.reason || ""}`))
 				if (!this.disposed) {
-					this.attemptReconnect()
+					this.scheduleReconnect("closed")
 				}
 			}
 		})
+		return this.connectingPromise
 	}
 
 	/**
 	 * Send session_start to begin a new task.
 	 */
-	sendSessionStart(task: string, cwd: string, zulongSystemPrompt?: string, projectId?: string): void {
+	sendSessionStart(task: string, cwd: string, zulongSystemPrompt?: string, projectId?: string, approvalMode?: ApprovalMode): void {
 		const payload: Record<string, string> = {
 			task,
 			cwd,
@@ -225,6 +264,9 @@ export class ZulongWebSocket extends EventEmitter {
 		}
 		if (projectId) {
 			payload.project_id = projectId
+		}
+		if (approvalMode) {
+			payload.approval_mode = approvalMode
 		}
 		this.send("task:start", payload)
 	}
@@ -326,6 +368,11 @@ export class ZulongWebSocket extends EventEmitter {
 		this.disposed = true
 		this.pendingMessages = []
 		this.stopHeartbeat()
+		if (this.reconnectTimer) {
+			clearTimeout(this.reconnectTimer)
+			this.reconnectTimer = null
+		}
+		this.connectingPromise = null
 		if (this.ws) {
 			this.ws.onclose = null
 			this.ws.onerror = null
@@ -397,7 +444,7 @@ export class ZulongWebSocket extends EventEmitter {
 				this.emit("task_progress", msg.payload)
 				break
 			case "task_complete":
-				this.emit("task_complete", msg.payload.result || "")
+				this.emit("task_complete", msg.payload.result || "", msg.payload)
 				break
 			case "task_error":
 				this.emit("task_error", msg.payload.error || "Unknown error")
@@ -426,6 +473,9 @@ export class ZulongWebSocket extends EventEmitter {
 			case "ide_approval_result":
 				this.emit("ide_approval_result", msg.payload)
 				break
+			case "ide_runtime_settings":
+				this.emit("ide_runtime_settings", msg.payload)
+				break
 			case "ide_get_context":
 				this.emit("ide_get_context", msg.payload)
 				break
@@ -448,19 +498,24 @@ export class ZulongWebSocket extends EventEmitter {
 			existing && typeof existing === "object"
 				? { ...(existing as Partial<InteractionPayload>) }
 				: this.buildFallbackInteraction(msg)
+		const approvalId = (base as any).approval_id || payload.approval_id || payload.approvalId
 		const interactionId =
 			base.interaction_id ||
+			approvalId ||
 			payload.interaction_id ||
 			payload.call_id ||
 			payload.msg_id ||
 			msg.msg_id ||
 			`${msg.type}:${Date.now()}`
-		const pairId = base.pair_id || payload.pair_id || payload.call_id || interactionId
+		const pairId = base.pair_id || payload.pair_id || approvalId || payload.call_id || interactionId
+		const riskLevel = this.normalizeRiskLevel((base as any).risk_level || payload.risk_level || payload.risk)
+		const approvalMode = this.normalizeApprovalMode((base as any).approval_mode || payload.approval_mode)
 
-		return {
+		const interaction = {
 			...base,
 			interaction_id: String(interactionId),
 			pair_id: String(pairId),
+			approval_id: approvalId ? String(approvalId) : (base as any).approval_id,
 			kind: this.normalizeInteractionKind(base.kind),
 			status: this.normalizeInteractionStatus(base.status),
 			title: base.title || this.defaultInteractionTitle(msg),
@@ -468,6 +523,13 @@ export class ZulongWebSocket extends EventEmitter {
 			timestamp: base.timestamp ?? payload.timestamp ?? msg.ts,
 			turn: base.turn ?? payload.turn,
 		} as InteractionPayload
+		if (riskLevel) {
+			interaction.risk_level = riskLevel
+		}
+		if (approvalMode) {
+			interaction.approval_mode = approvalMode
+		}
+		return interaction
 	}
 
 	private buildFallbackInteraction(msg: ZulongMessage): Partial<InteractionPayload> {
@@ -518,7 +580,6 @@ export class ZulongWebSocket extends EventEmitter {
 					risks_summary: payload.risks_summary,
 					next_step: payload.next_step,
 					memory_changes: payload.memory_changes,
-					progress: 100,
 				}
 			case "graph_memory_diff":
 				return {
@@ -614,6 +675,41 @@ export class ZulongWebSocket extends EventEmitter {
 		}
 	}
 
+	private normalizeRiskLevel(risk: unknown): InteractionPayload["risk_level"] | undefined {
+		switch (String(risk || "").trim().toUpperCase()) {
+			case "LOW":
+				return "LOW"
+			case "MEDIUM":
+				return "MEDIUM"
+			case "HIGH":
+				return "HIGH"
+			case "CRITICAL":
+			case "DANGER":
+			case "POPUP":
+				return "CRITICAL"
+			default:
+				return undefined
+		}
+	}
+
+	private normalizeApprovalMode(mode: unknown): InteractionPayload["approval_mode"] | undefined {
+		switch (String(mode || "").trim().toLowerCase()) {
+			case "full":
+			case "full_auto":
+				return "full_auto"
+			case "read_only":
+			case "whitelist":
+				return "whitelist"
+			case "manual":
+			case "off":
+				return "manual"
+			case "popup":
+				return "popup"
+			default:
+				return undefined
+		}
+	}
+
 	private parseToolArgs(raw: unknown): Record<string, any> | undefined {
 		if (!raw) {
 			return undefined
@@ -652,18 +748,22 @@ export class ZulongWebSocket extends EventEmitter {
 		}
 	}
 
-	private attemptReconnect(): void {
+	private scheduleReconnect(reason: string): void {
+		if (this.disposed || this.reconnectTimer || this.isConnected) {
+			return
+		}
 		this.reconnectAttempts++
 		const delay = Math.min(
 			this.maxReconnectDelay,
 			this.reconnectDelay * Math.pow(2, Math.min(this.reconnectAttempts - 1, 5)),
 		)
-		Logger.warn(`[ZulongWS] Reconnecting... attempt ${this.reconnectAttempts} (delay ${delay}ms)`)
-		setTimeout(() => {
+		Logger.warn(`[ZulongWS] Reconnecting after ${reason}... attempt ${this.reconnectAttempts} (delay ${delay}ms)`)
+		this.reconnectTimer = setTimeout(() => {
+			this.reconnectTimer = null
 			if (!this.disposed) {
 				this.emit("reconnecting", this.reconnectAttempts)
 				this.connect().catch(() => {
-					// Reconnect failure handled by onclose
+					// Reconnect failure is handled by scheduleReconnect from error/close/timeout.
 				})
 			}
 		}, delay)

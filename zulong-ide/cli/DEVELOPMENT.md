@@ -191,7 +191,7 @@ These options are available for the default command (running a task directly):
 ### Quick Start
 
 ```bash
-# 1. Install all dependencies (root, webview-ui, cli)
+# 1. Install all dependencies (root and cli)
 npm run install:all
 
 # 2. Build and link globally so you can run `cline` from anywhere
@@ -207,7 +207,7 @@ Run these from the repository root:
 
 | Script | Description |
 |--------|-------------|
-| `npm run install:all` | Install deps for root, webview-ui, and cli |
+| `npm run install:all` | Install deps for root and cli |
 | `npm run cli:build` | Generate protos and build CLI |
 | `npm run cli:build:production` | Production build (minified) |
 | `npm run cli:link` | Build and `npm link` so you can run `cline` from anywhere |

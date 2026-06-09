@@ -72,6 +72,13 @@ class EdgeType(Enum):
     SEMANTIC = "semantic"           # 语义相似 (embedding cosine > 阈值)
     CAUSAL = "causal"               # 因果关系 (KG 中 CAUSED 关系)
     ASSOCIATION = "association"     # 赫布学习产生的关联
+    DERIVED_FROM = "derived_from"   # 经验来源于任务/trace/节点
+    APPLIES_TO = "applies_to"       # 经验适用于任务/工具/场景
+    SIMILAR_TO = "similar_to"       # 经验之间语义相似
+    CORRECTS = "corrects"           # 新经验修正错误节点/旧经验
+    DEPENDS_ON = "depends_on"       # 经验依赖某前置经验/节点
+    CONTRADICTS = "contradicts"     # 经验之间冲突
+    FAILED_THEN_SUCCEEDED = "failed_then_succeeded"  # 失败节点指向后续成功节点
 
 
 # 结构性边类型 -- 永不被修剪
@@ -89,7 +96,12 @@ class Importance(Enum):
 
 
 class Temperature(Enum):
-    """节点温度标签"""
+    """节点温度标签。
+
+    这是存储生命周期/前端展示层的温度标签，不是 retrieve_context()
+    检索冷热路径的唯一裁判。检索冷热路径按 hot_window_minutes 形成的
+    时间窗口路由；存储冷热可结合重要度、访问次数、激活值等多维信号。
+    """
     HOT = "hot"        # 最近被访问/激活
     WARM = "warm"      # 中等时间未激活
     COLD = "cold"      # 长期未激活
@@ -581,9 +593,6 @@ class MemoryGraph:
             "total_prune_cycles": 0,
         }
 
-        # 尝试加载已有数据
-        self._load()
-
         # 启动时健康检查: 清理膨胀的 ASSOCIATION 边
         self._sanitize_association_edges()
 
@@ -670,6 +679,26 @@ class MemoryGraph:
     def get_node(self, node_id: str) -> Optional[GraphNode]:
         """获取节点"""
         return self._nodes.get(node_id)
+
+    def update_node(self, node: GraphNode) -> bool:
+        """更新节点对象（兼容 Hybrid/Sharded MemoryGraph 公共契约）。"""
+        if not node or node.node_id not in self._nodes:
+            return False
+        with self._data_lock:
+            self._nodes[node.node_id] = node
+            self._index_node_address(node.node_id, node.metadata or {})
+            if self._graph.has_node(node.node_id):
+                self._graph.nodes[node.node_id].update(node.to_dict())
+            self._pending_changes.append({
+                "action": "update_node",
+                "data": {
+                    "id": node.node_id,
+                    "type": node.node_type.value,
+                    "label": node.label,
+                },
+            })
+            self._mark_dirty()
+        return True
 
     def remove_node(self, node_id: str) -> bool:
         """移除节点及其所有关联边"""
@@ -782,7 +811,10 @@ class MemoryGraph:
         return temp
 
     def is_recent(self, node_id: str, window_seconds: int = 1800) -> bool:
-        """判断节点是否在热窗口内（检索路由用）
+        """判断节点是否在检索热窗口内（retrieve_context 路由用）。
+
+        这里的“热”只表示最近 window_seconds 内访问/激活过，
+        不等同于存储生命周期里的 temperature=hot。
 
         Args:
             node_id: 节点 ID
@@ -1173,10 +1205,24 @@ class MemoryGraph:
         """
         if not address:
             return None
+        address = str(address or "").strip().replace("\\", "/")
+
+        def _normalize_tg_head(value: str) -> str:
+            if not value.startswith("tg:"):
+                return value
+            parts = value.split("/", 1)
+            head = parts[0][3:].strip()
+            if head and not head.startswith("tg_") and head.isdigit():
+                head = f"tg_{head}"
+            suffix = "/" + parts[1] if len(parts) > 1 else ""
+            return f"tg:{head}{suffix}"
+
+        address = _normalize_tg_head(address)
 
         # 格式 1: tg:{graph_id}/task:{node_id}
         if address.startswith("tg:"):
             parts = address.split("/")
+            graph_id = parts[0][3:]
             for part in parts:
                 if part.startswith("task:"):
                     # 直接用 task:{node_id} 作为图内 node_id 查找
@@ -1185,6 +1231,16 @@ class MemoryGraph:
                         return node
                     # 也尝试原始 part 作为 node_id
                     node = self._nodes.get(part)
+                    if node:
+                        return node
+            if len(parts) >= 2 and parts[-1]:
+                local_id = parts[-1]
+                for candidate in (
+                    f"task:{graph_id}/{local_id}",
+                    f"task:{local_id}",
+                    local_id,
+                ):
+                    node = self._nodes.get(candidate)
                     if node:
                         return node
 
@@ -2296,12 +2352,14 @@ class MemoryGraph:
         hot_window_minutes: int = 30,
         session_id: str = "",
     ) -> List[Dict[str, Any]]:
-        """核心检索方法：在同一张图上通过标签互斥过滤实现两条并行检索路径
+        """核心检索方法：在同一张图上通过时间窗口路由两条并行检索路径。
 
-        路径 A: 遍历热数据（time_scope=recent），排除温/冷数据
-        路径 B: FAISS 向量检索非热数据，排除热数据
+        路径 A: 遍历检索热窗口内的数据（近期访问/激活，time_scope=recent）
+        路径 B: FAISS/关键词检索非热窗口的历史数据，排除热窗口数据
 
         两条路径通过 asyncio.gather() 并行执行，结果合并后按分数排序。
+        注意：检索冷热只按本轮时间窗口划分；存储冷热是另一套生命周期标签，
+        可由时间、重要度、访问次数、激活值等多维度共同决定。
 
         Args:
             query_text: 用户查询文本
@@ -2577,7 +2635,7 @@ class MemoryGraph:
     def _retrieve_hot(
         self, query_text: str, window_seconds: int, session_id: str = ""
     ) -> List[Dict[str, Any]]:
-        """路径 A: 热数据图遍历（排除温/冷数据）
+        """路径 A: 检索热窗口内的数据图遍历。
 
         筛选热窗口内的节点，关键词匹配 + BFS 扩散。
         当提供 session_id 时，优先返回当前会话节点。
@@ -2767,7 +2825,10 @@ class MemoryGraph:
     def _retrieve_cold(
         self, query_text: str, top_k: int, window_seconds: int
     ) -> List[Dict[str, Any]]:
-        """路径 B: 非热数据混合检索（FAISS 向量 + 关键词并行，排除热数据）
+        """路径 B: 非热窗口历史数据混合检索（FAISS 向量 + 关键词并行）。
+
+        这里的“冷路径”是检索术语，表示不在本轮热窗口内的历史候选；
+        不等同于存储生命周期里的 temperature=cold。
 
         P0-3 修正: 原冷路径仅依赖 FAISS 向量检索，缺失关键词匹配导致
         长期低热度但关键词高度相关的记忆被遗漏。现在同时执行向量检索和
@@ -3038,15 +3099,14 @@ class MemoryGraph:
         self._dirty = True
 
     def save(self) -> bool:
-        """旧 NetworkX 单 JSON 持久化已废弃。"""
-        logger.warning("[MemoryGraph] NetworkX 单 JSON 保存已废弃，运行态应使用分片 Hybrid 后端")
-        self._dirty = False
-        return False
+        """兼容检查点 no-op。
 
-    def _load(self) -> bool:
-        """旧 NetworkX 单 JSON 加载已废弃。"""
-        logger.info("[MemoryGraph] 跳过旧单 JSON 加载；运行态由分片 Hybrid 后端负责持久化")
-        return False
+        旧 NetworkX 单 JSON 持久化已移出运行链路；运行态只允许
+        ShardedMemoryGraph.save_all() 持久化分片数据。保留此方法是为了
+        兼容少量算法层/测试代码中的 save() 调用，不写入旧单文件图谱。
+        """
+        self._dirty = False
+        return True
 
     def _sanitize_association_edges(self):
         """启动时健康检查: 清理膨胀的 ASSOCIATION 边
@@ -3342,6 +3402,36 @@ class MemoryGraph:
     # 前端序列化 + 变更追踪
     # ============================================================
 
+    _LEGACY_DIALOGUE_TASK_LINK_TYPES = {
+        "dialogue_round_task",
+        "dialogue_to_task",
+        "sub_dialogue_to_task",
+    }
+
+    def _node_type_value_for_frontend_filter(self, node_id: str) -> str:
+        node = self._nodes.get(node_id)
+        if node:
+            value = node.node_type.value if hasattr(node.node_type, "value") else str(node.node_type)
+            return value.lower()
+        if "/dialogue:" in node_id or node_id.startswith("dialogue:"):
+            return "dialogue"
+        if "/task:" in node_id or node_id.startswith("task:"):
+            return "task"
+        return ""
+
+    def _should_hide_frontend_edge(self, src: str, dst: str, data: Dict[str, Any]) -> bool:
+        """Hide legacy dialogue-task containment edges from frontend snapshots."""
+        metadata = data.get("metadata") or {}
+        link_type = str(metadata.get("link_type") or data.get("link_type") or "").strip()
+        if link_type in self._LEGACY_DIALOGUE_TASK_LINK_TYPES:
+            return True
+        edge_type = str(data.get("edge_type") or "").lower()
+        if edge_type != "hierarchy":
+            return False
+        src_type = self._node_type_value_for_frontend_filter(src)
+        dst_type = self._node_type_value_for_frontend_filter(dst)
+        return src_type == "dialogue" and dst_type == "task"
+
     # ------ 分层查询辅助方法 ------
 
     def _get_root_node_ids(self) -> Set[str]:
@@ -3349,6 +3439,8 @@ class MemoryGraph:
         has_hierarchy_parent: Set[str] = set()
         has_hierarchy_child: Set[str] = set()
         for src, target, data in self._graph.edges(data=True):
+            if self._should_hide_frontend_edge(src, target, data):
+                continue
             if data.get("edge_type") == "hierarchy":
                 has_hierarchy_parent.add(target)
                 has_hierarchy_child.add(src)
@@ -3359,19 +3451,28 @@ class MemoryGraph:
     def _count_hierarchy_children(self, node_id: str) -> int:
         """计算节点的 HIERARCHY 子节点数（轻量版，不实例化 GraphNode）"""
         count = 0
-        for _, _, data in self._graph.out_edges(node_id, data=True):
+        for _, target, data in self._graph.out_edges(node_id, data=True):
+            if self._should_hide_frontend_edge(node_id, target, data):
+                continue
             if data.get("edge_type") == "hierarchy":
                 count += 1
         return count
 
     def _serialize_node(self, node: "GraphNode", include_children_count: bool = False) -> Dict[str, Any]:
         """将单个节点序列化为前端 dict"""
+        metadata = dict(node.metadata or {})
+        node_type = node.node_type.value if hasattr(node.node_type, "value") else str(node.node_type)
+        if node_type == "dialogue":
+            metadata["task_graph_address"] = ""
+            full_path = str(metadata.get("full_path") or "")
+            if full_path.startswith("task:") or "/task:" in full_path:
+                metadata["full_path"] = node.node_id
         d = {
             "id": node.node_id,
-            "type": node.node_type.value,
+            "type": node_type,
             "label": node.label,
             "activation": round(node.activation, 3),
-            "metadata": node.metadata,
+            "metadata": metadata,
         }
         if include_children_count:
             d["children_count"] = self._count_hierarchy_children(node.node_id)
@@ -3385,6 +3486,7 @@ class MemoryGraph:
             "type": data.get("edge_type", "reference"),
             "weight": round(data.get("weight", 0.5), 3),
             "protected": data.get("protected", False),
+            "metadata": data.get("metadata", {}) or {},
         }
 
     # ------ 前端序列化 ------
@@ -3421,6 +3523,8 @@ class MemoryGraph:
                 nodes.append(self._serialize_node(node, include_children_count=True))
             edges = []
             for src, dst, data in self._graph.edges(data=True):
+                if self._should_hide_frontend_edge(src, dst, data):
+                    continue
                 edges.append(self._serialize_edge(src, dst, data))
             return {
                 "nodes": nodes,
@@ -3435,6 +3539,8 @@ class MemoryGraph:
         has_hierarchy_parent: Set[str] = set()
         has_hierarchy_child: Set[str] = set()
         for src, target, data in self._graph.edges(data=True):
+            if self._should_hide_frontend_edge(src, target, data):
+                continue
             if data.get("edge_type") == "hierarchy":
                 has_hierarchy_parent.add(target)
                 has_hierarchy_child.add(src)
@@ -3475,6 +3581,8 @@ class MemoryGraph:
             # 仅收集层级树根之间的边
             edges = []
             for src, dst, data in self._graph.edges(data=True):
+                if self._should_hide_frontend_edge(src, dst, data):
+                    continue
                 if src in hierarchy_roots and dst in hierarchy_roots:
                     edges.append(self._serialize_edge(src, dst, data))
 
@@ -3493,6 +3601,8 @@ class MemoryGraph:
             next_layer: Set[str] = set()
             for nid in current_layer:
                 for _, target, data in self._graph.out_edges(nid, data=True):
+                    if self._should_hide_frontend_edge(nid, target, data):
+                        continue
                     if data.get("edge_type") == "hierarchy" and target not in visible_ids:
                         next_layer.add(target)
                         visible_ids.add(target)
@@ -3508,6 +3618,8 @@ class MemoryGraph:
 
         edges = []
         for src, dst, data in self._graph.edges(data=True):
+            if self._should_hide_frontend_edge(src, dst, data):
+                continue
             if src in visible_ids and dst in visible_ids:
                 edges.append(self._serialize_edge(src, dst, data))
 
@@ -3532,6 +3644,8 @@ class MemoryGraph:
             # 收集所有参与层级关系的节点 ID
             in_hierarchy: Set[str] = set()
             for src, target, data in self._graph.edges(data=True):
+                if self._should_hide_frontend_edge(src, target, data):
+                    continue
                 if data.get("edge_type") == "hierarchy":
                     in_hierarchy.add(src)
                     in_hierarchy.add(target)
@@ -3545,6 +3659,8 @@ class MemoryGraph:
             # 孤立节点之间的边
             edges = []
             for src, dst, data in self._graph.edges(data=True):
+                if self._should_hide_frontend_edge(src, dst, data):
+                    continue
                 if src in group_child_ids and dst in group_child_ids:
                     edges.append(self._serialize_edge(src, dst, data))
             return {
@@ -3561,6 +3677,8 @@ class MemoryGraph:
 
         edges = []
         for src, dst, data in self._graph.edges(data=True):
+            if self._should_hide_frontend_edge(src, dst, data):
+                continue
             # 父→子 或 子↔子 的边
             if (src == node_id and dst in child_ids) or \
                (src in child_ids and dst in child_ids):
@@ -3721,6 +3839,8 @@ class MemoryGraph:
         # 序列化边（两端都在 visible_ids 中的边）
         edges = []
         for src, dst, data in self._graph.edges(data=True):
+            if self._should_hide_frontend_edge(src, dst, data):
+                continue
             if src in visible_ids and dst in visible_ids:
                 edges.append(self._serialize_edge(src, dst, data))
 

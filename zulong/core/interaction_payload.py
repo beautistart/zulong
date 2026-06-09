@@ -47,14 +47,18 @@ class InteractionPayload:
     plan_steps: Optional[List[str]] = None
 
     # 审批
+    approval_id: Optional[str] = None
+    action_summary: Optional[str] = None
     risk_level: Optional[RiskLevel] = None
     risk_reason: Optional[str] = None
+    confirmation_state: Optional[str] = None
     approval_mode: Optional[ApprovalMode] = None
 
     # 进度
     progress: Optional[float] = None
     current_step: Optional[int] = None
     total_steps: Optional[int] = None
+    progress_items: Optional[List[Dict[str, Any]]] = None
 
     # 总结 (kind=summary)
     completed_items: Optional[List[str]] = None
@@ -88,10 +92,16 @@ class InteractionPayload:
             result["tool_args"] = self.tool_args
         if self.plan_steps is not None:
             result["plan_steps"] = self.plan_steps
+        if self.approval_id is not None:
+            result["approval_id"] = self.approval_id
+        if self.action_summary is not None:
+            result["action_summary"] = self.action_summary
         if self.risk_level is not None:
             result["risk_level"] = self.risk_level
         if self.risk_reason is not None:
             result["risk_reason"] = self.risk_reason
+        if self.confirmation_state is not None:
+            result["confirmation_state"] = self.confirmation_state
         if self.approval_mode is not None:
             result["approval_mode"] = self.approval_mode
         if self.progress is not None:
@@ -100,6 +110,8 @@ class InteractionPayload:
             result["current_step"] = self.current_step
         if self.total_steps is not None:
             result["total_steps"] = self.total_steps
+        if self.progress_items is not None:
+            result["progress_items"] = self.progress_items
         if self.completed_items is not None:
             result["completed_items"] = self.completed_items
         if self.verified_items is not None:

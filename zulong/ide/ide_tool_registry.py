@@ -44,6 +44,8 @@ _ZULONG_TOOLS_DISABLED_IN_IDE_MODE = {
     "exec_write_file",
     "exec_run_command",
     "exec_read_file",
+    # ToolRAG 入口不参与首轮 IDE 工具注入；工具不足时走 request_tool_supplement。
+    "search_tools",
 }
 
 # 继续已有任务图时物理排除的内部工具（防止 LLM 重新创建/扩展已恢复的任务图）

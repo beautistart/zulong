@@ -15,6 +15,8 @@ import logging
 import time
 import asyncio
 import threading
+import re
+import json
 from typing import Dict, Any, List, Optional
 
 from .base import BaseTool, ToolCategory, ToolRequest, ToolResult
@@ -123,6 +125,17 @@ def _build_memory_address(
     """构造 LLM 可回跳的图记忆地址，不改变既有工具协议。"""
     item = item or {}
     meta = dict(item.get("metadata") or _node_metadata(node))
+    node_type = str(
+        item.get("node_type")
+        or item.get("type")
+        or getattr(getattr(node, "node_type", ""), "value", getattr(node, "node_type", ""))
+        or ""
+    ).lower()
+    if node_type == "dialogue":
+        meta["task_graph_address"] = ""
+        full_path_value = str(meta.get("full_path") or "")
+        if full_path_value.startswith("task:") or "/task:" in full_path_value:
+            meta["full_path"] = node_id
     graph_memory_id = (
         item.get("graph_memory_id")
         or meta.get("graph_memory_id")
@@ -322,6 +335,168 @@ def _brief_node(mg: Any, node: Any) -> Dict[str, Any]:
     return _attach_address_fields(data, mg, node_id, node=node)
 
 
+def _normalize_batch_memory_entries(
+    content: str,
+    raw_entries: Any = None,
+) -> List[Dict[str, str]]:
+    """Return structured memory entries while preserving single-note behavior."""
+    entries: List[Dict[str, str]] = []
+    if isinstance(raw_entries, list):
+        for idx, item in enumerate(raw_entries, start=1):
+            if isinstance(item, dict):
+                item_content = str(item.get("content") or item.get("text") or "").strip()
+                item_label = str(item.get("label") or "").strip()
+            else:
+                item_content = str(item or "").strip()
+                item_label = ""
+            if item_content:
+                entries.append({
+                    "label": item_label or item_content[:50],
+                    "content": item_content,
+                    "source_index": str(idx),
+                })
+        if entries:
+            return entries
+
+    lines = []
+    for raw_line in str(content or "").splitlines():
+        line = re.sub(r"^\s*(?:[-*+]|\d+[.)]|[（(]?\d+[）)])\s*", "", raw_line).strip()
+        if line:
+            lines.append(line)
+    marker_re = re.compile(r"\bZL-[A-Z0-9-]+-\d{2,}\b", re.IGNORECASE)
+    marked_lines = [line for line in lines if marker_re.search(line)]
+    if len(marked_lines) >= 2:
+        return [
+            {
+                "label": (marker_re.search(line).group(0) if marker_re.search(line) else line[:50]),
+                "content": line,
+                "source_index": str(idx),
+            }
+            for idx, line in enumerate(marked_lines, start=1)
+        ]
+
+    marker_matches = list(marker_re.finditer(str(content or "")))
+    if len(marker_matches) >= 2:
+        text = str(content or "")
+        parts = []
+        for idx, match in enumerate(marker_matches):
+            start = match.start()
+            end = marker_matches[idx + 1].start() if idx + 1 < len(marker_matches) else len(text)
+            part = text[start:end].strip(" \n\r\t;；,，")
+            if part:
+                parts.append((match.group(0), part))
+        if len(parts) >= 2:
+            return [
+                {"label": marker, "content": part, "source_index": str(idx)}
+                for idx, (marker, part) in enumerate(parts, start=1)
+            ]
+
+    return []
+
+
+def _strong_recall_tokens(query: str) -> List[str]:
+    """Extract stable markers such as ZL-MEM-... for exact recall promotion."""
+    text = str(query or "")
+    tokens: List[str] = []
+    for marker in re.findall(r"\bZL-[A-Z0-9-]+(?:-\d{2,})?\b", text, flags=re.IGNORECASE):
+        if marker not in tokens:
+            tokens.append(marker)
+    for token in re.findall(r"\b[A-Za-z0-9][A-Za-z0-9_-]{2,}\b", text):
+        if len(token) >= 4 and token not in tokens:
+            tokens.append(token)
+    return tokens
+
+
+def _memory_item_search_text(item: Dict[str, Any], node: Any = None) -> str:
+    meta = dict(item.get("metadata") or _node_metadata(node))
+    parts = [
+        item.get("node_id", ""),
+        item.get("graph_memory_id", ""),
+        item.get("label", ""),
+        item.get("content", ""),
+        item.get("summary", ""),
+        getattr(node, "node_id", "") if node is not None else "",
+        getattr(node, "label", "") if node is not None else "",
+        getattr(node, "content", "") if node is not None else "",
+        getattr(node, "content_summary", "") if node is not None else "",
+        json.dumps(meta, ensure_ascii=False, sort_keys=True) if meta else "",
+    ]
+    return " ".join(str(part or "") for part in parts).lower()
+
+
+def _exact_recall_rank(query: str, item: Dict[str, Any], node: Any = None) -> float:
+    search_text = _memory_item_search_text(item, node=node)
+    query_lower = str(query or "").strip().lower()
+    tokens = _strong_recall_tokens(query)
+    has_match = bool(query_lower and query_lower in search_text)
+    if not has_match:
+        has_match = any(token.lower() in search_text for token in tokens)
+    if not has_match:
+        return 0.0
+
+    meta = dict(item.get("metadata") or _node_metadata(node))
+    node_type = _enum_value(item.get("node_type") or item.get("type") or getattr(node, "node_type", ""))
+    source = str(item.get("source") or meta.get("source") or "").lower()
+    node_id = str(item.get("node_id") or getattr(node, "node_id", ""))
+
+    rank = 10.0 + _safe_round(item.get("score", 0.0), 4)
+    if node_type == "knowledge":
+        rank += 5.0
+    if source in {"model_note", "model_note_batch_entry"}:
+        rank += 4.0
+    if meta.get("importance") == "must_remember":
+        rank += 2.0
+    if any(token.lower() in str(item.get("label", "")).lower() for token in tokens):
+        rank += 2.0
+    if node_id.startswith("dialogue:"):
+        rank -= 2.0
+    return rank
+
+
+def _merge_exact_recall_results(
+    mg: Any,
+    query: str,
+    results: List[Dict[str, Any]],
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    """Promote exact marker hits without changing the recall_memory contract."""
+    try:
+        keyword_results = mg.search_nodes(query=query, max_results=max(top_k * 3, 10))
+    except Exception:
+        keyword_results = []
+    if not keyword_results:
+        return results
+
+    ranked = []
+    for item in keyword_results:
+        node_id = item.get("node_id") or item.get("graph_memory_id") or ""
+        node = mg.get_node(node_id) if node_id else None
+        rank = _exact_recall_rank(query, item, node=node)
+        if rank > 0:
+            exact_item = dict(item)
+            exact_item["score"] = max(float(item.get("score", 0.0) or 0.0), rank)
+            exact_item["source"] = "keyword_exact"
+            ranked.append((rank, exact_item))
+    if not ranked:
+        return results
+
+    merged: List[Dict[str, Any]] = []
+    seen = set()
+    for _rank, item in sorted(ranked, key=lambda pair: (-pair[0], str(pair[1].get("node_id", "")))):
+        node_id = item.get("node_id") or item.get("graph_memory_id") or ""
+        if not node_id or node_id in seen:
+            continue
+        seen.add(node_id)
+        merged.append(item)
+    for item in results or []:
+        node_id = item.get("node_id") or item.get("graph_memory_id") or ""
+        if not node_id or node_id in seen:
+            continue
+        seen.add(node_id)
+        merged.append(item)
+    return merged
+
+
 class RecallMemoryTool(BaseTool):
     """recall_memory — 检索记忆
 
@@ -346,13 +521,19 @@ class RecallMemoryTool(BaseTool):
     def execute(self, request: ToolRequest) -> ToolResult:
         start_time = time.time()
         query = request.parameters.get("query", "")
-        top_k = request.parameters.get("top_k", 5)
+        try:
+            top_k = min(max(int(request.parameters.get("top_k", 5) or 5), 1), 20)
+        except (TypeError, ValueError):
+            top_k = 5
         seed_node_id = (
             request.parameters.get("seed_node_id")
             or request.parameters.get("graph_memory_id")
             or request.parameters.get("node_id")
         )
-        expand_depth = min(int(request.parameters.get("expand_depth", 0) or 0), 3)
+        try:
+            expand_depth = min(max(int(request.parameters.get("expand_depth", 0) or 0), 0), 3)
+        except (TypeError, ValueError):
+            expand_depth = 0
 
         if not query:
             return self._create_result(
@@ -381,6 +562,8 @@ class RecallMemoryTool(BaseTool):
             if not results:
                 # 降级到关键词搜索
                 results = mg.search_nodes(query=query, max_results=top_k)
+            else:
+                results = _merge_exact_recall_results(mg, query, list(results or []), top_k)
 
             if seed_node_id:
                 if not mg.has_node(seed_node_id):
@@ -492,11 +675,14 @@ class RecallMemoryTool(BaseTool):
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "要检索的内容描述，如'用户之前提到的项目需求'",
+                    "description": "要检索的内容描述，例如“用户之前提到的项目需求”或“上次讨论的偏好”。",
                 },
                 "top_k": {
                     "type": "integer",
-                    "description": "返回结果数量（默认 5）",
+                    "description": "返回结果数量。",
+                    "default": 5,
+                    "minimum": 1,
+                    "maximum": 20,
                 },
                 "seed_node_id": {
                     "type": "string",
@@ -508,7 +694,10 @@ class RecallMemoryTool(BaseTool):
                 },
                 "expand_depth": {
                     "type": "integer",
-                    "description": "可选：种子增量回忆的 BFS 深度，默认 0，最大 3",
+                    "description": "可选：种子增量回忆的 BFS 深度。",
+                    "default": 0,
+                    "minimum": 0,
+                    "maximum": 3,
                 },
             },
             "required": ["query"],
@@ -537,7 +726,7 @@ class ReadMemoryNodeTool(BaseTool):
 
     def execute(self, request: ToolRequest) -> ToolResult:
         start_time = time.time()
-        node_id = request.parameters.get("node_id", "")
+        node_id = request.parameters.get("node_id", "") or request.parameters.get("graph_memory_id", "")
 
         if not node_id:
             return self._create_result(
@@ -583,7 +772,8 @@ class ReadMemoryNodeTool(BaseTool):
             # 解析后端引用
             backend_content = None
             if getattr(node, "backend_ref", ""):
-                ref_data = mg.resolve_backend_ref(node_id)
+                resolver = getattr(mg, "resolve_backend_ref", None)
+                ref_data = resolver(node_id) if callable(resolver) else None
                 if ref_data:
                     backend_content = ref_data.get("content", "")
 
@@ -652,10 +842,18 @@ class ReadMemoryNodeTool(BaseTool):
             "properties": {
                 "node_id": {
                     "type": "string",
-                    "description": "要读取的节点 ID / graph_memory_id，如 'dialogue:session_xxx' 或 'task:node_xxx'",
+                    "description": "要读取的节点 ID；可直接使用 recall_memory 返回的 graph_memory_id。",
+                },
+                "graph_memory_id": {
+                    "type": "string",
+                    "description": "可选：来自 recall_memory 返回的图记忆地址，等同 node_id。",
                 },
             },
-            "required": ["node_id"],
+            "anyOf": [
+                {"required": ["node_id"]},
+                {"required": ["graph_memory_id"]},
+            ],
+            "required": [],
         }
 
 
@@ -686,6 +884,7 @@ class SaveMemoryNoteTool(BaseTool):
         content = request.parameters.get("content", "")
         label = request.parameters.get("label", "")
         importance = request.parameters.get("importance", "normal")
+        raw_entries = request.parameters.get("entries")
 
         if not content:
             return self._create_result(
@@ -724,64 +923,121 @@ class SaveMemoryNoteTool(BaseTool):
 
             # 创建节点
             now = time.time()
-            node_id = f"note:{int(now * 1000)}"
-            node = GraphNode(
-                node_id=node_id,
-                node_type=NodeType.KNOWLEDGE,
-                label=label,
-                activation=0.8,
-                created_at=now,
-                last_accessed=now,
-                access_count=1,
-                metadata={
-                    "content": content,
-                    "importance": imp_level.value,
-                    "source": "model_note",
-                },
-            )
+            batch_entries = _normalize_batch_memory_entries(content, raw_entries)
+            node_specs = batch_entries or [{
+                "label": label,
+                "content": content,
+                "source_index": "1",
+            }]
+            batch_root_id = ""
+            if batch_entries:
+                batch_root_id = f"note_batch:{int(now * 1000)}"
+                batch_label = label or f"批量记忆 {len(batch_entries)} 条"
+                root_node = GraphNode(
+                    node_id=batch_root_id,
+                    node_type=NodeType.EPISODE,
+                    label=batch_label[:120],
+                    activation=0.8,
+                    created_at=now,
+                    last_accessed=now,
+                    access_count=1,
+                    metadata={
+                        "content": content,
+                        "importance": imp_level.value,
+                        "source": "model_note_batch",
+                        "entry_count": len(batch_entries),
+                    },
+                )
+                mg.add_node(root_node)
+                mg.set_importance(batch_root_id, imp_level)
+                mg.index_summary(batch_root_id, f"{batch_label} {content}"[:1000])
 
-            mg.add_node(node)
-            mg.set_importance(node_id, imp_level)
-
-            # 索引到 FAISS 以支持语义搜索
-            mg.index_summary(node_id, f"{label} {content}")
-
-            # 与当前焦点节点建立关联
             ctx = mg.get_last_focus_context()
-            if ctx and ctx.get("focused_task_node_id"):
-                from zulong.memory.memory_graph import EdgeType
-                mg.add_edge(
-                    ctx["focused_task_node_id"],
-                    node_id,
-                    EdgeType.REFERENCE,
-                    weight=0.6,
+            focus_node_id = (ctx or {}).get("focused_task_node_id")
+
+            created_nodes = []
+            semantic_total = 0
+            from zulong.memory.memory_graph import EdgeType
+            for index, spec in enumerate(node_specs, start=1):
+                item_content = str(spec.get("content") or "").strip()
+                if not item_content:
+                    continue
+                item_label = str(spec.get("label") or label or item_content[:50]).strip()[:120]
+                suffix = f":{index:03d}" if batch_entries else ""
+                node_id = f"note:{int(now * 1000)}{suffix}"
+                node = GraphNode(
+                    node_id=node_id,
+                    node_type=NodeType.KNOWLEDGE,
+                    label=item_label,
+                    activation=0.8,
+                    created_at=now + index * 0.000001,
+                    last_accessed=now,
+                    access_count=1,
+                    metadata={
+                        "content": item_content,
+                        "importance": imp_level.value,
+                        "source": "model_note_batch_entry" if batch_entries else "model_note",
+                        "batch_root_id": batch_root_id,
+                        "batch_index": spec.get("source_index") or str(index),
+                    },
                 )
 
-            logger.info(f"[save_memory_note] 保存节点 {node_id}: {label}")
+                mg.add_node(node)
+                mg.set_importance(node_id, imp_level)
+                mg.index_summary(node_id, f"{item_label} {item_content}")
 
-            # P2-7: 自动语义关联 — 发现与新笔记语义相似的已有节点并建边
-            # 类比：人记下新知识时，大脑自动将其与已有相关记忆建立关联
-            _semantic_count = 0
-            try:
-                sem_neighbors = mg.discover_semantic_neighbors(
-                    node_id, top_k=3, threshold=0.75,
+                if batch_root_id:
+                    mg.add_edge(batch_root_id, node_id, EdgeType.HIERARCHY, weight=1.0, protected=True)
+                if focus_node_id:
+                    mg.add_edge(focus_node_id, node_id, EdgeType.REFERENCE, weight=0.6)
+
+                logger.info(f"[save_memory_note] 保存节点 {node_id}: {item_label}")
+
+                _semantic_count = 0
+                try:
+                    sem_neighbors = mg.discover_semantic_neighbors(
+                        node_id, top_k=3, threshold=0.75,
+                    )
+                    _semantic_count = len(sem_neighbors)
+                except Exception as _sem_err:
+                    logger.debug(f"[save_memory_note] 语义关联跳过: {_sem_err}")
+                semantic_total += _semantic_count
+                node_obj = mg.get_node(node_id)
+                created_nodes.append({
+                    "node_id": node_id,
+                    "graph_memory_id": node_id,
+                    "shard_id": _safe_get_shard_id(mg, node_id, node=node_obj),
+                    "full_path": node_id,
+                    "memory_address": _build_memory_address(mg, node_id, node=node_obj),
+                    "label": item_label,
+                    "importance": imp_level.value,
+                    "semantic_links": _semantic_count,
+                })
+
+            if not created_nodes:
+                return self._create_result(
+                    success=False,
+                    error="未解析到可保存的记忆内容",
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
                 )
-                _semantic_count = len(sem_neighbors)
-            except Exception as _sem_err:
-                logger.debug(f"[save_memory_note] 语义关联跳过: {_sem_err}")
 
+            primary = created_nodes[0]
             return self._create_result(
                 success=True,
                 data={
-                    "node_id": node_id,
-                    "graph_memory_id": node_id,
-                    "shard_id": _safe_get_shard_id(mg, node_id, node=mg.get_node(node_id)),
-                    "full_path": node_id,
-                    "memory_address": _build_memory_address(mg, node_id, node=mg.get_node(node_id)),
-                    "label": label,
+                    "node_id": primary["node_id"],
+                    "graph_memory_id": primary["graph_memory_id"],
+                    "shard_id": primary["shard_id"],
+                    "full_path": primary["full_path"],
+                    "memory_address": primary["memory_address"],
+                    "label": primary["label"],
                     "importance": imp_level.value,
-                    "semantic_links": _semantic_count,
-                    "message": "笔记已保存到记忆图",
+                    "semantic_links": semantic_total,
+                    "created_count": len(created_nodes),
+                    "batch_root_id": batch_root_id,
+                    "nodes": created_nodes,
+                    "message": f"已保存 {len(created_nodes)} 条记忆到记忆图",
                 },
                 execution_time=time.time() - start_time,
                 request_id=request.request_id,
@@ -813,6 +1069,17 @@ class SaveMemoryNoteTool(BaseTool):
                     "enum": ["trivial", "normal", "identity", "fact", "important", "must_remember"],
                     "description": "重要性级别（默认 normal）",
                 },
+                "entries": {
+                    "type": "array",
+                    "description": "可选：批量记忆条目；每项可为字符串或包含 label/content 的对象",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string", "description": "条目标签"},
+                            "content": {"type": "string", "description": "条目内容"},
+                        },
+                    },
+                },
             },
             "required": ["content"],
         }
@@ -842,7 +1109,10 @@ class DiscoverRelatedTool(BaseTool):
     def execute(self, request: ToolRequest) -> ToolResult:
         start_time = time.time()
         node_id = request.parameters.get("node_id", "") or request.parameters.get("graph_memory_id", "")
-        max_depth = request.parameters.get("max_depth", 2)
+        try:
+            max_depth = min(max(int(request.parameters.get("max_depth", 2) or 2), 1), 3)
+        except (TypeError, ValueError):
+            max_depth = 2
 
         if not node_id:
             return self._create_result(
@@ -938,18 +1208,25 @@ class DiscoverRelatedTool(BaseTool):
             "properties": {
                 "node_id": {
                     "type": "string",
-                    "description": "起始节点 ID",
+                    "description": "起始节点 ID；可直接使用 recall_memory 返回的 graph_memory_id。",
                 },
                 "graph_memory_id": {
                     "type": "string",
-                    "description": "可选：来自 recall_memory 返回的图记忆地址，等同 node_id",
+                    "description": "可选：来自 recall_memory 返回的图记忆地址，等同 node_id。",
                 },
                 "max_depth": {
                     "type": "integer",
-                    "description": "图遍历最大深度（默认 2，最大 3）",
+                    "description": "图遍历最大深度。",
+                    "default": 2,
+                    "minimum": 1,
+                    "maximum": 3,
                 },
             },
-            "required": ["node_id"],
+            "anyOf": [
+                {"required": ["node_id"]},
+                {"required": ["graph_memory_id"]},
+            ],
+            "required": [],
         }
 
 
@@ -1592,7 +1869,7 @@ class DeleteMemoryNodeTool(BaseTool):
                         if node:
                             preview.append({
                                 "node_id": nid,
-                                "type": node.node_type.value,
+                                "type": _node_type_value(node),
                                 "label": node.label,
                             })
                     return self._create_result(
@@ -1622,8 +1899,8 @@ class DeleteMemoryNodeTool(BaseTool):
                     continue
 
                 # 安全防护：identity 级别节点不可删除
-                imp = mg.get_importance(nid)
-                if imp and imp == Importance.IDENTITY:
+                imp = _safe_get_importance(mg, node)
+                if imp == Importance.IDENTITY.value:
                     protected.append({
                         "node_id": nid,
                         "label": node.label,
@@ -1636,7 +1913,7 @@ class DeleteMemoryNodeTool(BaseTool):
                 if ok:
                     deleted.append({
                         "node_id": nid,
-                        "type": node.node_type.value,
+                        "type": _node_type_value(node),
                         "label": node.label,
                     })
                     # 如果是任务节点，同步从 TaskGraph 中移除
@@ -1658,6 +1935,38 @@ class DeleteMemoryNodeTool(BaseTool):
                 f"[delete_memory_node] 删除 {len(deleted)} 个节点，"
                 f"保护 {len(protected)} 个，未找到 {len(not_found)} 个"
             )
+            if deleted:
+                try:
+                    from zulong.core.event_bus import event_bus
+                    from zulong.core.types import EventPriority, EventType, ZulongEvent
+
+                    deleted_ids = [item["node_id"] for item in deleted if item.get("node_id")]
+                    event_bus.publish(ZulongEvent(
+                        type=EventType.MEMORY_GRAPH_UPDATED,
+                        priority=EventPriority.LOW,
+                        source="delete_memory_node",
+                        payload={
+                            "update_type": "delta",
+                            "ts": time.time(),
+                            "nodes": [],
+                            "edges": [],
+                            "changes": [
+                                {"action": "remove_node", "data": {"id": node_id}}
+                                for node_id in deleted_ids
+                            ],
+                            "changed_node_ids": deleted_ids,
+                            "deleted_node_ids": deleted_ids,
+                            "stats": {
+                                "transport": "delta",
+                                "changed_nodes": len(deleted_ids),
+                                "changed_edges": 0,
+                            },
+                        },
+                    ))
+                except Exception as _event_err:
+                    logger.debug(
+                        f"[delete_memory_node] MemoryGraph 删除事件发布跳过: {_event_err}"
+                    )
 
             return self._create_result(
                 success=True,

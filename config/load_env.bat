@@ -25,6 +25,8 @@ set ZULONG_OLLAMA_API_KEY=EMPTY
 REM L2 推理配置
 set ZULONG_L2_CORE_MODEL=%ZULONG_OLLAMA_MODEL_ID%
 set ZULONG_L2_BACKUP_MODEL=%ZULONG_OLLAMA_BACKUP_MODEL_ID%
+set ZULONG_L2_BACKUP_BASE_URL=%ZULONG_OLLAMA_BASE_URL%
+set ZULONG_L2_BACKUP_API_KEY=%ZULONG_OLLAMA_API_KEY%
 set ZULONG_L2_MAX_TOKENS=1024
 set ZULONG_L2_TEMPERATURE=0.3
 set ZULONG_L2_TOP_P=0.85
@@ -43,16 +45,13 @@ set ZULONG_RAG_ENABLED=true
 set ZULONG_RAG_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
 
 REM 工具系统配置
-set ZULONG_OPENCLAW_ENABLED=true
-set ZULONG_OPENCLAW_API_URL=http://localhost:3000
-set ZULONG_OPENCLAW_WEBSOCKET_URL=ws://localhost:5555
 set ZULONG_WEB_SEARCH_ENABLED=true
 
 REM Web 服务配置
-set ZULONG_API_HOST=localhost
-set ZULONG_API_PORT=3000
-set ZULONG_WEBSOCKET_HOST=localhost
-set ZULONG_WEBSOCKET_PORT=5555
+set ZULONG_API_HOST=127.0.0.1
+set ZULONG_API_PORT=8090
+set ZULONG_WEBSOCKET_HOST=127.0.0.1
+set ZULONG_WEBSOCKET_PORT=8090
 
 REM 安全配置
 set ZULONG_API_KEY=zulong-default-key-change-in-production
@@ -70,6 +69,7 @@ echo   - LLM 后端：%ZULONG_LLM_BACKEND%
 echo   - Ollama 地址：%ZULONG_OLLAMA_BASE_URL%
 echo   - 核心模型：%ZULONG_L2_CORE_MODEL%
 echo   - 备用模型：%ZULONG_L2_BACKUP_MODEL%
+echo   - 备用模型地址：%ZULONG_L2_BACKUP_BASE_URL%
 echo   - 环境：%ZULONG_ENV%
 echo ================================================================
 
@@ -84,7 +84,7 @@ if exist "config\.env" (
                 for /f "tokens=1,* delims==" %%b in ("!line!") do (
                     endlocal
                     set "%%b=%%c"
-                    echo   [加载] %%b=%%c
+                    echo   [加载] %%b
                     setlocal enabledelayedexpansion
                 )
             )
@@ -95,6 +95,12 @@ if exist "config\.env" (
 ) else (
     echo [INFO] 未找到 config\.env 文件，使用默认配置
 )
+
+REM 兼容仍读取旧 LLM_*_BACKUP 命名的模块
+if not defined LLM_MODEL_ID_BACKUP set "LLM_MODEL_ID_BACKUP=%ZULONG_L2_BACKUP_MODEL%"
+if not defined LLM_BASE_URL_BACKUP set "LLM_BASE_URL_BACKUP=%ZULONG_L2_BACKUP_BASE_URL%"
+if not defined LLM_API_KEY_BACKUP set "LLM_API_KEY_BACKUP=%ZULONG_L2_BACKUP_API_KEY%"
+if not defined USE_VLLM_FOR_L2_BACKUP set "USE_VLLM_FOR_L2_BACKUP=false"
 
 echo ================================================================
 echo 环境变量加载完成！

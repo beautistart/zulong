@@ -32,7 +32,7 @@ class WebSearchTool(BaseTool):
         super().__init__(name="web_search", category=ToolCategory.NETWORK)
         self.description = (
             "联网搜索工具。当需要查询实时信息、最新新闻、技术文档、百科知识等"
-            "互联网内容时使用。参数：query（搜索关键词），count（结果数量，默认 5）"
+            "互联网内容时使用。"
         )
         self.searxng_url = searxng_url
         self.language = language
@@ -141,11 +141,14 @@ class WebSearchTool(BaseTool):
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "搜索关键词",
+                    "description": "搜索关键词或自然语言查询。",
                 },
                 "count": {
                     "type": "integer",
-                    "description": "返回结果数量，1-20，默认 5",
+                    "description": "返回结果数量。",
+                    "default": 5,
+                    "minimum": 1,
+                    "maximum": 20,
                 },
             },
             "required": ["query"],

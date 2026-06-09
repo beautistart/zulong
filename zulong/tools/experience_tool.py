@@ -59,18 +59,29 @@ class SearchExperienceTool(BaseTool):
                 request_id=request.request_id,
             )
 
-        if self._rag_manager is None:
-            return self._create_result(
-                success=False,
-                error="RAGManager 未初始化，经验库不可用",
-                execution_time=time.time() - start_time,
-                request_id=request.request_id,
-            )
-
         try:
-            results = self._rag_manager.search("experience", query, top_k=top_k)
+            results = []
+            if self._rag_manager is not None:
+                results = self._rag_manager.search("experience", query, top_k=top_k)
 
             if not results:
+                fallback_docs = self._search_enhanced_store(query, top_k)
+                if fallback_docs:
+                    logger.info(
+                        f"[SearchExperienceTool] query='{query[:40]}' -> "
+                        f"found {len(fallback_docs)} enhanced docs"
+                    )
+                    return self._create_result(
+                        success=True,
+                        data={
+                            "message": f"找到 {len(fallback_docs)} 条相关经验",
+                            "docs_found": len(fallback_docs),
+                            "documents": fallback_docs,
+                            "source": "enhanced_experience_store",
+                        },
+                        execution_time=time.time() - start_time,
+                        request_id=request.request_id,
+                    )
                 return self._create_result(
                     success=True,
                     data={
@@ -117,6 +128,29 @@ class SearchExperienceTool(BaseTool):
                 execution_time=time.time() - start_time,
                 request_id=request.request_id,
             )
+
+    def _search_enhanced_store(self, query: str, top_k: int) -> list:
+        """Fallback to the task experience store when ExperienceRAG is not hydrated."""
+        try:
+            from zulong.memory.enhanced_experience_store import get_enhanced_experience_store
+
+            store = get_enhanced_experience_store()
+            experiences = store.search_by_text(query, limit=max(1, int(top_k or 3)))
+        except Exception as exc:
+            logger.debug(f"[SearchExperienceTool] 增强经验库回退检索跳过: {exc}")
+            return []
+
+        docs = []
+        for exp in experiences[:top_k]:
+            content = getattr(exp, "content", "")
+            docs.append({
+                "doc_id": getattr(exp, "id", ""),
+                "content": content[:800] if content else "",
+                "similarity": None,
+                "experience_type": getattr(exp, "experience_type", ""),
+                "tags": list(getattr(exp, "tags", []) or [])[:8],
+            })
+        return docs
 
     def _get_parameters_schema(self) -> Dict[str, Any]:
         return {

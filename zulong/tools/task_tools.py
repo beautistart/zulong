@@ -16,6 +16,7 @@ import json
 import asyncio
 import threading
 import re
+from pathlib import Path
 from difflib import SequenceMatcher
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -23,7 +24,11 @@ from .base import BaseTool, ToolCategory, ToolRequest, ToolResult
 
 logger = logging.getLogger(__name__)
 
-# 当前活跃的 TaskGraph（模块级单例，模型按需创建）
+# 按 workspace 隔离的任务图字典（修复跨窗口污染问题）
+_workspace_task_graphs: Dict[str, Any] = {}
+_workspace_graph_ids: Dict[str, str] = {}
+
+# 向后兼容的全局单例（内部调用无 workspace 上下文时使用）
 _active_task_graph = None
 _active_graph_id = None
 _active_workspace_dir = None  # 当前活跃任务的工作目录绝对路径
@@ -31,6 +36,50 @@ _active_graph_lock = threading.RLock()
 
 # 任务图磁盘备份目录
 _GRAPH_BACKUP_DIR = os.path.join(".", "data", "graph_backups")
+
+
+def normalize_task_graph_id(value: Any) -> str:
+    """Normalize TaskGraph identifiers and addresses to the runtime graph id.
+
+    Accepted examples:
+    - tg_1780901327
+    - tg:tg_1780901327
+    - tg:1780901327
+    - tg:tg_1780901327/task:o1
+    """
+    raw = str(value or "").strip().strip("`'\" ")
+    if not raw:
+        return ""
+    raw = raw.replace("\\", "/")
+    match = re.search(r"\btg_\d+\b", raw)
+    if match:
+        return match.group(0)
+    head = raw.split("/", 1)[0].strip()
+    if head.startswith("tg:"):
+        head = head[3:].strip()
+    elif head.startswith("task:"):
+        head = head[5:].strip()
+    head = head.strip()
+    if head.startswith("tg_"):
+        return head
+    if re.fullmatch(r"\d{6,}", head):
+        return f"tg_{head}"
+    return head
+
+
+def normalize_task_graph_address(value: Any, default_node_id: str = "req") -> str:
+    """Return a canonical MemoryGraph task address for a TaskGraph reference."""
+    raw = str(value or "").strip().strip("`'\" ").replace("\\", "/")
+    graph_id = normalize_task_graph_id(raw)
+    if not graph_id:
+        return ""
+    node_id = str(default_node_id or "req").strip() or "req"
+    if "/" in raw:
+        tail = raw.split("/", 1)[1].strip()
+        if tail:
+            first = tail.split("/", 1)[0].strip()
+            node_id = first[5:] if first.startswith("task:") else first
+    return f"tg:{graph_id}/task:{node_id}"
 
 # ─── 守卫常量 ─────────────────────────────────────────────
 DUPLICATE_LABEL_THRESHOLD = 0.65   # bigram Jaccard 阈值，>=此值视为重复
@@ -105,6 +154,167 @@ def _label_similarity(a: str, b: str) -> float:
     return intersection / union if union > 0 else 0.0
 
 
+_WINDOWS_ABS_PATH_RE = re.compile(r"(?P<path>[A-Za-z]:[\\/][A-Za-z0-9_.$~ (){}\[\]\-\\/]+)")
+_POSIX_ABS_PATH_RE = re.compile(r"(?P<path>/(?:[^，。；;,\n\r\"'`]+))")
+_EXPLICIT_WORKSPACE_PATH_RE = re.compile(
+    r"(?:工作区|工作目录|项目目录|项目文件夹|workspace|project\s+dir|project\s+directory)"
+    r"\s*(?:为|是|:|：)?\s*"
+    r"(?P<path>[A-Za-z]:[\\/][A-Za-z0-9_.$~ (){}\[\]\-\\/]+|/(?:[^，。；;,\n\r\"'`]+))",
+    re.IGNORECASE,
+)
+_PROJECT_NAME_PATTERNS = (
+    re.compile(r"(?:项目文件夹|项目目录|文件夹|目录)\s*[“\"'](?P<name>[^”\"']{1,80})[”\"']"),
+    re.compile(r"以\s*[“\"'](?P<name>[^”\"']{1,80})[”\"']\s*为项目"),
+    re.compile(r"创建(?:一个)?(?:项目文件夹|项目目录|文件夹|目录)\s*(?P<name>[\w\-\u4e00-\u9fff]{1,80})"),
+    re.compile(r"(?:项目文件夹|项目目录|文件夹|目录)\s*(?P<name>[A-Za-z][A-Za-z0-9_-]{0,79})"),
+)
+_PATH_TRAILING_ACTION_RE = re.compile(
+    r"(?i)(?:\.\s+|\s+)(?=(?:write|create|make|implement|add|run|final|then|please|package|pkg|module|file|files|test|tests)\b)"
+)
+
+
+def _trim_inferred_path_candidate(candidate: str) -> str:
+    """Trim natural-language action text accidentally captured after a path."""
+    cleaned = str(candidate or "").strip().strip("“”\"'` ")
+    cleaned = re.split(_PATH_TRAILING_ACTION_RE, cleaned, maxsplit=1)[0].strip()
+    return cleaned.rstrip("\\/")
+
+
+def _normalize_path_for_match(path_value: str) -> str:
+    try:
+        return str(Path(str(path_value or "")).resolve()).lower().replace("/", "\\")
+    except Exception:
+        return str(path_value or "").lower().replace("/", "\\")
+
+
+def _task_graph_leaf_counts(tg) -> Tuple[int, int]:
+    try:
+        leaves = [
+            n for n in tg.get_leaf_nodes()
+            if getattr(n, "id", "") != "req"
+            and not getattr(n, "id", "").startswith("crg_")
+        ]
+        unfinished = [
+            n for n in leaves
+            if getattr(n, "status", "") not in ("completed", "skipped")
+        ]
+        return len(leaves), len(unfinished)
+    except Exception:
+        return 0, 0
+
+
+def _score_suspend_candidate(state, query: str, workspace_hint: str = "") -> float:
+    text = f"{getattr(state, 'description', '')} {getattr(getattr(state, 'task_graph', None), 'title', '')}".lower()
+    query_clean = str(query or "").lower().strip()
+    score = float(getattr(state, "suspended_at", 0) or 0) / 1_000_000_000.0
+
+    if query_clean:
+        if query_clean in text:
+            score += 10.0
+        elif any(token and token in text for token in re.split(r"\s+", query_clean)):
+            score += 4.0
+        else:
+            score += SequenceMatcher(None, query_clean, text).ratio() * 3.0
+
+    tg = getattr(state, "task_graph", None)
+    if tg:
+        leaves, unfinished = _task_graph_leaf_counts(tg)
+        if unfinished > 0:
+            score += 5.0
+        if leaves > 0:
+            score += min(3.0, max(0.0, (leaves - unfinished) / leaves * 3.0))
+        workspace = getattr(tg, "metadata", {}).get("workspace_dir", "")
+        if workspace_hint and workspace:
+            if _normalize_path_for_match(workspace) == _normalize_path_for_match(workspace_hint):
+                score += 8.0
+
+    return score
+
+
+def _clean_project_folder_name(name: str) -> str:
+    cleaned = str(name or "").strip().strip("“”\"'` ")
+    cleaned = re.split(r"[，。；;,\s]", cleaned)[0].strip()
+    return cleaned.rstrip(".。")
+
+
+def infer_project_workspace_hint(text: str) -> Tuple[str, str]:
+    """Infer explicit parent path and project folder name from a user request.
+
+    The parser only preserves concrete placement constraints such as
+    "在 D:/AI/project 下创建项目文件夹 mao"; L2 still owns planning.
+    """
+    raw = str(text or "")
+    target_path = ""
+    project_name = ""
+
+    workspace_match = _EXPLICIT_WORKSPACE_PATH_RE.search(raw)
+    if workspace_match:
+        candidate = _trim_inferred_path_candidate(workspace_match.group("path"))
+        candidate = re.sub(r"(?:下|中|里|作为|创建).*$", "", candidate).strip()
+        final_path = Path(candidate.rstrip("\\/"))
+        if final_path.name:
+            return str(final_path.parent), _clean_project_folder_name(final_path.name)
+
+    path_match = _WINDOWS_ABS_PATH_RE.search(raw) or _POSIX_ABS_PATH_RE.search(raw)
+    if path_match:
+        candidate = _trim_inferred_path_candidate(path_match.group("path"))
+        candidate = re.sub(r"(?:文件夹|目录|下|中|里|作为|为|创建).*$", "", candidate).strip()
+        target_path = candidate.rstrip("\\/")
+
+    for pattern in _PROJECT_NAME_PATTERNS:
+        match = pattern.search(raw)
+        if match:
+            project_name = _clean_project_folder_name(match.group("name"))
+            if project_name:
+                break
+
+    if target_path and not project_name:
+        try:
+            final_path = Path(target_path)
+            if final_path.name:
+                return str(final_path.parent), _clean_project_folder_name(final_path.name)
+        except Exception:
+            pass
+
+    if target_path and project_name:
+        try:
+            final_path = Path(target_path) / project_name
+            if final_path.exists():
+                target_path = str(final_path.parent)
+        except Exception:
+            pass
+
+    return target_path, project_name
+
+
+def _explicit_recreate_requested(text: str) -> bool:
+    """Whether the user explicitly chose a fresh task over old task recovery."""
+    raw = str(text or "").lower()
+    if not raw:
+        return False
+    recreate_cues = (
+        "全新任务",
+        "新任务",
+        "重新创建",
+        "重新新建",
+        "删除旧任务",
+        "丢弃旧任务",
+        "不要恢复",
+        "不恢复",
+        "不是恢复",
+        "重新开始",
+        "已明确选择删除旧任务",
+        "delete old task",
+        "discard old task",
+        "do not resume",
+        "don't resume",
+        "fresh task",
+        "new task",
+        "recreate",
+    )
+    return any(cue in raw for cue in recreate_cues)
+
+
 def _extract_title_core(title: str) -> str:
     """从任务标题中提取核心主题词。"""
     s = (title or "").strip()
@@ -161,6 +371,74 @@ def _titles_related(old_title: str, new_title: str) -> bool:
     if union == 0:
         return False
     return (len(bigrams_a & bigrams_b) / union) >= 0.3
+
+
+def _graph_workspace_health(tg, workspace_dir: Optional[str]) -> Dict[str, Any]:
+    """检查活跃任务图绑定的工作目录是否仍可用于继续任务。"""
+    health: Dict[str, Any] = {
+        "ok": True,
+        "workspace_dir": workspace_dir or "",
+        "missing": [],
+        "reason": "",
+    }
+    if not workspace_dir:
+        return health
+
+    workspace = Path(workspace_dir)
+    if not workspace.exists() or not workspace.is_dir():
+        health.update({
+            "ok": False,
+            "reason": f"任务工作目录不存在: {workspace_dir}",
+            "missing": [workspace_dir],
+        })
+        return health
+
+    try:
+        completed_nodes = [
+            node for node in getattr(tg, "_nodes", {}).values()
+            if getattr(node, "status", "") == "completed"
+        ]
+        user_files = [
+            p for p in workspace.rglob("*")
+            if p.is_file() and ".zulong" not in p.parts and ".zlong" not in p.parts
+        ]
+        if completed_nodes and not user_files:
+            health.update({
+                "ok": False,
+                "reason": "任务图已有完成节点，但工作目录里没有可见项目文件",
+                "missing": ["project_files"],
+            })
+            return health
+
+        mentioned_files = set()
+        file_re = re.compile(r"(?<![\w./\\-])([\w.-]+\.(?:html|css|js|ts|tsx|jsx|json|md|py|txt|png|jpg|jpeg|webp|svg|yml|yaml))(?![\w./\\-])", re.IGNORECASE)
+        for node in completed_nodes:
+            text = "\n".join(
+                str(value or "")
+                for value in (
+                    getattr(node, "label", ""),
+                    getattr(node, "desc", ""),
+                    getattr(node, "result", ""),
+                )
+            )
+            for match in file_re.finditer(text):
+                mentioned_files.add(match.group(1))
+
+        missing_files = []
+        existing_names = {p.name.lower() for p in user_files}
+        for filename in sorted(mentioned_files):
+            if filename.lower() not in existing_names:
+                missing_files.append(filename)
+        if missing_files:
+            health.update({
+                "ok": False,
+                "reason": "任务图记录中已完成的文件在工作目录中缺失",
+                "missing": missing_files[:20],
+            })
+    except Exception as exc:
+        logger.debug(f"[task_create_plan] 工作目录健康检查跳过: {exc}")
+
+    return health
 
 
 def _extract_ordinal(text: str) -> Optional[int]:
@@ -250,6 +528,139 @@ def _fuzzy_resolve_node_id(tg, raw_id: str) -> Tuple[Optional[str], float, str]:
     return (None, 0.0, "no_match")
 
 
+def _is_user_task_node(node) -> bool:
+    """任务执行节点过滤：CRG/code graph 节点不参与完成度和归档判断。"""
+    node_id = str(getattr(node, "id", "") or "")
+    return bool(node_id) and node_id != "req" and not node_id.startswith("crg_")
+
+
+def _user_leaf_nodes(tg) -> List[Any]:
+    try:
+        return [n for n in tg.get_leaf_nodes() if _is_user_task_node(n)]
+    except Exception:
+        return []
+
+
+def _compact_semantic_summary(text: str, limit: int = 500) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit].rstrip()
+
+
+def _find_or_create_summary_node(tg):
+    """找到或创建任务总结节点，承载最终答案的结构化投射。"""
+    try:
+        for node in getattr(tg, "_nodes", {}).values():
+            metadata = getattr(node, "metadata", {}) or {}
+            if metadata.get("role") == "final_summary":
+                return node
+
+        summary_id = "summary"
+        if tg.get_node(summary_id):
+            idx = 2
+            while tg.get_node(f"summary_{idx}"):
+                idx += 1
+            summary_id = f"summary_{idx}"
+
+        node = tg.add_node(
+            id=summary_id,
+            label="任务总结",
+            type="summary",
+            status="completed",
+            desc="本轮任务最终总结",
+            result="",
+        )
+        node.metadata["role"] = "final_summary"
+        node.metadata["source"] = "submit_final_answer"
+        tg.add_h_edge("req", summary_id)
+        return node
+    except Exception as e:
+        logger.warning("[TaskGraph] 创建总结节点失败（非致命）: %s", e)
+        return None
+
+
+def _sync_task_graph_to_memory(tg) -> None:
+    """将完整 TaskGraph 投射到 MemoryGraph，确保新增总结节点也能进入图记忆。"""
+    try:
+        from zulong.memory.memory_graph import get_memory_graph
+        from zulong.memory.graph_adapters import TaskGraphAdapter
+        mg = get_memory_graph()
+        if mg is not None:
+            TaskGraphAdapter().sync(mg, tg)
+    except Exception as e:
+        logger.debug("[TaskGraph] MemoryGraph 全量同步跳过: %s", e)
+
+
+def _persist_task_graph_backup(tg) -> None:
+    try:
+        graph_id = normalize_task_graph_id(getattr(tg, "id", "")) or _active_graph_id
+        if graph_id:
+            _backup_graph_to_disk(tg, graph_id)
+    except Exception as e:
+        logger.debug("[TaskGraph] 备份跳过: %s", e)
+
+
+def _write_final_answer_to_task_graph(tg, answer: str, source: str = "submit_final_answer") -> bool:
+    """把最终答案同时写入根节点和总结节点，并同步到 MemoryGraph。"""
+    answer = str(answer or "").strip()
+    if tg is None or not answer:
+        return False
+
+    summary = _compact_semantic_summary(answer)
+    updated = False
+
+    try:
+        root = tg.get_node("req")
+        if root is not None:
+            root.status = "completed"
+            root.result = answer
+            root.semantic_summary = summary
+            root.analysis_content = answer
+            root.metadata["role"] = "task_root"
+            root.metadata["final_answer_length"] = len(answer)
+            root.metadata["final_answer_updated_at"] = time.time()
+            root.metadata["final_answer_source"] = source
+            updated = True
+
+        summary_node = _find_or_create_summary_node(tg)
+        if summary_node is not None:
+            summary_node.status = "completed"
+            summary_node.result = answer
+            summary_node.semantic_summary = summary
+            summary_node.analysis_content = answer
+            summary_node.desc = summary_node.desc or "本轮任务最终总结"
+            summary_node.metadata["role"] = "final_summary"
+            summary_node.metadata["source"] = source
+            summary_node.metadata["final_answer_length"] = len(answer)
+            summary_node.metadata["final_answer_updated_at"] = time.time()
+            updated = True
+
+        if updated:
+            try:
+                tg._mark_dirty()
+            except Exception:
+                pass
+            _sync_task_graph_to_memory(tg)
+            _persist_task_graph_backup(tg)
+            if getattr(tg, "on_change_callback", None):
+                tg.on_change_callback("final_answer_update", {
+                    "node_id": "req",
+                    "summary_node_id": getattr(summary_node, "id", ""),
+                    "answer_length": len(answer),
+                    "source": source,
+                })
+            logger.info(
+                "[TaskGraph] 最终答案已写入根节点和总结节点: graph=%s len=%s",
+                getattr(tg, "id", ""),
+                len(answer),
+            )
+        return updated
+    except Exception as e:
+        logger.warning("[TaskGraph] 写入最终答案失败（非致命）: %s", e)
+        return False
+
+
 def _auto_archive_completed(tg):
     """将已完成的任务图归档到 completed_tasks（幂等，重复调用安全）"""
     try:
@@ -259,11 +670,33 @@ def _auto_archive_completed(tg):
         root = tg.get_node("req")
         description = root.label if root else getattr(tg, 'title', '未命名任务')
         graph_id = getattr(tg, 'id', '') or _active_graph_id or f"tg_{int(time.time())}"
+        root_result = str(getattr(root, "result", "") or "").strip() if root else ""
+        if not root or getattr(root, "status", "") != "completed" or not root_result:
+            logger.info(
+                "[TaskArchive] 跳过自动归档: %s 根节点尚无最终总结",
+                graph_id,
+            )
+            return
+
+        leaves = _user_leaf_nodes(tg)
+        unfinished = [
+            n for n in leaves
+            if getattr(n, "status", "") not in ("completed", "skipped")
+        ]
+        if leaves and unfinished:
+            logger.warning(
+                "[TaskArchive] 跳过自动归档: %s 仍有 %s/%s 个叶子节点未完成: %s",
+                graph_id,
+                len(unfinished),
+                len(leaves),
+                ", ".join(f"{n.id}({n.label})" for n in unfinished[:5]),
+            )
+            return
 
         archive = CompletedTaskArchive(
             task_id=graph_id,
             description=description,
-            final_answer=(root.result or "") if root else "",
+            final_answer=root_result,
             duration=(time.time() - getattr(tg, "created_at", time.time())) if hasattr(tg, "created_at") else 0,
             total_turns=tg.metadata.get("total_turns", 0) if hasattr(tg, "metadata") else 0,
             completion_status="completed",
@@ -278,9 +711,16 @@ def _auto_archive_completed(tg):
         logger.warning(f"[TaskArchive] 自动归档失败（非致命）: {e}")
 
 
-def get_active_task_graph():
-    """获取当前活跃的 TaskGraph"""
+def get_active_task_graph(workspace_dir=None):
+    """获取当前活跃的 TaskGraph
+    
+    Args:
+        workspace_dir: 可选，传入时返回该 workspace 专属图谱，避免跨窗口污染
+    """
     with _active_graph_lock:
+        if workspace_dir:
+            key = os.path.abspath(workspace_dir)
+            return _workspace_task_graphs.get(key)
         return _active_task_graph
 
 
@@ -290,13 +730,269 @@ def get_active_workspace_dir():
         return _active_workspace_dir
 
 
+def _normalize_workspace_dir(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    try:
+        return os.path.abspath(os.path.normpath(os.path.expanduser(os.path.expandvars(str(value)))))
+    except Exception:
+        return str(value or "").strip()
+
+
+def _infer_workspace_from_file_refs(tg) -> str:
+    """Infer a task workspace from absolute file attachments."""
+    candidates: List[str] = []
+    try:
+        for node in getattr(tg, "_nodes", {}).values():
+            for ref in getattr(node, "files", []) or []:
+                ref_path = str(getattr(ref, "path", "") or "").strip()
+                if not ref_path or not os.path.isabs(ref_path):
+                    continue
+                target = Path(_normalize_workspace_dir(ref_path))
+                if target.exists() and target.is_dir():
+                    candidates.append(str(target))
+                else:
+                    candidates.append(str(target.parent))
+    except Exception:
+        return ""
+
+    existing_dirs = []
+    for candidate in candidates:
+        try:
+            path = Path(candidate)
+            if path.exists() and path.is_dir():
+                existing_dirs.append(str(path.resolve()))
+        except Exception:
+            continue
+    if not existing_dirs:
+        return ""
+
+    try:
+        common = os.path.commonpath(existing_dirs)
+        if common and os.path.isdir(common):
+            return _normalize_workspace_dir(common)
+    except Exception:
+        pass
+    return _normalize_workspace_dir(existing_dirs[0])
+
+
+def _infer_workspace_from_project_registry(graph_id: str) -> str:
+    graph_id = normalize_task_graph_id(graph_id)
+    if not graph_id:
+        return ""
+    try:
+        from zulong.workspace.project_registry import get_project_registry
+        project = get_project_registry().get_project_by_graph_id(graph_id)
+        if project and project.path:
+            workspace = _normalize_workspace_dir(project.path)
+            if os.path.isdir(workspace):
+                return workspace
+    except Exception:
+        pass
+    return ""
+
+
+def _resolve_task_workspace_dir(tg, graph_id: str = "", workspace_dir: Optional[str] = None) -> str:
+    """Resolve and persist the workspace bound to a TaskGraph."""
+    graph_id = normalize_task_graph_id(graph_id or getattr(tg, "id", "") or getattr(tg, "graph_id", ""))
+    candidates = [
+        workspace_dir,
+        getattr(tg, "metadata", {}).get("workspace_dir", "") if tg is not None else "",
+        _infer_workspace_from_project_registry(graph_id),
+        _infer_workspace_from_file_refs(tg) if tg is not None else "",
+    ]
+
+    # Preserve the current binding only for the same graph.
+    try:
+        if graph_id and graph_id == _active_graph_id:
+            candidates.append(_active_workspace_dir)
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        workspace = _normalize_workspace_dir(candidate)
+        if not workspace:
+            continue
+        if os.path.isdir(workspace):
+            if tg is not None:
+                try:
+                    tg.metadata["workspace_dir"] = workspace
+                except Exception:
+                    pass
+            return workspace
+    return ""
+
+
+_OUTPUT_FILE_RE = re.compile(
+    r"(?<![\w.-])([A-Za-z0-9][A-Za-z0-9_\-]*(?:\.[A-Za-z0-9][A-Za-z0-9_\-]{0,10})+)(?![\w.-])"
+)
+_OUTPUT_FILE_EXTENSIONS = {
+    ".html", ".css", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+    ".py", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".xml",
+    ".svg", ".png", ".jpg", ".jpeg", ".webp", ".ico", ".csv", ".sql",
+    ".sh", ".ps1", ".bat", ".cmd", ".env", ".ini", ".scss", ".less",
+    ".vue", ".svelte", ".java", ".go", ".rs", ".c", ".cpp", ".h", ".cs",
+    ".php", ".rb",
+}
+
+
+def _expected_output_files_for_node(node) -> List[str]:
+    """Extract explicit file outputs promised by a task node label/desc."""
+    text = f"{getattr(node, 'label', '')}\n{getattr(node, 'desc', '')}"
+    seen: set[str] = set()
+    files: List[str] = []
+    for match in _OUTPUT_FILE_RE.finditer(text):
+        name = match.group(1).strip()
+        suffix = Path(name).suffix.lower()
+        if suffix not in _OUTPUT_FILE_EXTENSIONS:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        files.append(name)
+    return files
+
+
+def _file_ref_matches_expected(ref, expected_name: str, workspace: Optional[Path]) -> bool:
+    ref_path = str(getattr(ref, "path", "") or "").strip()
+    ref_name = str(getattr(ref, "name", "") or os.path.basename(ref_path)).strip()
+    if not ref_path:
+        return False
+
+    expected_norm = expected_name.replace("\\", "/").lower()
+    ref_name_norm = ref_name.replace("\\", "/").lower()
+    ref_path_norm = ref_path.replace("\\", "/").lower()
+    if (
+        expected_norm != ref_name_norm
+        and not ref_path_norm.endswith("/" + expected_norm)
+        and os.path.basename(expected_norm) != os.path.basename(ref_name_norm)
+    ):
+        return False
+
+    target = Path(ref_path)
+    if not target.is_absolute():
+        if workspace is None:
+            return False
+        target = workspace / ref_path
+
+    try:
+        target = target.resolve()
+        if workspace is not None:
+            workspace_resolved = workspace.resolve()
+            if os.path.commonpath([str(workspace_resolved), str(target)]) != str(workspace_resolved):
+                return False
+        return target.is_file()
+    except Exception:
+        return False
+
+
+def _missing_expected_output_files(tg, node) -> Tuple[List[str], str]:
+    """Return missing explicit output files for completed file-production nodes."""
+    expected = _expected_output_files_for_node(node)
+    if not expected:
+        return [], ""
+
+    workspace_dir = _resolve_task_workspace_dir(
+        tg,
+        getattr(tg, "id", "") or getattr(tg, "graph_id", ""),
+        getattr(tg, "metadata", {}).get("workspace_dir") or get_active_workspace_dir() or "",
+    )
+    workspace: Optional[Path] = None
+    if workspace_dir:
+        workspace = Path(workspace_dir).resolve()
+        if not workspace.exists():
+            return expected, str(workspace)
+
+    missing: List[str] = []
+    for file_name in expected:
+        attached_files = getattr(node, "files", []) or []
+        if any(_file_ref_matches_expected(ref, file_name, workspace) for ref in attached_files):
+            continue
+
+        if workspace is None:
+            missing.append(file_name)
+            continue
+
+        candidate = Path(file_name)
+        if candidate.is_absolute():
+            target = candidate.resolve()
+        else:
+            target = (workspace / file_name).resolve()
+        try:
+            if os.path.commonpath([str(workspace), str(target)]) != str(workspace):
+                missing.append(file_name)
+                continue
+        except ValueError:
+            missing.append(file_name)
+            continue
+        if not target.is_file():
+            missing.append(file_name)
+    return missing, str(workspace)
+
+
+def _is_user_seeded_empty_task_graph(tg) -> bool:
+    """Return True for a user-created placeholder graph with no real plan yet."""
+    if tg is None:
+        return False
+    try:
+        if not getattr(tg, "metadata", {}).get("user_seeded_empty_graph"):
+            return False
+        nodes = getattr(tg, "_nodes", {}) or {}
+        non_root_nodes = [nid for nid in nodes if nid != "req"]
+        if non_root_nodes:
+            return False
+        root = tg.get_node("req") if hasattr(tg, "get_node") else nodes.get("req")
+        if root and getattr(root, "status", "") not in ("pending", "in_progress"):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def set_active_task_graph(tg, graph_id, workspace_dir=None):
     """设置当前活跃的 TaskGraph，并自动备份到磁盘"""
     global _active_task_graph, _active_graph_id, _active_workspace_dir
+    graph_id = normalize_task_graph_id(graph_id)
+    if tg is not None and graph_id:
+        try:
+            tg.id = graph_id
+            tg.graph_id = graph_id
+        except Exception:
+            pass
+    resolved_workspace = _resolve_task_workspace_dir(tg, graph_id, workspace_dir)
     with _active_graph_lock:
+        if tg is None:
+            clear_workspace = _normalize_workspace_dir(workspace_dir) or _active_workspace_dir
+            if clear_workspace:
+                key = os.path.abspath(clear_workspace)
+                _workspace_task_graphs.pop(key, None)
+                _workspace_graph_ids.pop(key, None)
+            if graph_id:
+                for key, gid in list(_workspace_graph_ids.items()):
+                    if normalize_task_graph_id(gid) == graph_id:
+                        _workspace_task_graphs.pop(key, None)
+                        _workspace_graph_ids.pop(key, None)
+            _active_task_graph = None
+            _active_graph_id = None
+            _active_workspace_dir = None
+            try:
+                from zulong.l2.task_state_manager import task_state_manager
+                task_state_manager.clear_active_task(graph_id or None, clear_stack=True)
+            except Exception as e:
+                logger.debug(f"[TaskTools] TaskStateManager 清理跳过: {e}")
+            return
+
         _active_task_graph = tg
         _active_graph_id = graph_id
-        _active_workspace_dir = workspace_dir
+        _active_workspace_dir = resolved_workspace or None
+
+        # 按 workspace 隔离存储（修复跨窗口污染）
+        if resolved_workspace:
+            key = os.path.abspath(resolved_workspace)
+            _workspace_task_graphs[key] = tg
+            _workspace_graph_ids[key] = graph_id
+
         # 磁盘备份：每次设置活跃图时保存一份，防止数据丢失
         if tg is not None and graph_id:
             _backup_graph_to_disk(tg, graph_id)
@@ -312,7 +1008,7 @@ def set_active_task_graph(tg, graph_id, workspace_dir=None):
             from zulong.l2.task_state_manager import task_state_manager
             current_tsm_task = task_state_manager.get_active_task()
             if tg is not None and graph_id and current_tsm_task != graph_id:
-                task_state_manager.create_task(graph_id, [])
+                task_state_manager.create_task(graph_id, [], freeze_existing=False)
                 logger.debug(
                     f"[TaskTools] 已同步 TaskGraph {graph_id} 到 TaskStateManager"
                 )
@@ -363,7 +1059,6 @@ def _create_task_workspace(
     if project_mode and project_name:
         try:
             from zulong.workspace.project_registry import get_project_registry
-            from zulong.workspace.vscode_launcher import launch_vscode_window
 
             registry = get_project_registry()
             info = registry.create_project(
@@ -372,15 +1067,8 @@ def _create_task_workspace(
                 task_graph_id=graph_id,
                 source="web",
                 target_path=target_path,
+                reuse_existing=bool(target_path),
             )
-
-            # 自动打开 VS Code（如果配置启用）
-            try:
-                from zulong.config.config_manager import get_config
-                if get_config("workspace.auto_open_vscode", True):
-                    launch_vscode_window(info.path)
-            except Exception as e:
-                logger.warning(f"[Workspace] VS Code 启动失败（不影响任务）: {e}")
 
             # 广播 PROJECT_CREATED 事件到 Web 前端
             try:
@@ -433,6 +1121,23 @@ def _backup_graph_to_disk(tg, graph_id: str):
         os.replace(tmp_path, backup_path)
         logger.debug(f"[GraphBackup] 已备份任务图到 {backup_path}")
 
+        custom_path = ""
+        try:
+            custom_path = str(getattr(tg, "metadata", {}).get("task_graph_file_path") or "")
+        except Exception:
+            custom_path = ""
+        if custom_path:
+            custom_abs = os.path.abspath(os.path.normpath(os.path.expanduser(os.path.expandvars(custom_path))))
+            if os.path.abspath(backup_path) != custom_abs:
+                os.makedirs(os.path.dirname(custom_abs), exist_ok=True)
+                custom_tmp = custom_abs + ".tmp"
+                with open(custom_tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(custom_tmp, custom_abs)
+                logger.debug(f"[GraphBackup] 已同步任务图到用户文件 {custom_abs}")
+
         # 增量更新语义索引
         try:
             title = getattr(tg, 'title', '') or data.get('title', '')
@@ -466,6 +1171,7 @@ def load_graph_from_backup(graph_id: str):
     Returns:
         TaskGraph 实例，或 None
     """
+    graph_id = normalize_task_graph_id(graph_id)
     try:
         backup_path = os.path.join(_GRAPH_BACKUP_DIR, f"{graph_id}.json")
         if not os.path.exists(backup_path):
@@ -479,6 +1185,46 @@ def load_graph_from_backup(graph_id: str):
     except Exception as e:
         logger.warning(f"[GraphBackup] 从备份恢复失败: {e}")
         return None
+
+
+def load_task_graph_deterministic(graph_id: str, workspace_dir: Optional[str] = None) -> bool:
+    """Load a TaskGraph by exact id and make it active.
+
+    Order: current memory binding -> disk backup -> MemoryGraph rebuild.
+    This is used when the Web/IDE payload explicitly carries task_graph_id;
+    heuristic suspended-task recovery must not override it.
+    """
+    graph_id = normalize_task_graph_id(graph_id)
+    if not graph_id:
+        return False
+
+    current = get_active_task_graph(workspace_dir=workspace_dir) or get_active_task_graph()
+    if current and normalize_task_graph_id(getattr(current, "id", "")) == graph_id:
+        set_active_task_graph(current, graph_id, workspace_dir=workspace_dir)
+        logger.info("[TaskTools] 确定性恢复 Level 1 (内存): %s", graph_id)
+        return True
+
+    tg = load_graph_from_backup(graph_id)
+    if tg:
+        set_active_task_graph(tg, graph_id, workspace_dir=workspace_dir)
+        logger.info("[TaskTools] 确定性恢复 Level 2 (磁盘): %s", graph_id)
+        return True
+
+    try:
+        from zulong.memory.memory_graph import get_memory_graph
+        from zulong.memory.graph_adapters import rebuild_task_graph_from_memory
+        mg = get_memory_graph()
+        if mg:
+            tg = rebuild_task_graph_from_memory(mg, graph_id)
+            if tg:
+                set_active_task_graph(tg, graph_id, workspace_dir=workspace_dir)
+                logger.info("[TaskTools] 确定性恢复 Level 3 (MemoryGraph): %s", graph_id)
+                return True
+    except Exception as exc:
+        logger.debug("[TaskTools] 确定性恢复 MemoryGraph 跳过: %s", exc)
+
+    logger.warning("[TaskTools] 确定性恢复失败: %s", graph_id)
+    return False
 
 
 def load_latest_uncompleted_backup():
@@ -567,6 +1313,18 @@ def load_latest_backup():
 
             # 跳过只有 req 单节点的骨架图
             if len(tg._nodes) <= 1:
+                continue
+
+            leaves = [n for n in tg.get_leaf_nodes() if getattr(n, "id", "") != "req"]
+            unfinished = [
+                n for n in leaves
+                if getattr(n, "status", "") not in ("completed", "skipped")
+            ]
+            if leaves and not unfinished:
+                logger.info(
+                    f"[GraphBackup] 跳过已完成备份: {graph_id}, "
+                    f"nodes={len(tg._nodes)}"
+                )
                 continue
 
             logger.info(
@@ -721,11 +1479,156 @@ class TaskCreatePlanTool(BaseTool):
     def execute(self, request: ToolRequest) -> ToolResult:
         start_time = time.time()
         title = request.parameters.get("title", "未命名任务")
+        user_requirement = request.parameters.get("user_requirement", "")
+        inferred_target_path, inferred_project_name = infer_project_workspace_hint(
+            f"{user_requirement}\n{title}"
+        )
+        requested_target_path = request.parameters.get("target_path", "")
+        requested_project_name = request.parameters.get("project_name", "")
+        requested_target_norm = _normalize_path_for_match(requested_target_path)
+        inferred_final_norm = ""
+        if inferred_target_path and inferred_project_name:
+            try:
+                inferred_final_norm = _normalize_path_for_match(
+                    str(Path(inferred_target_path) / inferred_project_name)
+                )
+            except Exception:
+                inferred_final_norm = ""
+        if (
+            user_requirement
+            and inferred_target_path
+            and inferred_project_name
+            and requested_target_norm
+            and requested_target_norm == inferred_final_norm
+            and requested_project_name
+            and requested_project_name != inferred_project_name
+        ):
+            target_path = inferred_target_path
+            project_name = inferred_project_name
+        elif requested_target_path or requested_project_name:
+            target_path = requested_target_path or inferred_target_path
+            project_name = requested_project_name or inferred_project_name or title
+        else:
+            target_path = inferred_target_path
+            project_name = inferred_project_name or title
+        existing_task_policy = str(
+            request.parameters.get("existing_task_policy")
+            or request.parameters.get("existingTaskPolicy")
+            or "ask"
+        ).strip().lower()
+        if existing_task_policy not in {"ask", "reuse", "recreate"}:
+            existing_task_policy = "ask"
+        if existing_task_policy == "ask" and _explicit_recreate_requested(
+            f"{user_requirement}\n{title}"
+        ):
+            existing_task_policy = "recreate"
 
         try:
             # 🔥 拦截：如果当前有活跃任务图且仍有未完成节点，不创建新图谱
             # 直接返回现有图谱概览，引导模型继续使用 task_view_overview
             old_tg = get_active_task_graph()
+            if old_tg is not None and _is_user_seeded_empty_task_graph(old_tg):
+                logger.info(
+                    "[task_create_plan] 当前为空会话预建图谱，转为真实任务: %s -> %s",
+                    getattr(old_tg, "title", ""),
+                    title,
+                )
+                old_root = old_tg.get_node("req") if hasattr(old_tg, "get_node") else None
+                if old_root is not None:
+                    old_root.label = title
+                    old_root.desc = user_requirement or title
+                    old_root.status = "in_progress"
+                old_tg.title = title
+                old_tg.metadata["user_requirement"] = user_requirement or title
+                old_tg.metadata["user_seeded_empty_graph"] = False
+                if project_name:
+                    old_tg.metadata["project_name"] = project_name
+                if target_path:
+                    old_tg.metadata["target_path"] = target_path
+                set_active_task_graph(
+                    old_tg,
+                    getattr(old_tg, "id", "") or _active_graph_id,
+                    workspace_dir=(
+                        getattr(old_tg, "metadata", {}).get("workspace_dir")
+                        or get_active_workspace_dir()
+                        or target_path
+                    ),
+                )
+                return self._create_result(
+                    success=True,
+                    data={
+                        "graph_id": getattr(old_tg, "id", "") or _active_graph_id,
+                        "root_node_id": "req",
+                        "title": title,
+                        "user_requirement": user_requirement or title,
+                        "workspace_dir": getattr(old_tg, "metadata", {}).get("workspace_dir") or "",
+                        "task_graph_file_path": getattr(old_tg, "metadata", {}).get("task_graph_file_path") or "",
+                        "message": "已使用空会话预建图谱承接当前任务。请用 task_add_node 添加子任务。",
+                    },
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
+
+            if old_tg is not None:
+                old_root = old_tg.get_node("req")
+                old_title = old_root.label if old_root else old_tg.title
+                old_workspace_dir = (
+                    getattr(old_tg, "metadata", {}).get("workspace_dir")
+                    or get_active_workspace_dir()
+                    or ""
+                )
+                old_workspace_health = _graph_workspace_health(old_tg, old_workspace_dir)
+                if (
+                    _titles_related(old_title, title)
+                    and not old_workspace_health.get("ok", True)
+                    and existing_task_policy == "ask"
+                ):
+                    decision_message = (
+                        f"检测到当前任务图标题仍是「{old_title}」，但绑定目录/文件状态异常："
+                        f"{old_workspace_health.get('reason') or '工作目录不完整'}。"
+                        "请用户明确选择：回复「恢复上个任务」继续旧图谱，或回复「删除旧任务并重新创建」后创建全新任务。"
+                    )
+                    try:
+                        from zulong.launcher.web_chat_router import update_task_execution_status
+                        update_task_execution_status(
+                            state="blocked",
+                            phase="workspace_missing_needs_decision",
+                            message=decision_message,
+                            workspace_path=old_workspace_dir,
+                            task_graph_id=_active_graph_id,
+                            progress_items=[{
+                                "label": "等待用户选择旧任务处理方式",
+                                "status": "blocked",
+                                "source": "task_graph",
+                                "detail": decision_message,
+                                "timestamp": time.time(),
+                            }],
+                        )
+                    except Exception:
+                        pass
+                    return self._create_result(
+                        success=True,
+                        data={
+                            "graph_id": _active_graph_id,
+                            "title": old_title,
+                            "already_exists": True,
+                            "needs_user_decision": True,
+                            "workspace_dir": old_workspace_dir,
+                            "workspace_health": old_workspace_health,
+                            "message": decision_message,
+                        },
+                        execution_time=time.time() - start_time,
+                        request_id=request.request_id,
+                    )
+                if existing_task_policy == "recreate":
+                    logger.info(
+                        "[task_create_plan] 用户/LLM 选择重建任务，清除旧活跃图谱: %s -> %s",
+                        old_title,
+                        title,
+                    )
+                    set_active_task_graph(None, None)
+                    old_tg = None
+
             if old_tg is not None:
                 old_root = old_tg.get_node("req")
                 old_title = old_root.label if old_root else old_tg.title
@@ -785,6 +1688,48 @@ class TaskCreatePlanTool(BaseTool):
                         # 继续往下走，创建新图谱
                 else:
                     logger.info(f"[task_create_plan] 拦截重复创建：已有活跃图谱 '{old_title}' ({completed}/{total})")
+                    if existing_task_policy == "ask":
+                        decision_message = (
+                            f"当前已有未完成任务图「{old_title}」({completed}/{total} 已完成)。"
+                            "请先由 LLM 结合用户语义决定：复用旧任务、删除旧任务并重建，或向用户澄清。"
+                        )
+                        try:
+                            from zulong.launcher.web_chat_router import update_task_execution_status
+                            update_task_execution_status(
+                                state="blocked",
+                                phase="existing_task_needs_policy",
+                                message=decision_message,
+                                workspace_path=(
+                                    getattr(old_tg, "metadata", {}).get("workspace_dir")
+                                    or get_active_workspace_dir()
+                                    or ""
+                                ),
+                                task_graph_id=_active_graph_id,
+                                progress_items=[{
+                                    "label": "等待 LLM/用户确认任务归属",
+                                    "status": "blocked",
+                                    "source": "task_graph",
+                                    "detail": decision_message,
+                                    "timestamp": time.time(),
+                                }],
+                            )
+                        except Exception:
+                            pass
+                        return self._create_result(
+                            success=True,
+                            data={
+                                "graph_id": _active_graph_id,
+                                "title": old_title,
+                                "already_exists": True,
+                                "needs_policy_decision": True,
+                                "existing_task_policy": existing_task_policy,
+                                "progress": f"已有活跃任务图「{old_title}」({completed}/{total} 已完成)。",
+                                "next_pending_node_id": next_pending_id,
+                                "message": decision_message,
+                            },
+                            execution_time=time.time() - start_time,
+                            request_id=request.request_id,
+                        )
                     return self._create_result(
                         success=True,
                         data={
@@ -808,26 +1753,37 @@ class TaskCreatePlanTool(BaseTool):
             tg = TaskGraph(title=title, graph_id=graph_id)
 
             # 创建根节点
+            root_desc = user_requirement or title
             root = tg.add_node(
                 id="req",
                 label=title,
                 type="requirement",
                 status="in_progress",
-                desc=title,
+                desc=root_desc,
             )
 
             # 创建独立工作目录（使用项目模式）
-            target_path = request.parameters.get("target_path", "")
             workspace_dir = _create_task_workspace(
                 graph_id,
                 project_mode=True,
-                project_name=title,
-                project_desc=title,
+                project_name=project_name,
+                project_desc=root_desc,
                 target_path=target_path,
             )
             tg.metadata["workspace_dir"] = workspace_dir
+            tg.metadata["project_name"] = project_name
+            tg.metadata["target_path"] = target_path
 
             set_active_task_graph(tg, graph_id, workspace_dir=workspace_dir)
+
+            vscode_open_result = {
+                "ok": False,
+                "status": "not_attempted",
+                "reason": (
+                    "task_create_plan 只创建并绑定任务工作区；"
+                    "前台 VS Code 窗口必须由 ide_open_workspace 或 Web 端按钮显式触发。"
+                ),
+            }
 
             # 同步到 MemoryGraph
             try:
@@ -857,8 +1813,17 @@ class TaskCreatePlanTool(BaseTool):
                     "graph_id": graph_id,
                     "root_node_id": "req",
                     "title": title,
+                    "user_requirement": root_desc,
+                    "project_name": project_name,
+                    "target_path": target_path,
                     "workspace_dir": workspace_dir,
-                    "message": f"任务规划图已创建。根节点: req ({title})。请用 task_add_node 添加子任务。",
+                    "vscode_opened": bool(vscode_open_result.get("ok")),
+                    "vscode_open_result": vscode_open_result,
+                    "message": (
+                        f"任务规划图已创建，工作目录已创建为 {workspace_dir}。"
+                        "如需查看代码，可通过打开 VS Code 动作进入该目录。"
+                        "请用 task_add_node 添加子任务。"
+                    ),
                 },
                 execution_time=time.time() - start_time,
                 request_id=request.request_id,
@@ -883,7 +1848,22 @@ class TaskCreatePlanTool(BaseTool):
                 },
                 "target_path": {
                     "type": "string",
-                    "description": "可选：用户指定的项目父目录绝对路径。如果用户明确说了'在D:/project/创建'，则传入D:/project/。留空则使用默认工作区。",
+                    "description": "可选：用户指定的项目父目录绝对路径。例如 Windows 的 D:/project/，或 Linux/macOS 的 /home/user/project/。留空则使用默认工作区。",
+                },
+                "project_name": {
+                    "type": "string",
+                    "description": "可选：用户明确指定的项目文件夹名，例如 tank。若用户只描述任务标题，可留空由系统从需求文本推断。",
+                },
+                "existing_task_policy": {
+                    "type": "string",
+                    "enum": ["ask", "reuse", "recreate"],
+                    "description": (
+                        "当内存里已有同名或相关任务图时的处理策略。"
+                        "该字段必须由 LLM 根据用户语义决定：ask=需要向用户澄清；"
+                        "reuse=复用当前旧任务图；recreate=删除/丢弃当前旧任务图并创建新任务。"
+                        "不要由代码关键词推断。"
+                    ),
+                    "default": "ask",
                 },
             },
             "required": ["title"],
@@ -937,6 +1917,7 @@ class TaskAddNodeTool(BaseTool):
             auto_title = f"自动任务规划 - {label[:30]}" if len(label) > 30 else f"自动任务规划 - {label}"
             auto_request = ToolRequest(
                 tool_name="task_create_plan",
+                action="create",
                 parameters={"title": auto_title},
                 request_id=f"auto_{request.request_id}",
             )
@@ -1105,14 +2086,15 @@ class TaskAddNodeTool(BaseTool):
 
             tg.add_h_edge(parent_id, node_id)
 
-            # TSD 23.11 Bug A fix: 父节点有子节点后即为容器"完成"，解除子节点死锁
+            # 拆解只改变结构，不代表父节点执行完成。
+            # 父节点完成状态必须来自子节点完成级联或最终答案写入。
             parent = tg.get_node(parent_id)
             if parent and parent.status == "in_progress":
-                parent.status = "completed"
-                parent.result = f"已拆解为 {len(tg.get_children(parent_id))} 个子任务"
+                parent.metadata["decomposed_child_count"] = len(tg.get_children(parent_id))
+                parent.metadata["decomposed_at"] = time.time()
                 logger.info(
-                    f"[task_add_node] 父节点 {parent_id} in_progress→completed"
-                    f"（容器已拆解，{len(tg.get_children(parent_id))}个子任务）"
+                    f"[task_add_node] 父节点 {parent_id} 已拆解，保持 {parent.status} 状态"
+                    f"（{len(tg.get_children(parent_id))}个子任务）"
                 )
 
             logger.info(f"[task_add_node] 添加节点 {node_id} ({node_type}): {label}")
@@ -1293,9 +2275,10 @@ class TaskMarkStatusTool(BaseTool):
 
             # Rule B: result 质量门卫（标记 completed 时验证 result 内容）
             # 防止 LLM 将错误/限流响应当作有效结果标记完成
+            _result_text = ""
+            _rule_b_reject = None
             if status == "completed" and node_id != "req":
                 _result_text = (result or "").strip()
-                _rule_b_reject = None
 
                 if not _result_text:
                     _rule_b_reject = (
@@ -1314,6 +2297,13 @@ class TaskMarkStatusTool(BaseTool):
                         "rate limit", "timeout", "timed out",
                         "too many requests", "server error",
                         "internal error", "服务繁忙", "请求过于频繁",
+                        "任务执行中断", "强制收敛", "未产出",
+                        "进行中但未产出", "尚未完成", "还未完成",
+                        "未完成节点", "未完成", "待完成", "待开始",
+                        "需要继续执行", "是否继续", "请继续执行",
+                        "未生成", "未创建", "没有产出",
+                        "无法完成", "不能完成", "触发循环保护",
+                        "系统当前出问题", "stalled", "blocked", "interrupted",
                     ]
                     _lower = _result_text.lower()
                     for _pat in _error_patterns:
@@ -1327,14 +2317,41 @@ class TaskMarkStatusTool(BaseTool):
                             )
                             break
 
-                if _rule_b_reject:
+            if _rule_b_reject:
+                logger.info(
+                    f"[task_mark_status] Rule B 拒绝: {node_id}, "
+                    f"result='{(_result_text or '')[:60]}'"
+                )
+                return self._create_result(
+                    success=False,
+                    error=_rule_b_reject,
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
+
+            # Rule C: 文件产出真实性门卫。
+            # 如果节点标题/描述明确包含 game.js、README.md 等文件名，
+            # 标记完成前必须能在当前任务工作区看到真实文件。
+            if status == "completed" and node_id != "req":
+                missing_files, workspace_for_check = _missing_expected_output_files(tg, node)
+                if missing_files:
+                    workspace_hint = (
+                        f" 当前任务工作区: {workspace_for_check}。"
+                        if workspace_for_check else " 当前任务缺少绑定工作区。"
+                    )
+                    reject_msg = (
+                        f"操作被拒绝：节点 {node_id}（{node.label}）声明产出文件，"
+                        f"但未检测到真实文件: {', '.join(missing_files)}。"
+                        f"{workspace_hint}"
+                        "请先调用 ide_write_file 等真实写入工具完成落盘，"
+                        "再标记该节点为 completed。"
+                    )
                     logger.info(
-                        f"[task_mark_status] Rule B 拒绝: {node_id}, "
-                        f"result='{(_result_text or '')[:60]}'"
+                        f"[task_mark_status] Rule C 拒绝: {node_id}, missing={missing_files}"
                     )
                     return self._create_result(
                         success=False,
-                        error=_rule_b_reject,
+                        error=reject_msg,
                         execution_time=time.time() - start_time,
                         request_id=request.request_id,
                     )
@@ -1625,7 +2642,10 @@ class TaskSuspendTool(BaseTool):
                         "task_id": task_id,
                         "description": description,
                         "reason": reason,
-                        "message": f"任务 '{description}' 已挂起 (ID: {task_id})。用户可以说'继续'来恢复。",
+                        "message": (
+                            f"任务 '{description}' 已挂起 (ID: {task_id})。"
+                            "后续由 LLM 根据用户语义判断是否恢复该任务。"
+                        ),
                     },
                     execution_time=time.time() - start_time,
                     request_id=request.request_id,
@@ -1671,7 +2691,7 @@ class TaskListSuspendedTool(BaseTool):
     def __init__(self):
         super().__init__(name="task_list_suspended", category=ToolCategory.CUSTOM)
         self.description = (
-            "列出所有已挂起的任务。当用户说'继续'、'接着做'、'上次那个任务'等，"
+            "列出所有已挂起的任务。当 LLM 判断用户语义是在恢复旧任务时，"
             "先调用此工具查看有哪些挂起的任务，然后决定恢复哪个。"
             "也可以传入 query 参数来按描述模糊匹配。"
         )
@@ -1685,20 +2705,95 @@ class TaskListSuspendedTool(BaseTool):
     def execute(self, request: ToolRequest) -> ToolResult:
         start_time = time.time()
         query = request.parameters.get("query", "")
+        workspace_hint = (
+            request.parameters.get("workspace_path")
+            or request.parameters.get("workspace_dir")
+            or get_active_workspace_dir()
+            or ""
+        )
 
         try:
+            active_tg = get_active_task_graph()
+            if query and active_tg:
+                active_graph_id = normalize_task_graph_id(getattr(active_tg, "id", ""))
+                active_title = getattr(active_tg, "title", "") or ""
+                try:
+                    root = active_tg.get_node("req")
+                    if root and getattr(root, "label", ""):
+                        active_title = root.label
+                except Exception:
+                    pass
+                active_workspace = (
+                    getattr(active_tg, "metadata", {}).get("workspace_dir")
+                    or get_active_workspace_dir()
+                    or ""
+                )
+                same_workspace = bool(
+                    workspace_hint
+                    and active_workspace
+                    and _normalize_path_for_match(workspace_hint) == _normalize_path_for_match(active_workspace)
+                )
+                query_related = (
+                    (active_graph_id and active_graph_id in str(query))
+                    or _titles_related(active_title, str(query))
+                    or str(query).lower() in active_title.lower()
+                )
+                if same_workspace and query_related:
+                    logger.info(
+                        "[task_list_suspended] 当前活跃图已匹配查询，跳过挂起任务恢复: graph=%s query=%s",
+                        active_graph_id,
+                        query,
+                    )
+                    return self._create_result(
+                        success=True,
+                        data={
+                            "resumed": False,
+                            "already_active": True,
+                            "graph_id": active_graph_id,
+                            "title": active_title,
+                            "workspace_dir": active_workspace,
+                            "message": (
+                                f"当前任务图「{active_title}」已绑定到该工作区，"
+                                "无需从挂起任务恢复；请继续查看或扩展当前任务图。"
+                            ),
+                        },
+                        execution_time=time.time() - start_time,
+                        request_id=request.request_id,
+                    )
+
             from zulong.l2.task_suspension import TaskSuspensionManager
             mgr = TaskSuspensionManager()
 
             if query:
-                match = _run_async(mgr.find_by_description(query, return_full_state=True))
-                if match is None:
+                candidates = []
+                for summary in _run_async(mgr.list_suspended_tasks()):
+                    task_id = summary.get("task_id")
+                    if not task_id:
+                        continue
+                    state = _run_async(mgr.resume_task(task_id, consume=False))
+                    if not state:
+                        continue
+                    score = _score_suspend_candidate(state, query, workspace_hint)
+                    if score <= 0:
+                        continue
+                    candidates.append((score, state))
+
+                if not candidates:
                     return self._create_result(
                         success=True,
                         data={"tasks": [], "message": f"没有找到匹配 '{query}' 的挂起任务"},
                         execution_time=time.time() - start_time,
                         request_id=request.request_id,
                     )
+
+                candidates.sort(
+                    key=lambda item: (
+                        item[0],
+                        getattr(item[1], "suspended_at", 0) or 0,
+                    ),
+                    reverse=True,
+                )
+                match = candidates[0][1]
 
                 if hasattr(match, 'task_id'):
                     if match.task_graph:
@@ -1721,6 +2816,8 @@ class TaskListSuspendedTool(BaseTool):
                             "iteration_count": match.iteration_count,
                             "messages_count": len(match.messages),
                             "has_task_graph": match.task_graph is not None,
+                            "workspace_dir": _ws if match.task_graph else "",
+                            "candidate_count": len(candidates),
                             "message": (
                                 f"已恢复任务 '{match.description}' (ID: {match.task_id})。"
                                 + (f" TaskGraph 已加载。" if match.task_graph else "")
@@ -1766,6 +2863,10 @@ class TaskListSuspendedTool(BaseTool):
                 "query": {
                     "type": "string",
                     "description": "用于模糊匹配任务描述的关键词（可选，不填则列出全部）",
+                },
+                "workspace_path": {
+                    "type": "string",
+                    "description": "可选：用于恢复候选打分的目标工作区绝对路径，例如 D:/AI/project/tank。",
                 },
             },
             "required": [],
@@ -2636,20 +3737,12 @@ class SubmitFinalAnswerTool(BaseTool):
         tg = get_active_task_graph()
         if tg is not None:
             try:
-                # 找根节点: 没有父节点的那个 (h_edges 中不作为 child 出现)
-                child_ids = {c for _, c in tg._h_edges}
-                root = None
-                for nid, node in tg._nodes.items():
-                    if nid not in child_ids:
-                        root = node
-                        break
-                if root is not None:
-                    root.result = answer
-                    root.status = "completed"
-                    logger.info(
-                        "[SubmitFinalAnswer] 已将最终答案写入根节点 %s，任务标记完成",
-                        root.id,
-                    )
+                _write_final_answer_to_task_graph(
+                    tg,
+                    answer,
+                    source="submit_final_answer",
+                )
+                _auto_archive_completed(tg)
             except Exception as e:
                 logger.warning("[SubmitFinalAnswer] 更新 TaskGraph 失败: %s", e)
 
@@ -2717,11 +3810,8 @@ class TaskResumeByAddressTool(BaseTool):
                 request_id=request.request_id,
             )
 
-        # 从地址中解析 graph_id
-        graph_id = None
-        if address.startswith("tg:"):
-            parts = address.split("/")
-            graph_id = parts[0][3:]  # 去掉 "tg:" 前缀
+        address = normalize_task_graph_address(address)
+        graph_id = normalize_task_graph_id(address)
 
         if not graph_id:
             return self._create_result(
@@ -2764,7 +3854,10 @@ class TaskResumeByAddressTool(BaseTool):
                     f"[TaskResumeByAddress] 地址无法解析: {address}")
                 # 不阻断——仍尝试重建（graph_id 可能有对应的其他节点）
 
-            rebuilt_tg = rebuild_task_graph_from_memory(mg, graph_id)
+            if load_task_graph_deterministic(graph_id):
+                rebuilt_tg = get_active_task_graph()
+            else:
+                rebuilt_tg = rebuild_task_graph_from_memory(mg, graph_id)
             if rebuilt_tg is None:
                 return self._create_result(
                     success=False,

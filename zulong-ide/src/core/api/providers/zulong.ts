@@ -14,17 +14,19 @@
  */
 
 import { ModelInfo } from "@shared/api"
+import type { ApprovalMode } from "@shared/ApprovalWhitelist"
 import { ZulongStorageMessage } from "@/shared/messages/content"
 import { ZulongTool } from "@/shared/tools"
 import { ApiHandler, ApiHandlerModel, CommonApiHandlerOptions } from "../index"
 import { ApiStream, ApiStreamChunk } from "../transform/stream"
-import { ZulongWebSocket, ZulongToolRequest } from "../transport/zulong-websocket"
+import { DEFAULT_ZULONG_IDE_WS_URL, ZulongWebSocket, ZulongToolRequest } from "../transport/zulong-websocket"
 import { Logger } from "@/shared/services/Logger"
 import fs from "fs"
 import path from "path"
 
 export interface ZulongHandlerOptions extends CommonApiHandlerOptions {
 	zulongServerUrl?: string
+	zulongApprovalMode?: ApprovalMode
 }
 
 const ZULONG_MODEL_INFO: ModelInfo = {
@@ -46,7 +48,7 @@ export class ZulongHandler implements ApiHandler {
 	constructor(options: ZulongHandlerOptions) {
 		this.options = options
 		// 🔥 长连接模式：在构造函数中初始化WebSocket
-		const serverUrl = options.zulongServerUrl || "ws://127.0.0.1:8090"
+		const serverUrl = options.zulongServerUrl || DEFAULT_ZULONG_IDE_WS_URL
 		this.transport = new ZulongWebSocket(serverUrl)
 		Logger.info(`[ZulongHandler] WebSocket initialized (long connection mode), serverUrl=${serverUrl}`)
 	}
@@ -56,7 +58,7 @@ export class ZulongHandler implements ApiHandler {
 	 */
 	private async ensureConnected(): Promise<string> {
 		if (!this.transport) {
-			const serverUrl = this.options.zulongServerUrl || "ws://127.0.0.1:8090"
+			const serverUrl = this.options.zulongServerUrl || DEFAULT_ZULONG_IDE_WS_URL
 			this.transport = new ZulongWebSocket(serverUrl)
 		}
 
@@ -94,6 +96,18 @@ export class ZulongHandler implements ApiHandler {
 	updateModelInfo(updates: Partial<ModelInfo>): void {
 		this.dynamicModelInfo = { ...this.dynamicModelInfo, ...updates }
 		Logger.info(`[ZulongHandler] Model info updated: contextWindow=${this.dynamicModelInfo.contextWindow}, maxTokens=${this.dynamicModelInfo.maxTokens}`)
+	}
+
+	sendIdeApprovalResult(payload: Record<string, any>): void {
+		void (async () => {
+			await this.ensureConnected()
+			if (!this.transport) {
+				throw new Error("Transport not initialized")
+			}
+			this.transport.sendIdeApprovalResult(payload)
+		})().catch((error) => {
+			Logger.error(`[ZulongHandler] Failed to send approval result: ${error}`)
+		})
 	}
 
 	async *createMessage(
@@ -159,7 +173,7 @@ export class ZulongHandler implements ApiHandler {
 			})
 		} catch (err) {
 			Logger.error(`[ZulongHandler] Connection failed: ${err}`)
-			const serverUrl = this.options.zulongServerUrl || "ws://127.0.0.1:8090"
+			const serverUrl = this.options.zulongServerUrl || DEFAULT_ZULONG_IDE_WS_URL
 			yield {
 				type: "text" as const,
 				text: `[Zulong] WebSocket connection failed: ${err}\nPlease ensure the Zulong IDE Server is running at ${serverUrl}`,
@@ -224,8 +238,10 @@ export class ZulongHandler implements ApiHandler {
 			}
 		})
 
-		this.transport.on("task_complete", (_result: string) => {
-			Logger.info("[ZulongHandler] \u2190 task_complete")
+		this.transport.on("task_complete", (_result: string, payload?: any) => {
+			const phase = payload?.phase || payload?.status || "succeeded"
+			Logger.info(`[ZulongHandler] \u2190 task_complete phase=${phase}`)
+			pushChunk({ type: "status_update", phase })
 			pushChunk({ type: "done" })
 		})
 
@@ -284,27 +300,21 @@ export class ZulongHandler implements ApiHandler {
 			Logger.info(`[ZulongHandler] \u2190 system_ready: status=${payload.status}, failed_modules=${payload.failed_modules?.join(",") || "none"}`)
 		})
 
-		// Detect resume: if there are prior assistant messages, this is a resumed session
-		const hasHistory = messages.some((m) => m.role === "assistant")
-		if (hasHistory) {
-			const graphId = this.extractGraphId(messages)
-			Logger.info(`[ZulongHandler] \u2192 session_resume (detected prior history), cwd=${cwd}, graph_id=${graphId || "none"}`)
-			this.transport.sendSessionResume(taskText, cwd, systemPrompt, graphId)
-		} else {
-			// 检测当前 cwd 是否为祖龙项目，提取 project_id
-			let projectId: string | undefined
-			try {
-				const projectJsonPath = path.join(cwd, ".zulong", "project.json")
-				if (fs.existsSync(projectJsonPath)) {
-					const projData = JSON.parse(fs.readFileSync(projectJsonPath, "utf-8"))
-					projectId = projData.project_id
-				}
-			} catch {
-				// 忽略读取失败
+		// 恢复任务属于 L1-B/L2 的语义判断，provider 不再用关键词硬判。
+		// 这里统一进入 session_start；带明确 graph_id 的协议级恢复仍由后端
+		// session_resume 通道处理。
+		let projectId: string | undefined
+		try {
+			const projectJsonPath = path.join(cwd, ".zulong", "project.json")
+			if (fs.existsSync(projectJsonPath)) {
+				const projData = JSON.parse(fs.readFileSync(projectJsonPath, "utf-8"))
+				projectId = projData.project_id
 			}
-			Logger.info(`[ZulongHandler] \u2192 session_start, cwd=${cwd}, project_id=${projectId || "none"}`)
-			this.transport.sendSessionStart(taskText, cwd, systemPrompt, projectId)
+		} catch {
+			// 忽略读取失败
 		}
+		Logger.info(`[ZulongHandler] \u2192 session_start, cwd=${cwd}, project_id=${projectId || "none"}`)
+		this.transport.sendSessionStart(taskText, cwd, systemPrompt, projectId, this.options.zulongApprovalMode)
 
 		// Yield chunks from the queue
 		const STREAM_TIMEOUT_MS = 330 * 1000 // 后端CORE超时300s + 30s缓冲，防止IDE永久卡在"思考中"
@@ -389,31 +399,6 @@ export class ZulongHandler implements ApiHandler {
 		Logger.info("[ZulongHandler] Explicit dispose called, closing WebSocket")
 		this.transport?.dispose()
 		this.transport = null
-	}
-
-	/**
-	 * 从历史消息中提取最近的 graph_id (格式: tg_NNNNNNNNNN)
-	 */
-	private extractGraphId(messages: ZulongStorageMessage[]): string | undefined {
-		const pattern = /\btg_\d{10,13}\b/
-		for (let i = messages.length - 1; i >= 0; i--) {
-			const msg = messages[i]
-			if (msg.role !== "assistant") continue
-			const content = msg.content
-			if (typeof content === "string") {
-				const match = content.match(pattern)
-				if (match) return match[0]
-			} else if (Array.isArray(content)) {
-				for (const block of content) {
-					if (typeof block === "object" && block !== null) {
-						const text = (block as any).text || JSON.stringify(block)
-						const match = text.match(pattern)
-						if (match) return match[0]
-					}
-				}
-			}
-		}
-		return undefined
 	}
 
 	abort(): void {

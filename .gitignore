@@ -47,6 +47,7 @@ docker-compose.searxng.yml
 safetensorsvers/
 backup_old_vision_arch/
 backups/
+data_clear_backups/
 
 # ===== 内部文档 (含核心架构细节) =====
 资料/

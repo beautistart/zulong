@@ -214,8 +214,8 @@ Cline v3.82.0 fork → zulong-ide 插件 → 全面重写通信协议 (XML → W
 
 | 需求工具 | 现有等价物 | 位置 | 状态 | 差距说明 |
 |----------|-----------|------|------|---------|
-| `web_search` | `OpenClawSearchTool.search` | `tools/openclaw_search.py` | **已有** | 依赖本地 OpenClaw API (`http://localhost:3000/api`)，需确保 OpenClaw 服务可用 |
-| `web_fetch` | `OpenClawSearchTool.fetch_webpage` | `tools/openclaw_search.py` | **已有** | 专门的 `fetch_webpage` action，通过 OpenClaw API 代理获取；另有 `NetworkTool.get` 作为底层 HTTP GET |
+| `web_search` | `WebSearchTool.search` | `tools/web_search.py` | **已有** | 通过配置的搜索引擎执行联网检索 |
+| `web_fetch` | `NetworkTool.get` / 按需工具补充 | `tools/system_tools.py` / `tools/search_tools.py` | **按需** | 网页抓取不再绑定旧外部桥接服务 |
 | `ask_user` | `ask_followup_question` | `ide/ide_tool_registry.py` IDE_REMOTE_TOOLS | **仅 IDE 可用** | 只注册为远程工具，Web/EventBus 入口无法使用。需提升为内部工具 |
 | `submit_final_answer` | **幽灵工具** | 被 circuit_breaker / attention_window / task_graph 引用但从未注册 | **未实现** | 5 个模块预期它存在 (CB白名单、AW模式切换、TG注释)，但 `tools/` 目录中无定义 |
 | `attempt_completion` | `IDE_REMOTE_TOOLS` 中的远程工具 | `ide/ide_tool_registry.py` | **仅 IDE 可用** | 同 ask_user，需提升或统一 |
@@ -241,8 +241,8 @@ Cline v3.82.0 fork → zulong-ide 插件 → 全面重写通信协议 (XML → W
 |--------|------|------|------|
 | **P0** | `submit_final_answer` | **新增内部工具** | 结束 FC 循环，返回最终回复。5 个模块已预期其存在 |
 | **P0** | `ask_user` | **新增内部工具** | Web/EventBus 场景下向用户提问。IDE 场景降级为 `ask_followup_question` 远程调用 |
-| **P1** | `web_search` | **别名映射** | 将 `openclaw_search` 的 `search` action 暴露为独立 FC 工具 schema |
-| **P1** | `web_fetch` | **别名映射** | 将 `openclaw_search` 的 `fetch_webpage` action 暴露为独立 FC 工具 schema |
+| **P1** | `web_search` | **保留直连工具** | 使用 `WebSearchTool` 作为独立 FC 工具 schema |
+| **P1** | `web_fetch` | **按需补充** | 需要网页正文时通过工具补充机制引入 |
 | **P2** | `generate_image` | 按需新增 | 通用任务 (如设计无人机) 可能需要图像生成能力 |
 | **P2** | `structured_output` | 按需新增 | 输出结构化数据 (JSON/表格/图表) |
 
@@ -458,7 +458,7 @@ _GENERAL_TOOLS = {
     "task_mark_status", "task_get_detail", "task_view_overview",
     "recall_memory", "read_memory_node", "discover_related",
     "navigate_attention", "search_experience",
-    "openclaw_search",  # web_search
+    "web_search",
     "ask_user",         # 新增
     "submit_final_answer",  # 新增
 }
@@ -533,7 +533,7 @@ def is_duplicate_task(new_desc: str, parent_desc: str, ancestors: List[str]) -> 
 
 ### 11.1 核心结论
 
-1. **web_search/web_fetch 已有**: `OpenClawSearchTool` 同时提供搜索和网页获取, 无需重复设计
+1. **web_search/web_fetch 已有**: `WebSearchTool` 提供联网检索；网页正文抓取按需通过工具补充进入
 2. **ask_user/submit_final_answer 缺失**: 是最紧迫的补全项, 5 个核心模块预期 `submit_final_answer` 存在但未实现
 3. **code-review-graph 推荐集成**: MIT 许可 + SQLite 零基础设施 + MCP 原生, 是唯一安全可商用的代码智能工具
 4. **GitNexus 许可证致命**: PolyForm Noncommercial 禁止商用, 功能最强但不可用

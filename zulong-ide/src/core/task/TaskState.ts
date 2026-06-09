@@ -80,4 +80,7 @@ export class TaskState {
 	// Auto-context summarization
 	currentlySummarizing = false
 	lastAutoCompactTriggerIndex?: number
+
+	// 任务阶段状态（对齐TSD §23.3.6）: idle | initializing | running | blocked | completed | failed
+	taskPhase: string = "running"
 }

@@ -148,9 +148,9 @@
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
-│                    VS Code Extension (前端)                     │
+│                    Zulong Web (统一用户交互端)                 │
 │  ┌─────────────────────────────────────────────────────────┐  │
-│  │  React + Vite Webview (webview-ui/)                      │  │
+│  │  Static Web UI (zulong_web/static/)                    │  │
 │  │  ├─ Chat 组件: 对话界面 + Markdown 渲染                  │  │
 │  │  ├─ Settings 组件: Zulong WebSocket 配置                 │  │
 │  │  ├─ History 组件: 会话历史                               │  │
@@ -1203,29 +1203,6 @@ MQ-2 烟雾传感器
 | 评估权重 | 朝向/距离/速度 | 0.3 / 0.5 / 0.2 |
 
 **导航-安全协同**: L3 导航输出速度指令 → L1-A 安全约束检查 → L0 执行器执行。L1-A 可随时覆盖 L3 的指令。
-
-## 9.5.9 OpenClaw Bridge
-
-OpenClaw Bridge 是祖龙与实体机器人之间的事件桥接层:
-
-```
-祖龙 EventBus ←→ EventBusClient ←→ 适配器/监听器 ←→ 机器人硬件
-                   (ZeroMQ/HTTP)
-```
-
-**组件**:
-
-| 组件 | 方向 | 功能 |
-|------|------|------|
-| `MicAdapter` | 机器人→祖龙 | 音频采集 → USER_SPEECH 事件 |
-| `VisionReporter` | 机器人→祖龙 | 视觉检测 → SENSOR_VISION 事件 |
-| `ExecuteListener` | 祖龙→机器人 | TASK_EXECUTE → 机器人动作指令 |
-| `SpeakListener` | 祖龙→机器人 | ACTION_SPEAK → 语音播报 |
-| `WebAdapter` | 双向 | HTTP API + Web UI 交互 |
-
-**设计原则**: Bridge 不加载模型，不做决策，仅做事件格式转换。所有智能逻辑保留在祖龙主系统中。
-
----
 
 # 第 10 章：MCP 协议支持
 

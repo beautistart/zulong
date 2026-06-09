@@ -502,8 +502,8 @@ class SystemBootstrap:
         # 不再需要独立的 TTS 事件处理器监听 L2_OUTPUT
         logger.info("[BOOTSTRAP] TTS Integration: SpeakerDevice will call TTS expert on ACTION_SPEAK events")
         
-        # 🎯 5. 启动 WebSocket 服务器 (OpenClaw Bridge 连接)
-        logger.info("[BOOTSTRAP] Starting WebSocket Server for OpenClaw Bridge...")
+        # 🎯 5. 启动远程事件 WebSocket 服务器
+        logger.info("[BOOTSTRAP] Starting remote EventBus WebSocket Server...")
         
         async def start_ws():
             await start_websocket_server()
@@ -643,10 +643,17 @@ class SystemBootstrap:
                 logger.info("   保存 MemoryGraph...")
                 if hasattr(MemoryGraph._instance, "save_all"):
                     MemoryGraph._instance.save_all()
-                elif hasattr(MemoryGraph._instance, "save"):
-                    MemoryGraph._instance.save()
-                stats = MemoryGraph._instance.stats
-                logger.info(f"   ✅ MemoryGraph 已保存 ({stats['total_nodes']} 节点, {stats['total_edges']} 边)")
+                    stats = (
+                        MemoryGraph._instance.get_stats()
+                        if hasattr(MemoryGraph._instance, "get_stats")
+                        else getattr(MemoryGraph._instance, "stats", {})
+                    )
+                    logger.info(
+                        f"   ✅ MemoryGraph 分片已保存 "
+                        f"({stats.get('total_nodes', 0)} 节点, {stats.get('total_edges', 0)} 边)"
+                    )
+                else:
+                    logger.info("   ⚠️ MemoryGraph 当前实例不是分片后端，跳过旧单 JSON 保存")
         except Exception as e:
             logger.error(f"❌ 保存持久化数据失败：{e}", exc_info=True)
         

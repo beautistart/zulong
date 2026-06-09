@@ -59,6 +59,19 @@ MEMORY_TOOL_NAMES = {
     "search_experience",
 }
 
+MEMORY_SAVE_CUES = (
+    "记住", "保存记忆", "存储记忆", "记忆存储", "写入记忆",
+    "保存到记忆", "保存到长期记忆", "存到记忆", "记录到记忆",
+    "写入长期记忆", "长期记忆写入", "保存这个事实", "记录这个事实",
+    "备忘", "笔记", "remember", "save memory", "store memory",
+)
+
+MEMORY_RECALL_CUES = (
+    "记得", "回忆", "检索记忆", "读取记忆", "从长期记忆", "长期记忆检索",
+    "之前", "上次", "刚才", "历史", "经验",
+    "recall", "previous", "last time",
+)
+
 TASK_TOOL_NAMES = {
     "task_create_plan",
     "task_add_node",
@@ -249,7 +262,12 @@ def predict_tools_for_turn(
         add(["web_search"], "问题涉及实时/最新互联网信息")
         context_bundle["needs_realtime"] = True
 
-    if _needs_memory(lower, intent_result):
+    if _needs_memory_save(lower):
+        add(["save_memory_note", "recall_memory", "read_memory_node", "discover_related", "search_experience"], "用户明确要求写入长期记忆")
+        context_bundle["needs_memory"] = True
+        context_bundle["needs_memory_write"] = True
+        task_graph_policy = "none"
+    elif _needs_memory(lower, intent_result):
         add(["recall_memory", "read_memory_node", "discover_related", "search_experience"], "需要结合祖龙图记忆或历史经验")
         context_bundle["needs_memory"] = True
 
@@ -259,6 +277,17 @@ def predict_tools_for_turn(
         task_graph_policy = "inspect"
 
     if _needs_project_read(lower):
+        requires_code_graph_anchor = _needs_code_graph_task_anchor(lower)
+        if requires_code_graph_anchor:
+            add([
+                "task_create_plan",
+                "task_add_node",
+                "task_view_overview",
+                "task_mark_status",
+                "submit_final_answer",
+            ], "创建代码图谱前需要先创建/绑定任务图节点，便于 CRG 挂载到任务图")
+            context_bundle["code_graph_requires_task_graph"] = True
+            task_graph_policy = "inspect_or_create"
         add([
             "read_file",
             "zulong_code_query",
@@ -277,24 +306,31 @@ def predict_tools_for_turn(
 
     if _needs_task_graph(lower, intent_result, has_task_graph):
         add([
+            "search_experience",
             "task_view_overview",
             "task_get_detail",
             "task_create_plan",
             "task_add_node",
             "task_mark_status",
             "task_update_node",
+            "task_list_suspended",
+            "task_resume_by_address",
             "task_suspend",
             "submit_final_answer",
-        ], "可能需要任务图跟踪或继续复杂任务")
-        task_graph_policy = "reuse" if has_task_graph else "inspect_or_create"
+        ], "可能需要任务图跟踪、创建或恢复复杂任务，并参考历史执行经验")
+        # L1-B 只声明需要任务图能力；是否恢复旧任务由 L2/LLM
+        # 通过 task_list_suspended / task_resume_by_address 等工具语义判断。
+        task_graph_policy = "inspect_or_create"
 
-    if _needs_write(lower):
+    if _needs_write(lower) and not context_bundle.get("needs_memory_write"):
         if _has_explicit_host_path(text):
             add(["ide_write_file"], "用户请求在明确的宿主机路径创建或修改文件")
             context_bundle["needs_ide_file_write"] = True
             if _needs_directory_create(lower):
                 context_bundle["needs_directory_create"] = True
-        add(["exec_write_file", "task_attach_file", "zulong_memory_write_with_code"], "用户请求创建或修改文件/代码")
+        else:
+            add(["exec_write_file"], "用户请求在当前任务工作区创建或修改文件")
+        add(["task_attach_file", "zulong_memory_write_with_code"], "用户请求创建或修改文件/代码")
         risk_notes.append("涉及文件写入，应走 diff、审批和 checkpoint。")
         task_graph_policy = "inspect_or_create"
 
@@ -422,13 +458,38 @@ def summarize_tool_bundle(prediction: Dict[str, Any], *, limit: int = 1600) -> s
         lines.extend(f"  - {r}" for r in risks[:4])
     ctx = prediction.get("context_bundle") or {}
     if ctx.get("needs_ide_file_write"):
-        lines.append(
-            "- 文件写入提示: 用户给出了宿主机绝对路径，优先调用 ide_write_file，"
-            "不要只用自然语言声称创建成功。"
-        )
+        if policy == "inspect_or_create":
+            lines.append(
+                "- 文件写入提示: 用户给出了宿主机绝对路径。若任务需要新建项目/多步开发，"
+                "先建立 TaskGraph/workspace 绑定，再调用 ide_write_file 写具体文件；"
+                "不要只用自然语言声称创建成功。"
+            )
+        else:
+            lines.append(
+                "- 文件写入提示: 用户给出了宿主机绝对路径，优先调用 ide_write_file，"
+                "不要只用自然语言声称创建成功。"
+            )
     if ctx.get("needs_directory_create"):
+        if policy == "inspect_or_create":
+            lines.append(
+                "- 目录创建提示: 若这是新项目/复杂任务的根目录，先检索历史经验并调用 "
+                "task_create_plan 创建绑定 workspace_dir；ide_write_file(create_directory=true) "
+                "只用于已有工作区内的普通子目录创建。"
+            )
+        else:
+            lines.append(
+                "- 目录创建提示: 用户要求创建文件夹/目录，调用 ide_write_file 时必须设置 create_directory=true。"
+            )
+    if ctx.get("code_graph_requires_task_graph"):
         lines.append(
-            "- 目录创建提示: 用户要求创建文件夹/目录，调用 ide_write_file 时必须设置 create_directory=true。"
+            "- 代码图谱前置条件: 创建项目级代码图谱前必须先调用 task_create_plan 创建/绑定任务图根节点；"
+            "需要细分时再用 task_add_node 添加代码分析子节点，然后调用 index_project。"
+        )
+    if prediction.get("task_graph_policy") in {"reuse", "inspect", "continue"} or any(
+        name in {"task_list_suspended", "task_resume_by_address"} for name in prediction.get("predicted_tools", [])
+    ):
+        lines.append(
+            "- 任务恢复提示: 是否恢复旧任务必须由你结合用户语义判断；需要恢复时先调用 task_list_suspended 或 task_resume_by_address，不要新建任务图。"
         )
     if ctx.get("needs_vscode_command"):
         lines.append(
@@ -461,37 +522,7 @@ def _finalize_prediction(
             continue
         if name not in names:
             names.append(name)
-    priority = {
-        "request_tool_supplement": 0,
-        "search_tools": 1,
-        "web_search": 2,
-        "index_project": 3,
-        "search_code_symbols": 4,
-        "get_symbol_context": 5,
-        "get_impact_analysis": 6,
-        "zulong_code_query": 7,
-        "index_code_file": 8,
-        "analyze_module": 9,
-        "read_file": 10,
-        "get_diagnostics": 11,
-        "open_problems": 12,
-        "task_view_overview": 15,
-        "task_get_detail": 16,
-        "task_create_plan": 17,
-        "task_mark_status": 18,
-        "task_update_node": 19,
-        "ide_write_file": 24,
-        "exec_write_file": 25,
-        "exec_run_command": 30,
-        "vscode_run_command": 31,
-        "ask_user_input": 40,
-        "ask_user_select_file": 41,
-        "vscode_manage_extension": 42,
-        "open_settings": 43,
-    }
-    names.sort(key=lambda n: priority.get(n, 50))
-    if max_prompt_tools:
-        names = names[:max(1, max_prompt_tools)]
+    # L1-B只做工具预判，不做工具优先级裁剪。常驻工具由L2注入。
     return ToolPrediction(
         predicted_tools=names,
         context_bundle=context_bundle,
@@ -597,8 +628,13 @@ def _keyword_score(query: str, name: str, entry: ToolBagEntry) -> int:
         (("运行", "测试", "构建", "命令", "终端", "npm", "python"), TERMINAL_TOOL_NAMES),
         (("打开", "启动", "切换", "项目", "工作区", "文件夹", "目录", "vscode", "ide", "workspace", "folder"), IDE_TOOL_NAMES),
         (("任务", "计划", "进度", "继续", "恢复"), TASK_TOOL_NAMES),
-        (("记忆", "历史", "经验", "回忆"), MEMORY_TOOL_NAMES),
+        (("记忆", "历史", "经验", "回忆", "记住", "备忘", "笔记"), MEMORY_TOOL_NAMES),
     ]
+    is_memory_save = _needs_memory_save(query)
+    if name == "save_memory_note" and is_memory_save:
+        score += 12
+    if name in WRITE_TOOL_NAMES | CODE_TOOL_NAMES and is_memory_save:
+        score -= 4
     for words, names in groups:
         if name in names and any(w in query for w in words):
             score += 4
@@ -622,6 +658,7 @@ def _keyword_score(query: str, name: str, entry: ToolBagEntry) -> int:
         phrase in query
         for phrase in (
             "只读",
+            "read only",
             "read-only",
             "readonly",
             "不要修改",
@@ -670,6 +707,21 @@ def _needs_extension_management(text: str) -> bool:
     ]
     lowered = text.lower()
     return any(indicator.lower() in lowered for indicator in indicators)
+
+
+def _has_read_only_constraint(text: str) -> bool:
+    lowered = (text or "").lower()
+    literal_cues = (
+        "不要修改", "不修改", "无需修改", "不需要修改",
+        "不要改", "别改", "不要动", "不要动文件", "不要改文件",
+        "不要写", "不写", "不要生成文件",
+        "不要保存", "不保存", "只读", "仅分析", "只分析",
+        "read only", "read-only", "readonly",
+        "do not modify", "don't modify", "without modifying",
+        "do not edit", "don't edit", "no edit", "no edits",
+        "analyze only", "inspect only", "no file changes", "no changes",
+    )
+    return any(cue in lowered for cue in literal_cues)
 
 
 def _is_simple_social(text: str) -> bool:
@@ -745,17 +797,41 @@ def _needs_realtime(text: str) -> bool:
 
 def _needs_memory(text: str, intent_result: Optional[Dict[str, Any]]) -> bool:
     intent = (intent_result or {}).get("intent", "").lower()
-    return intent in {"chat_memory", "task_resume"} or any(k in text for k in (
-        "记得", "记住", "回忆", "之前", "上次", "刚才", "历史", "经验",
-    ))
+    return intent in {"chat_memory", "task_resume"} or any(k in text for k in MEMORY_SAVE_CUES + MEMORY_RECALL_CUES)
+
+
+def _needs_memory_save(text: str) -> bool:
+    return any(k in text for k in MEMORY_SAVE_CUES)
 
 
 def _needs_project_read(text: str) -> bool:
+    if _needs_memory_save(text) and not any(k in text for k in (
+        "读取", "查看", "分析项目", "分析代码", "当前项目", "当前工作区",
+        "源码", "模块", "函数", "类", "仓库",
+        "read file", "source code", "current project", "current workspace",
+    )):
+        return False
     return any(k in text for k in (
         "代码", "项目", "文件", "模块", "函数", "类", "报错", "bug",
         "日志", "源码", "编译", "依赖", "仓库", "实现", "重构",
         "code", "project", "file", "function", "class", "bug",
     )) or bool(re.search(r"\b[\w\-./\\]+\.(py|ts|tsx|js|jsx|json|yaml|yml|md|html|css|go|rs|java|cpp|c|cs)\b", text))
+
+
+def _needs_code_graph_task_anchor(text: str) -> bool:
+    explicit_code_graph = any(k in text for k in (
+        "代码图谱", "代码结构图", "创建图谱", "建立图谱", "生成图谱",
+        "code graph", "crg", "index_project",
+    ))
+    project_scope = any(k in text for k in (
+        "项目", "系统", "架构", "源码", "代码库", "仓库", "工程",
+        "project", "architecture", "codebase", "repository",
+    ))
+    analysis_scope = any(k in text for k in (
+        "分析", "理解", "梳理", "扫描", "索引", "结构", "深度",
+        "analyze", "analysis", "understand", "inspect", "index",
+    ))
+    return explicit_code_graph or (project_scope and analysis_scope)
 
 
 def _needs_ide_workspace_open(text: str) -> bool:
@@ -772,40 +848,49 @@ def _needs_ide_workspace_open(text: str) -> bool:
 
 
 def _needs_task_graph(text: str, intent_result: Optional[Dict[str, Any]], has_task_graph: bool) -> bool:
+    if _has_read_only_constraint(text) and any(k in text for k in (
+        "inspect", "analysis", "analyze", "compare", "检查", "分析", "对比",
+    )):
+        return has_task_graph
     explicit_task_cues = any(k in text for k in (
         "任务", "计划", "步骤", "复杂", "项目开发",
-        "实现一个", "做一个", "开发", "重构",
+        "实现一个", "做一个", "开发", "重构", "编写",
         "implement", "create", "build", "develop", "write", "refactor",
         "next step", "plan",
     ))
     if explicit_task_cues:
         return True
+    complex_creation_cues = any(k in text for k in (
+        "创建", "新建", "生成", "写", "实现", "制作", "搭建",
+        "web端", "web 端", "网页", "小游戏", "游戏", "应用", "项目",
+    ))
+    if complex_creation_cues and (_needs_directory_create(text) or _has_explicit_host_path(text)):
+        return True
     if not has_task_graph:
         return False
     followup_cues = any(k in text for k in (
-        "继续", "接着", "恢复", "上次那个", "刚才那个",
         "下一步", "然后呢", "做到哪了", "进度", "未完成",
     ))
     return followup_cues
 
 
 def _needs_write(text: str) -> bool:
-    if any(k in text for k in (
-        "不要修改", "不修改", "无需修改", "不需要修改",
-        "不要改", "别改", "不要动", "不要动文件", "不要改文件",
-        "不要写", "不写", "不要创建", "不要生成文件",
-        "不要保存", "不保存", "只读", "仅分析", "只分析",
-        "read-only", "readonly", "do not modify", "don't modify",
-        "do not edit", "don't edit", "without modifying", "analyze only",
-        "no file changes", "no changes",
-    )):
+    if _needs_memory_save(text):
+        return False
+    if _needs_memory(text, None) and any(k in text for k in ("回忆", "检索", "读取", "召回", "回答", "复述")):
+        return False
+    if _has_read_only_constraint(text):
         return False
     if _is_presentation_only_request(text):
         return False
-    return any(k in text for k in (
+    if any(k in text for k in (
         "写", "创建", "新建", "命名为", "命名成", "生成", "修改", "修复",
         "实现", "删除", "替换", "保存到", "新增", "改一下", "补齐", "重构",
-        "write", "create", "modify", "fix", "implement", "delete",
+    )):
+        return True
+    return bool(re.search(
+        r"\b(write|create|modify|fix|implement|delete|refactor|develop|build)\b",
+        text,
     ))
 
 

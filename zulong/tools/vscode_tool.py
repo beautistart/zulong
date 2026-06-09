@@ -3,11 +3,11 @@
 
 import logging
 import subprocess
-import shutil
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 
 from .base import BaseTool, ToolRequest, ToolResult, ToolCategory, ToolStatus
+from zulong.workspace.vscode_launcher import resolve_vscode_command
 
 logger = logging.getLogger(__name__)
 
@@ -49,21 +49,21 @@ class VSCodeTool(BaseTool):
             bool: 是否初始化成功
         """
         try:
-            # 检查 code 命令是否存在
-            code_path = shutil.which(self.code_command)
-            
-            if code_path:
+            resolved = resolve_vscode_command(self.code_command)
+
+            if resolved.get("ok"):
                 self.vscode_installed = True
-                self.vscode_path = code_path
-                logger.info(f"[VSCodeTool] VSCode CLI found at: {code_path}")
+                self.vscode_path = str(resolved["command"])
+                self.code_command = self.vscode_path
+                logger.info(f"[VSCodeTool] VSCode CLI found at: {self.vscode_path}")
                 
                 # 获取版本信息
                 version = self._get_version()
                 logger.info(f"[VSCodeTool] Version: {version}")
             else:
                 self.vscode_installed = False
-                logger.warning("[VSCodeTool] VSCode CLI not found in PATH")
-                logger.warning("[VSCodeTool] Please install VSCode and add 'code' to PATH")
+                logger.warning("[VSCodeTool] VSCode CLI not found")
+                logger.warning("[VSCodeTool] Please install VSCode/Cursor CLI or configure ZULONG_VSCODE_COMMAND")
             
             self.status = ToolStatus.READY
             return self.vscode_installed

@@ -1,0 +1,68 @@
+name: Platform Smoke
+
+on:
+  push:
+    paths:
+      - "zulong/**"
+      - "scripts/**"
+      - "config/**"
+      - "requirements*.txt"
+      - "tests/platform/**"
+      - "zulong-ide/src/**"
+      - "zulong-ide/webview-ui/src/**"
+      - "zulong-ide/scripts/**"
+      - "zulong-ide/package*.json"
+      - "zulong-ide/tsconfig*.json"
+      - ".github/workflows/platform-smoke.yml"
+  pull_request:
+    paths:
+      - "zulong/**"
+      - "scripts/**"
+      - "config/**"
+      - "requirements*.txt"
+      - "tests/platform/**"
+      - "zulong-ide/src/**"
+      - "zulong-ide/webview-ui/src/**"
+      - "zulong-ide/scripts/**"
+      - "zulong-ide/package*.json"
+      - "zulong-ide/tsconfig*.json"
+      - ".github/workflows/platform-smoke.yml"
+
+jobs:
+  smoke:
+    name: ${{ matrix.os }} Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        python-version: ["3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install smoke dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-core.txt -r requirements-dev.txt opencv-python imageio-ffmpeg
+
+      - name: Run platform smoke
+        run: python scripts/smoke_platform.py --skip-audio-devices --json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: zulong-ide/package-lock.json
+
+      - name: Install Zulong IDE dependencies
+        working-directory: zulong-ide
+        run: npm ci
+
+      - name: Run Zulong IDE platform smoke
+        working-directory: zulong-ide
+        run: npm run smoke:platform -- --json

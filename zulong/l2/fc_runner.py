@@ -25,6 +25,13 @@ if TYPE_CHECKING:
     from zulong.l2.inference_engine import InferenceEngine
 
 from zulong.l2.circuit_breaker import CircuitBreakerState
+from zulong.l2.tool_budget import (
+    engine_tool_budget_exhausted,
+    get_engine_tool_budget,
+    get_engine_tool_calls_used,
+    record_engine_tool_calls_used,
+    sync_engine_tool_budget,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +54,7 @@ class FCRunner:
 
     # 连续 response=None 拦截的安全上限
     _MAX_NULL_RESPONSES = 3
+    _MAX_UNCOMPLETED_RETRIES = 0
 
     # 重复工具死循环检测阈值
     _DUPLICATE_TOOL_CHECK_TURNS = 3  # 连续N轮调用相同工具+相同参数判定为死循环
@@ -133,6 +141,7 @@ class FCRunner:
         # 重置 RuleGuardian 计数器
         if hasattr(self.engine, '_rule_guardian'):
             self.engine._rule_guardian.reset()
+        sync_engine_tool_budget(self.engine, user_input)
 
         # 组装初始状态
         state: Dict = {
@@ -171,6 +180,15 @@ class FCRunner:
                 "普通 L2 直答应使用单次模型决策路径"
             )
             self.engine._last_fc_terminate_reason = "no_tool_call"
+            self._on_loop_done(state, None, 0)
+            return None, 0
+
+        initial_tool_calls_data = self._apply_tool_call_budget(
+            state,
+            initial_tool_calls_data,
+        )
+        if not initial_tool_calls_data:
+            self.engine._last_fc_terminate_reason = "tool_budget_exhausted"
             self._on_loop_done(state, None, 0)
             return None, 0
 
@@ -223,10 +241,21 @@ class FCRunner:
 
                 # ── Phase 3a: Exec Tools (有工具调用) ──
                 if state.get("tool_calls_data"):
+                    limited = self._apply_tool_call_budget(
+                        state,
+                        state.get("tool_calls_data") or [],
+                    )
+                    state["tool_calls_data"] = limited
+                    if not limited:
+                        continue
+                    clears_uncompleted_retry = self._tool_calls_show_real_progress(limited)
                     result = self.exec_tools_state(state)
                     state.update(result)
                     if state.get("should_terminate"):
                         break
+                    if clears_uncompleted_retry:
+                        state["null_response_count"] = 0
+                        state["_uncompleted_retry_cycles"] = 0
                     continue  # 回到 check
 
                 # ── Phase 3b: Eval Response (纯文本回复) ──
@@ -239,6 +268,25 @@ class FCRunner:
                 if state.get("response") is None:
                     null_count = state.get("null_response_count", 0)
                     if null_count >= self._MAX_NULL_RESPONSES:
+                        if self._has_uncompleted_task_graph():
+                            retries = state.get("_uncompleted_retry_cycles", 0) + 1
+                            state["_uncompleted_retry_cycles"] = retries
+                            if retries > self._MAX_UNCOMPLETED_RETRIES:
+                                response = self._block_uncompleted_task_graph(state)
+                                state["response"] = response
+                                state["should_terminate"] = "uncompleted_retry_exhausted"
+                                logger.warning(
+                                    "[FCRunner] 未完成任务图连续重试无进展，标记 blocked 并终止"
+                                )
+                                break
+                            state["null_response_count"] = 0
+                            state["cb_force_no_tools"] = False
+                            self._inject_continue_uncompleted_task(state)
+                            logger.warning(
+                                f"[FCRunner] 连续 {null_count} 次拦截，但任务图仍未完成，"
+                                "重置拦截计数并继续工具循环"
+                            )
+                            continue
                         logger.warning(
                             f"[FCRunner] 连续 {null_count} 次拦截，"
                             f"超过安全上限 ({self._MAX_NULL_RESPONSES})，"
@@ -281,6 +329,108 @@ class FCRunner:
         return response, fc_turn
 
     # ── 通用安全网 ──────────────────────────────────────────
+
+    def _apply_tool_call_budget(
+        self,
+        state: Dict,
+        tool_calls_data: List[Dict],
+    ) -> List[Dict]:
+        """Enforce explicit user tool-call budgets before execution."""
+        if not tool_calls_data:
+            return []
+        budget = get_engine_tool_budget(self.engine)
+        if budget is None:
+            return tool_calls_data
+        used = get_engine_tool_calls_used(self.engine)
+        remaining = max(0, budget - used)
+        if remaining <= 0:
+            self._inject_tool_budget_convergence(state, budget, used)
+            return []
+        allowed = tool_calls_data[:remaining]
+        skipped = len(tool_calls_data) - len(allowed)
+        record_engine_tool_calls_used(self.engine, len(allowed))
+        if skipped > 0 or engine_tool_budget_exhausted(self.engine):
+            self._inject_tool_budget_convergence(
+                state,
+                budget,
+                used + len(allowed),
+                skipped=skipped,
+            )
+        return allowed
+
+    @staticmethod
+    def _tool_calls_show_real_progress(tool_calls_data: List[Dict]) -> bool:
+        """Return True when a tool call is likely to advance task state.
+
+        Read-only probes should not reset the "unfinished task" retry guard.
+        This keeps a complex task visibly blocked when the model keeps
+        inspecting or marking "in_progress" without producing files/results.
+        """
+        progress_tools = {
+            "ide_write_file",
+            "exec_write_file",
+            "write_to_file",
+            "replace_in_file",
+            "delete_file",
+            "create_directory",
+            "exec_run_command",
+            "execute_command",
+            "task_create_plan",
+            "task_add_node",
+            "task_update_node",
+            "task_update_content",
+            "task_attach_file",
+            "task_resume_by_address",
+            "task_suspend",
+            "save_memory_note",
+            "delete_memory_node",
+            "delete_memory_edge",
+            "set_importance",
+            "activate_memory_network",
+            "submit_final_answer",
+        }
+        for tc in tool_calls_data or []:
+            function = tc.get("function") or {}
+            name = function.get("name") or ""
+            if name in progress_tools:
+                return True
+            if name == "task_mark_status":
+                raw_args = function.get("arguments") or "{}"
+                try:
+                    import json
+                    args = json.loads(raw_args)
+                except Exception:
+                    args = {}
+                if str(args.get("status") or "").lower() in {
+                    "completed",
+                    "blocked",
+                    "skipped",
+                    "failed",
+                }:
+                    return True
+        return False
+
+    @staticmethod
+    def _inject_tool_budget_convergence(
+        state: Dict,
+        budget: int,
+        used: int,
+        *,
+        skipped: int = 0,
+    ) -> None:
+        note = (
+            f"[工具预算硬控] 用户要求本轮最多调用 {budget} 个工具；"
+            f"当前已允许执行 {used} 个。"
+        )
+        if skipped > 0:
+            note += f" 已拦截 {skipped} 个超额工具调用。"
+        note += " 请基于已有工具结果和上下文直接总结，不允许继续调用工具。"
+        state["cb_force_no_tools"] = True
+        state.setdefault("messages", []).append({
+            "role": "user",
+            "content": note,
+        })
+        state["tool_calls_data"] = None
 
     def _detect_duplicate_tool_loop(self, state: Dict) -> None:
         """重复工具调用死循环检测
@@ -485,6 +635,101 @@ class FCRunner:
     ) -> None:
         """钩子: 循环完成"""
         pass
+
+    @staticmethod
+    def _inject_continue_uncompleted_task(state: Dict) -> None:
+        next_label = ""
+        next_desc = ""
+        try:
+            from zulong.tools.task_tools import get_active_task_graph, _save_active_backup
+
+            tg = get_active_task_graph()
+            if tg:
+                leaves = [
+                    node for node in tg.get_leaf_nodes()
+                    if not getattr(node, "id", "").startswith("crg_")
+                ]
+                uncompleted = [
+                    node for node in leaves
+                    if getattr(node, "status", "") not in ("completed", "skipped")
+                ]
+                if uncompleted:
+                    current = next(
+                        (
+                            node for node in uncompleted
+                            if getattr(node, "status", "") == "in_progress"
+                        ),
+                        uncompleted[0],
+                    )
+                    if getattr(current, "status", "") != "in_progress":
+                        tg.update_node_status(current.id, "in_progress")
+                        try:
+                            _save_active_backup()
+                        except Exception:
+                            pass
+                    next_label = f"{current.id}({current.label})"
+                    next_desc = current.desc or current.label
+        except Exception:
+            next_label = ""
+            next_desc = ""
+
+        detail = (
+            f" 当前应执行: {next_label}。{next_desc}"
+            if next_label else ""
+        )
+        state.setdefault("messages", []).append({
+            "role": "user",
+            "content": (
+                "[任务图继续执行] 当前任务图仍有未完成节点。"
+                "请继续调用真实工具推进任务，不要直接总结或只输出进度句。"
+                "如果当前节点要求文件产出，下一步必须调用 ide_write_file 或相应写入工具真实落盘。"
+                f"{detail}"
+            ),
+        })
+
+    @staticmethod
+    def _block_uncompleted_task_graph(state: Dict) -> str:
+        next_label = ""
+        detail = "模型多轮没有继续调用真实工具，任务被标记为 blocked，等待用户或后续恢复。"
+        try:
+            from zulong.tools.task_tools import get_active_task_graph, _save_active_backup
+
+            tg = get_active_task_graph()
+            if tg:
+                leaves = [
+                    node for node in tg.get_leaf_nodes()
+                    if not getattr(node, "id", "").startswith("crg_")
+                ]
+                uncompleted = [
+                    node for node in leaves
+                    if getattr(node, "status", "") not in ("completed", "skipped")
+                ]
+                current = next(
+                    (
+                        node for node in uncompleted
+                        if getattr(node, "status", "") == "in_progress"
+                    ),
+                    uncompleted[0] if uncompleted else None,
+                )
+                if current is not None:
+                    next_label = f"{current.id}({current.label})"
+                    detail = (
+                        f"节点 {next_label} 连续多轮没有产生真实工具调用或文件产出，"
+                        "已标记为 blocked。"
+                    )
+                    try:
+                        tg.update_node_status(current.id, "blocked", result=detail)
+                        _save_active_backup()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        return (
+            "任务已阻断：当前任务图仍有未完成节点，但模型连续多轮没有继续调用真实工具。"
+            + (f"\n阻断节点：{next_label}。" if next_label else "")
+            + f"\n原因：{detail}"
+        )
 
     @staticmethod
     def _has_uncompleted_task_graph() -> bool:

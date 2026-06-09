@@ -126,7 +126,7 @@ VS Code 插件内的 TypeScript 执行桥，是 LLM 操作 VS Code 的唯一入�
 
 ## 四、C 类: Web 端刷新对话恢复
 
-**代码位置**: `openclaw_bridge/web/static/index.html`
+**代码位置**: `zulong_web/static/index.html`
 
 **问题**: 页面刷新后，`switchToSession()` 因 WebSocket 未连接而失败 → 聊天区显示"无法加载对话记录"。WS 连接后 `syncBackendState()` 只刷侧栏，不加载消息。
 
@@ -219,7 +219,7 @@ COMPLEX 系统提示中新增 5 行 VS Code 工具使用指令:
 
 | 文件 | 变更行数 | 说明 |
 |------|---------|------|
-| `openclaw_bridge/web/static/index.html` | ~30 | Web 刷新对话恢复修复 |
+| `zulong_web/static/index.html` | ~30 | Web 刷新对话恢复修复 |
 | `zulong/ide/ide_server.py` | ~200 | REST API 扩展 (LLM配置/模型层/会话CRUD/任务图谱) + PreloadManager |
 | `zulong/launcher/web_chat_router.py` | ~200 | 消息持久化 + 统一协议 + 对话编排 + LLM/模型/会话 API |
 

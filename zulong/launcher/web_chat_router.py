@@ -9,9 +9,14 @@ Web 前端是主系统界面，聊天消息不经过 IDE Server。
 """
 
 import asyncio
+import copy
 import json
 import logging
+import os
+import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Set
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -31,6 +36,200 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _PRE_LLM_CONTEXT_TIMEOUT = 0.25
+_MEMORY_GRAPH_SNAPSHOT_LOCK = threading.Lock()
+_MEMORY_GRAPH_SNAPSHOT_TIMEOUT = 6.0
+_VISIBLE_MESSAGE_MIRROR_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="zulong-visible-mirror")
+_WINDOWS_PATH_IN_TEXT_RE = re.compile(r"(?P<path>[A-Za-z]:[\\/][^\s，。；;,\n\r\"'`]+)")
+_POSIX_PATH_IN_TEXT_RE = re.compile(r"(?P<path>/(?:[^\s，。；;,\n\r\"'`]+))")
+
+
+def _copy_payload_for_background(payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return copy.deepcopy(payload or {})
+    except Exception:
+        return dict(payload or {})
+
+
+def _mirror_visible_message_background(
+    *,
+    conversation_id: str,
+    turn_id: str,
+    role: str,
+    text: str,
+    event_type: str,
+    source: str,
+    payload: Dict[str, Any],
+) -> None:
+    mirror_payload = _copy_payload_for_background(payload)
+
+    def _run() -> None:
+        try:
+            from zulong.launcher.memory_mirror import mirror_interaction_to_memory_graph
+
+            mirror_interaction_to_memory_graph(
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                role=role,
+                text=text,
+                event_type=event_type,
+                source=source,
+                payload=mirror_payload,
+            )
+        except Exception as mirror_exc:
+            logger.debug(f"[WebChatRouter] MemoryGraph 后台镜像跳过: {event_type}: {mirror_exc}")
+
+    try:
+        _VISIBLE_MESSAGE_MIRROR_EXECUTOR.submit(_run)
+    except Exception as submit_exc:
+        logger.debug(f"[WebChatRouter] MemoryGraph 后台镜像提交失败: {event_type}: {submit_exc}")
+
+
+def _extract_explicit_workspace_path(text: str) -> str:
+    """Return an explicit workspace path mentioned by the user.
+
+    If the mentioned target does not exist yet, use the nearest existing
+    parent as the workspace so Web programming tasks can create new folders
+    without falling back to the Zulong repo directory.
+    """
+    raw = str(text or "")
+    match = _WINDOWS_PATH_IN_TEXT_RE.search(raw) or _POSIX_PATH_IN_TEXT_RE.search(raw)
+    if not match:
+        return ""
+    candidate = match.group("path").strip().rstrip("\\/。；;，,")
+    try:
+        path = os.path.abspath(os.path.expanduser(os.path.expandvars(candidate)))
+        if os.path.exists(path):
+            return path
+        parent = os.path.dirname(path)
+        while parent and parent != os.path.dirname(parent):
+            if os.path.isdir(parent):
+                return parent
+            parent = os.path.dirname(parent)
+    except Exception:
+        return ""
+    return ""
+
+
+def _same_path(left: Optional[str], right: Optional[str]) -> bool:
+    if not left or not right:
+        return False
+    try:
+        return os.path.normcase(os.path.abspath(str(left))) == os.path.normcase(os.path.abspath(str(right)))
+    except Exception:
+        return str(left) == str(right)
+
+
+def _resolve_active_task_workspace(
+    preferred: Optional[str] = None,
+    task_graph_id: Optional[str] = None,
+) -> str:
+    """Resolve the current task workspace without falling back to repo cwd."""
+    candidates: List[str] = []
+
+    def add_candidate(value: Optional[str]) -> None:
+        if value:
+            candidates.append(value)
+
+    if task_graph_id:
+        try:
+            from zulong.workspace.project_registry import get_project_registry
+            project = get_project_registry().get_project_by_graph_id(task_graph_id)
+            if project and project.path:
+                add_candidate(project.path)
+        except Exception:
+            pass
+
+    try:
+        from zulong.tools.task_tools import get_active_task_graph, get_active_workspace_dir
+        active_workspace = get_active_workspace_dir()
+        active_graph = get_active_task_graph()
+        active_graph_id = getattr(active_graph, "id", None) if active_graph else None
+        if active_workspace and (not task_graph_id or active_graph_id == task_graph_id):
+            add_candidate(active_workspace)
+        if active_graph is not None:
+            meta_workspace = getattr(active_graph, "metadata", {}).get("workspace_dir")
+            if meta_workspace and (not task_graph_id or active_graph_id == task_graph_id):
+                add_candidate(meta_workspace)
+    except Exception:
+        pass
+
+    # Web payloads can carry stale IDE context. Prefer authoritative task
+    # binding first, and only use the requested path as a final fallback.
+    add_candidate(preferred)
+
+    for candidate in candidates:
+        try:
+            path = os.path.abspath(os.path.expanduser(os.path.expandvars(str(candidate))))
+            if os.path.exists(path):
+                return path
+        except Exception:
+            continue
+    return ""
+
+
+def _active_task_graph_binding() -> Dict[str, str]:
+    """Return active TaskGraph id/workspace for Web message attribution."""
+    binding = {"task_graph_id": "", "workspace_path": ""}
+    try:
+        from zulong.tools.task_tools import get_active_task_graph, get_active_workspace_dir
+        tg = get_active_task_graph()
+        if tg:
+            binding["task_graph_id"] = str(getattr(tg, "id", "") or "")
+            meta = getattr(tg, "metadata", {}) or {}
+            binding["workspace_path"] = str(meta.get("workspace_dir") or "")
+        if not binding["workspace_path"]:
+            binding["workspace_path"] = str(get_active_workspace_dir() or "")
+    except Exception:
+        pass
+    return binding
+
+
+def _extract_bfs_task_graph_id(bfs_ctx: Dict[str, Any], user_text: str = "") -> str:
+    """Extract the bound TaskGraph ID from BFS session context.
+
+    TSD 23.11 uses the conversation window as the recovery anchor. Older BFS
+    payloads may leave top-level task_graph_id empty while still returning the
+    active task as node_id="task:tg_xxx"; promote that stable graph address.
+    """
+    graph_id = str(bfs_ctx.get("task_graph_id") or "").strip()
+    if graph_id:
+        return graph_id
+
+    active_tasks = bfs_ctx.get("active_tasks") or []
+    if not isinstance(active_tasks, list):
+        return ""
+
+    candidates: List[Dict[str, Any]] = []
+    for task in active_tasks:
+        if not isinstance(task, dict):
+            continue
+        node_id = str(task.get("node_id") or "").strip()
+        if node_id.startswith("task:"):
+            task = dict(task)
+            task["_graph_id"] = node_id.split("task:", 1)[1].strip()
+            candidates.append(task)
+
+    if not candidates:
+        return ""
+
+    active_like = [
+        task for task in candidates
+        if str(task.get("status") or "").lower() in {"active", "running", "in_progress", "pending"}
+    ]
+    pool = active_like or candidates
+
+    query_tokens = set(re.findall(r"[\w\u4e00-\u9fff]+", str(user_text or "").lower()))
+
+    def score(task: Dict[str, Any]) -> float:
+        label = str(task.get("label") or "").lower()
+        label_tokens = set(re.findall(r"[\w\u4e00-\u9fff]+", label))
+        lexical = len(query_tokens & label_tokens) / max(1, len(query_tokens | label_tokens))
+        substring = 1.0 if label and (label in str(user_text or "").lower() or str(user_text or "").lower() in label) else 0.0
+        activation = float(task.get("activation") or 0)
+        return substring * 2.0 + lexical + activation
+
+    pool.sort(key=score, reverse=True)
+    return str(pool[0].get("_graph_id") or "").strip()
 
 # ── 状态 ──────────────────────────────────────────────
 
@@ -49,6 +248,14 @@ _ws_client_types: Dict[int, str] = {}
 # asyncio task 并发 send_json，会在 drain waiter 上触发 AssertionError。
 _ws_send_locks: Dict[int, asyncio.Lock] = {}
 
+# Low-priority visual updates can arrive in bursts while L2 is finishing. Keep
+# only one in-flight broadcast per noisy type so they cannot delay chat output.
+_NOISY_BROADCAST_TYPES = {"MEMORY_GRAPH_UPDATE", "THINKING_STEP"}
+_NOISY_MIN_INTERVALS = {"MEMORY_GRAPH_UPDATE": 5.0, "THINKING_STEP": 0.75}
+_noisy_broadcast_pending: Set[str] = set()
+_noisy_broadcast_last_sent: Dict[str, float] = {}
+_noisy_broadcast_lock = threading.Lock()
+
 # 统一协议桥接器
 _protocol_bridge = ProtocolBridge()
 
@@ -60,6 +267,29 @@ _event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 # 活跃聊天取消事件（IDE 模式使用）
 _chat_cancels: Dict[str, asyncio.Event] = {}
+_recent_stop_ack_at: Dict[str, float] = {}
+
+# Web 主界面的任务运行状态。TSD §23.3 要求执行中、等待审批、
+# 长时间无事件都能被用户明确区分。
+_TASK_STATUS_STALE_SECONDS = 90.0
+_task_execution_status: Dict[str, Any] = {
+    "state": "idle",
+    "phase": "idle",
+    "message": "当前没有正在执行的任务。",
+    "request_id": "",
+    "conversation_id": "",
+    "session_id": "",
+    "workspace_path": "",
+    "project_id": "",
+    "task_graph_id": "",
+    "tool_name": "",
+    "awaiting_approval": False,
+    "approval": None,
+    "last_progress_at": 0.0,
+    "last_state_change_at": time.time(),
+    "stale_after_seconds": _TASK_STATUS_STALE_SECONDS,
+    "progress_items": [],
+}
 
 
 def _get_ws_send_lock(ws: WebSocket) -> asyncio.Lock:
@@ -83,6 +313,354 @@ def _forget_ws_connection(ws: WebSocket) -> None:
         _monitor_connections.discard(ws)
     except Exception:
         pass
+
+
+def _interaction_status_for_state(state: str) -> str:
+    state = str(state or "").lower()
+    if state in {"completed", "succeeded", "success", "idle"}:
+        return "succeeded" if state != "idle" else "pending"
+    if state in {"failed", "error"}:
+        return "failed"
+    if state in {"blocked", "possibly_stalled", "stalled"}:
+        return "blocked"
+    if state in {"cancelled", "canceled"}:
+        return "cancelled"
+    if state in {"waiting_approval", "awaiting_approval", "workspace_trust_required"}:
+        return "awaiting_approval"
+    return "running"
+
+
+def _build_task_status_interaction(status: Dict[str, Any]) -> Dict[str, Any]:
+    state = str(status.get("state") or "running")
+    phase = str(status.get("phase") or state)
+    message = str(status.get("message") or "任务状态更新")
+    conversation_id = str(status.get("conversation_id") or status.get("session_id") or "")
+    request_id = str(status.get("request_id") or status.get("turn_id") or "")
+    pair_id = "task-status"
+    if conversation_id or request_id:
+        pair_id += f":{conversation_id or request_id}"
+    if phase in {"approval_required", "approval_resolved", "workspace_trust_required"}:
+        approval = status.get("approval") if isinstance(status.get("approval"), dict) else {}
+        pair_id = str(approval.get("approval_id") or approval.get("approvalId") or pair_id)
+    else:
+        approval = {}
+    progress_items = status.get("progress_items")
+    if not isinstance(progress_items, list) or not progress_items:
+        item_status = "running"
+        if state in {"completed", "succeeded"}:
+            item_status = "completed"
+        elif state in {"blocked", "possibly_stalled", "failed"}:
+            item_status = "blocked" if state != "failed" else "failed"
+        elif state in {"waiting_approval", "awaiting_approval", "workspace_trust_required"}:
+            item_status = "running"
+        progress_items = [{
+            "id": phase,
+            "label": message,
+            "status": item_status,
+            "source": "heartbeat" if phase in {"heartbeat", "stalled_watch"} else "task_graph",
+            "timestamp": status.get("last_progress_at") or time.time(),
+        }]
+    interaction = {
+        "interaction_id": pair_id,
+        "pair_id": pair_id,
+        "kind": "approval" if status.get("awaiting_approval") else "progress",
+        "status": _interaction_status_for_state(state),
+        "title": status.get("title") or _task_status_title(state, phase),
+        "detail": _humanize_task_status_text(message),
+        "tool_name": approval.get("tool_name") or status.get("tool_name") or "",
+        "progress_items": progress_items[:8],
+        "next_step": status.get("next_step") or "",
+        "timestamp": time.time(),
+    }
+    for key in (
+        "approval_id",
+        "approvalId",
+        "action_summary",
+        "tool_args",
+        "risk_level",
+        "risk_reason",
+        "approval_mode",
+        "confirmation_state",
+    ):
+        value = approval.get(key)
+        if value not in (None, ""):
+            normalized_key = "approval_id" if key == "approvalId" else key
+            interaction[normalized_key] = value
+    if approval and not interaction.get("action_summary"):
+        interaction["action_summary"] = approval.get("summary") or approval.get("message") or message
+    return interaction
+
+
+def _task_status_title(state: str, phase: str) -> str:
+    state = str(state or "").lower()
+    phase = str(phase or "").lower()
+    if state in {"waiting_approval", "awaiting_approval"}:
+        return "任务已暂停，等待审批"
+    if state == "workspace_trust_required" or phase == "workspace_trust_required":
+        return "任务已暂停，等待 VS Code 信任"
+    if state in {"possibly_stalled", "stalled"}:
+        return "任务疑似卡住"
+    if state in {"completed", "succeeded"}:
+        return "任务已完成"
+    if state in {"failed", "blocked"}:
+        return "任务受阻"
+    if state in {"idle", ""}:
+        return "当前空闲"
+    return "任务执行中"
+
+
+def _humanize_task_status_text(text: str) -> str:
+    """Convert internal event labels into user-facing task status text."""
+    raw = str(text or "").strip()
+    if not raw:
+        return raw
+
+    direct_map = {
+        "pipeline.pipeline_start": "任务链路已启动，正在准备上下文。",
+        "pipeline.agent_start": "祖龙正在分析任务并准备下一步。",
+        "pipeline.agent_done": "本轮推理已完成，正在整理结果。",
+        "pipeline.pipeline_done": "任务链路已完成。",
+        "agent_tool_call": "正在调用工具处理任务。",
+        "agent_tool_result": "工具已返回结果，正在继续判断。",
+        "MEMORY_GRAPH_UPDATE": "记忆图谱已更新。",
+    }
+    if raw in direct_map:
+        return direct_map[raw]
+    if raw.startswith("pipeline."):
+        return "任务链路正在推进。"
+    if raw.startswith("agent_"):
+        return "祖龙正在推进任务。"
+    return raw
+
+
+def _looks_like_incomplete_final_text(text: str) -> bool:
+    """Detect final replies that are actually forced-stop/blockage reports."""
+    raw = str(text or "")
+    if not raw:
+        return False
+    stripped = raw.strip()
+    positive_markers = (
+        "全部完成",
+        "任务完成",
+        "已完成",
+        "已创建",
+        "已生成",
+        "已写入",
+        "创建成功",
+        "写入成功",
+        "生成成功",
+    )
+    if any(marker in raw for marker in positive_markers) and "未完成" not in raw:
+        return False
+    lowered = raw.lower()
+    hard_markers = [
+        "任务执行中断",
+        "强制收敛",
+        "无法正常回复",
+        "系统当前出问题",
+        "安全防护触发",
+        "触发循环保护",
+    ]
+    if any(marker.lower() in lowered for marker in hard_markers):
+        return True
+    report_shape = ("汇报", "报告", "清单", "列表", "总览", "如下")
+    report_context = ("历史", "记忆", "节点", "清理", "删除", "候选", "未完成", "blocked")
+    if (
+        any(marker in raw for marker in report_shape)
+        and sum(1 for marker in report_context if marker.lower() in lowered) >= 2
+    ):
+        return False
+    short_status_markers = (
+        "任务受阻",
+        "任务疑似卡住",
+        "stalled",
+        "possibly_stalled",
+        "blocked",
+        "timed out",
+        "interrupted",
+    )
+    if len(stripped) <= 160 and any(marker.lower() in lowered for marker in short_status_markers):
+        return True
+    return False
+
+
+def _active_task_completion_snapshot(task_graph_id: Optional[str] = None) -> Dict[str, Any]:
+    """Return authoritative active TaskGraph completion state."""
+    snapshot: Dict[str, Any] = {
+        "total": 0,
+        "completed": 0,
+        "uncompleted": 0,
+        "blocked": 0,
+        "uncompleted_labels": [],
+    }
+    try:
+        from zulong.tools.task_tools import get_active_task_graph
+        tg = get_active_task_graph()
+        if not tg:
+            return snapshot
+        if task_graph_id and getattr(tg, "id", None) and getattr(tg, "id", None) != task_graph_id:
+            return snapshot
+        leaves = [n for n in tg.get_leaf_nodes() if getattr(n, "id", "") != "req"]
+        snapshot["total"] = len(leaves)
+        snapshot["completed"] = sum(1 for n in leaves if getattr(n, "status", "") in ("completed", "skipped"))
+        uncompleted = [n for n in leaves if getattr(n, "status", "") not in ("completed", "skipped")]
+        snapshot["uncompleted"] = len(uncompleted)
+        snapshot["blocked"] = sum(1 for n in uncompleted if getattr(n, "status", "") == "blocked")
+        snapshot["uncompleted_labels"] = [
+            f"{getattr(n, 'id', '')}({getattr(n, 'label', '')})"
+            for n in uncompleted[:6]
+        ]
+    except Exception:
+        pass
+    return snapshot
+
+
+def _task_status_snapshot() -> Dict[str, Any]:
+    snapshot = dict(_task_execution_status)
+    now = time.time()
+    last_progress = float(snapshot.get("last_progress_at") or 0.0)
+    if (
+        snapshot.get("state") == "running"
+        and not snapshot.get("awaiting_approval")
+        and last_progress > 0
+        and now - last_progress > _TASK_STATUS_STALE_SECONDS
+    ):
+        elapsed = int(now - last_progress)
+        snapshot.update({
+            "state": "possibly_stalled",
+            "phase": "stalled_watch",
+            "message": f"连接仍正常，但已 {elapsed}s 未观察到任务推进；可能卡在模型或工具调用，建议查看日志或等待恢复。",
+        })
+    snapshot["now"] = now
+    snapshot["elapsed_since_progress"] = round(now - last_progress, 1) if last_progress else None
+    if str(snapshot.get("state") or "").lower() == "idle":
+        snapshot["interaction"] = None
+    else:
+        snapshot["interaction"] = _build_task_status_interaction(snapshot)
+    return snapshot
+
+
+def _broadcast_task_execution_status(snapshot: Dict[str, Any]) -> None:
+    message = {
+        "type": "TASK_EXECUTION_STATUS",
+        **snapshot,
+        "payload": snapshot,
+        "_persisted": True,
+    }
+    _schedule_broadcast(message)
+
+
+def _is_cancelled_turn(
+    request_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> bool:
+    request_key = str(request_id or "").strip()
+    conversation_key = str(conversation_id or session_id or "").strip()
+    current_state = str(_task_execution_status.get("state") or "").lower()
+    current_request = str(_task_execution_status.get("request_id") or "").strip()
+    current_conversation = str(
+        _task_execution_status.get("conversation_id")
+        or _task_execution_status.get("session_id")
+        or ""
+    ).strip()
+    if current_state == "cancelled":
+        if request_key and current_request and request_key == current_request:
+            return True
+        if not request_key and conversation_key and conversation_key == current_conversation:
+            return True
+    try:
+        from zulong.core.state_manager import state_manager
+        is_cancelled = getattr(state_manager, "is_cancelled_context", None)
+        if callable(is_cancelled):
+            return bool(is_cancelled(request_key or None, conversation_key or None))
+    except Exception:
+        pass
+    return False
+
+
+def update_task_execution_status(
+    *,
+    state: Optional[str] = None,
+    phase: Optional[str] = None,
+    message: Optional[str] = None,
+    request_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+    project_id: Optional[str] = None,
+    task_graph_id: Optional[str] = None,
+    tool_name: Optional[str] = None,
+    awaiting_approval: Optional[bool] = None,
+    approval: Optional[Dict[str, Any]] = None,
+    progress_items: Optional[List[Dict[str, Any]]] = None,
+    broadcast: bool = True,
+) -> Dict[str, Any]:
+    """Update and broadcast the Web-visible task execution status."""
+    now = time.time()
+    previous_state = _task_execution_status.get("state")
+    incoming_state = str(state or "").lower()
+    if (
+        incoming_state in {"running", "completed", "succeeded"}
+        and _is_cancelled_turn(request_id, conversation_id, session_id)
+    ):
+        logger.info(
+            "[WebChatRouter] 忽略已取消请求的后续状态: request_id=%s state=%s phase=%s",
+            request_id or "-",
+            state or "-",
+            phase or "-",
+        )
+        return _task_status_snapshot()
+    if state is not None:
+        _task_execution_status["state"] = state
+    if phase is not None:
+        _task_execution_status["phase"] = phase
+    if message is not None:
+        _task_execution_status["message"] = message
+    for key, value in (
+        ("request_id", request_id),
+        ("conversation_id", conversation_id),
+        ("session_id", session_id),
+        ("workspace_path", workspace_path),
+        ("project_id", project_id),
+        ("task_graph_id", task_graph_id),
+        ("tool_name", tool_name),
+    ):
+        if value is not None:
+            _task_execution_status[key] = value or ""
+    if conversation_id is not None and session_id is None:
+        _task_execution_status["session_id"] = conversation_id or ""
+    if awaiting_approval is not None:
+        _task_execution_status["awaiting_approval"] = bool(awaiting_approval)
+    if approval is not None:
+        _task_execution_status["approval"] = dict(approval)
+    elif awaiting_approval is False:
+        _task_execution_status["approval"] = None
+    if progress_items is not None:
+        _task_execution_status["progress_items"] = list(progress_items)
+    progress_states = {
+        "accepted",
+        "running",
+        "model_call",
+        "tool_call",
+        "tool_result",
+        "approval_resolved",
+        "streaming",
+        "completed",
+        "failed",
+        "blocked",
+    }
+    if (
+        state in {"running", "completed", "failed", "blocked", "cancelled", "succeeded"}
+        or phase in progress_states
+    ):
+        _task_execution_status["last_progress_at"] = now
+    if previous_state != _task_execution_status.get("state") or phase is not None:
+        _task_execution_status["last_state_change_at"] = now
+    snapshot = _task_status_snapshot()
+    if broadcast:
+        _broadcast_task_execution_status(snapshot)
+    return snapshot
 
 
 def _extract_text_from_message(message: dict) -> str:
@@ -136,6 +714,7 @@ def _resolve_conversation_binding(message: dict) -> Dict[str, Optional[str]]:
         "project_id": message.get("project_id") or payload.get("project_id"),
         "task_graph_id": message.get("task_graph_id") or payload.get("task_graph_id"),
     }
+    task_fallback_allowed = True
 
     if turn_id:
         try:
@@ -143,6 +722,16 @@ def _resolve_conversation_binding(message: dict) -> Dict[str, Optional[str]]:
         except Exception:
             turn_binding = None
         if turn_binding:
+            message_has_task_binding = bool(
+                binding.get("workspace_path")
+                or binding.get("project_id")
+                or binding.get("task_graph_id")
+            )
+            turn_has_task_binding = bool(
+                turn_binding.get("workspace_path")
+                or turn_binding.get("project_id")
+                or turn_binding.get("task_graph_id")
+            )
             resolved_conversation_id = turn_binding.get("conversation_id")
             if (
                 explicit_conversation_id
@@ -159,6 +748,8 @@ def _resolve_conversation_binding(message: dict) -> Dict[str, Optional[str]]:
             binding["workspace_path"] = binding["workspace_path"] or turn_binding.get("workspace_path")
             binding["project_id"] = binding["project_id"] or turn_binding.get("project_id")
             binding["task_graph_id"] = binding["task_graph_id"] or turn_binding.get("task_graph_id")
+            if not message_has_task_binding and not turn_has_task_binding:
+                task_fallback_allowed = False
 
     if not binding["conversation_id"]:
         try:
@@ -170,6 +761,53 @@ def _resolve_conversation_binding(message: dict) -> Dict[str, Optional[str]]:
                 binding["task_graph_id"] = binding["task_graph_id"] or active.get("task_graph_id")
         except Exception:
             binding["conversation_id"] = None
+
+    status_request_id = str(_task_execution_status.get("request_id") or "")
+    status_conversation_id = str(
+        _task_execution_status.get("conversation_id")
+        or _task_execution_status.get("session_id")
+        or ""
+    )
+    if (
+        task_fallback_allowed
+        and (
+        (turn_id and status_request_id and str(turn_id) == status_request_id)
+        or (
+            binding.get("conversation_id")
+            and status_conversation_id
+            and binding.get("conversation_id") == status_conversation_id
+        )
+        )
+    ):
+        binding["workspace_path"] = (
+            binding.get("workspace_path")
+            or _task_execution_status.get("workspace_path")
+            or None
+        )
+        binding["project_id"] = (
+            binding.get("project_id")
+            or _task_execution_status.get("project_id")
+            or None
+        )
+        binding["task_graph_id"] = (
+            binding.get("task_graph_id")
+            or _task_execution_status.get("task_graph_id")
+            or None
+        )
+
+    if task_fallback_allowed and (not binding.get("workspace_path") or not binding.get("task_graph_id")):
+        active_binding = _active_task_graph_binding()
+        if active_binding:
+            binding["workspace_path"] = (
+                binding.get("workspace_path")
+                or active_binding.get("workspace_path")
+                or None
+            )
+            binding["task_graph_id"] = (
+                binding.get("task_graph_id")
+                or active_binding.get("task_graph_id")
+                or None
+            )
 
     return binding
 
@@ -241,24 +879,19 @@ def _persist_web_visible_message(message: dict) -> None:
             project_id=binding.get("project_id"),
             task_graph_id=binding.get("task_graph_id"),
         )
-        try:
-            from zulong.launcher.memory_mirror import mirror_interaction_to_memory_graph
-
-            mirror_payload = dict(payload)
-            mirror_payload.setdefault("source_event_id", event_id)
-            if binding.get("task_graph_id") and not mirror_payload.get("task_graph_id"):
-                mirror_payload["task_graph_id"] = binding["task_graph_id"]
-            mirror_interaction_to_memory_graph(
-                conversation_id=conversation_id,
-                turn_id=binding.get("turn_id") or event_id,
-                role=role,
-                text=text,
-                event_type=event_type or "web_event",
-                source="web_runtime" if role == "assistant" else "ide_bridge",
-                payload=mirror_payload,
-            )
-        except Exception as mirror_exc:
-            logger.debug(f"[WebChatRouter] MemoryGraph 镜像跳过: {event_type}: {mirror_exc}")
+        mirror_payload = dict(payload)
+        mirror_payload.setdefault("source_event_id", event_id)
+        if binding.get("task_graph_id") and not mirror_payload.get("task_graph_id"):
+            mirror_payload["task_graph_id"] = binding["task_graph_id"]
+        _mirror_visible_message_background(
+            conversation_id=conversation_id,
+            turn_id=binding.get("turn_id") or event_id,
+            role=role,
+            text=text,
+            event_type=event_type or "web_event",
+            source="web_runtime" if role == "assistant" else "ide_bridge",
+            payload=mirror_payload,
+        )
         try:
             from zulong.review.task_execution_extractor import maybe_finalize_task_execution_trace
 
@@ -301,13 +934,502 @@ def _failure_response_text(reason: str) -> str:
     return f"系统当前出问题了，{reason}，因此无法正常回复。"
 
 
+def _compact_dialogue_id(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(value or ""))
+
+
+def _memory_node_id(node: Any) -> str:
+    if node is None:
+        return ""
+    if isinstance(node, dict):
+        return str(node.get("node_id") or node.get("id") or "")
+    return str(getattr(node, "node_id", "") or getattr(node, "id", "") or "")
+
+
+def _memory_node_metadata(node: Any) -> Dict[str, Any]:
+    if node is None:
+        return {}
+    if isinstance(node, dict):
+        meta = node.get("metadata") or {}
+    else:
+        meta = getattr(node, "metadata", {}) or {}
+    return dict(meta) if isinstance(meta, dict) else {}
+
+
+def _memory_node_type_value(node: Any) -> str:
+    if node is None:
+        return ""
+    if isinstance(node, dict):
+        raw = node.get("node_type") or node.get("type") or ""
+    else:
+        raw = getattr(node, "node_type", "") or getattr(node, "type", "")
+    return str(getattr(raw, "value", raw) or "").lower()
+
+
+def _is_dialogue_session_node_id(node_id: str) -> bool:
+    node_id = str(node_id or "")
+    return node_id.startswith("dialogue:session_") and "/" not in node_id
+
+
+def _is_dialogue_session_node(node: Any) -> bool:
+    node_id = _memory_node_id(node)
+    meta = _memory_node_metadata(node)
+    node_type = _memory_node_type_value(node)
+    return (
+        _is_dialogue_session_node_id(node_id)
+        and (not node_type or node_type == "dialogue")
+        and meta.get("sub_type") in {"session", None, ""}
+    )
+
+
+def _safe_has_memory_node(mg: Any, node_id: str) -> bool:
+    if not mg or not node_id:
+        return False
+    try:
+        return bool(mg.has_node(node_id))
+    except Exception:
+        return False
+
+
+def _safe_get_memory_node(mg: Any, node_id: str) -> Any:
+    if not mg or not node_id:
+        return None
+    try:
+        return mg.get_node(node_id)
+    except Exception:
+        return None
+
+
+def _resolve_dialogue_session_node_id(mg: Any, session_id: str) -> str:
+    raw = str(session_id or "").strip()
+    if not raw:
+        return ""
+
+    candidates: List[str] = []
+
+    def add(value: Optional[str]) -> None:
+        value = str(value or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    add(raw)
+    try:
+        store = get_interaction_store()
+        conv = store.get_conversation(raw)
+        if conv:
+            add(conv.get("session_node_id"))
+        by_node = store.find_conversation_by_session_node(raw)
+        if by_node:
+            add(by_node.get("session_node_id"))
+            add(f"dialogue:session_{_compact_dialogue_id(by_node.get('conversation_id') or '')}")
+    except Exception:
+        pass
+    if raw.startswith("dialogue:session_"):
+        add(raw)
+    else:
+        add(f"dialogue:session_{_compact_dialogue_id(raw)}")
+
+    for candidate in candidates:
+        if _safe_has_memory_node(mg, candidate):
+            node = _safe_get_memory_node(mg, candidate)
+            if _is_dialogue_session_node(node) or _is_dialogue_session_node_id(candidate):
+                return candidate
+    for candidate in candidates:
+        if _is_dialogue_session_node_id(candidate):
+            return candidate
+    return candidates[0] if candidates else raw
+
+
+def _memory_children_ids(mg: Any, node_id: str) -> List[str]:
+    if not mg or not node_id:
+        return []
+    try:
+        return [
+            _memory_node_id(child)
+            for child in (mg.get_children(node_id) or [])
+            if _memory_node_id(child)
+        ]
+    except Exception:
+        pass
+    try:
+        graph = getattr(mg, "_graph", None)
+        if graph is not None and node_id in graph:
+            children = []
+            for child_id in list(graph.successors(node_id)):
+                edge_data = graph[node_id].get(child_id, {}) or {}
+                edge_type = str(getattr(edge_data.get("edge_type"), "value", edge_data.get("edge_type", "")))
+                if edge_type == "hierarchy":
+                    children.append(str(child_id))
+            return children
+    except Exception:
+        pass
+    return []
+
+
+def _collect_hierarchy_node_ids(mg: Any, root_id: str) -> List[str]:
+    if not mg or not root_id or not _safe_has_memory_node(mg, root_id):
+        return []
+    ordered: List[str] = []
+    seen: Set[str] = set()
+    queue: List[str] = [root_id]
+    while queue:
+        current = queue.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+        ordered.append(current)
+        for child_id in _memory_children_ids(mg, current):
+            if child_id not in seen:
+                queue.append(child_id)
+    return ordered
+
+
+def _save_memory_graph_if_possible(mg: Any) -> None:
+    try:
+        if hasattr(mg, "save_all"):
+            mg.save_all()
+    except Exception:
+        pass
+
+
+def _publish_memory_nodes_removed(deleted_node_ids: List[str], *, source: str) -> None:
+    if not deleted_node_ids:
+        return
+    try:
+        from zulong.core.event_bus import event_bus
+        from zulong.core.types import EventPriority, EventType, ZulongEvent
+
+        event_bus.publish(ZulongEvent(
+            type=EventType.MEMORY_GRAPH_UPDATED,
+            priority=EventPriority.LOW,
+            source=source,
+            payload={
+                "update_type": "delta",
+                "ts": time.time(),
+                "nodes": [],
+                "edges": [],
+                "changes": [
+                    {"action": "remove_node", "data": {"id": node_id}}
+                    for node_id in deleted_node_ids
+                ],
+                "changed_node_ids": list(deleted_node_ids),
+                "deleted_node_ids": list(deleted_node_ids),
+                "stats": {
+                    "transport": "delta",
+                    "changed_nodes": len(deleted_node_ids),
+                    "changed_edges": 0,
+                },
+            },
+        ))
+    except Exception as exc:
+        logger.debug(f"[WebChatRouter] MemoryGraph 删除事件发布跳过: {exc}")
+
+
+def _cleanup_dialogue_session_indexes(session_id: str, session_node_id: str = "") -> List[str]:
+    removed: List[str] = []
+    candidates: List[str] = []
+
+    def add(value: Optional[str]) -> None:
+        value = str(value or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    add(session_id)
+    add(session_node_id)
+    if session_node_id and _is_dialogue_session_node_id(session_node_id):
+        add(session_node_id.replace("dialogue:session_", "", 1))
+    try:
+        store = get_interaction_store()
+        for value in list(candidates):
+            conv = store.get_conversation(value)
+            if conv:
+                add(conv.get("conversation_id"))
+                add(conv.get("session_node_id"))
+            by_node = store.find_conversation_by_session_node(value)
+            if by_node:
+                add(by_node.get("conversation_id"))
+                add(by_node.get("session_node_id"))
+        for value in candidates:
+            conv = store.get_conversation(value)
+            if conv and store.delete_conversation(value):
+                removed.append(value)
+    except Exception as exc:
+        logger.debug(f"[WebChatRouter] 会话索引清理跳过: {exc}")
+    return removed
+
+
+def _cleanup_runtime_session(session_id: str) -> bool:
+    cleared = False
+    try:
+        from zulong.ide.ide_server import get_session_store
+        store = get_session_store()
+        store.delete(session_id)
+    except Exception:
+        pass
+    try:
+        from zulong.ide.ide_server import _sessions
+        if session_id in _sessions:
+            sess = _sessions[session_id]
+            if sess.fc_task and not sess.fc_task.done():
+                sess.cancel_event.set()
+                sess.fc_task.cancel()
+            _sessions.pop(session_id, None)
+            cleared = True
+    except Exception:
+        pass
+    return cleared
+
+
+def _remove_memory_nodes(mg: Any, node_ids: List[str]) -> List[Dict[str, Any]]:
+    deleted: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for node_id in reversed(node_ids):
+        if not node_id or node_id in seen:
+            continue
+        seen.add(node_id)
+        node = _safe_get_memory_node(mg, node_id)
+        if node is None:
+            continue
+        node_info = {
+            "node_id": node_id,
+            "type": _memory_node_type_value(node),
+            "label": getattr(node, "label", "") if not isinstance(node, dict) else node.get("label", ""),
+        }
+        try:
+            if mg.remove_node(node_id):
+                deleted.append(node_info)
+        except Exception as exc:
+            logger.debug(f"[WebChatRouter] 删除 MemoryGraph 节点失败 {node_id}: {exc}")
+    deleted.reverse()
+    return deleted
+
+
+def _delete_dialogue_session_cascade(session_id: str, *, cascade: bool = True) -> Dict[str, Any]:
+    mg = _get_active_memory_graph()
+    session_node_id = _resolve_dialogue_session_node_id(mg, session_id)
+    nodes_to_remove: List[str] = []
+    deleted: List[Dict[str, Any]] = []
+    if cascade and mg and _safe_has_memory_node(mg, session_node_id):
+        nodes_to_remove = _collect_hierarchy_node_ids(mg, session_node_id)
+        deleted = _remove_memory_nodes(mg, nodes_to_remove)
+        _save_memory_graph_if_possible(mg)
+
+    deleted_ids = [item["node_id"] for item in deleted]
+    _cleanup_dialogue_session_indexes(session_id, session_node_id)
+    ide_session_cleared = _cleanup_runtime_session(session_id)
+    if session_node_id and session_node_id != session_id:
+        _cleanup_runtime_session(session_node_id)
+
+    _publish_memory_nodes_removed(deleted_ids, source="WebChatRouter/DeleteSession")
+    return {
+        "session_id": session_id,
+        "session_node_id": session_node_id,
+        "deleted": True,
+        "mg_nodes_deleted": len(deleted),
+        "nodes_deleted": len(deleted),
+        "deleted_node_ids": deleted_ids,
+        "ide_session_cleared": ide_session_cleared,
+    }
+
+
+def _message_event_matches_node(event: Optional[Dict[str, Any]], node_id: str, meta: Dict[str, Any]) -> bool:
+    if not event:
+        return False
+    payload = meta.get("payload") if isinstance(meta.get("payload"), dict) else {}
+    event_id = str(event.get("event_id") or "")
+    if event_id and event_id in {
+        str(meta.get("source_event_id") or ""),
+        str(payload.get("source_event_id") or ""),
+        str(payload.get("event_id") or ""),
+        str(payload.get("id") or ""),
+    }:
+        return True
+    conversation_id = str(event.get("conversation_id") or "")
+    turn_id = str(event.get("turn_id") or "")
+    role = str(event.get("role") or "")
+    event_type = str(event.get("event_type") or "")
+    return bool(
+        conversation_id
+        and turn_id
+        and meta.get("conversation_id") == conversation_id
+        and meta.get("request_id") == turn_id
+        and (not role or meta.get("role") == role)
+        and (not event_type or meta.get("event_type") == event_type)
+    )
+
+
+def _resolve_message_memory_node_ids(
+    mg: Any,
+    session_id: str,
+    message_id: str,
+    event: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    message_id = str(message_id or "").strip()
+    if not mg or not message_id:
+        return []
+    candidates: List[str] = []
+
+    def add(value: Optional[str]) -> None:
+        value = str(value or "").strip()
+        if value and value not in candidates and _safe_has_memory_node(mg, value):
+            candidates.append(value)
+
+    add(message_id)
+    session_node_id = _resolve_dialogue_session_node_id(
+        mg,
+        session_id or (event or {}).get("conversation_id") or "",
+    )
+    if event:
+        turn_id = str(event.get("turn_id") or "")
+        role = str(event.get("role") or "")
+        event_type = str(event.get("event_type") or "")
+        if session_node_id and turn_id:
+            round_id = f"{session_node_id}/round_{_compact_dialogue_id(turn_id)}"
+            if role == "user":
+                add(round_id)
+            add(f"{round_id}/{_compact_dialogue_id(role or 'message')}_{_compact_dialogue_id(event_type or 'message')}")
+
+    try:
+        from zulong.memory.memory_graph import NodeType
+        node_types = [
+            NodeType.DIALOGUE,
+            NodeType.TOOL_CALL,
+            NodeType.TOOL_RESULT,
+            NodeType.APPROVAL,
+        ]
+    except Exception:
+        node_types = ["dialogue", "tool_call", "tool_result", "approval"]
+
+    for node_type in node_types:
+        try:
+            nodes = mg.get_nodes_by_type(node_type) or []
+        except Exception:
+            continue
+        for node in nodes:
+            node_id = _memory_node_id(node)
+            if not node_id or node_id in candidates:
+                continue
+            meta = _memory_node_metadata(node)
+            payload = meta.get("payload") if isinstance(meta.get("payload"), dict) else {}
+            if (
+                node_id == message_id
+                or meta.get("full_path") == message_id
+                or message_id in {
+                    str(meta.get("source_event_id") or ""),
+                    str(payload.get("source_event_id") or ""),
+                    str(payload.get("event_id") or ""),
+                    str(payload.get("id") or ""),
+                }
+                or _message_event_matches_node(event, node_id, meta)
+            ):
+                candidates.append(node_id)
+
+    if event and str(event.get("role") or "") == "user":
+        round_candidates = [
+            node_id for node_id in candidates
+            if _memory_node_metadata(_safe_get_memory_node(mg, node_id)).get("sub_type") == "round"
+        ]
+        if round_candidates:
+            return round_candidates
+    return candidates
+
+
+def _delete_dialogue_message_cascade(session_id: str, message_id: str) -> Dict[str, Any]:
+    store = get_interaction_store()
+    event = None
+    try:
+        event = store.get_event(message_id)
+    except Exception:
+        event = None
+    mg = _get_active_memory_graph()
+    target_ids = _resolve_message_memory_node_ids(mg, session_id, message_id, event)
+    nodes_to_remove: List[str] = []
+    for target_id in target_ids:
+        for node_id in _collect_hierarchy_node_ids(mg, target_id):
+            if node_id not in nodes_to_remove:
+                nodes_to_remove.append(node_id)
+
+    deleted = _remove_memory_nodes(mg, nodes_to_remove) if mg else []
+    if deleted:
+        _save_memory_graph_if_possible(mg)
+        _publish_memory_nodes_removed(
+            [item["node_id"] for item in deleted],
+            source="WebChatRouter/DeleteMessage",
+        )
+    event_deleted = False
+    try:
+        event_deleted = store.delete_event(message_id)
+    except Exception:
+        event_deleted = False
+    return {
+        "status": "ok",
+        "session_id": session_id,
+        "message_id": message_id,
+        "removed": len(deleted),
+        "mg_nodes_deleted": len(deleted),
+        "deleted_node_ids": [item["node_id"] for item in deleted],
+        "event_deleted": event_deleted,
+    }
+
+
 def _collect_dialogue_sessions(limit: int = 200) -> Dict[str, Any]:
     store = get_conversation_orchestrator().store
     store_sessions = []
+    mg = None
+    graph_session_ids: Set[str] = set()
+    try:
+        if _launcher_ready_for_memory_backfill():
+            mg = _get_active_memory_graph()
+    except Exception:
+        mg = None
+
     try:
         for conv in store.list_conversations(limit=limit):
+            conv_id = conv.get("conversation_id") or ""
+            session_node_id = conv.get("session_node_id")
+            try:
+                last_active_at = float(conv.get("last_active_at") or conv.get("updated_at") or 0)
+            except Exception:
+                last_active_at = 0.0
+            stale_enough_for_inferred_cleanup = time.time() - last_active_at > 30.0
+            inferred_session_node_id = session_node_id
+            if mg and not inferred_session_node_id and conv_id:
+                try:
+                    if hasattr(mg, "get_session_node_id_for_conversation"):
+                        inferred_session_node_id = mg.get_session_node_id_for_conversation(conv_id)
+                except Exception:
+                    inferred_session_node_id = None
+                if not inferred_session_node_id:
+                    inferred_session_node_id = (
+                        conv_id if _is_dialogue_session_node_id(conv_id)
+                        else f"dialogue:session_{_compact_dialogue_id(conv_id)}"
+                    )
+            if mg and session_node_id and not _safe_has_memory_node(mg, session_node_id):
+                try:
+                    store.delete_conversation(conv_id)
+                except Exception:
+                    pass
+                continue
+            if (
+                mg
+                and inferred_session_node_id
+                and not _safe_has_memory_node(mg, inferred_session_node_id)
+                and (
+                    session_node_id
+                    or _is_dialogue_session_node_id(conv_id)
+                    or (
+                        stale_enough_for_inferred_cleanup
+                        and (conv.get("source") or "") in {"web_chat", "interaction_store", "workspace"}
+                    )
+                )
+            ):
+                try:
+                    store.delete_conversation(conv_id)
+                except Exception:
+                    pass
+                continue
             store_sessions.append({
-                "id": conv.get("conversation_id"),
+                "id": conv_id,
                 "title": conv.get("title") or "对话记录",
                 "created_at": conv.get("created_at") or 0,
                 "last_active_at": conv.get("last_active_at") or conv.get("created_at") or 0,
@@ -318,25 +1440,44 @@ def _collect_dialogue_sessions(limit: int = 200) -> Dict[str, Any]:
                 "cwd": conv.get("workspace_path"),
                 "project_id": conv.get("project_id"),
                 "task_graph_id": conv.get("task_graph_id"),
+                "dialogue_session_id": inferred_session_node_id,
+                "session_node_id": inferred_session_node_id,
             })
     except Exception as store_err:
         logger.debug(f"[WebChatRouter] interaction store session list skipped: {store_err}")
 
     sessions = store_sessions
     try:
-        from zulong.memory.graph_adapters import DialogueAdapter
-
-        mg = _get_active_memory_graph()
         if mg:
+            from zulong.memory.graph_adapters import DialogueAdapter
+
             graph_sessions = DialogueAdapter.list_sessions(mg)
-            known = {s.get("id") for s in graph_sessions}
-            sessions = store_sessions + [s for s in graph_sessions if s.get("id") not in known]
+            for graph_session in graph_sessions:
+                graph_session["source"] = graph_session.get("source") or "memory_graph"
+                graph_session["dialogue_session_id"] = graph_session.get("id")
+                graph_session["session_node_id"] = graph_session.get("id")
+                graph_session_ids.add(str(graph_session.get("id") or ""))
+            known = {
+                str(s.get("id") or "")
+                for s in store_sessions
+            } | {
+                str(s.get("dialogue_session_id") or s.get("session_node_id") or "")
+                for s in store_sessions
+            }
+            sessions = store_sessions + [
+                s for s in graph_sessions
+                if str(s.get("id") or "") not in known
+            ]
     except Exception as mg_err:
         logger.debug(f"[WebChatRouter] memory graph session list skipped: {mg_err}")
 
     active = None
     try:
         active = store.find_active_conversation(max_age_seconds=86400)
+        if active and mg:
+            active_node_id = active.get("session_node_id")
+            if active_node_id and not _safe_has_memory_node(mg, active_node_id):
+                active = None
     except Exception:
         active = None
 
@@ -350,13 +1491,14 @@ def _collect_dialogue_sessions(limit: int = 200) -> Dict[str, Any]:
     }
 
 
-def _get_active_memory_graph():
+def _get_active_memory_graph(*, allow_fallback: bool = False):
     """Return the MemoryGraph instance owned by LauncherApp when available.
 
-    The launcher module manager is the owner of the running memory graph. Some
-    lower-level helpers can create fallback graph instances from config, which
-    risks split-brain snapshots. Web routes should prefer the active launcher
-    context and only fall back when the launcher has not started yet.
+    The launcher module manager is the owner of the running memory graph. Web
+    routes must not create a fallback graph while the launcher is still
+    selecting/launching, because frontend dashboard probes can otherwise load
+    the full sharded MemoryGraph before the startup sequence reaches that
+    module.
     """
     try:
         from zulong.launcher import app as launcher_app_module
@@ -368,8 +1510,11 @@ def _get_active_memory_graph():
                 graph = mg.context.get("memory_graph")
                 if graph is not None:
                     return graph
+            return None
     except Exception:
         pass
+    if not allow_fallback:
+        return None
     try:
         from zulong.memory.memory_graph import get_memory_graph
 
@@ -393,14 +1538,37 @@ async def _ws_heartbeat_loop():
         await asyncio.sleep(30)
         if _ws_clients:
             try:
-                await _broadcast({
-                    "type": "THINKING_STEP",
-                    "step_type": "heartbeat",
-                    "request_id": "",
-                    "data": {"message": "正在处理中..."},
-                    "timestamp": time.time(),
-                    "_persisted": True,  # 跳过持久化
-                })
+                status = _task_status_snapshot()
+                state = str(status.get("state") or "").lower()
+                if (
+                    state in {"idle", "cancelled", "canceled", "completed", "succeeded", "failed"}
+                    and time.time() - float(status.get("last_state_change_at") or 0) > 10
+                ):
+                    continue
+                _broadcast_task_execution_status(status)
+                if (
+                    status.get("interaction") is not None
+                    and state not in {"idle", "cancelled", "canceled", "completed", "succeeded", "failed"}
+                ):
+                    await _broadcast({
+                        "type": "THINKING_STEP",
+                        "step_type": "heartbeat",
+                        "request_id": status.get("request_id") or "",
+                        "conversation_id": status.get("conversation_id") or "",
+                        "session_id": status.get("session_id") or status.get("conversation_id") or "",
+                        "workspace_path": status.get("workspace_path") or "",
+                        "project_id": status.get("project_id") or "",
+                        "task_graph_id": status.get("task_graph_id") or "",
+                        "data": {
+                            "message": status.get("message") or "连接正常。",
+                            "state": status.get("state"),
+                            "phase": status.get("phase"),
+                            "elapsed_since_progress": status.get("elapsed_since_progress"),
+                            "interaction": status.get("interaction"),
+                        },
+                        "timestamp": time.time(),
+                        "_persisted": True,  # 跳过持久化
+                    })
             except Exception:
                 pass
 
@@ -491,18 +1659,49 @@ def _schedule_broadcast(message: dict) -> None:
     """从非 asyncio 线程安全地调度广播到所有 /ws 客户端"""
     loop = _event_loop
     msg_type = message.get("type", "?")
+    noisy_key = str(msg_type) if msg_type in _NOISY_BROADCAST_TYPES else ""
+    if noisy_key:
+        now = time.monotonic()
+        min_interval = _NOISY_MIN_INTERVALS.get(noisy_key, 0.0)
+        with _noisy_broadcast_lock:
+            if noisy_key in _noisy_broadcast_pending:
+                logger.info(
+                    "[WebChatRouter] _schedule_broadcast: 合并低优先级过程事件 type=%s",
+                    msg_type,
+                )
+                return
+            last_sent = _noisy_broadcast_last_sent.get(noisy_key, 0.0)
+            if min_interval > 0 and now - last_sent < min_interval:
+                logger.debug(
+                    "[WebChatRouter] _schedule_broadcast: 节流低优先级过程事件 type=%s",
+                    msg_type,
+                )
+                return
+            _noisy_broadcast_pending.add(noisy_key)
+            _noisy_broadcast_last_sent[noisy_key] = now
+
     if loop and loop.is_running():
         logger.info(f"[WebChatRouter] _schedule_broadcast: type={msg_type}, loop_running=True, ws_clients={len(_ws_clients)}")
         future = asyncio.run_coroutine_threadsafe(_broadcast(message), loop)
         # 捕获异步广播的异常
         def _on_done(f):
-            exc = f.exception()
+            if noisy_key:
+                with _noisy_broadcast_lock:
+                    _noisy_broadcast_pending.discard(noisy_key)
+            try:
+                exc = f.exception()
+            except asyncio.CancelledError:
+                logger.warning(f"[WebChatRouter] _broadcast 已取消: type={msg_type}")
+                return
             if exc:
                 logger.error(f"[WebChatRouter] _broadcast 异常: {exc}")
             else:
                 logger.info(f"[WebChatRouter] _broadcast 完成: type={msg_type}")
         future.add_done_callback(_on_done)
     else:
+        if noisy_key:
+            with _noisy_broadcast_lock:
+                _noisy_broadcast_pending.discard(noisy_key)
         logger.warning(f"[WebChatRouter] _schedule_broadcast 跳过: type={msg_type}, loop={loop}, loop_running={loop.is_running() if loop else 'N/A'}")
 
 
@@ -515,14 +1714,57 @@ async def _broadcast(message: dict) -> None:
         return
     logger.info(f"[WebChatRouter] _broadcast: type={msg_type}, 发送给 {len(_ws_clients)} 个客户端")
     dead: Set[WebSocket] = set()
-    for ws in list(_ws_clients):
-        try:
-            await _send_to_ws(ws, message, persist=False)
+    clients = list(_ws_clients)
+    tasks = [
+        asyncio.create_task(_send_broadcast_to_client(ws, message, str(msg_type)))
+        for ws in clients
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for ws, result in zip(clients, results):
+        if result is True:
             logger.info(f"[WebChatRouter] _broadcast: 成功发送 {msg_type}")
-        except Exception as e:
-            logger.error(f"[WebChatRouter] _broadcast: 发送失败 {msg_type}: {e}")
-            dead.add(ws)
+            continue
+        if isinstance(result, Exception):
+            logger.error(f"[WebChatRouter] _broadcast: 发送失败 {msg_type}: {result}")
+        dead.add(ws)
     _ws_clients.difference_update(dead)
+
+
+def _broadcast_timeout_for_type(msg_type: str) -> float:
+    if msg_type in {"CHAT_RESPONSE", "TASK_EXECUTION_STATUS", "CHAT_STREAM"}:
+        return 15.0
+    if msg_type in {"THINKING_STEP", "MEMORY_GRAPH_UPDATE"}:
+        return 0.75
+    if msg_type in {"TASK_GRAPH_UPDATE", "CODE_ANCHOR_UPDATE"}:
+        return 2.0
+    return 3.0
+
+
+async def _send_broadcast_to_client(ws: WebSocket, message: dict, msg_type: str) -> bool:
+    if msg_type in {"MEMORY_GRAPH_UPDATE", "THINKING_STEP"}:
+        lock = _ws_send_locks.get(id(ws))
+        if lock and lock.locked():
+            logger.info(
+                "[WebChatRouter] _broadcast: 跳过繁忙连接的过程事件，避免阻塞聊天响应 type=%s",
+                msg_type,
+            )
+            return True
+
+    timeout = _broadcast_timeout_for_type(msg_type)
+    try:
+        if msg_type == "MEMORY_GRAPH_UPDATE" and (message.get("nodes") or message.get("edges")):
+            await asyncio.wait_for(_send_memory_graph_payload(ws, message), timeout=timeout)
+            return True
+        return await asyncio.wait_for(_send_to_ws(ws, message, persist=False), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[WebChatRouter] _broadcast: 发送超时，保留客户端连接 type=%s",
+            msg_type,
+        )
+        return True
+    except Exception:
+        _forget_ws_connection(ws)
+        raise
 
 
 # ── EventBus 回调（从分发线程调用，非 asyncio） ───────
@@ -545,27 +1787,45 @@ def _on_l2_output(event) -> None:
     conversation_id = binding.get("conversation_id")
     logger.info(f"[WebChatRouter] _on_l2_output 被调用: text_len={len(text)}, request_id={request_id}, ws_clients={len(_ws_clients)}")
     if text:
-        try:
-            if conversation_id:
-                decision = RouteDecision(
-                    conversation_id=conversation_id,
-                    turn_id=request_id or "",
-                    text="",
-                    workspace_path=binding.get("workspace_path"),
-                    project_id=binding.get("project_id"),
-                    task_graph_id=binding.get("task_graph_id"),
+        if _is_cancelled_turn(request_id, conversation_id, conversation_id):
+            logger.info(
+                "[WebChatRouter] 丢弃已取消请求的迟到 L2_OUTPUT: request_id=%s text_len=%s",
+                request_id or "-",
+                len(text),
+            )
+            return
+        bound_task_graph_id = binding.get("task_graph_id")
+        completion = (
+            _active_task_completion_snapshot(bound_task_graph_id)
+            if bound_task_graph_id
+            else {"total": 0, "completed": 0, "uncompleted": 0, "blocked": 0, "uncompleted_labels": []}
+        )
+        incomplete_final = _looks_like_incomplete_final_text(text)
+        has_uncompleted_work = bool(completion.get("total") and completion.get("uncompleted"))
+        if incomplete_final or has_uncompleted_work:
+            state = "blocked"
+            phase = "forced_convergence" if incomplete_final else "incomplete_task_graph"
+            if has_uncompleted_work:
+                message = (
+                    f"任务未完成：任务图进度 "
+                    f"{completion.get('completed')}/{completion.get('total')}，"
+                    f"剩余 {completion.get('uncompleted')} 项。"
                 )
-                get_conversation_orchestrator().record_assistant_text(
-                    decision,
-                    text,
-                    payload={
-                        "raw_markdown": text,
-                        "display_text": text,
-                        "speech_text": speech_text,
-                    },
+            elif completion.get("total"):
+                message = (
+                    f"任务图已完成 {completion.get('completed')}/{completion.get('total')}，"
+                    "但最终回复仍是中断/受阻说明，不能标记为正常完成。"
                 )
-        except Exception:
-            pass
+            else:
+                message = "任务返回了中断/受阻说明，不能标记为完成。"
+            item_label = message
+            item_status = "blocked"
+        else:
+            state = "completed"
+            phase = "completed"
+            message = "任务已返回最终回复。"
+            item_label = "生成最终回复"
+            item_status = "completed"
         _schedule_broadcast({
             "type": "CHAT_RESPONSE",
             "text": text,
@@ -579,6 +1839,53 @@ def _on_l2_output(event) -> None:
             "task_graph_id": binding.get("task_graph_id"),
             "_persisted": True,
         })
+        update_task_execution_status(
+            state=state,
+            phase=phase,
+            message=message,
+            request_id=request_id,
+            conversation_id=conversation_id,
+            session_id=conversation_id,
+            workspace_path=binding.get("workspace_path"),
+            project_id=binding.get("project_id"),
+            task_graph_id=binding.get("task_graph_id"),
+            tool_name="",
+            awaiting_approval=False,
+            progress_items=[{
+                "label": item_label,
+                "status": item_status,
+                "source": "summary",
+                "timestamp": time.time(),
+            }],
+        )
+        if conversation_id:
+            def _record_assistant_output() -> None:
+                try:
+                    decision = RouteDecision(
+                        conversation_id=conversation_id,
+                        turn_id=request_id or "",
+                        text="",
+                        workspace_path=binding.get("workspace_path"),
+                        project_id=binding.get("project_id"),
+                        task_graph_id=binding.get("task_graph_id"),
+                    )
+                    get_conversation_orchestrator().record_assistant_text(
+                        decision,
+                        text,
+                        payload={
+                            "raw_markdown": text,
+                            "display_text": text,
+                            "speech_text": speech_text,
+                        },
+                    )
+                except Exception as record_exc:
+                    logger.debug(f"[WebChatRouter] assistant 输出后台持久化跳过: {record_exc}")
+
+            threading.Thread(
+                target=_record_assistant_output,
+                name="zulong-web-assistant-persist",
+                daemon=True,
+            ).start()
 
 
 def _on_l2_output_stream(event) -> None:
@@ -597,6 +1904,24 @@ def _on_l2_output_stream(event) -> None:
     })
     conversation_id = binding.get("conversation_id")
     if chunk or text:
+        if _is_cancelled_turn(request_id, conversation_id, conversation_id):
+            logger.info(
+                "[WebChatRouter] 丢弃已取消请求的迟到流式输出: request_id=%s",
+                request_id or "-",
+            )
+            return
+        update_task_execution_status(
+            state="running",
+            phase="streaming",
+            message="任务正在输出结果。",
+            request_id=request_id,
+            conversation_id=conversation_id,
+            session_id=conversation_id,
+            workspace_path=binding.get("workspace_path"),
+            project_id=binding.get("project_id"),
+            task_graph_id=binding.get("task_graph_id"),
+            broadcast=False,
+        )
         _schedule_broadcast({
             "type": "STREAMING_RESPONSE",
             "text": text,
@@ -613,13 +1938,107 @@ def _on_l2_output_stream(event) -> None:
 def _on_l2_thinking_step(event) -> None:
     payload = event.payload
     if payload:
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        message = data.get("message") or payload.get("message") or payload.get("step_type") or "任务执行中。"
+        interaction = data.get("interaction") if isinstance(data, dict) else None
+        progress_items = interaction.get("progress_items") if isinstance(interaction, dict) else data.get("progress_items")
+        update_task_execution_status(
+            state="running",
+            phase=str(payload.get("step_type") or "thinking"),
+            message=str(message),
+            request_id=payload.get("request_id"),
+            conversation_id=payload.get("conversation_id") or payload.get("session_id"),
+            session_id=payload.get("session_id") or payload.get("conversation_id"),
+            workspace_path=payload.get("workspace_path"),
+            project_id=payload.get("project_id"),
+            task_graph_id=payload.get("task_graph_id"),
+            progress_items=progress_items if isinstance(progress_items, list) else None,
+            broadcast=False,
+        )
         _schedule_broadcast({"type": "THINKING_STEP", **payload})
+
+
+def _compact_memory_graph_update(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep background graph notifications light; full graph is request-driven."""
+    payload = dict(payload or {})
+    if payload.get("update_type") == "delta" or payload.get("changes"):
+        nodes = payload.pop("nodes", None) or []
+        edges = payload.pop("edges", None) or []
+        payload.pop("execution_view", None)
+        stats = dict(payload.get("stats") or {})
+        stats.setdefault("transport", "delta")
+        stats.setdefault("changed_nodes", len(payload.get("changed_node_ids") or []))
+        stats.setdefault("changed_edges", len(payload.get("changed_edge_ids") or []))
+        stats.setdefault("returned_nodes", len(nodes))
+        stats.setdefault("returned_edges", len(edges))
+        payload["stats"] = stats
+        payload["nodes"] = []
+        payload["edges"] = []
+        payload["update_type"] = "delta"
+        payload["summary_only"] = False
+        payload.setdefault("ts", time.time())
+        return payload
+
+    nodes = payload.pop("nodes", None) or []
+    edges = payload.pop("edges", None) or []
+    payload.pop("execution_view", None)
+    stats = dict(payload.get("stats") or {})
+    stats.setdefault("total_nodes", len(nodes))
+    stats.setdefault("total_edges", len(edges))
+    stats["transport"] = "summary"
+    payload["stats"] = stats
+    payload["nodes"] = []
+    payload["edges"] = []
+    payload["update_type"] = "summary"
+    payload["summary_only"] = True
+    payload.setdefault("ts", time.time())
+    return payload
 
 
 def _on_memory_graph_updated(event) -> None:
     payload = event.payload
     if payload:
-        _schedule_broadcast({"type": "MEMORY_GRAPH_UPDATE", **payload})
+        _sync_deleted_dialogue_sessions_from_memory_update(payload)
+        _schedule_broadcast({
+            "type": "MEMORY_GRAPH_UPDATE",
+            **_compact_memory_graph_update(payload),
+        })
+
+
+def _deleted_node_ids_from_memory_payload(payload: Dict[str, Any]) -> List[str]:
+    deleted: List[str] = []
+    for node_id in payload.get("deleted_node_ids") or []:
+        value = str(node_id or "").strip()
+        if value and value not in deleted:
+            deleted.append(value)
+    for change in payload.get("changes") or []:
+        if not isinstance(change, dict) or change.get("action") != "remove_node":
+            continue
+        data = change.get("data") if isinstance(change.get("data"), dict) else {}
+        value = str(data.get("id") or data.get("node_id") or "").strip()
+        if value and value not in deleted:
+            deleted.append(value)
+    return deleted
+
+
+def _sync_deleted_dialogue_sessions_from_memory_update(payload: Dict[str, Any]) -> None:
+    deleted_ids = _deleted_node_ids_from_memory_payload(payload)
+    if not deleted_ids:
+        return
+    for node_id in deleted_ids:
+        if not _is_dialogue_session_node_id(node_id):
+            continue
+        removed_sessions = _cleanup_dialogue_session_indexes(node_id, node_id)
+        session_ids = list(dict.fromkeys([node_id] + removed_sessions))
+        _schedule_broadcast({
+            "type": "SESSION_DELETED",
+            "ts": time.time(),
+            "session_id": removed_sessions[0] if removed_sessions else node_id,
+            "session_node_id": node_id,
+            "session_ids": session_ids,
+            "nodes_deleted": 1,
+            "deleted_node_ids": deleted_ids,
+        })
 
 
 def _on_action_speak(event) -> None:
@@ -638,11 +2057,27 @@ def _on_project_created(event) -> None:
     """项目创建事件 → 通知 Web 前端"""
     payload = event.payload
     if payload:
+        conversation_id = payload.get("conversation_id") or payload.get("session_id")
+        workspace_path = payload.get("path", "")
+        task_graph_id = payload.get("task_graph_id", "")
+        if conversation_id and workspace_path:
+            try:
+                get_interaction_store().upsert_conversation(
+                    conversation_id,
+                    source="workspace",
+                    workspace_path=workspace_path,
+                    project_id=payload.get("project_id"),
+                    task_graph_id=task_graph_id,
+                    active=True,
+                )
+            except Exception:
+                pass
         _schedule_broadcast({
             "type": "PROJECT_CREATED",
             "project_id": payload.get("project_id", ""),
             "name": payload.get("name", ""),
             "path": payload.get("path", ""),
+            "workspace_path": payload.get("path", ""),
             "task_graph_id": payload.get("task_graph_id", ""),
             "status": payload.get("status", ""),
         })
@@ -666,6 +2101,30 @@ async def _handle_chat_message(ws: WebSocket, data: dict) -> None:
     data["turn_id"] = decision.turn_id
 
     await _send_turn_accepted(ws, decision)
+    update_task_execution_status(
+        state="running",
+        phase="accepted",
+        message="任务已接收，正在交给 L1-B/L2 主链处理。",
+        request_id=decision.turn_id,
+        conversation_id=decision.conversation_id,
+        session_id=decision.conversation_id,
+        workspace_path=decision.workspace_path,
+        project_id=decision.project_id,
+        task_graph_id=decision.task_graph_id,
+        tool_name="",
+        awaiting_approval=False,
+        progress_items=[{
+            "label": "任务已接收",
+            "status": "completed",
+            "source": "plan",
+            "timestamp": time.time(),
+        }, {
+            "label": "L1-B/L2 正在处理",
+            "status": "running",
+            "source": "plan",
+            "timestamp": time.time(),
+        }],
+    )
 
     logger.info(
         "[WebChatRouter] 消息: text=%s, mode=%s",
@@ -701,6 +2160,7 @@ async def _chat_via_eventbus(ws, text, request_id, session_id, referenced_nodes,
         from zulong.core.types import EventType, EventPriority, ZulongEvent
 
         payload = {"text": text, "confidence": 1.0}
+        explicit_workspace = _extract_explicit_workspace_path(text)
         if session_id:
             payload["session_id"] = session_id
         if request_id:
@@ -714,26 +2174,32 @@ async def _chat_via_eventbus(ws, text, request_id, session_id, referenced_nodes,
                 "workspace_path": decision.workspace_path,
                 "project_id": decision.project_id,
                 "task_graph_id": decision.task_graph_id,
+                "referenced_task_graph_id": decision.referenced_task_graph_id,
+                "task_graph_reference_mode": decision.task_graph_reference_mode,
                 "source": decision.source,
             })
-
-        # TSD 23.11.3: BFS 自恢复 — 注入会话上下文
-        if session_id:
+        if payload.get("task_graph_id") or payload.get("graph_id"):
             try:
-                from zulong.ide.ide_server import _retrieve_session_context
-                bfs_ctx = await _retrieve_session_context(session_id)
-                if bfs_ctx:
-                    payload["bfs_context"] = bfs_ctx
-                    if bfs_ctx.get("task_graph_id") and not payload.get("task_graph_id"):
-                        payload["task_graph_id"] = bfs_ctx["task_graph_id"]
-                    logger.info(
-                        f"[WebChatRouter] BFS 上下文注入: "
-                        f"session={session_id}, "
-                        f"rounds={len(bfs_ctx.get('recent_rounds', []))}, "
-                        f"tasks={len(bfs_ctx.get('active_tasks', []))}"
-                    )
-            except Exception as _e:
-                logger.debug(f"[WebChatRouter] BFS 上下文跳过: {_e}")
+                from zulong.tools.task_tools import normalize_task_graph_id
+
+                normalized_graph_id = normalize_task_graph_id(
+                    payload.get("task_graph_id") or payload.get("graph_id")
+                )
+                payload["task_graph_id"] = normalized_graph_id
+                payload["graph_id"] = normalized_graph_id
+                if decision:
+                    decision.task_graph_id = normalized_graph_id
+            except Exception:
+                pass
+        if explicit_workspace:
+            payload["workspace_path"] = explicit_workspace
+            payload["cwd"] = explicit_workspace
+            if decision:
+                decision.workspace_path = explicit_workspace
+
+        # TSD 23.11: Web 只传递 session/conversation anchor。
+        # BFS 自恢复、冷热路径检索和上下文打包属于 L1-B 主链职责，
+        # 不在发布 USER_TEXT 前同步等待，避免 Web Router 抢占 L1-B 热链路。
 
         event = ZulongEvent(
             type=EventType.USER_TEXT,
@@ -746,9 +2212,43 @@ async def _chat_via_eventbus(ws, text, request_id, session_id, referenced_nodes,
         # 如果在事件循环线程中执行会阻塞 WebSocket ping/pong 和消息广播
         loop = asyncio.get_running_loop()
         loop.run_in_executor(None, event_bus.publish, event)
+        update_task_execution_status(
+            state="running",
+            phase="running",
+            message="任务执行中：L1-B 已接收，L2/FC 正在推进。",
+            request_id=request_id,
+            conversation_id=session_id,
+            session_id=session_id,
+            workspace_path=payload.get("workspace_path"),
+            project_id=payload.get("project_id"),
+            task_graph_id=payload.get("task_graph_id"),
+            tool_name="",
+            awaiting_approval=False,
+            progress_items=[{
+                "label": "任务进入执行链路",
+                "status": "running",
+                "source": "plan",
+                "timestamp": time.time(),
+            }],
+        )
         logger.info("[WebChatRouter] USER_TEXT 已发布到 EventBus (via executor)")
     except Exception as e:
         logger.error(f"[WebChatRouter] EventBus 发布失败: {e}", exc_info=True)
+        update_task_execution_status(
+            state="failed",
+            phase="failed",
+            message=f"消息无法提交到推理链路：{e}",
+            request_id=request_id,
+            conversation_id=session_id,
+            session_id=session_id,
+            progress_items=[{
+                "label": "提交推理链路失败",
+                "status": "failed",
+                "source": "summary",
+                "detail": str(e),
+                "timestamp": time.time(),
+            }],
+        )
         msg = {
             "type": "CHAT_RESPONSE",
             "text": _failure_response_text(f"消息无法提交到推理链路：{e}"),
@@ -825,6 +2325,93 @@ async def _handle_stop_generation(data: dict) -> None:
     """处理停止生成请求 — 支持单session停止和全局停止"""
     request_id = data.get("request_id")
     session_id = data.get("session_id")
+    stop_key = str(request_id or session_id or "__global__")
+    now = time.time()
+    last_stop_ack = _recent_stop_ack_at.get(stop_key, 0.0)
+    is_duplicate_stop = bool(last_stop_ack and now - last_stop_ack < 1.0)
+    _recent_stop_ack_at[stop_key] = now
+    for key, ts in list(_recent_stop_ack_at.items()):
+        if now - ts > 30:
+            _recent_stop_ack_at.pop(key, None)
+
+    if request_id and request_id in _chat_cancels:
+        _chat_cancels[request_id].set()
+        logger.info(f"[WebChatRouter] 已设置 Web chat cancel_event: {request_id}")
+
+    try:
+        from zulong.core.state_manager import state_manager
+        if hasattr(state_manager, "request_interrupt"):
+            state_manager.request_interrupt(request_id=request_id, session_id=session_id)
+        else:
+            state_manager.set_interrupt_flag(True)
+        logger.info("[WebChatRouter] 停止生成: 全局 scoped interrupt 已记录")
+    except Exception as e:
+        logger.warning(f"[WebChatRouter] 设置全局中断标志失败: {e}")
+
+    try:
+        from zulong.l2.task_state_manager import task_state_manager
+        task_state_manager.clear_active_task(clear_stack=False)
+    except Exception as e:
+        logger.debug(f"[WebChatRouter] 清理 TaskStateManager active 跳过: {e}")
+
+    try:
+        from zulong.tools.task_tools import (
+            get_active_task_graph,
+            normalize_task_graph_id,
+            set_active_task_graph,
+        )
+
+        expected_graph_id = normalize_task_graph_id(
+            data.get("task_graph_id")
+            or _task_execution_status.get("task_graph_id")
+            or ""
+        )
+        active_tg = get_active_task_graph()
+        active_graph_id = normalize_task_graph_id(getattr(active_tg, "id", "")) if active_tg else ""
+        if expected_graph_id and active_graph_id and active_graph_id != expected_graph_id:
+            set_active_task_graph(None, None)
+            logger.info(
+                "[WebChatRouter] 停止后清除错焦点任务图: active=%s expected=%s",
+                active_graph_id,
+                expected_graph_id,
+            )
+    except Exception as e:
+        logger.debug(f"[WebChatRouter] 停止后任务图焦点检查跳过: {e}")
+
+    if not is_duplicate_stop:
+        update_task_execution_status(
+            state="cancelled",
+            phase="cancelled",
+            message="用户已停止当前任务。",
+            request_id=request_id,
+            conversation_id=session_id,
+            session_id=session_id,
+            awaiting_approval=False,
+            progress_items=[{
+                "label": "用户已停止任务",
+                "status": "completed",
+                "source": "user_interject",
+                "timestamp": time.time(),
+            }],
+        )
+        await _broadcast({
+            "type": "STOP_ACK",
+            "request_id": request_id,
+            "session_id": session_id,
+            "message": "停止指令已确认",
+        })
+    else:
+        logger.info("[WebChatRouter] 忽略重复停止确认: request_id=%s", request_id or "-")
+
+    try:
+        import sys
+        l2_module = sys.modules.get("zulong.l2.inference_engine")
+        engine = getattr(l2_module, "inference_engine", None) if l2_module else None
+        if engine and hasattr(engine, "request_interrupt"):
+            engine.request_interrupt(request_id=request_id, session_id=session_id)
+            logger.info("[WebChatRouter] 停止生成: 已同步到已加载的 L2 引擎")
+    except Exception as e:
+        logger.debug(f"[WebChatRouter] 同步 L2 引擎中断跳过: {e}")
 
     # ── 核心：设置 IDE FC Runner 的 cancel_event ──
     stopped_sessions = 0
@@ -851,23 +2438,22 @@ async def _handle_stop_generation(data: dict) -> None:
     except Exception as e:
         logger.warning(f"[WebChatRouter] 设置 cancel_event 失败: {e}")
 
-    if _is_full_mode():
-        try:
-            from zulong.core.event_bus import event_bus
-            from zulong.core.types import EventType, EventPriority, ZulongEvent
-            event = ZulongEvent(
-                type=EventType.USER_TEXT,
-                source="launcher/web_ui",
-                payload={"action": "stop_generation", "request_id": request_id},
-                priority=EventPriority.HIGH,
-            )
-            event_bus.publish(event)
-        except Exception as e:
-            logger.error(f"[WebChatRouter] 停止生成失败: {e}")
-    else:
-        if request_id and request_id in _chat_cancels:
-            _chat_cancels[request_id].set()
-            logger.info(f"[WebChatRouter] 已取消: {request_id}")
+    try:
+        from zulong.core.event_bus import event_bus
+        from zulong.core.types import EventType, EventPriority, ZulongEvent
+        event = ZulongEvent(
+            type=EventType.SYSTEM_INTERRUPT,
+            source="launcher/web_ui",
+            payload={
+                "reason": "user_stop_generation",
+                "request_id": request_id,
+                "session_id": session_id,
+            },
+            priority=EventPriority.HIGH,
+        )
+        event_bus.publish(event)
+    except Exception as e:
+        logger.error(f"[WebChatRouter] 发布停止中断失败: {e}")
 
 
 async def _handle_conversation_switch(data: dict) -> None:
@@ -979,28 +2565,66 @@ async def _handle_ide_action(ws: WebSocket, action: str, data: dict) -> None:
     payload = data.get("payload") if isinstance(data.get("payload"), dict) else dict(data)
     payload.setdefault("conversation_id", data.get("conversation_id") or data.get("session_id"))
     payload.setdefault("turn_id", data.get("turn_id") or data.get("request_id"))
+    requested_workspace = payload.get("workspace_path") or payload.get("cwd")
+    workspace_path = _resolve_active_task_workspace(
+        requested_workspace,
+        payload.get("task_graph_id") or payload.get("graph_id"),
+    )
+    if workspace_path:
+        payload["workspace_path"] = workspace_path
+        payload["cwd"] = workspace_path
+        conversation_id = payload.get("conversation_id") or payload.get("session_id")
+        try:
+            if conversation_id:
+                get_interaction_store().upsert_conversation(
+                    conversation_id,
+                    source=payload.get("source") or "web_ui",
+                    workspace_path=workspace_path,
+                    task_graph_id=payload.get("task_graph_id") or payload.get("graph_id"),
+                    active=True,
+                )
+        except Exception:
+            pass
     try:
         from zulong.ide.ide_server import request_ide_action
+        logger.info(
+            "[WebChatRouter] IDE action=%s requested_workspace=%s resolved_workspace=%s task_graph_id=%s",
+            action,
+            requested_workspace,
+            workspace_path,
+            payload.get("task_graph_id") or payload.get("graph_id"),
+        )
         result = await request_ide_action(action, payload)
-        await _send_to_ws(ws, {
-            "type": "ide_action_result",
-            "action": action,
-            "payload": result,
-            "conversation_id": payload.get("conversation_id"),
-            "request_id": payload.get("turn_id"),
-        })
+        await _send_to_ws(ws, make_unified_message(
+            MessageType.IDE_ACTION_RESULT,
+            {
+                "action": action,
+                "payload": result,
+                "conversation_id": payload.get("conversation_id"),
+                "turn_id": payload.get("turn_id"),
+            },
+            session_id=payload.get("conversation_id") or payload.get("session_id") or "",
+            msg_id=payload.get("turn_id") or None,
+        ))
     except Exception as e:
-        await _send_to_ws(ws, {
-            "type": "ide_action_result",
-            "action": action,
-            "payload": {"ok": False, "error": str(e)},
-            "conversation_id": payload.get("conversation_id"),
-            "request_id": payload.get("turn_id"),
-        })
+        await _send_to_ws(ws, make_unified_message(
+            MessageType.IDE_ACTION_RESULT,
+            {
+                "action": action,
+                "payload": {"ok": False, "error": str(e)},
+                "conversation_id": payload.get("conversation_id"),
+                "turn_id": payload.get("turn_id"),
+            },
+            session_id=payload.get("conversation_id") or payload.get("session_id") or "",
+            msg_id=payload.get("turn_id") or None,
+        ))
 
 
 _EXECUTION_NODE_TYPES = {"tool_call", "tool_result", "approval"}
+_MEMORY_GRAPH_EXECUTION_VIEW_LIMIT = 120
 _MEMORY_GRAPH_EXECUTION_BACKFILL_DONE = False
+_MEMORY_GRAPH_EXECUTION_BACKFILL_STARTED = False
+_MEMORY_GRAPH_CHUNK_MAX_BYTES = 520 * 1024
 
 
 def _enum_value(value: Any) -> str:
@@ -1036,7 +2660,12 @@ def _get_memory_node(mg: Any, node_id: str) -> Optional[Any]:
     return None
 
 
-def _serialize_memory_node_for_snapshot(mg: Any, node: Any) -> Dict[str, Any]:
+def _serialize_memory_node_for_snapshot(
+    mg: Any,
+    node: Any,
+    *,
+    include_children_count: bool = True,
+) -> Dict[str, Any]:
     node_id = _memory_node_id(node)
     node_type = _memory_node_type(node)
     metadata = _memory_node_metadata(node)
@@ -1077,7 +2706,8 @@ def _serialize_memory_node_for_snapshot(mg: Any, node: Any) -> Dict[str, Any]:
             data[attr] = value
     try:
         if hasattr(mg, "get_children"):
-            data["children_count"] = len(mg.get_children(node_id))
+            if include_children_count and node_type not in _EXECUTION_NODE_TYPES:
+                data["children_count"] = len(mg.get_children(node_id))
     except Exception:
         pass
     return data
@@ -1149,11 +2779,168 @@ def _collect_execution_edges_sharded(mg: Any, execution_ids: Set[str]) -> List[D
     return edges
 
 
-def _get_memory_graph_execution_view(mg: Any) -> Dict[str, Any]:
+def _collect_sharded_execution_nodes(
+    mg: Any,
+    *,
+    limit: int = _MEMORY_GRAPH_EXECUTION_VIEW_LIMIT,
+) -> Optional[Dict[str, Any]]:
+    if not hasattr(mg, "list_all_shards") or not hasattr(mg, "get_shard"):
+        return None
+
+    candidates: List[Any] = []
+    type_counts: Dict[str, int] = {node_type: 0 for node_type in sorted(_EXECUTION_NODE_TYPES)}
+    try:
+        shard_ids = sorted(list(mg.list_all_shards()), reverse=True)
+    except Exception:
+        shard_ids = []
+
+    for shard_id in shard_ids:
+        try:
+            shard = mg.get_shard(shard_id, load_if_missing=True)
+        except TypeError:
+            shard = mg.get_shard(shard_id)
+        except Exception:
+            shard = None
+        if not shard:
+            continue
+        properties = getattr(shard, "properties", None)
+        if not properties or not hasattr(properties, "get_nodes_by_type"):
+            continue
+        for node_type in sorted(_EXECUTION_NODE_TYPES):
+            try:
+                iterator = properties.get_nodes_by_type(node_type)
+            except Exception:
+                continue
+            for node in iterator or []:
+                type_counts[node_type] += 1
+                candidates.append(node)
+
+    candidates.sort(
+        key=lambda node: (
+            float(getattr(node, "created_at", 0.0) or 0.0),
+            _memory_node_id(node),
+        ),
+        reverse=True,
+    )
+    visible_nodes = candidates[:max(1, int(limit or _MEMORY_GRAPH_EXECUTION_VIEW_LIMIT))]
+    nodes_by_id = {
+        _memory_node_id(node): _serialize_memory_node_for_snapshot(
+            mg,
+            node,
+            include_children_count=False,
+        )
+        for node in visible_nodes
+        if _memory_node_id(node)
+    }
+    execution_ids = set(nodes_by_id)
+    return {
+        "nodes_by_id": nodes_by_id,
+        "execution_ids": execution_ids,
+        "type_counts": type_counts,
+        "total_execution_nodes": sum(type_counts.values()),
+        "truncated": len(candidates) > len(visible_nodes),
+    }
+
+
+def _collect_execution_edges_for_visible_nodes(
+    mg: Any,
+    execution_ids: Set[str],
+    *,
+    max_edges: int = 360,
+    max_neighbors_per_node: int = 24,
+) -> List[Dict[str, Any]]:
+    if not execution_ids:
+        return []
+    if not hasattr(mg, "list_all_shards") or not hasattr(mg, "get_shard"):
+        edges = _collect_execution_edges_networkx(mg, execution_ids)
+        return edges[:max_edges]
+
+    collected: List[Dict[str, Any]] = []
+    seen: Set[tuple] = set()
+
+    def add_edge(src: str, dst: str, edge_type: Any = None, edge_props: Any = None) -> bool:
+        if not src or not dst:
+            return False
+        edge_payload = _serialize_memory_edge_for_snapshot(src, dst, edge_type, edge_props)
+        key = (str(edge_payload.get("source") or ""), str(edge_payload.get("target") or ""), str(edge_payload.get("type") or ""))
+        if not key[0] or not key[1] or key in seen:
+            return False
+        seen.add(key)
+        collected.append(edge_payload)
+        return len(collected) >= max_edges
+
+    for node_id in sorted(execution_ids):
+        if len(collected) >= max_edges:
+            break
+        try:
+            shard, _ = mg._get_indexed_shard(node_id) if hasattr(mg, "_get_indexed_shard") else (None, None)
+        except Exception:
+            shard = None
+        if not shard:
+            continue
+
+        for mode in ("out", "in"):
+            if len(collected) >= max_edges:
+                break
+            try:
+                neighbors = list(shard.get_topology_neighbors(node_id, mode=mode) or [])
+            except Exception:
+                neighbors = []
+            for neighbor_id in neighbors[:max_neighbors_per_node]:
+                if len(collected) >= max_edges:
+                    break
+                if mode == "out":
+                    src_id, dst_id = node_id, str(neighbor_id)
+                else:
+                    src_id, dst_id = str(neighbor_id), node_id
+                try:
+                    edge_info = shard.get_topology_edge_info(src_id, dst_id)
+                except Exception:
+                    edge_info = None
+                edge_type = edge_info[0] if edge_info else "reference"
+                try:
+                    edge_props = shard.get_edge(src_id, dst_id)
+                except Exception:
+                    edge_props = None
+                if add_edge(src_id, dst_id, edge_type, edge_props):
+                    break
+
+        for getter in ("_get_cross_edges_from", "_get_cross_edges_to"):
+            if len(collected) >= max_edges or not hasattr(mg, getter):
+                continue
+            try:
+                cross_edges = getattr(mg, getter)(node_id) or []
+            except Exception:
+                cross_edges = []
+            for edge in cross_edges[:max_neighbors_per_node]:
+                if len(collected) >= max_edges:
+                    break
+                src_id = str(edge.get("src_id") or edge.get("source") or "")
+                dst_id = str(edge.get("dst_id") or edge.get("target") or "")
+                edge_type = edge.get("edge_type") or edge.get("type") or "reference"
+                if add_edge(src_id, dst_id, edge_type, edge):
+                    break
+
+    return collected
+
+
+def _get_memory_graph_execution_view(
+    mg: Any,
+    *,
+    limit: int = _MEMORY_GRAPH_EXECUTION_VIEW_LIMIT,
+) -> Dict[str, Any]:
     nodes_by_id: Dict[str, Dict[str, Any]] = {}
     execution_ids: Set[str] = set()
+    type_counts: Dict[str, int] = {node_type: 0 for node_type in sorted(_EXECUTION_NODE_TYPES)}
+    truncated = False
 
-    if hasattr(mg, "get_nodes_by_type"):
+    sharded_view = _collect_sharded_execution_nodes(mg, limit=limit)
+    if sharded_view is not None:
+        nodes_by_id = dict(sharded_view.get("nodes_by_id") or {})
+        execution_ids = set(sharded_view.get("execution_ids") or set())
+        type_counts.update(sharded_view.get("type_counts") or {})
+        truncated = bool(sharded_view.get("truncated"))
+    elif hasattr(mg, "get_nodes_by_type"):
         for node_type in sorted(_EXECUTION_NODE_TYPES):
             try:
                 nodes = mg.get_nodes_by_type(node_type)
@@ -1163,54 +2950,107 @@ def _get_memory_graph_execution_view(mg: Any) -> Dict[str, Any]:
                 node_id = _memory_node_id(node)
                 if not node_id:
                     continue
+                type_counts[node_type] += 1
+                if len(nodes_by_id) >= limit:
+                    truncated = True
+                    continue
                 execution_ids.add(node_id)
-                nodes_by_id[node_id] = _serialize_memory_node_for_snapshot(mg, node)
+                nodes_by_id[node_id] = _serialize_memory_node_for_snapshot(
+                    mg,
+                    node,
+                    include_children_count=False,
+                )
 
-    edges = _collect_execution_edges_networkx(mg, execution_ids)
-    if not edges:
-        edges = _collect_execution_edges_sharded(mg, execution_ids)
+    edges = _collect_execution_edges_for_visible_nodes(mg, execution_ids)
 
     for edge in edges:
         for endpoint in (edge.get("source"), edge.get("target")):
             if endpoint and endpoint not in nodes_by_id:
                 node = _get_memory_node(mg, str(endpoint))
                 if node:
-                    nodes_by_id[str(endpoint)] = _serialize_memory_node_for_snapshot(mg, node)
+                    nodes_by_id[str(endpoint)] = _serialize_memory_node_for_snapshot(
+                        mg,
+                        node,
+                        include_children_count=False,
+                    )
 
     nodes = list(nodes_by_id.values())
     nodes.sort(key=lambda item: (item.get("created_at") or 0, item.get("id") or ""))
-
-    type_counts: Dict[str, int] = {node_type: 0 for node_type in sorted(_EXECUTION_NODE_TYPES)}
-    for node_id in execution_ids:
-        node_type = nodes_by_id.get(node_id, {}).get("type")
-        if node_type in type_counts:
-            type_counts[node_type] += 1
+    visible_execution_ids = {str(node.get("id")) for node in nodes if node.get("id")}
 
     return {
         "nodes": nodes,
         "edges": edges,
-        "execution_node_ids": sorted(execution_ids),
+        "execution_node_ids": sorted(node_id for node_id in execution_ids if node_id in visible_execution_ids),
         "stats": {
-            "total_execution_nodes": len(execution_ids),
+            "total_execution_nodes": sum(type_counts.values()) or len(execution_ids),
             "total_execution_edges": len(edges),
+            "returned_execution_nodes": len(execution_ids),
+            "returned_nodes_with_context": len(nodes),
+            "returned_execution_edges": len(edges),
+            "view_limit": limit,
+            "truncated": truncated,
             **type_counts,
         },
     }
 
 
 def _ensure_execution_events_backfilled(mg: Any) -> None:
-    global _MEMORY_GRAPH_EXECUTION_BACKFILL_DONE
-    if _MEMORY_GRAPH_EXECUTION_BACKFILL_DONE:
+    global _MEMORY_GRAPH_EXECUTION_BACKFILL_DONE, _MEMORY_GRAPH_EXECUTION_BACKFILL_STARTED
+    if _MEMORY_GRAPH_EXECUTION_BACKFILL_DONE or _MEMORY_GRAPH_EXECUTION_BACKFILL_STARTED:
         return
-    _MEMORY_GRAPH_EXECUTION_BACKFILL_DONE = True
-    try:
-        from zulong.launcher.memory_mirror import backfill_recent_interactions_to_memory_graph
+    if not _launcher_ready_for_memory_backfill():
+        return
+    _MEMORY_GRAPH_EXECUTION_BACKFILL_STARTED = True
 
-        count = backfill_recent_interactions_to_memory_graph(limit=20, events_per_conversation=800)
-        if count:
-            logger.info("[WebChatRouter] MemoryGraph 执行事件回填完成: %s events", count)
+    def _run_backfill() -> None:
+        global _MEMORY_GRAPH_EXECUTION_BACKFILL_DONE, _MEMORY_GRAPH_EXECUTION_BACKFILL_STARTED
+        try:
+            from zulong.launcher.memory_mirror import backfill_recent_interactions_to_memory_graph
+
+            count = backfill_recent_interactions_to_memory_graph(limit=5, events_per_conversation=100)
+            if count:
+                logger.info("[WebChatRouter] MemoryGraph 执行事件回填完成: %s events", count)
+        except Exception as exc:
+            logger.debug("[WebChatRouter] MemoryGraph 执行事件回填跳过: %s", exc)
+        finally:
+            _MEMORY_GRAPH_EXECUTION_BACKFILL_DONE = True
+            _MEMORY_GRAPH_EXECUTION_BACKFILL_STARTED = False
+
+    try:
+        loop = _event_loop
+        if loop and loop.is_running():
+            loop.run_in_executor(None, _run_backfill)
+        else:
+            threading.Thread(
+                target=_run_backfill,
+                name="zulong-memory-backfill",
+                daemon=True,
+            ).start()
+        logger.info("[WebChatRouter] MemoryGraph 执行事件回填已转入后台")
     except Exception as exc:
-        logger.debug("[WebChatRouter] MemoryGraph 执行事件回填跳过: %s", exc)
+        _MEMORY_GRAPH_EXECUTION_BACKFILL_STARTED = False
+        _MEMORY_GRAPH_EXECUTION_BACKFILL_DONE = True
+        logger.debug("[WebChatRouter] MemoryGraph 执行事件回填调度失败: %s", exc)
+
+
+def _launcher_ready_for_memory_backfill() -> bool:
+    """Backfill is optional; never let it compete with startup modules."""
+    try:
+        from zulong.launcher import app as launcher_app_module
+
+        launcher = getattr(launcher_app_module, "_app_instance", None)
+        if launcher is None:
+            return False
+        if getattr(launcher, "phase", "") != "running":
+            return False
+        manager = getattr(launcher, "manager", None)
+        if manager is None:
+            return False
+        status = manager.get_status() if hasattr(manager, "get_status") else {}
+        return bool(status.get("launched"))
+    except Exception:
+        return False
 
 
 def _merge_execution_view_into_payload(payload: Dict[str, Any], execution_view: Dict[str, Any]) -> Dict[str, Any]:
@@ -1244,6 +3084,12 @@ def _merge_execution_view_into_payload(payload: Dict[str, Any], execution_view: 
 
     stats = dict(payload.get("stats") or {})
     execution_stats = dict(execution_view.get("stats") or {})
+    if "returned_nodes" in stats:
+        stats.setdefault("active_skeleton_returned_nodes", stats.get("returned_nodes"))
+    if "returned_edges" in stats:
+        stats.setdefault("active_skeleton_returned_edges", stats.get("returned_edges"))
+    stats["returned_nodes"] = len(nodes)
+    stats["returned_edges"] = len(edges)
     stats["execution"] = execution_stats
     stats["execution_nodes"] = execution_stats.get("total_execution_nodes", 0)
 
@@ -1258,12 +3104,12 @@ def _merge_execution_view_into_payload(payload: Dict[str, Any], execution_view: 
 async def _push_memory_graph_snapshot(ws: WebSocket) -> None:
     """推送记忆图谱快照到指定 WebSocket"""
     try:
-        payload = _get_memory_graph_snapshot_payload()
+        if not _launcher_ready_for_memory_backfill():
+            await _send_memory_graph_payload(ws, _empty_memory_graph_payload())
+            return
+        payload = await _get_memory_graph_snapshot_payload_async(include_execution=True)
         if payload:
-            await _send_to_ws(ws, {
-                "type": "MEMORY_GRAPH_UPDATE",
-                **payload,
-            })
+            await _send_memory_graph_payload(ws, payload)
     except Exception as e:
         logger.debug(f"[WebChatRouter] 推送记忆图谱失败: {e}")
         try:
@@ -1280,26 +3126,249 @@ async def _push_memory_graph_snapshot(ws: WebSocket) -> None:
             pass
 
 
-def _get_memory_graph_snapshot_payload() -> dict:
+async def _push_memory_graph_summary(ws: WebSocket) -> None:
     try:
+        if not _launcher_ready_for_memory_backfill():
+            return
+        payload = await _get_memory_graph_snapshot_payload_async(summary_only=True)
+        await _send_to_ws(ws, {
+            "type": "MEMORY_GRAPH_UPDATE",
+            **payload,
+        }, persist=False)
+    except Exception as e:
+        logger.debug(f"[WebChatRouter] 推送记忆图谱摘要失败: {e}")
+
+
+async def _send_memory_graph_payload(ws: WebSocket, payload: Dict[str, Any]) -> None:
+    """Send a MemoryGraph snapshot in bounded frames without dropping content."""
+    chunks, snapshot_id = _chunk_memory_graph_payload(payload)
+    for index, chunk_payload in enumerate(chunks):
+        chunk_payload["chunk_index"] = index
+        chunk_payload["chunk_total"] = len(chunks)
+        chunk_payload["is_last_chunk"] = index == len(chunks) - 1
+        chunk_payload["update_type"] = "full" if index == 0 else "full_chunk"
+        chunk_payload["snapshot_id"] = snapshot_id
+        await _send_to_ws(ws, chunk_payload, persist=False)
+
+
+def _chunk_memory_graph_payload(payload: Dict[str, Any]) -> tuple[List[Dict[str, Any]], str]:
+    """Build bounded MemoryGraph frames without dropping nodes or edges."""
+    nodes = list((payload or {}).get("nodes") or [])
+    edges = list((payload or {}).get("edges") or [])
+    snapshot_id = f"mg-{int(time.time() * 1000)}"
+
+    base_payload = {
+        key: value
+        for key, value in (payload or {}).items()
+        if key not in ("nodes", "edges", "execution_view")
+    }
+    execution_view = payload.get("execution_view") if isinstance(payload, dict) else None
+    execution_nodes_by_id: Dict[str, Dict[str, Any]] = {}
+    if isinstance(execution_view, dict):
+        for node in execution_view.get("nodes") or []:
+            if isinstance(node, dict) and node.get("id"):
+                execution_nodes_by_id[str(node["id"])] = node
+
+    base_stats = dict(base_payload.get("stats") or {})
+    base_stats.setdefault("total_nodes", len(nodes))
+    base_stats.setdefault("total_edges", len(edges))
+    base_stats["returned_nodes"] = len(nodes)
+    base_stats["returned_edges"] = len(edges)
+    base_stats["transport"] = "chunked"
+    base_payload["stats"] = base_stats
+
+    chunks: List[Dict[str, Any]] = []
+    node_index = 0
+    edge_index = 0
+    while node_index < len(nodes) or edge_index < len(edges) or not chunks:
+        chunk_nodes: List[Dict[str, Any]] = []
+        chunk_edges: List[Dict[str, Any]] = []
+        chunk_node_ids: Set[str] = set()
+
+        while node_index < len(nodes):
+            candidate = nodes[node_index]
+            candidate_nodes = chunk_nodes + [candidate]
+            candidate_node_ids = {
+                str(node.get("id"))
+                for node in candidate_nodes
+                if isinstance(node, dict) and node.get("id")
+            }
+            candidate_payload = _build_memory_graph_chunk_payload(
+                base_payload,
+                snapshot_id,
+                0,
+                1,
+                False,
+                candidate_nodes,
+                chunk_edges,
+                candidate_node_ids,
+                execution_view,
+                execution_nodes_by_id,
+            )
+            if (
+                chunk_nodes
+                and _json_size_bytes(candidate_payload) > _MEMORY_GRAPH_CHUNK_MAX_BYTES
+            ):
+                break
+            chunk_nodes.append(candidate)
+            node_index += 1
+            chunk_node_ids = candidate_node_ids
+            if _json_size_bytes(candidate_payload) > _MEMORY_GRAPH_CHUNK_MAX_BYTES:
+                break
+
+        while edge_index < len(edges):
+            candidate_edge = edges[edge_index]
+            candidate_edges = chunk_edges + [candidate_edge]
+            candidate_payload = _build_memory_graph_chunk_payload(
+                base_payload,
+                snapshot_id,
+                0,
+                1,
+                False,
+                chunk_nodes,
+                candidate_edges,
+                chunk_node_ids,
+                execution_view,
+                execution_nodes_by_id,
+            )
+            if (
+                chunk_edges
+                and _json_size_bytes(candidate_payload) > _MEMORY_GRAPH_CHUNK_MAX_BYTES
+            ):
+                break
+            chunk_edges.append(candidate_edge)
+            edge_index += 1
+            if _json_size_bytes(candidate_payload) > _MEMORY_GRAPH_CHUNK_MAX_BYTES:
+                break
+
+        chunks.append(_build_memory_graph_chunk_payload(
+            base_payload,
+            snapshot_id,
+            0,
+            1,
+            False,
+            chunk_nodes,
+            chunk_edges,
+            chunk_node_ids,
+            execution_view,
+            execution_nodes_by_id,
+        ))
+
+    transport = "chunked" if len(chunks) > 1 else "single"
+    for chunk in chunks:
+        chunk.setdefault("stats", {})["transport"] = transport
+    return chunks, snapshot_id
+
+
+def _json_size_bytes(data: Dict[str, Any]) -> int:
+    return len(json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _build_memory_graph_chunk_payload(
+    base_payload: Dict[str, Any],
+    snapshot_id: str,
+    index: int,
+    total_chunks: int,
+    is_last_chunk: bool,
+    chunk_nodes: List[Dict[str, Any]],
+    chunk_edges: List[Dict[str, Any]],
+    chunk_node_ids: Set[str],
+    execution_view: Any,
+    execution_nodes_by_id: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    chunk_execution_nodes = [
+        node for node in chunk_nodes
+        if isinstance(node, dict) and str(node.get("id")) in execution_nodes_by_id
+    ]
+    chunk_execution_edges = [
+        edge for edge in chunk_edges
+        if (
+            str(edge.get("source") if not isinstance(edge.get("source"), dict) else edge.get("source", {}).get("id")) in chunk_node_ids
+            or str(edge.get("target") if not isinstance(edge.get("target"), dict) else edge.get("target", {}).get("id")) in chunk_node_ids
+        )
+    ]
+    chunk_payload = dict(base_payload)
+    chunk_payload.update({
+        "type": "MEMORY_GRAPH_UPDATE",
+        "update_type": "full" if index == 0 else "full_chunk",
+        "snapshot_id": snapshot_id,
+        "chunk_index": index,
+        "chunk_total": total_chunks,
+        "is_last_chunk": is_last_chunk,
+        "nodes": chunk_nodes,
+        "edges": chunk_edges,
+    })
+    if isinstance(execution_view, dict):
+        chunk_payload["execution_view"] = {
+            "nodes": chunk_execution_nodes,
+            "edges": chunk_execution_edges,
+            "execution_node_ids": [
+                str(node.get("id"))
+                for node in chunk_execution_nodes
+                if isinstance(node, dict) and node.get("id")
+            ],
+            "stats": execution_view.get("stats") or {},
+        }
+    return chunk_payload
+
+
+def _get_memory_graph_snapshot_payload(
+    summary_only: bool = False,
+    include_execution: bool = False,
+) -> dict:
+    try:
+        if not _launcher_ready_for_memory_backfill():
+            return _empty_memory_graph_payload(summary_only=summary_only, unavailable_reason="launcher_not_ready")
         mg = _get_active_memory_graph()
         if not mg:
+            return _empty_memory_graph_payload(summary_only=summary_only, unavailable_reason="memory_graph_unavailable")
+        if summary_only:
+            try:
+                stats = dict(mg.get_total_stats()) if hasattr(mg, "get_total_stats") else {}
+            except Exception:
+                stats = {}
+            if not stats:
+                stats = dict(getattr(mg, "_stats", {}) or {})
+            try:
+                skeleton = mg.get_active_skeleton() if hasattr(mg, "get_active_skeleton") else {}
+            except Exception:
+                skeleton = {}
+            skeleton_stats = dict(skeleton.get("stats") or {}) if isinstance(skeleton, dict) else {}
             return {
-                "update_type": "full",
+                "update_type": "summary",
                 "ts": time.time(),
                 "nodes": [],
                 "edges": [],
-                "stats": {"total_nodes": 0, "total_edges": 0},
+                "stats": {
+                    "total_nodes": stats.get("total_nodes", 0),
+                    "total_edges": stats.get("total_edges", 0),
+                    "active_skeleton_nodes": skeleton_stats.get(
+                        "node_count",
+                        len(skeleton.get("node_ids") or []) if isinstance(skeleton, dict) else 0,
+                    ),
+                    "active_skeleton_edges": skeleton_stats.get(
+                        "edge_count",
+                        len(skeleton.get("edges") or []) if isinstance(skeleton, dict) else 0,
+                    ),
+                    "transport": "summary",
+                },
             }
-        if hasattr(mg, "to_frontend_dict"):
-            payload = mg.to_frontend_dict(depth=0)
-        elif hasattr(mg, "get_snapshot_for_frontend"):
-            payload = mg.get_snapshot_for_frontend()
-        else:
-            payload = {}
-        _ensure_execution_events_backfilled(mg)
-        execution_view = _get_memory_graph_execution_view(mg)
-        payload = _merge_execution_view_into_payload(payload or {}, execution_view)
+        acquired = _MEMORY_GRAPH_SNAPSHOT_LOCK.acquire(blocking=False)
+        if not acquired:
+            return _empty_memory_graph_payload(unavailable_reason="snapshot_busy")
+        try:
+            if hasattr(mg, "to_frontend_dict"):
+                payload = mg.to_frontend_dict(depth=0)
+            elif hasattr(mg, "get_snapshot_for_frontend"):
+                payload = mg.get_snapshot_for_frontend()
+            else:
+                payload = {}
+        finally:
+            _MEMORY_GRAPH_SNAPSHOT_LOCK.release()
+        if include_execution:
+            _ensure_execution_events_backfilled(mg)
+            execution_view = _get_memory_graph_execution_view(mg)
+            payload = _merge_execution_view_into_payload(payload or {}, execution_view)
         return {
             "update_type": "full",
             "ts": time.time(),
@@ -1316,10 +3385,54 @@ def _get_memory_graph_snapshot_payload() -> dict:
         }
 
 
+async def _get_memory_graph_snapshot_payload_async(
+    *,
+    summary_only: bool = False,
+    include_execution: bool = False,
+) -> dict:
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                _get_memory_graph_snapshot_payload,
+                summary_only,
+                include_execution,
+            ),
+            timeout=1.0 if summary_only else _MEMORY_GRAPH_SNAPSHOT_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        return _empty_memory_graph_payload(
+            summary_only=True,
+            unavailable_reason="snapshot_timeout",
+        )
+
+
+def _empty_memory_graph_payload(
+    *,
+    summary_only: bool = False,
+    unavailable_reason: Optional[str] = None,
+) -> dict:
+    payload = {
+        "update_type": "summary" if summary_only else "full",
+        "ts": time.time(),
+        "nodes": [],
+        "edges": [],
+        "stats": {"total_nodes": 0, "total_edges": 0},
+    }
+    if unavailable_reason:
+        payload["unavailable_reason"] = unavailable_reason
+    return payload
+
+
 @router.get("/api/memory-graph/snapshot")
-async def get_memory_graph_snapshot():
+async def get_memory_graph_snapshot(
+    summary_only: bool = True,
+    include_execution: bool = True,
+):
     """Return a fast MemoryGraph frontend snapshot for Web fallback loading."""
-    return _get_memory_graph_snapshot_payload()
+    return await _get_memory_graph_snapshot_payload_async(
+        summary_only=summary_only,
+        include_execution=include_execution,
+    )
 
 
 @router.get("/api/memory-graph/context-seed")
@@ -1392,13 +3505,14 @@ async def _handle_memory_context_seed(ws: WebSocket, data: Dict[str, Any]) -> No
 async def _handle_list_dialogue_sessions(ws: WebSocket) -> None:
     """查询 MemoryGraph 中所有对话会话节点，返回会话列表"""
     try:
-        session_store = _collect_dialogue_sessions()
+        loop = asyncio.get_running_loop()
+        session_store = await loop.run_in_executor(None, _collect_dialogue_sessions)
         sent = await _send_to_ws(ws, {
             "type": "SESSION_LIST",
             "ts": time.time(),
             "sessions": session_store["sessions"],
             "activeSessionId": session_store.get("activeSessionId"),
-        })
+        }, persist=False)
         if sent:
             logger.info(f"[WebChatRouter] SESSION_LIST: 返回 {len(session_store['sessions'])} 个会话")
     except Exception as e:
@@ -1409,7 +3523,7 @@ async def _handle_list_dialogue_sessions(ws: WebSocket) -> None:
             "ts": time.time(),
             "sessions": [],
             "error": str(e),
-            })
+            }, persist=False)
         except Exception:
             pass
 
@@ -1468,104 +3582,19 @@ async def _handle_get_session_messages(ws: WebSocket, session_id: str) -> None:
 async def _handle_delete_dialogue_session(ws: WebSocket, session_id: str) -> None:
     """删除对话会话及其所有子节点（BFS 级联删除），同步清理 TaskGraph/AgentSessionStore/IDESession"""
     try:
-        mg = _get_active_memory_graph()
-        if not mg or not mg.has_node(session_id):
-            await _send_to_ws(ws, {
-                "type": "SESSION_DELETED",
-                "ts": time.time(),
-                "session_id": session_id,
-                "nodes_deleted": 0,
-                "error": "会话不存在",
-            })
-            return
-
-        # BFS 收集 HIERARCHY 子节点
-        nodes_to_remove = [session_id]
-        queue = [session_id]
-        while queue:
-            parent = queue.pop(0)
-            if hasattr(mg, '_graph') and parent in mg._graph:
-                for child_id in list(mg._graph.successors(parent)):
-                    edge_data = mg._graph[parent].get(child_id, {})
-                    if edge_data.get("edge_type") == "hierarchy":
-                        nodes_to_remove.append(child_id)
-                        queue.append(child_id)
-
-        # 从叶子到根逐个删除 MemoryGraph 节点
-        mg_deleted_count = 0
-        for nid in reversed(nodes_to_remove):
-            if mg.remove_node(nid):
-                mg_deleted_count += 1
-
-        if hasattr(mg, "save_all"):
-            mg.save_all()
-
-        # 同步清理 TaskGraph 中的任务节点
-        tg_deleted_count = 0
-        for nid in nodes_to_remove:
-            if nid.startswith("task:tg_"):
-                try:
-                    from zulong.tools.task_tools import get_active_task_graph
-                    tg = get_active_task_graph()
-                    if tg and tg.has_node(nid):
-                        tg.remove_node(nid)
-                        tg_deleted_count += 1
-                except Exception:
-                    pass
-            else:
-                try:
-                    from zulong.tools.task_tools import get_active_task_graph
-                    tg = get_active_task_graph()
-                    if tg and tg.has_node(nid):
-                        tg.remove_node(nid)
-                        tg_deleted_count += 1
-                except Exception:
-                    pass
-
-        # 同步清理 AgentSessionStore
-        try:
-            from zulong.ide.ide_server import get_session_store
-            store = get_session_store()
-            store.delete(session_id)
-        except Exception:
-            pass
-
-        # 同步清理 IDE _sessions（如存在）
-        ide_session_cleared = False
-        try:
-            from zulong.ide.ide_server import _sessions
-            if session_id in _sessions:
-                sess = _sessions[session_id]
-                if sess.fc_task and not sess.fc_task.done():
-                    sess.cancel_event.set()
-                    sess.fc_task.cancel()
-                _sessions.pop(session_id, None)
-                ide_session_cleared = True
-        except Exception:
-            pass
-
-        # 广播删除事件
-        try:
-            from zulong.ide.ide_server import broadcast_monitor_event
-            await broadcast_monitor_event("SESSION_DELETED", {
-                "session_id": session_id,
-                "mg_nodes_deleted": mg_deleted_count,
-                "tg_nodes_deleted": tg_deleted_count,
-            })
-        except Exception:
-            pass
-
-        await _send_to_ws(ws, {
+        result = _delete_dialogue_session_cascade(session_id, cascade=True)
+        await _broadcast({
             "type": "SESSION_DELETED",
             "ts": time.time(),
             "session_id": session_id,
-            "nodes_deleted": mg_deleted_count,
-            "tg_nodes_deleted": tg_deleted_count,
+            "session_node_id": result.get("session_node_id") or "",
+            "nodes_deleted": result.get("mg_nodes_deleted", 0),
+            "deleted_node_ids": result.get("deleted_node_ids") or [],
         })
         logger.info(
             f"[WebChatRouter] DELETE_DIALOGUE_SESSION: {session_id} → "
-            f"MG删除{mg_deleted_count}个, TG删除{tg_deleted_count}个, "
-            f"IDE session={'已清除' if ide_session_cleared else '无'}")
+            f"MG删除{result.get('mg_nodes_deleted', 0)}个, "
+            f"session_node={result.get('session_node_id') or '-'}")
     except Exception as e:
         logger.error(f"[WebChatRouter] DELETE_DIALOGUE_SESSION 失败: {e}", exc_info=True)
         await _send_to_ws(ws, {
@@ -1586,64 +3615,37 @@ async def list_sessions_rest():
 @router.delete("/api/chat/sessions/{session_id}")
 async def delete_session_rest(session_id: str, cascade: bool = True):
     """REST API 删除会话（级联清理 MemoryGraph/TaskGraph/AgentSessionStore）"""
-    mg_nodes_deleted = 0
-    tg_nodes_deleted = 0
-
-    if cascade:
-        try:
-            mg = _get_active_memory_graph()
-            if mg and mg.has_node(session_id):
-                nodes_to_remove = [session_id]
-                queue = [session_id]
-                while queue:
-                    parent = queue.pop(0)
-                    if hasattr(mg, '_graph') and parent in mg._graph:
-                        for child_id in list(mg._graph.successors(parent)):
-                            edge_data = mg._graph[parent].get(child_id, {})
-                            if edge_data.get("edge_type") == "hierarchy":
-                                nodes_to_remove.append(child_id)
-                                queue.append(child_id)
-                for nid in reversed(nodes_to_remove):
-                    if mg.remove_node(nid):
-                        mg_nodes_deleted += 1
-                if hasattr(mg, "save_all"):
-                    mg.save_all()
-        except Exception as e:
-            logger.warning(f"[REST] 级联删除MG失败: {e}")
-
-        try:
-            from zulong.tools.task_tools import get_active_task_graph
-            tg = get_active_task_graph()
-            if tg and tg.has_node(session_id):
-                if tg.remove_node(session_id):
-                    tg_nodes_deleted += 1
-        except Exception:
-            pass
-
-        try:
-            from zulong.ide.ide_server import get_session_store
-            store = get_session_store()
-            store.delete(session_id)
-        except Exception:
-            pass
-
-        try:
-            from zulong.ide.ide_server import _sessions
-            if session_id in _sessions:
-                sess = _sessions[session_id]
-                if sess.fc_task and not sess.fc_task.done():
-                    sess.cancel_event.set()
-                    sess.fc_task.cancel()
-                _sessions.pop(session_id, None)
-        except Exception:
-            pass
-
-    return {
+    result = _delete_dialogue_session_cascade(session_id, cascade=cascade)
+    await _broadcast({
+        "type": "SESSION_DELETED",
+        "ts": time.time(),
         "session_id": session_id,
-        "deleted": True,
-        "mg_nodes_deleted": mg_nodes_deleted,
-        "tg_nodes_deleted": tg_nodes_deleted,
+        "session_node_id": result.get("session_node_id") or "",
+        "nodes_deleted": result.get("mg_nodes_deleted", 0),
+        "deleted_node_ids": result.get("deleted_node_ids") or [],
+    })
+    return {
+        **result,
+        "tg_nodes_deleted": 0,
     }
+
+
+@router.delete("/api/chat/sessions/{session_id}/messages/{message_id:path}")
+async def delete_chat_message_rest(session_id: str, message_id: str):
+    """删除单条 Web 对话内容，并同步删除对应 MemoryGraph 子节点。"""
+    result = _delete_dialogue_message_cascade(session_id, message_id)
+    if result.get("removed") or result.get("event_deleted"):
+        try:
+            session_store = _collect_dialogue_sessions()
+            await _broadcast({
+                "type": "SESSION_LIST",
+                "ts": time.time(),
+                "sessions": session_store["sessions"],
+                "activeSessionId": session_store.get("activeSessionId"),
+            })
+        except Exception:
+            pass
+    return result
 
 
 async def _send_to_ws(ws: WebSocket, message: dict, *, persist: bool = True) -> bool:
@@ -1697,41 +3699,44 @@ async def _send_initial_dashboard_state(ws: WebSocket) -> None:
     task_graph_snapshot = None
     memory_graph_stats = None
     code_anchor_stats = None
-    try:
-        from zulong.ide.ide_server import _get_engine
-        engine_ready = _get_engine() is not None
-    except Exception:
-        pass
-    try:
-        from zulong.tools.task_tools import get_active_task_graph
-        tg = get_active_task_graph()
-        if tg:
-            task_graph_snapshot = tg.to_frontend_dict()
-    except Exception:
-        pass
-    try:
-        mg = _get_active_memory_graph()
-        if mg:
-            memory_graph_stats = {
-                "total_nodes": mg._stats.get("total_nodes", 0),
-                "total_edges": mg._stats.get("total_edges", 0),
-            }
-    except Exception:
-        pass
-    try:
-        from zulong.memory.code_anchor import get_code_anchor_store
-        store = get_code_anchor_store()
-        if store:
-            code_anchor_stats = store.get_stats()
-    except Exception:
-        pass
+    launcher_ready = _launcher_ready_for_memory_backfill()
+    if launcher_ready:
+        try:
+            from zulong.ide.ide_server import _get_engine
+            engine_ready = _get_engine() is not None
+        except Exception:
+            pass
+        try:
+            from zulong.tools.task_tools import get_active_task_graph
+            tg = get_active_task_graph()
+            if tg:
+                task_graph_snapshot = tg.to_frontend_dict()
+        except Exception:
+            pass
+        try:
+            mg = _get_active_memory_graph()
+            if mg:
+                memory_graph_stats = {
+                    "total_nodes": mg._stats.get("total_nodes", 0),
+                    "total_edges": mg._stats.get("total_edges", 0),
+                }
+        except Exception:
+            pass
+        try:
+            from zulong.memory.code_anchor import get_code_anchor_store
+            store = get_code_anchor_store()
+            if store:
+                code_anchor_stats = store.get_stats()
+        except Exception:
+            pass
 
     active_sessions_info = []
-    try:
-        from zulong.ide.ide_server import _sessions as _ide_sessions
-        active_sessions_info = [s.to_info_dict() for s in _ide_sessions.values()]
-    except Exception:
-        pass
+    if launcher_ready:
+        try:
+            from zulong.ide.ide_server import _sessions as _ide_sessions
+            active_sessions_info = [s.to_info_dict() for s in _ide_sessions.values()]
+        except Exception:
+            pass
 
     return await _send_to_ws(ws, {
         "type": "WELCOME",
@@ -1740,11 +3745,12 @@ async def _send_initial_dashboard_state(ws: WebSocket) -> None:
             "engine_ready": engine_ready,
             "launch_mode": _launch_mode,
             "task_graph": task_graph_snapshot,
+            "task_execution_status": _task_status_snapshot(),
             "memory_graph_stats": memory_graph_stats,
             "code_anchor_stats": code_anchor_stats,
             "active_sessions": active_sessions_info,
         },
-    })
+    }, persist=False)
 
 
 async def handle_unified_root_ws(
@@ -1767,14 +3773,15 @@ async def handle_unified_root_ws(
     if _event_loop is None:
         _event_loop = asyncio.get_running_loop()
 
-    try:
-        from zulong.ide.ide_server import _monitor_connections
-        _monitor_connections.add(ws)
-        import zulong.ide.ide_server as _ide_srv
-        if _ide_srv._main_event_loop is None:
-            _ide_srv._main_event_loop = _event_loop
-    except Exception:
-        pass
+    if _launcher_ready_for_memory_backfill():
+        try:
+            from zulong.ide.ide_server import _monitor_connections
+            _monitor_connections.add(ws)
+            import zulong.ide.ide_server as _ide_srv
+            if _ide_srv._main_event_loop is None:
+                _ide_srv._main_event_loop = _event_loop
+        except Exception:
+            pass
 
     if initial_msg:
         payload = initial_msg.get("payload", {}) if isinstance(initial_msg, dict) else {}
@@ -1786,7 +3793,7 @@ async def handle_unified_root_ws(
             "status": "ok",
             "client_type": _ws_client_types.get(id(ws), "dashboard"),
         },
-    )):
+    ), persist=False):
         _ws_clients.discard(ws)
         _ws_protocols.pop(id(ws), None)
         _ws_client_types.pop(id(ws), None)
@@ -1797,7 +3804,7 @@ async def handle_unified_root_ws(
         _ws_client_types.pop(id(ws), None)
         return
     try:
-        await _push_memory_graph_snapshot(ws)
+        await _push_memory_graph_summary(ws)
     except WebSocketDisconnect:
         _ws_clients.discard(ws)
         _ws_protocols.pop(id(ws), None)
@@ -1819,11 +3826,11 @@ async def handle_unified_root_ws(
                     await _send_to_ws(ws, make_unified_message(
                         MessageType.TASK_ACK,
                         {"status": "ok", "client_type": _ws_client_types[id(ws)]},
-                    ))
+                    ), persist=False)
                     continue
 
                 if msg_type == MessageType.PING:
-                    await _send_to_ws(ws, make_unified_message(MessageType.PONG, {}))
+                    await _send_to_ws(ws, make_unified_message(MessageType.PONG, {}), persist=False)
                     continue
 
                 legacy = _protocol_bridge.from_unified(unified, target_format="web", direction="uplink")
@@ -1882,11 +3889,12 @@ async def handle_unified_root_ws(
         _ws_clients.discard(ws)
         _ws_protocols.pop(id(ws), None)
         _ws_client_types.pop(id(ws), None)
-        try:
-            from zulong.ide.ide_server import _monitor_connections
-            _monitor_connections.discard(ws)
-        except Exception:
-            pass
+        if _launcher_ready_for_memory_backfill():
+            try:
+                from zulong.ide.ide_server import _monitor_connections
+                _monitor_connections.discard(ws)
+            except Exception:
+                pass
 
 
 # ── WebSocket 端点 ────────────────────────────────────
@@ -1902,16 +3910,17 @@ async def ws_chat_endpoint(ws: WebSocket):
     if _event_loop is None:
         _event_loop = asyncio.get_running_loop()
 
-    # 同时加入 /monitor 广播集，接收 TASK_GRAPH_UPDATE 等系统事件
-    try:
-        from zulong.ide.ide_server import _monitor_connections
-        _monitor_connections.add(ws)
-        # 确保 ide_server 的 _main_event_loop 也被设置（Launcher 模式下 startup 不走）
-        import zulong.ide.ide_server as _ide_srv
-        if _ide_srv._main_event_loop is None:
-            _ide_srv._main_event_loop = _event_loop
-    except Exception:
-        pass
+    # 启动完成后才接入 IDE 监控集，避免选择页/Dashboard 探针提前导入重模块。
+    if _launcher_ready_for_memory_backfill():
+        try:
+            from zulong.ide.ide_server import _monitor_connections
+            _monitor_connections.add(ws)
+            # 确保 ide_server 的 _main_event_loop 也被设置（Launcher 模式下 startup 不走）
+            import zulong.ide.ide_server as _ide_srv
+            if _ide_srv._main_event_loop is None:
+                _ide_srv._main_event_loop = _event_loop
+        except Exception:
+            pass
 
     logger.info(f"[WebChatRouter] /ws 已连接 (total={len(_ws_clients)})")
 
@@ -1919,26 +3928,28 @@ async def ws_chat_endpoint(ws: WebSocket):
         _ws_clients.discard(ws)
         _ws_protocols.pop(id(ws), None)
         _ws_client_types.pop(id(ws), None)
-        try:
-            from zulong.ide.ide_server import _monitor_connections
-            _monitor_connections.discard(ws)
-        except Exception:
-            pass
+        if _launcher_ready_for_memory_backfill():
+            try:
+                from zulong.ide.ide_server import _monitor_connections
+                _monitor_connections.discard(ws)
+            except Exception:
+                pass
         logger.info("[WebChatRouter] /ws 初始状态发送前客户端已断开")
         return
 
-    # 推送记忆图谱快照
+    # 建连只推轻量摘要；完整图谱由前端在用户打开记忆图谱时按需请求。
     try:
-        await _push_memory_graph_snapshot(ws)
+        await _push_memory_graph_summary(ws)
     except WebSocketDisconnect:
         _ws_clients.discard(ws)
         _ws_protocols.pop(id(ws), None)
         _ws_client_types.pop(id(ws), None)
-        try:
-            from zulong.ide.ide_server import _monitor_connections
-            _monitor_connections.discard(ws)
-        except Exception:
-            pass
+        if _launcher_ready_for_memory_backfill():
+            try:
+                from zulong.ide.ide_server import _monitor_connections
+                _monitor_connections.discard(ws)
+            except Exception:
+                pass
         logger.info("[WebChatRouter] /ws 初始图谱发送前客户端已断开")
         return
 
@@ -1958,7 +3969,7 @@ async def ws_chat_endpoint(ws: WebSocket):
                     await _send_to_ws(ws, make_unified_message(
                         MessageType.TASK_ACK,
                         {"status": "ok", "client_type": client_type},
-                    ))
+                    ), persist=False)
                     continue
 
                 # ── 统一协议: 未显式握手但直接发送 namespace 类型 ──
@@ -1978,13 +3989,15 @@ async def ws_chat_endpoint(ws: WebSocket):
                 )
 
                 if msg_type == "ping":
-                    await _send_to_ws(ws, {"type": "pong", "ts": time.time()})
+                    await _send_to_ws(ws, {"type": "pong", "ts": time.time()}, persist=False)
                 elif msg_type == "CHAT_MESSAGE":
                     asyncio.create_task(_handle_chat_message(ws, data))
                 elif msg_type == "STOP_GENERATION":
                     asyncio.create_task(_handle_stop_generation(data))
                 elif msg_type == "STOP_TASK":
                     asyncio.create_task(_handle_stop_generation(data))
+                elif msg_type == "settings_update":
+                    asyncio.create_task(_handle_settings_update(ws, data.get("payload", data)))
                 elif msg_type == "conversation:switch":
                     asyncio.create_task(_handle_conversation_switch(data.get("payload", data)))
                 elif msg_type in ("CHAT_VISIBLE_MESSAGE", "chat:visible_message"):
@@ -2063,11 +4076,12 @@ async def ws_chat_endpoint(ws: WebSocket):
         _ws_clients.discard(ws)
         _ws_protocols.pop(id(ws), None)
         _ws_client_types.pop(id(ws), None)
-        try:
-            from zulong.ide.ide_server import _monitor_connections
-            _monitor_connections.discard(ws)
-        except Exception:
-            pass
+        if _launcher_ready_for_memory_backfill():
+            try:
+                from zulong.ide.ide_server import _monitor_connections
+                _monitor_connections.discard(ws)
+            except Exception:
+                pass
         logger.info(f"[WebChatRouter] /ws 已断开 (total={len(_ws_clients)})")
 
 
@@ -2213,15 +4227,20 @@ async def _transcribe_pcm16_audio(audio_data: bytes) -> dict:
                 sensevoice_model_path = "./models/OpenASR/sensevoice-small-onnx"
                 asr_device = "auto"
             try:
-                from zulong.utils.device import resolve_device
-                asr_device = resolve_device(asr_device, prefer_gpu=True)
+                from zulong.utils.device import resolve_audio_model_devices
+                audio_devices = resolve_audio_model_devices(asr_device, prefer_gpu=True)
             except Exception:
-                pass
+                audio_devices = {
+                    "sensevoice": "cpu",
+                    "whisper": "cpu",
+                    "yamnet": "cpu",
+                }
             container.initialize(
                 enable_yamnet=False,
                 enable_sensevoice=True,
                 enable_whisper=True,
-                sensevoice_device=asr_device,
+                sensevoice_device=audio_devices["sensevoice"],
+                whisper_device=audio_devices["whisper"],
                 sensevoice_model_path=sensevoice_model_path,
             )
 
@@ -2253,6 +4272,37 @@ async def _transcribe_pcm16_audio(audio_data: bytes) -> dict:
     except Exception as e:
         logger.error(f"[WebChatRouter] ASR转写失败: {e}", exc_info=True)
         return {"status": "error", "text": "", "message": str(e)}
+
+
+async def _handle_settings_update(ws: WebSocket, payload: dict) -> None:
+    """Apply Web runtime settings that affect task execution."""
+    try:
+        from zulong.config.approval_config import set_runtime_approval_mode
+
+        mode = payload.get("approval_mode")
+        response: Dict[str, Any] = {"status": "ok"}
+        if mode:
+            response["approval_mode"] = set_runtime_approval_mode(str(mode))
+            logger.info("[WebChatRouter] 审批模式更新: %s", response["approval_mode"])
+            try:
+                from zulong.ide.ide_server import broadcast_runtime_settings
+                response["ide_bridges_synced"] = await broadcast_runtime_settings({
+                    "approval_mode": response["approval_mode"],
+                })
+            except Exception as sync_exc:
+                response["ide_bridges_synced"] = 0
+                response["ide_sync_error"] = str(sync_exc)
+                logger.debug("[WebChatRouter] IDE 审批模式同步失败: %s", sync_exc)
+        await _send_to_ws(ws, {
+            "type": "settings_ack",
+            "payload": response,
+        })
+    except Exception as exc:
+        logger.warning("[WebChatRouter] settings_update 失败: %s", exc)
+        await _send_to_ws(ws, {
+            "type": "settings_ack",
+            "payload": {"status": "error", "error": str(exc)},
+        })
 
 
 # ── TSD 23.11.3: BFS 自恢复辅助函数 ──────────────────────────

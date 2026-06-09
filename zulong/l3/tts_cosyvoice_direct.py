@@ -25,10 +25,10 @@ class CosyVoiceDirectClient:
     
     def __init__(
         self,
-        integrated_python_path: str = r"D:\BaiduNetdiskDownload\CosyVoiceV2\python\python.exe",
-        model_dir: str = r"D:\BaiduNetdiskDownload\CosyVoiceV2\CosyVoice\iic\CosyVoice2-0.5B",
-        code_path: str = r"D:\BaiduNetdiskDownload\CosyVoiceV2\CosyVoice",
-        default_prompt_audio: str = r"D:\BaiduNetdiskDownload\CosyVoiceV2\CosyVoice\asset\zero_shot_prompt.wav",
+        integrated_python_path: str = None,
+        model_dir: str = None,
+        code_path: str = None,
+        default_prompt_audio: str = None,
         default_prompt_text: str = "希望你以后能够做的比我还好呦。",
         use_gpu: bool = True
     ):
@@ -43,10 +43,13 @@ class CosyVoiceDirectClient:
             default_prompt_text: 默认提示文本
             use_gpu: 是否使用 GPU 加速
         """
-        self.integrated_python_path = integrated_python_path
-        self.model_dir = model_dir
-        self.code_path = code_path
-        self.default_prompt_audio = default_prompt_audio
+        from zulong.tts.cosyvoice_config import get_external_runtime_config
+
+        runtime = get_external_runtime_config()
+        self.integrated_python_path = integrated_python_path or runtime["integrated_python_path"]
+        self.model_dir = model_dir or runtime["model_dir"]
+        self.code_path = code_path or runtime["code_path"]
+        self.default_prompt_audio = default_prompt_audio or runtime["prompt_audio"]
         self.default_prompt_text = default_prompt_text
         self.sample_rate = 24000
         self.use_gpu = use_gpu
@@ -208,7 +211,7 @@ def test_direct_client():
     
     print("✓ 环境检查通过")
     
-    output_path = r"d:\AI\project\zulong_beta5\tests\output_cosyvoice_direct_client.wav"
+    output_path = os.path.join(os.getcwd(), "tests", "output_cosyvoice_direct_client.wav")
     
     print("\n测试语音合成...")
     success = client.synthesize(

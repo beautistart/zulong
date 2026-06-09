@@ -61,7 +61,7 @@ import { sendStateUpdate } from "./state/subscribeToState"
 import { sendChatButtonClickedEvent } from "./ui/subscribeToChatButtonClicked"
 
 /*
-https://github.com/microsoft/vscode-webview-ui-toolkit-samples/blob/main/default/weather-webview/src/providers/WeatherViewProvider.ts
+Historical VS Code webview host reference; production UI is Zulong Web.
 
 https://github.com/KumarVariable/vscode-extension-sidebar-html/blob/master/src/customSidebarViewProvider.ts
 */
@@ -186,10 +186,11 @@ export class Controller {
 
 			// Update API providers through cache service
 			const apiConfiguration = this.stateManager.getApiConfiguration()
+			const zulongProvider: ApiProvider = "zulong"
 			const updatedConfig = {
 				...apiConfiguration,
-				planModeApiProvider: "openrouter" as ApiProvider,
-				actModeApiProvider: "openrouter" as ApiProvider,
+				planModeApiProvider: zulongProvider,
+				actModeApiProvider: zulongProvider,
 			}
 			this.stateManager.setApiConfiguration(updatedConfig)
 
@@ -340,6 +341,28 @@ export class Controller {
 		if (history) {
 			await this.initTask(undefined, undefined, undefined, history.historyItem)
 		}
+	}
+
+	async handleIdeApprovalResult(payload: Record<string, any>) {
+		const approvalId = payload.approval_id || payload.approvalId || payload.interaction_id || payload.pair_id
+		const normalized = {
+			...payload,
+			approval_id: approvalId,
+			approved: payload.approved === true || payload.action === "approve",
+			action: payload.action || (payload.approved ? "approve" : "reject"),
+		}
+
+		if (!normalized.approval_id) {
+			Logger.warn("[Controller] Ignoring approval result without approval_id")
+			return
+		}
+
+		if (!this.task?.api.sendIdeApprovalResult) {
+			Logger.warn("[Controller] No active Zulong task can receive approval result")
+			return
+		}
+
+		this.task.api.sendIdeApprovalResult(normalized)
 	}
 
 	async updateTelemetrySetting(telemetrySetting: TelemetrySetting) {
@@ -1004,6 +1027,7 @@ export class Controller {
 			banners,
 			welcomeBanners,
 			openAiCodexIsAuthenticated,
+			taskPhase: this.task?.taskState.taskPhase || "idle",
 		}
 	}
 

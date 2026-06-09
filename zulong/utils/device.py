@@ -48,6 +48,52 @@ def resolve_device(requested: str | None = "auto", *, prefer_gpu: bool = True) -
     return "cpu"
 
 
+def resolve_sensevoice_device(requested: str | None = "auto", *, prefer_gpu: bool = True) -> str:
+    """Resolve sherpa-onnx SenseVoice provider device.
+
+    sherpa-onnx SenseVoice currently supports CPU/CUDA providers in this project.
+    Apple MPS is a PyTorch backend, so macOS MPS must degrade to CPU here.
+    """
+    if (requested or "auto").lower() == "mps":
+        return "cpu"
+    resolved = resolve_device(requested, prefer_gpu=prefer_gpu)
+    return "cuda" if resolved == "cuda" else "cpu"
+
+
+def resolve_yamnet_device(requested: str | None = "auto", *, prefer_gpu: bool = True) -> str:
+    """Resolve YAMNet runtime device.
+
+    TensorFlow Hub YAMNet in this project is either CUDA-capable TensorFlow or CPU.
+    MPS is not a TensorFlow device target here, so it degrades to CPU.
+    """
+    if (requested or "auto").lower() == "mps":
+        return "cpu"
+    resolved = resolve_device(requested, prefer_gpu=prefer_gpu)
+    return "cuda" if resolved == "cuda" else "cpu"
+
+
+def resolve_whisper_device(requested: str | None = "auto", *, prefer_gpu: bool = True) -> str:
+    """Resolve OpenAI Whisper runtime device."""
+    return resolve_device(requested, prefer_gpu=prefer_gpu)
+
+
+def resolve_audio_model_devices(requested: str | None = "auto", *, prefer_gpu: bool = True) -> Dict[str, Any]:
+    """Return the per-model audio device plan for YAMNet/SenseVoice/Whisper."""
+    base = resolve_device(requested, prefer_gpu=prefer_gpu)
+    normalized_requested = requested or "auto"
+    plan: Dict[str, Any] = {
+        "requested": normalized_requested,
+        "resolved": base,
+        "yamnet": resolve_yamnet_device(normalized_requested, prefer_gpu=prefer_gpu),
+        "sensevoice": resolve_sensevoice_device(normalized_requested, prefer_gpu=prefer_gpu),
+        "whisper": resolve_whisper_device(base, prefer_gpu=prefer_gpu),
+        "notes": [],
+    }
+    if base == "mps" or normalized_requested.lower() == "mps":
+        plan["notes"].append("SenseVoice/YAMNet use CPU because their runtimes do not use PyTorch MPS.")
+    return plan
+
+
 def torch_device(requested: str | None = "auto", *, prefer_gpu: bool = True):
     torch = _torch()
     resolved = resolve_device(requested, prefer_gpu=prefer_gpu)

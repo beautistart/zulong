@@ -6,8 +6,8 @@ attention_selection:
   max_switch_history: 50
   min_confidence_threshold: 0.3
   oscillation_detection_window: 10
-  pressure_threshold_high: 0.9
-  pressure_threshold_medium: 0.75
+  pressure_threshold_high: 0.6
+  pressure_threshold_medium: 0.5
 audio:
   asr:
     backend: sensevoice
@@ -118,7 +118,7 @@ intent_classification:
   backend: albert
   enabled: true
 l2_inference:
-  backup_model: qwen3.5:cloud
+  backup_model: ${ZULONG_L2_BACKUP_MODEL:gpt-5.5}
   circuit_breaker:
     bfs_min_interval: 3
     # 信号2: 模式循环
@@ -128,8 +128,8 @@ l2_inference:
     query_similarity_threshold: 0.85
     # 信号4: 上下文窗口压力
     context_window_size: 131072
-    context_yellow_ratio: 0.75
-    context_red_ratio: 0.9
+    context_yellow_ratio: 0.5
+    context_red_ratio: 0.6
     # 信号6: 无进度空转
     no_progress_red: 8
     no_progress_yellow: 5
@@ -239,6 +239,10 @@ llm:
     model_id: deepseek-v4-pro:cloud
     num_ctx: 1048576
     num_predict: 1024
+    # Ollama 增强配置
+    auto_discover: true          # 启动时自动发现已安装的模型
+    health_check_interval: 30    # 健康检查间隔（秒），0 表示禁用
+    keep_alive: 5m               # 模型在内存中保持的时间（如 5m, 1h, -1 表示永久）
   openai:
     api_key: ${OPENAI_API_KEY}
     backend: openai
@@ -247,6 +251,30 @@ llm:
     - gpt-3.5-turbo
     - gpt-4-turbo
     model_id: gpt-4o-mini
+  openrouter:
+    api_key: ${OPENROUTER_API_KEY}
+    backend: openrouter
+    base_url: https://openrouter.ai/api/v1
+    model_id: openai/gpt-4o-mini
+    # OpenRouter 特定选项
+    app_name: zulong              # 应用名称（用于统计）
+    http_referer: ""              # 可选 HTTP Referer
+    fallback_models:              # 备用模型列表
+    - openai/gpt-4o-mini
+    - anthropic/claude-3.5-haiku
+    - google/gemini-2.0-flash-001
+  oneapi:
+    api_key: ${ONEAPI_API_KEY}
+    backend: oneapi
+    base_url: http://localhost:3000/v1
+    model_id: gpt-4o-mini
+  custom:
+    api_key: ${CUSTOM_LLM_API_KEY:EMPTY}
+    backend: custom
+    base_url: ${CUSTOM_LLM_BASE_URL:http://localhost:11434/v1}
+    model_id: ${CUSTOM_LLM_MODEL_ID:qwen3.5:4b}
+    # 通用的 OpenAI 兼容中转站配置
+    # 可用于对接任意 OpenAI API 兼容的中转站/代理服务
   preload:
     enabled: true
     timeout: 300
@@ -256,12 +284,12 @@ llm:
     backend: sglang
     base_url: http://localhost:30000/v1
     mem_fraction_static: 0.8
-    model_id: /mnt/d/AI/project/zulong_beta5/models/Qwen/Qwen3___5-0.8B-AWQ
+    model_id: ${ZULONG_SGLANG_MODEL_ID:./models/Qwen/Qwen3___5-0.8B-AWQ}
     schedule_conservativeness: 1.0
     schedule_policy: lpm
     tp_size: 1
   siliconflow:
-    api_key: ${SILICONFLOW_API_KEY}
+    api_key: sk-fmylzckwftjrirdovmqygassifruqckzjsqzpbmyjrbqivcy
     backend: siliconflow
     base_url: https://api.siliconflow.cn/v1
     model_id: deepseek-ai/DeepSeek-V4-Flash
@@ -286,7 +314,7 @@ llm:
     max_model_len: 4096
     max_num_batched_tokens: 2048
     max_num_seqs: 256
-    model_id: /mnt/d/AI/project/zulong_beta5/models/Qwen/Qwen3___5-0.8B-AWQ
+    model_id: ${ZULONG_VLLM_MODEL_ID:./models/Qwen/Qwen3___5-0.8B-AWQ}
     tensor_parallel_size: 1
     tool_call_parser: qwen3_xml
 memory:
@@ -377,11 +405,6 @@ tools:
   engine:
     max_workers: 5
     timeout: 60
-  openclaw:
-    api_url: http://localhost:3000
-    enabled: true
-    timeout: 30
-    websocket_url: ws://localhost:5555
   pipeline:
     workspace_dir: ./agent_workspace
   skill_packs:
@@ -441,6 +464,10 @@ web:
     port: 8080
     static_dir: ./web/static
 workspace:
-  auto_open_vscode: true
-  root: D:/AI/workspace
+  auto_open_vscode: false
+  root: ${ZULONG_WORKSPACE:./workspace}
   vscode_command: code
+  vscode_isolated_user_data: true
+  vscode_user_data_dir: ${ZULONG_VSCODE_USER_DATA_DIR:./data/vscode-user-data}
+  vscode_extensions_dir: ${ZULONG_VSCODE_EXTENSIONS_DIR:./data/vscode-extensions}
+  vscode_restore_windows: none

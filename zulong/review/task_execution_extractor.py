@@ -748,6 +748,14 @@ class TaskExecutionTraceExtractor:
                     }
                     for n in pending_nodes[:10]
                 ],
+                "completed_nodes": [
+                    {
+                        "id": str(n.get("id") or ""),
+                        "label": str(n.get("label") or ""),
+                        "status": str(n.get("status") or ""),
+                    }
+                    for n in completed_nodes[:10]
+                ],
                 "blocked_nodes": [
                     {
                         "id": str(n.get("id") or ""),
@@ -770,6 +778,7 @@ class TaskExecutionTraceExtractor:
                 "blocked": blocked,
                 "percent": int(latest_progress.get("percent") or 0),
                 "pending_nodes": [],
+                "completed_nodes": [],
                 "blocked_nodes": [],
             }
 
@@ -781,6 +790,7 @@ class TaskExecutionTraceExtractor:
             "blocked": 0,
             "percent": 0,
             "pending_nodes": [],
+            "completed_nodes": [],
             "blocked_nodes": [],
         }
 

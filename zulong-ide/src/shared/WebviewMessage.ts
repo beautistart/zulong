@@ -1,7 +1,9 @@
 export interface WebviewMessage {
-	type: "grpc_request" | "grpc_request_cancel"
+	type: "grpc_request" | "grpc_request_cancel" | "ide_approval_result"
 	grpc_request?: GrpcRequest
 	grpc_request_cancel?: GrpcCancel
+	ide_approval_result?: IdeApprovalResult
+	text?: string
 }
 
 export type GrpcRequest = {
@@ -14,6 +16,21 @@ export type GrpcRequest = {
 
 export type GrpcCancel = {
 	request_id: string // ID of the request to cancel
+}
+
+export type IdeApprovalResult = {
+	approval_id: string
+	approvalId?: string
+	interaction_id?: string
+	pair_id?: string
+	approved: boolean
+	action?: "approve" | "reject"
+	add_to_whitelist?: string
+	tool_name?: string
+	action_summary?: string
+	risk_level?: string
+	workspace_path?: string
+	cwd?: string
 }
 
 export type ZulongAskResponse = "yesButtonClicked" | "noButtonClicked" | "messageResponse"

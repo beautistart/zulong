@@ -1,0 +1,14 @@
+# ZULONG ML dependencies shared across platforms.
+# Install the platform-specific PyTorch wheel first when needed, then this file.
+
+torch>=2.0.0
+transformers>=4.30.0
+accelerate>=0.20.0
+sentence-transformers>=2.2.0
+
+# Vision
+Pillow>=9.5.0
+opencv-python>=4.7.0
+
+# Optional local ASR fallback
+openai-whisper>=20231117

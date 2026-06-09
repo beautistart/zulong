@@ -23,8 +23,9 @@ export interface AutoApprovalSettings {
 	}
 	// Global settings
 	enableNotifications: boolean // Show notifications for approval and task completion
-	// Zulong provider auto-approve mode: "full" = all tools, "read_only" = read ops only, "off" = use standard settings
-	zulongAutoApproveMode?: "full" | "read_only" | "off"
+	// Zulong provider approval mode.
+	// Legacy values are kept for migration from older extension versions.
+	zulongAutoApproveMode?: "full_auto" | "whitelist" | "manual" | "popup" | "full" | "read_only" | "off"
 }
 
 export const DEFAULT_AUTO_APPROVAL_SETTINGS: AutoApprovalSettings = {
@@ -43,5 +44,5 @@ export const DEFAULT_AUTO_APPROVAL_SETTINGS: AutoApprovalSettings = {
 		useMcp: true,
 	},
 	enableNotifications: false,
-	zulongAutoApproveMode: "full",
+	zulongAutoApproveMode: "manual",
 }
