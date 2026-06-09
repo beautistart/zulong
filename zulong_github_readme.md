@@ -2,7 +2,7 @@
 
 <img src="./docs/images/zulong_logo_transparent.png" alt="Zulong Logo" width="120" height="120" />
 
-# 祖龙 (ZULONG) v2.0.0
+# 祖龙 (ZULONG) v2.1.0
 
 ### 给 AI 代理装上能保持跨年级别完整记忆的"海马体"
 
@@ -68,16 +68,16 @@
 
 ---
 
-> **📢 v2.0.0 正式发布（2026-05-27）**
+> **📢 v2.1.0 正式发布（2026-06-09）**
 >
-> 重大架构升级：任务编排重构与交互体验革新。FC循环合并、交互式任务卡片、审批白名单、工具袋系统、记忆图谱可视化等。
+> 次版本升级：版本号统一、文档一致性修复与项目规范化。
 >
 > **核心更新**：
-> - ✅ **交互式任务卡片系统** - ApprovalCard/InteractionCard/StartupCard/SummaryCard
-> - ✅ **L1-B预判 + L2统一主链** - 废弃CHAT/COMPLEX/RESUME意图分类
-> - ✅ **工具袋系统 (ToolBag)** - 工具智能路由与预测加载
-> - ✅ **记忆图谱可视化面板** - BFS动画、注意力视图
-> - ✅ **跨年级完整记忆** - 完整状态序列化与恢复
+> - ✅ **版本号全面统一** — README.md、package.json、CHANGELOG.md 等全部对齐至 v2.1.0
+> - ✅ **IDE 扩展版本修正** — zulong-ide/package.json 从 0.2.0 修正为 2.1.0
+> - ✅ **架构描述升级** — L1-B预判 + L2统一主链替换旧版两阶段意图分类
+> - ✅ **代码行数同步** — 82K+ → 100K+
+> - ✅ **文档一致性修复** — 清除过时引用与旧版残留
 >
 > 详见 [CHANGELOG.md](./CHANGELOG.md)
 

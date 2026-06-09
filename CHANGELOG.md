@@ -14,6 +14,20 @@
 
 ---
 
+## [2.1.0] - 2026-06-09
+
+### 次版本升级 — 版本号统一与文档规范化
+
+#### 变更 (Changed)
+- 🔢 全面统一版本号至 v2.1.0（README.md、package.json、CHANGELOG.md、zulong_github_readme.md）
+- 📝 zulong_github_readme.md 架构描述更新：两阶段意图分类 → L1-B预判 + L2统一主链
+- 📝 zulong_github_readme.md 代码行数更新：82K+ → 100K+
+- 📝 zulong_github_readme.md 项目目录更新：beta4 → beta5
+- 🛠️ zulong-ide/package.json 版本号对齐：0.2.0 → 2.1.0
+- 📝 多处文档一致性修复与过时内容清理
+
+---
+
 ## [2.0.0] - 2026-05-27
 
 ### 重大架构升级 — 任务编排重构与交互体验革新
