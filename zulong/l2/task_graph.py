@@ -1070,6 +1070,152 @@ class TaskGraph:
             current = parent_id
         return chain
 
+    @staticmethod
+    def _status_icon(status: str) -> str:
+        """紧凑地图中的状态符号。"""
+        return {
+            "completed": "✅",
+            "in_progress": "🔄",
+            "pending": "⏳",
+            "blocked": "🚫",
+            "skipped": "⏭",
+            "needs_adjust": "⚠️",
+            "waiting_input": "❓",
+        }.get(status or "", "·")
+
+    @staticmethod
+    def _compact_label(text: str, max_len: int = 18) -> str:
+        label = " ".join(str(text or "").split())
+        if len(label) <= max_len:
+            return label
+        return label[: max_len - 1].rstrip() + "…"
+
+    def get_subtree_stats(self, node_id: str) -> Dict[str, int]:
+        """返回节点子树状态摘要，用于导航地图迷雾行。"""
+        with self._lock:
+            node_ids = [node_id] if node_id in self._nodes else []
+            node_ids.extend(self.get_all_descendants(node_id))
+            stats = {
+                "completed": 0,
+                "in_progress": 0,
+                "pending": 0,
+                "blocked": 0,
+                "skipped": 0,
+                "needs_adjust": 0,
+                "waiting_input": 0,
+                "total": 0,
+            }
+            for nid in node_ids:
+                if str(nid).startswith("crg_"):
+                    continue
+                node = self._nodes.get(nid)
+                if not node:
+                    continue
+                status = node.status or "pending"
+                stats[status] = stats.get(status, 0) + 1
+                stats["total"] += 1
+            return stats
+
+    def render_navigator_map(
+        self,
+        current_node_id: str = "",
+        uncovered_node_ids: Optional[List[str]] = None,
+    ) -> str:
+        """渲染三层紧凑导航地图：脊柱 + 迷雾 + 总计，最多 15 行。"""
+        with self._lock:
+            if not self._nodes:
+                return f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📍 {self.address} 空任务图\n━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            uncovered = {str(nid) for nid in (uncovered_node_ids or []) if str(nid)}
+            current_id = current_node_id or ""
+            if current_id not in self._nodes:
+                in_progress = [
+                    n for n in self._nodes.values()
+                    if n.status == "in_progress" and not n.id.startswith("crg_")
+                ]
+                current_id = in_progress[0].id if in_progress else (
+                    "req" if "req" in self._nodes else next(iter(self._nodes))
+                )
+
+            current = self._nodes[current_id]
+            ancestors = list(reversed(self.get_ancestor_chain(current_id)))
+            spine = ancestors + [current]
+            max_depth = max((self.get_node_depth(n.id) for n in self._nodes.values()), default=0)
+            depth = self.get_node_depth(current_id)
+            sep = "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            def node_chip(node: TaskNode, mark_current: bool = False) -> str:
+                marker = " ❓未探索" if node.id in uncovered else ""
+                suffix = " ◀" if mark_current else ""
+                return f"{node.id}[{self._status_icon(node.status)}]{marker}{suffix}"
+
+            lines: List[str] = [
+                sep,
+                f"📍 {self.get_node_address(current_id)} 深度{depth}/{max_depth}",
+                sep,
+                " › ".join(node_chip(n, n.id == current_id) for n in spine),
+            ]
+
+            children = [
+                c for c in self.get_children(current_id)
+                if not c.id.startswith("crg_")
+            ]
+            for child in children[:4]:
+                marker = " ❓未探索 — " if child.id in uncovered else ""
+                lines.append(
+                    f"  ├─ {child.id}[{self._status_icon(child.status)}] "
+                    f"{marker}{self._compact_label(child.label)}"
+                )
+            if len(children) > 4:
+                lines.append(f"  └─ … 还有 {len(children) - 4} 个子节点")
+
+            fog_lines: List[str] = []
+            for node in spine:
+                parent_id = self.get_parent(node.id)
+                if not parent_id:
+                    continue
+                siblings = [
+                    s for s in self.get_children(parent_id)
+                    if s.id != node.id and not s.id.startswith("crg_")
+                ]
+                if not siblings:
+                    continue
+                chips = []
+                for sib in siblings[:4]:
+                    stats = self.get_subtree_stats(sib.id)
+                    child_suffix = f"({stats['total']}子)" if stats.get("total", 0) > 1 else ""
+                    marker = " ❓未探索" if sib.id in uncovered else ""
+                    chips.append(f"{sib.id}[{self._status_icon(sib.status)}]{marker}{child_suffix}")
+                if len(siblings) > 4:
+                    chips.append(f"…+{len(siblings) - 4}")
+                fog_lines.append(f"🌫 {parent_id} 下其他分支: {' '.join(chips)}")
+                if len(fog_lines) >= 4:
+                    break
+
+            if fog_lines:
+                lines.append(sep)
+                lines.extend(fog_lines)
+
+            leaves = [
+                n for n in self.get_leaf_nodes()
+                if not n.id.startswith("crg_")
+            ]
+            total = len(leaves)
+            done = sum(1 for n in leaves if n.status in ("completed", "skipped"))
+            active = sum(1 for n in leaves if n.status == "in_progress")
+            pending = sum(1 for n in leaves if n.status in ("pending", "needs_adjust", "waiting_input"))
+            blocked = sum(1 for n in leaves if n.status == "blocked")
+            lines.append(sep)
+            lines.append(
+                f"📊 全局: {done}/{total} 完成 | {active}进行中 | "
+                f"{pending}待执行 | {blocked}阻塞"
+            )
+            lines.append(sep)
+
+            if len(lines) > 15:
+                lines = lines[:8] + [f"… 已折叠 {len(lines) - 14} 行导航细节"] + lines[-6:]
+            return "\n".join(lines)
+
     def get_ancestor_at_depth(self, node_id: str, target_depth: int) -> Optional[str]:
         """获取节点在指定深度的祖先节点 ID"""
         current = node_id

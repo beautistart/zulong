@@ -2355,6 +2355,8 @@ class Gatekeeper:
             "referenced_task_graph_id",
             "task_graph_reference_mode",
             "referenced_nodes",
+            "clear_active_graph",
+            "active_graph_policy",
             "source",
         ):
             if _simple_dialogue_turn and key in {
@@ -2377,10 +2379,15 @@ class Gatekeeper:
             "continue",
             "inspect_or_create",
         }
+        _clear_active_graph_requested = (
+            bool(packaged_task.get("clear_active_graph"))
+            or str(packaged_task.get("active_graph_policy") or "").lower() == "clear"
+        )
         if (
             recovered_task_graph_id
             and _task_policy_allows_recovery
             and not packaged_task.get("task_graph_id")
+            and not _clear_active_graph_requested
         ):
             packaged_task["task_graph_id"] = recovered_task_graph_id
         
@@ -2426,35 +2433,41 @@ class Gatekeeper:
             if len(task_text) > 76:
                 task_text = task_text[:73].rstrip() + "..."
             steps = []
-            if context_bundle.get("needs_memory") or any("memory" in str(t) for t in tools):
-                steps.append("先取相关记忆和经验")
             if context_bundle.get("needs_project_context") or any(str(t) in {"read_file", "search_code_symbols", "index_project", "analyze_module"} for t in tools):
-                steps.append("读取或检索项目代码")
+                steps.append("确认项目上下文")
             if policy in {"reuse", "inspect", "inspect_or_create", "continue"} or any(str(t).startswith("task_") for t in tools):
-                steps.append("同步任务图，确认当前进度")
-            if tools:
-                steps.append("把候选工具交给 L2 自主选择")
+                steps.append("确认当前任务状态")
             if not steps:
-                steps.append("判断是否需要工具，不需要时直接回复")
-            title = f"先看目标: {task_text}" if task_text else "先看目标和上下文"
+                steps.append("确认目标和上下文")
+            steps.append("进入执行链路")
+            title = f"任务已接收: {task_text}" if task_text else "任务已接收"
             detail_lines = [
-                "我会先确认这件事需要哪些上下文，再让 L2 决定是否真的调用工具。"
+                "任务已接收，正在确认目标和上下文。"
             ]
-            if tools:
-                detail_lines.append("候选能力: " + ", ".join(str(t) for t in tools[:6]))
-            if policy and policy != "none":
-                detail_lines.append("任务图: " + str(policy))
-            if reasons:
-                detail_lines.append("判断依据: " + "；".join(str(r) for r in reasons[:2]))
             interaction = {
                 "pair_id": f"l1b-tool-prediction-{request_id or int(time.time() * 1000)}",
                 "kind": "plan",
                 "status": "running",
                 "title": title,
                 "detail": "\n".join(detail_lines),
+                "source_channel": "system_status",
+                "channel": "status",
+                "ux_visibility": "details",
+                "is_background": True,
+                "tool_category": "background",
                 "progress": 0,
                 "plan_steps": steps[:5],
-                "next_step": "接下来由 L2 根据上下文做真实决策",
+                "progress_items": [
+                    {
+                        "id": f"l1b-tool-prediction-{request_id or 'active'}:{idx}",
+                        "label": step,
+                        "status": "running" if idx == 0 else "pending",
+                        "timestamp": time.time(),
+                        "source": "system_status",
+                    }
+                    for idx, step in enumerate(steps[:5])
+                ],
+                "next_step": "",
             }
             payload = {
                 "request_id": request_id or f"req_{int(time.time() * 1000)}",
@@ -2463,12 +2476,12 @@ class Gatekeeper:
                 "iteration": 0,
                 "timestamp": time.time(),
                 "data": {
-                    "tools": tools,
-                    "predicted_tools": tools,
+                    "tools": [],
+                    "predicted_tools": [],
                     "reasons": reasons,
                     "task_graph_policy": policy,
                     "context_bundle": context_bundle,
-                    "tool_count": len(tools),
+                    "tool_count": 0,
                     "progress": {
                         "total": 0,
                         "completed": 0,

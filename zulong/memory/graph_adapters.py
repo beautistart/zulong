@@ -945,6 +945,59 @@ class DialogueAdapter(BaseGraphAdapter):
 
     # ---------- Session 管理 ----------
 
+    @staticmethod
+    def session_node_id_for_conversation(conversation_id: str) -> str:
+        """Return the deterministic dialogue session node for a UI conversation."""
+        raw = str(conversation_id or "").strip()
+        if not raw:
+            return ""
+        if raw.startswith("dialogue:session_") and "/" not in raw:
+            return raw
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in raw)
+        return f"dialogue:session_{safe}"
+
+    def ensure_session_node(
+        self,
+        graph: MemoryGraph,
+        session_id: str,
+        *,
+        label_text: str = "",
+        conversation_id: str = "",
+        source: str = "web_chat",
+    ) -> str:
+        """Ensure a concrete dialogue session node exists without creating a hash alias."""
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return ""
+        conversation_id = str(conversation_id or "").strip()
+        if graph.has_node(session_id):
+            node = graph.get_node(session_id)
+            if node:
+                node.metadata.setdefault("sub_type", "session")
+                if conversation_id and not node.metadata.get("conversation_id"):
+                    node.metadata["conversation_id"] = conversation_id
+                if source and not node.metadata.get("source"):
+                    node.metadata["source"] = source
+            return session_id
+
+        graph.add_node(GraphNode(
+            node_id=session_id,
+            node_type=NodeType.DIALOGUE,
+            label=(label_text or conversation_id or session_id)[-60:],
+            backend_ref=f"interaction:{conversation_id or session_id}",
+            metadata={
+                "sub_type": "session",
+                "conversation_id": conversation_id,
+                "source": source,
+                "topic_summary": (label_text or "")[:200],
+                "bound_window_id": conversation_id,
+                "window_binding": source,
+                "round_count": 0,
+                "full_path": session_id,
+            },
+        ))
+        return session_id
+
     def ensure_session(
         self, graph: MemoryGraph, text: str,
         task_graph_id: Optional[str] = None,
@@ -990,6 +1043,8 @@ class DialogueAdapter(BaseGraphAdapter):
         self, graph: MemoryGraph, round_id: str,
         user_input: str, response: str,
         similarity_threshold: float = 0.55,
+        preferred_session_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
     ) -> str:
         """由 L2 调用：基于 Embedding 余弦相似度将 round 归属到正确的 Session
 
@@ -1010,6 +1065,26 @@ class DialogueAdapter(BaseGraphAdapter):
         Returns:
             session_id: 最终归属的 session 节点 ID
         """
+        preferred_session_id = str(preferred_session_id or "").strip()
+        conversation_id = str(conversation_id or "").strip()
+        if not preferred_session_id and conversation_id:
+            preferred_session_id = self.session_node_id_for_conversation(conversation_id)
+        if preferred_session_id:
+            preferred_session_id = self.session_node_id_for_conversation(preferred_session_id)
+            self.ensure_session_node(
+                graph,
+                preferred_session_id,
+                label_text=user_input,
+                conversation_id=conversation_id,
+            )
+            self._link_round_to_session(graph, round_id, preferred_session_id)
+            logger.info(
+                "[SessionAssign] 使用窗口绑定 session: conversation=%s -> %s",
+                conversation_id or "-",
+                preferred_session_id,
+            )
+            return preferred_session_id
+
         all_sessions = self._get_sessions(graph)
 
         # ── 策略 1: Embedding 余弦相似度 ──
@@ -1473,6 +1548,12 @@ class DialogueAdapter(BaseGraphAdapter):
                 "round_count": sess.metadata.get("round_count", len(rounds)),
                 "bound_task_id": sess.metadata.get("bound_task_id", ""),
                 "preview": preview,
+                "conversation_id": (
+                    sess.metadata.get("conversation_id")
+                    or sess.metadata.get("bound_window_id")
+                    or ""
+                ),
+                "window_binding": sess.metadata.get("window_binding", ""),
             })
 
         # 按 last_active_at 降序

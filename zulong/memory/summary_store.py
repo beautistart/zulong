@@ -826,8 +826,14 @@ class DualIndexSummaryStore:
     def _vector_search(self, query: str, limit: int) -> List[Tuple[str, float]]:
         """向量语义搜索（在线程池中执行）"""
         results = []
-        
-        query_embedding = self.embedding_manager.encode_query(query)
+
+        if getattr(getattr(self.summary_vector_store, "index", None), "ntotal", 0) <= 0:
+            return results
+
+        if getattr(self.embedding_manager, "_model", None) is None and hasattr(self.embedding_manager, "_mock_encode"):
+            query_embedding = self.embedding_manager._mock_encode([f"为这个句子生成表示以用于检索：{query}"])[0]
+        else:
+            query_embedding = self.embedding_manager.encode_query(query)
         if query_embedding is None:
             return results
         

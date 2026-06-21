@@ -54,7 +54,7 @@ class FCRunner:
 
     # 连续 response=None 拦截的安全上限
     _MAX_NULL_RESPONSES = 3
-    _MAX_UNCOMPLETED_RETRIES = 0
+    _MAX_UNCOMPLETED_RETRIES = 2
 
     # 重复工具死循环检测阈值
     _DUPLICATE_TOOL_CHECK_TURNS = 3  # 连续N轮调用相同工具+相同参数判定为死循环
@@ -156,6 +156,7 @@ class FCRunner:
             "response_content": None,
             "force_first_tool": force_first_tool,
             "forced_first_tool_name": forced_first_tool_name,
+            "forced_next_tool_name": "",
             "vllm_model_id": vllm_model_id,
             "tool_definitions": tool_definitions,
             "user_input_text": user_input,

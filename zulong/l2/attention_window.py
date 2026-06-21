@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Any, Set
 
+from zulong.core.message_visibility import strip_llm_message_metadata
+
 # ── LLM自主注意力选择模块导入 ──
 from .attention_types import (
     PressureMetrics, DecisionRequest, DecisionResponse,
@@ -150,6 +152,7 @@ class AttentionWindowManager:
         self.envelopes: List[MessageEnvelope] = []
         self._current_turn: int = 0
         self._current_node_id: Optional[str] = None
+        self._last_visible_node_ids: Set[str] = set()
         self._seq_counter: int = 0
         self._group_counter: int = 0
 
@@ -236,6 +239,14 @@ class AttentionWindowManager:
         )
         self._seq_counter += 1
         self.envelopes.append(envelope)
+
+    def _remember_visible_node_ids(self, envs: List[MessageEnvelope]) -> None:
+        """Cache the latest visible node ids from a windowing pass."""
+        self._last_visible_node_ids = {
+            str(env.node_id)
+            for env in envs
+            if getattr(env, "node_id", None)
+        }
 
     def new_tool_group(self) -> int:
         """分配一个新的工具调用组 ID"""
@@ -467,6 +478,7 @@ class AttentionWindowManager:
                 logger.warning(f"[AttentionWindow] LLM注意力选择执行失败: {e}")
 
         if not self.envelopes:
+            self._last_visible_node_ids = set()
             return []
 
         # P2-13: 动态调整budget（基于任务图节点数和当前模式）
@@ -511,9 +523,13 @@ class AttentionWindowManager:
                     kept.sort(key=lambda e: e.seq)
                     result = [e.msg for e in essential]
                     result.extend(e.msg for e in kept)
-                    return self._normalize_system_prefix(result)
+                    self._remember_visible_node_ids(essential + kept)
+                    return strip_llm_message_metadata(
+                        self._normalize_system_prefix(result)
+                    )
             # 兜底：仍然只返回 pinned
-            return [e.msg for e in sorted_pinned]
+            self._remember_visible_node_ids(sorted_pinned)
+            return strip_llm_message_metadata([e.msg for e in sorted_pinned])
 
         # 3. 按组处理：计算每个组的最高权重和总 tokens
         group_info: Dict[Optional[int], Dict] = {}
@@ -577,7 +593,8 @@ class AttentionWindowManager:
             result.append(summary_msg)
 
         result.extend(e.msg for e in kept_envs)
-        return self._normalize_system_prefix(result)
+        self._remember_visible_node_ids(list(pinned) + kept_envs)
+        return strip_llm_message_metadata(self._normalize_system_prefix(result))
 
     def _normalize_system_prefix(self, messages: List[Dict]) -> List[Dict]:
         """确保所有 role=system 消息位于数组开头（API 兼容性要求）

@@ -14,6 +14,12 @@ StatusType = Literal[
 ]
 RiskLevel = Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 ApprovalMode = Literal["full_auto", "whitelist", "manual", "popup"]
+ChannelType = Literal["ledger", "status", "final", "control"]
+SourceChannelType = Literal["internal_control", "system_status", "model_progress", "model_final"]
+UxVisibilityType = Literal["main", "details", "hidden"]
+ToolCategoryType = Literal[
+    "background", "read", "write", "command", "approval", "task_graph", "network", "other"
+]
 
 
 @dataclass
@@ -59,6 +65,17 @@ class InteractionPayload:
     current_step: Optional[int] = None
     total_steps: Optional[int] = None
     progress_items: Optional[List[Dict[str, Any]]] = None
+
+    # 可见性与追溯元数据
+    channel: Optional[ChannelType] = None
+    source_channel: Optional[SourceChannelType] = None
+    ux_visibility: Optional[UxVisibilityType] = None
+    is_background: Optional[bool] = None
+    tool_category: Optional[ToolCategoryType] = None
+    raw_details: Optional[Dict[str, Any]] = None
+    task_graph_binding: Optional[Dict[str, Any]] = None
+    completion_evidence: Optional[Dict[str, Any]] = None
+    memory_reference_edges: Optional[List[Dict[str, Any]]] = None
 
     # 总结 (kind=summary)
     completed_items: Optional[List[str]] = None
@@ -112,6 +129,24 @@ class InteractionPayload:
             result["total_steps"] = self.total_steps
         if self.progress_items is not None:
             result["progress_items"] = self.progress_items
+        if self.channel is not None:
+            result["channel"] = self.channel
+        if self.source_channel is not None:
+            result["source_channel"] = self.source_channel
+        if self.ux_visibility is not None:
+            result["ux_visibility"] = self.ux_visibility
+        if self.is_background is not None:
+            result["is_background"] = self.is_background
+        if self.tool_category is not None:
+            result["tool_category"] = self.tool_category
+        if self.raw_details is not None:
+            result["raw_details"] = self.raw_details
+        if self.task_graph_binding is not None:
+            result["task_graph_binding"] = self.task_graph_binding
+        if self.completion_evidence is not None:
+            result["completion_evidence"] = self.completion_evidence
+        if self.memory_reference_edges is not None:
+            result["memory_reference_edges"] = self.memory_reference_edges
         if self.completed_items is not None:
             result["completed_items"] = self.completed_items
         if self.verified_items is not None:

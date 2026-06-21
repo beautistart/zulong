@@ -451,12 +451,14 @@ class DebugConsole:
                 safe_print("[MemoryGraph] 未初始化 (降级运行中)")
                 return
 
-            stats = mg.stats
+            stats = mg.get_stats() if hasattr(mg, "get_stats") else getattr(mg, "stats", {})
+            total_nodes = stats.get("total_nodes", stats.get("node_count", 0))
+            total_edges = stats.get("total_edges", stats.get("edge_count", 0))
             safe_print("\n" + "=" * 56)
             safe_print("  [MemoryGraph] 记忆图谱状态")
             safe_print("=" * 56)
-            safe_print(f"  节点总数: {stats['total_nodes']}")
-            safe_print(f"  边总数:   {stats['total_edges']}")
+            safe_print(f"  节点总数: {total_nodes}")
+            safe_print(f"  边总数:   {total_edges}")
 
             # 节点类型分布
             if stats.get('node_types'):
@@ -465,24 +467,46 @@ class DebugConsole:
                 safe_print(f"  边类型:   {stats['edge_types']}")
 
             # 列出前 10 个节点
-            nodes = list(mg._nodes.values())
+            nodes = []
+            if hasattr(mg, "list_all_shards"):
+                try:
+                    for shard_id in mg.list_all_shards():
+                        shard = mg.get_shard(shard_id, load_if_missing=True)
+                        if not shard:
+                            continue
+                        nodes.extend(list(shard.properties.iter_nodes()))
+                        if len(nodes) >= 10:
+                            break
+                except Exception:
+                    nodes = []
             if nodes:
                 safe_print(f"\n  前 {min(10, len(nodes))} 个节点:")
                 for n in nodes[:10]:
-                    safe_print(f"    [{n.node_type.value}] {n.node_id}: {n.label}")
+                    node_type = getattr(getattr(n, "node_type", ""), "value", getattr(n, "node_type", ""))
+                    safe_print(f"    [{node_type}] {n.node_id}: {n.label}")
 
             # 列出前 10 条边
-            edges = list(mg._graph.edges(data=True))
+            edges = []
+            if hasattr(mg, "to_frontend_dict"):
+                try:
+                    edges = list((mg.to_frontend_dict(depth=0) or {}).get("edges") or [])
+                except Exception:
+                    edges = []
             if edges:
                 safe_print(f"\n  前 {min(10, len(edges))} 条边:")
-                for src, dst, data in edges[:10]:
-                    etype = data.get('edge_type', '?')
-                    weight = data.get('weight', 0)
-                    prot = " [protected]" if data.get('protected') else ""
+                for edge in edges[:10]:
+                    src = edge.get("source") or edge.get("src_id") or ""
+                    dst = edge.get("target") or edge.get("dst_id") or ""
+                    etype = edge.get("edge_type") or edge.get("type") or "?"
+                    try:
+                        weight = float(edge.get("weight", 0) or 0)
+                    except (TypeError, ValueError):
+                        weight = 0.0
+                    prot = " [protected]" if edge.get("protected") else ""
                     safe_print(f"    {src} --[{etype} w={weight:.2f}{prot}]--> {dst}")
 
             # 适配器状态
-            adapters = list(mg._adapters.keys())
+            adapters = list(getattr(mg, "_adapters", {}).keys())
             if adapters:
                 safe_print(f"\n  已注册适配器: {adapters}")
 

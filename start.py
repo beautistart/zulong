@@ -72,7 +72,7 @@ def main():
         print("\n[Zulong] 收到 KeyboardInterrupt，正在关闭...")
     finally:
         if not _shutdown_flag.is_set():
-            print("[Zulong] 祖龙系统已停止")
+            print("[Zulong] system stopped")
 
 
 if __name__ == "__main__":

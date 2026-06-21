@@ -81,6 +81,278 @@ def normalize_task_graph_address(value: Any, default_node_id: str = "req") -> st
             node_id = first[5:] if first.startswith("task:") else first
     return f"tg:{graph_id}/task:{node_id}"
 
+
+def _compact_dialogue_id(value: Any) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(value or ""))
+
+
+def infer_task_graph_owner_session_node_id(
+    conversation_id: Any = "",
+    session_node_id: Any = "",
+) -> str:
+    """Infer the dialogue session node address that owns a task graph."""
+    node_id = str(session_node_id or "").strip()
+    if node_id:
+        return node_id
+    conv_id = str(conversation_id or "").strip()
+    if not conv_id:
+        return ""
+    if conv_id.startswith("dialogue:session_") and "/" not in conv_id:
+        return conv_id
+    return f"dialogue:session_{_compact_dialogue_id(conv_id)}"
+
+
+def get_task_graph_owner(tg) -> Dict[str, str]:
+    """Return immutable owner metadata for a TaskGraph."""
+    meta = getattr(tg, "metadata", {}) or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    conversation_id = str(
+        meta.get("owner_conversation_id")
+        or meta.get("conversation_id")
+        or ""
+    ).strip()
+    session_node_id = str(
+        meta.get("owner_session_node_id")
+        or meta.get("session_node_id")
+        or meta.get("dialogue_session_id")
+        or ""
+    ).strip()
+    if not session_node_id and conversation_id:
+        session_node_id = infer_task_graph_owner_session_node_id(conversation_id)
+    return {
+        "owner_conversation_id": conversation_id,
+        "owner_session_node_id": session_node_id,
+    }
+
+
+def bind_task_graph_owner(
+    tg,
+    conversation_id: Any = "",
+    session_node_id: Any = "",
+    *,
+    claim_unowned: bool = False,
+) -> bool:
+    """Validate or claim the one-time owner binding of a TaskGraph.
+
+    A task graph inherits the dialogue session node address at first binding.
+    Once owner metadata exists, later calls may only activate the graph for the
+    same owner; they must not rebind it to another conversation.
+    """
+    if tg is None:
+        return False
+    expected_conversation_id = str(conversation_id or "").strip()
+    expected_session_node_id = infer_task_graph_owner_session_node_id(
+        expected_conversation_id,
+        session_node_id,
+    )
+    if not expected_conversation_id and not expected_session_node_id:
+        return True
+
+    owner = get_task_graph_owner(tg)
+    owner_conversation_id = owner.get("owner_conversation_id", "")
+    owner_session_node_id = owner.get("owner_session_node_id", "")
+
+    if owner_conversation_id or owner_session_node_id:
+        node_matches = bool(
+            expected_session_node_id
+            and owner_session_node_id
+            and expected_session_node_id == owner_session_node_id
+        )
+        conversation_matches = bool(
+            expected_conversation_id
+            and owner_conversation_id
+            and expected_conversation_id == owner_conversation_id
+        )
+        if not (node_matches or conversation_matches):
+            logger.warning(
+                "[TaskGraphOwner] 拒绝跨会话改绑: graph=%s owner=(%s,%s) expected=(%s,%s)",
+                getattr(tg, "id", "") or getattr(tg, "graph_id", ""),
+                owner_conversation_id or "-",
+                owner_session_node_id or "-",
+                expected_conversation_id or "-",
+                expected_session_node_id or "-",
+            )
+            return False
+        meta = getattr(tg, "metadata", None)
+        if isinstance(meta, dict):
+            if owner_conversation_id:
+                meta.setdefault("owner_conversation_id", owner_conversation_id)
+            elif expected_conversation_id:
+                meta["owner_conversation_id"] = expected_conversation_id
+            if owner_session_node_id:
+                meta.setdefault("owner_session_node_id", owner_session_node_id)
+            elif expected_session_node_id:
+                meta["owner_session_node_id"] = expected_session_node_id
+        return True
+
+    if not claim_unowned:
+        logger.warning(
+            "[TaskGraphOwner] 图谱尚未绑定 owner，拒绝被动激活: graph=%s expected=(%s,%s)",
+            getattr(tg, "id", "") or getattr(tg, "graph_id", ""),
+            expected_conversation_id or "-",
+            expected_session_node_id or "-",
+        )
+        return False
+
+    meta = getattr(tg, "metadata", None)
+    if not isinstance(meta, dict):
+        tg.metadata = {}
+        meta = tg.metadata
+    if expected_conversation_id:
+        meta["owner_conversation_id"] = expected_conversation_id
+        meta.setdefault("conversation_id", expected_conversation_id)
+    if expected_session_node_id:
+        meta["owner_session_node_id"] = expected_session_node_id
+        meta.setdefault("session_node_id", expected_session_node_id)
+        meta.setdefault("dialogue_session_id", expected_session_node_id)
+    logger.info(
+        "[TaskGraphOwner] 首次绑定任务图 owner: graph=%s owner=(%s,%s)",
+        getattr(tg, "id", "") or getattr(tg, "graph_id", ""),
+        expected_conversation_id or "-",
+        expected_session_node_id or "-",
+    )
+    return True
+
+
+def _interaction_store_claims_graph(conversation_id: Any, graph_id: Any) -> bool:
+    conversation_id = str(conversation_id or "").strip()
+    graph_id = normalize_task_graph_id(graph_id)
+    if not conversation_id or not graph_id:
+        return False
+    try:
+        from zulong.launcher.interaction_store import get_interaction_store
+
+        conv = get_interaction_store().get_conversation(conversation_id)
+        return normalize_task_graph_id((conv or {}).get("task_graph_id")) == graph_id
+    except Exception:
+        return False
+
+
+def _interaction_store_bound_graph(conversation_id: Any) -> str:
+    conversation_id = str(conversation_id or "").strip()
+    if not conversation_id:
+        return ""
+    try:
+        from zulong.launcher.interaction_store import get_interaction_store
+
+        conv = get_interaction_store().get_conversation(conversation_id)
+        return normalize_task_graph_id((conv or {}).get("task_graph_id"))
+    except Exception:
+        return ""
+
+
+def _request_owner_context(request_or_params: Any) -> Tuple[str, str]:
+    """Extract the dialogue session owner carried by FC tool parameters."""
+    params: Dict[str, Any] = {}
+    if isinstance(request_or_params, ToolRequest):
+        params = request_or_params.parameters or {}
+    elif isinstance(request_or_params, dict):
+        params = request_or_params
+    conversation_id = str(
+        params.get("conversation_id")
+        or params.get("session_id")
+        or ""
+    ).strip()
+    session_node_id = infer_task_graph_owner_session_node_id(
+        conversation_id,
+        params.get("session_node_id") or params.get("dialogue_session_id") or "",
+    )
+    return conversation_id, session_node_id
+
+
+def ensure_task_graph_owner_for_request(
+    tg,
+    request_or_params: Any,
+    *,
+    operation: str = "task_tool",
+    allow_store_claim: bool = True,
+) -> Tuple[bool, str]:
+    """Guard active TaskGraph access for the current dialogue session.
+
+    TaskGraph owner binding is immutable. Passive FC tools may only use an
+    unowned graph when InteractionStore already says this conversation owns it.
+    """
+    if tg is None:
+        return False, "当前没有活跃的任务图"
+    conversation_id, session_node_id = _request_owner_context(request_or_params)
+    if not conversation_id and not session_node_id:
+        return True, ""
+    graph_id = normalize_task_graph_id(
+        getattr(tg, "id", "") or getattr(tg, "graph_id", "") or _active_graph_id
+    )
+    claim_unowned = bool(
+        allow_store_claim and _interaction_store_claims_graph(conversation_id, graph_id)
+    )
+    if bind_task_graph_owner(
+        tg,
+        conversation_id=conversation_id,
+        session_node_id=session_node_id,
+        claim_unowned=claim_unowned,
+    ):
+        return True, ""
+    return (
+        False,
+        (
+            f"{operation} 被拒绝：当前任务图 {graph_id or '-'} 不属于当前会话 "
+            f"{conversation_id or session_node_id or '-'}，已阻止跨会话改绑。"
+        ),
+    )
+
+
+def _bind_conversation_task_graph_once(
+    *,
+    conversation_id: Any,
+    graph_id: Any,
+    title: str = "",
+    workspace_dir: str = "",
+    session_node_id: Any = "",
+    metadata: Optional[Dict[str, Any]] = None,
+    source: str = "task_tools",
+) -> bool:
+    """Persist the first task graph binding for a dialogue conversation."""
+    conversation_id = str(conversation_id or "").strip()
+    graph_id = normalize_task_graph_id(graph_id)
+    if not conversation_id or not graph_id:
+        return False
+    owner_session_node_id = infer_task_graph_owner_session_node_id(
+        conversation_id,
+        session_node_id,
+    )
+    try:
+        from zulong.launcher.interaction_store import get_interaction_store
+
+        store = get_interaction_store()
+        existing = store.get_conversation(conversation_id)
+        existing_graph_id = normalize_task_graph_id((existing or {}).get("task_graph_id"))
+        if existing_graph_id and existing_graph_id != graph_id:
+            logger.warning(
+                "[TaskGraphOwner] 会话已有图谱绑定，拒绝改绑: conversation=%s existing=%s incoming=%s",
+                conversation_id,
+                existing_graph_id,
+                graph_id,
+            )
+            return False
+        merged_meta = dict(metadata or {})
+        merged_meta.update({
+            "owner_conversation_id": conversation_id,
+            "owner_session_node_id": owner_session_node_id,
+        })
+        store.upsert_conversation(
+            conversation_id,
+            title=title or "",
+            source=source,
+            workspace_path=workspace_dir or None,
+            task_graph_id=graph_id,
+            session_node_id=owner_session_node_id or None,
+            metadata=merged_meta,
+            active=True,
+        )
+        return True
+    except Exception as exc:
+        logger.debug("[TaskGraphOwner] 会话图谱绑定写入跳过: %s", exc)
+        return False
+
 # ─── 守卫常量 ─────────────────────────────────────────────
 DUPLICATE_LABEL_THRESHOLD = 0.65   # bigram Jaccard 阈值，>=此值视为重复
 SEMANTIC_DEDUP_THRESHOLD = 0.85    # SequenceMatcher(label+desc) 阈值，>=此值视为语义重复
@@ -950,7 +1222,14 @@ def _is_user_seeded_empty_task_graph(tg) -> bool:
         return False
 
 
-def set_active_task_graph(tg, graph_id, workspace_dir=None):
+def set_active_task_graph(
+    tg,
+    graph_id,
+    workspace_dir=None,
+    conversation_id: Any = "",
+    session_node_id: Any = "",
+    claim_unowned: bool = False,
+):
     """设置当前活跃的 TaskGraph，并自动备份到磁盘"""
     global _active_task_graph, _active_graph_id, _active_workspace_dir
     graph_id = normalize_task_graph_id(graph_id)
@@ -960,6 +1239,13 @@ def set_active_task_graph(tg, graph_id, workspace_dir=None):
             tg.graph_id = graph_id
         except Exception:
             pass
+        if not bind_task_graph_owner(
+            tg,
+            conversation_id=conversation_id,
+            session_node_id=session_node_id,
+            claim_unowned=claim_unowned,
+        ):
+            return False
     resolved_workspace = _resolve_task_workspace_dir(tg, graph_id, workspace_dir)
     with _active_graph_lock:
         if tg is None:
@@ -981,7 +1267,7 @@ def set_active_task_graph(tg, graph_id, workspace_dir=None):
                 task_state_manager.clear_active_task(graph_id or None, clear_stack=True)
             except Exception as e:
                 logger.debug(f"[TaskTools] TaskStateManager 清理跳过: {e}")
-            return
+            return True
 
         _active_task_graph = tg
         _active_graph_id = graph_id
@@ -1027,6 +1313,7 @@ def set_active_task_graph(tg, graph_id, workspace_dir=None):
                 logger.debug(f"[TaskTools] TaskGraph {graph_id} 已同步到 MemoryGraph")
         except Exception as e:
             logger.debug(f"[TaskTools] MemoryGraph 同步跳过: {e}")
+    return True
 
 
 def _create_task_workspace(
@@ -1187,7 +1474,13 @@ def load_graph_from_backup(graph_id: str):
         return None
 
 
-def load_task_graph_deterministic(graph_id: str, workspace_dir: Optional[str] = None) -> bool:
+def load_task_graph_deterministic(
+    graph_id: str,
+    workspace_dir: Optional[str] = None,
+    conversation_id: Any = "",
+    session_node_id: Any = "",
+    claim_unowned: bool = False,
+) -> bool:
     """Load a TaskGraph by exact id and make it active.
 
     Order: current memory binding -> disk backup -> MemoryGraph rebuild.
@@ -1200,13 +1493,29 @@ def load_task_graph_deterministic(graph_id: str, workspace_dir: Optional[str] = 
 
     current = get_active_task_graph(workspace_dir=workspace_dir) or get_active_task_graph()
     if current and normalize_task_graph_id(getattr(current, "id", "")) == graph_id:
-        set_active_task_graph(current, graph_id, workspace_dir=workspace_dir)
+        if not set_active_task_graph(
+            current,
+            graph_id,
+            workspace_dir=workspace_dir,
+            conversation_id=conversation_id,
+            session_node_id=session_node_id,
+            claim_unowned=claim_unowned,
+        ):
+            return False
         logger.info("[TaskTools] 确定性恢复 Level 1 (内存): %s", graph_id)
         return True
 
     tg = load_graph_from_backup(graph_id)
     if tg:
-        set_active_task_graph(tg, graph_id, workspace_dir=workspace_dir)
+        if not set_active_task_graph(
+            tg,
+            graph_id,
+            workspace_dir=workspace_dir,
+            conversation_id=conversation_id,
+            session_node_id=session_node_id,
+            claim_unowned=claim_unowned,
+        ):
+            return False
         logger.info("[TaskTools] 确定性恢复 Level 2 (磁盘): %s", graph_id)
         return True
 
@@ -1217,7 +1526,15 @@ def load_task_graph_deterministic(graph_id: str, workspace_dir: Optional[str] = 
         if mg:
             tg = rebuild_task_graph_from_memory(mg, graph_id)
             if tg:
-                set_active_task_graph(tg, graph_id, workspace_dir=workspace_dir)
+                if not set_active_task_graph(
+                    tg,
+                    graph_id,
+                    workspace_dir=workspace_dir,
+                    conversation_id=conversation_id,
+                    session_node_id=session_node_id,
+                    claim_unowned=claim_unowned,
+                ):
+                    return False
                 logger.info("[TaskTools] 确定性恢复 Level 3 (MemoryGraph): %s", graph_id)
                 return True
     except Exception as exc:
@@ -1480,6 +1797,17 @@ class TaskCreatePlanTool(BaseTool):
         start_time = time.time()
         title = request.parameters.get("title", "未命名任务")
         user_requirement = request.parameters.get("user_requirement", "")
+        conversation_id = (
+            request.parameters.get("conversation_id")
+            or request.parameters.get("session_id")
+            or ""
+        )
+        session_node_id = infer_task_graph_owner_session_node_id(
+            conversation_id,
+            request.parameters.get("session_node_id")
+            or request.parameters.get("dialogue_session_id")
+            or "",
+        )
         inferred_target_path, inferred_project_name = infer_project_workspace_hint(
             f"{user_requirement}\n{title}"
         )
@@ -1527,6 +1855,22 @@ class TaskCreatePlanTool(BaseTool):
             # 🔥 拦截：如果当前有活跃任务图且仍有未完成节点，不创建新图谱
             # 直接返回现有图谱概览，引导模型继续使用 task_view_overview
             old_tg = get_active_task_graph()
+            if old_tg is not None and not bind_task_graph_owner(
+                old_tg,
+                conversation_id=conversation_id,
+                session_node_id=session_node_id,
+                claim_unowned=_interaction_store_claims_graph(
+                    conversation_id,
+                    getattr(old_tg, "id", "") or _active_graph_id,
+                ),
+            ):
+                logger.info(
+                    "[task_create_plan] 当前 active graph 不属于本会话，已清空后创建新图: active=%s conversation=%s",
+                    getattr(old_tg, "id", "") or _active_graph_id,
+                    conversation_id or "-",
+                )
+                set_active_task_graph(None, None)
+                old_tg = None
             if old_tg is not None and _is_user_seeded_empty_task_graph(old_tg):
                 logger.info(
                     "[task_create_plan] 当前为空会话预建图谱，转为真实任务: %s -> %s",
@@ -1553,6 +1897,23 @@ class TaskCreatePlanTool(BaseTool):
                         or get_active_workspace_dir()
                         or target_path
                     ),
+                    conversation_id=conversation_id,
+                    session_node_id=session_node_id,
+                    claim_unowned=_interaction_store_claims_graph(
+                        conversation_id,
+                        getattr(old_tg, "id", "") or _active_graph_id,
+                    ),
+                )
+                _bind_conversation_task_graph_once(
+                    conversation_id=conversation_id,
+                    graph_id=getattr(old_tg, "id", "") or _active_graph_id,
+                    title=title,
+                    workspace_dir=getattr(old_tg, "metadata", {}).get("workspace_dir") or "",
+                    session_node_id=session_node_id,
+                    metadata={
+                        "user_requirement": user_requirement or title,
+                        "task_graph_file_path": getattr(old_tg, "metadata", {}).get("task_graph_file_path") or "",
+                    },
                 )
                 return self._create_result(
                     success=True,
@@ -1621,6 +1982,19 @@ class TaskCreatePlanTool(BaseTool):
                         request_id=request.request_id,
                     )
                 if existing_task_policy == "recreate":
+                    if conversation_id and _interaction_store_claims_graph(
+                        conversation_id,
+                        getattr(old_tg, "id", "") or _active_graph_id,
+                    ):
+                        return self._create_result(
+                            success=False,
+                            error=(
+                                "当前会话的任务图谱已一次性绑定，不能在同一会话中重建为另一张图。"
+                                "请新建会话，或在当前图谱中追加/调整节点。"
+                            ),
+                            execution_time=time.time() - start_time,
+                            request_id=request.request_id,
+                        )
                     logger.info(
                         "[task_create_plan] 用户/LLM 选择重建任务，清除旧活跃图谱: %s -> %s",
                         old_title,
@@ -1680,6 +2054,19 @@ class TaskCreatePlanTool(BaseTool):
                         )
                     else:
                         # 无关任务 → 清除旧图，创建新图
+                        if conversation_id and _interaction_store_claims_graph(
+                            conversation_id,
+                            getattr(old_tg, "id", "") or _active_graph_id,
+                        ):
+                            return self._create_result(
+                                success=False,
+                                error=(
+                                    "当前会话已绑定完成任务图谱，不能改绑到新图谱。"
+                                    "请新建会话承接无关新任务。"
+                                ),
+                                execution_time=time.time() - start_time,
+                                request_id=request.request_id,
+                            )
                         logger.info(
                             f"[task_create_plan] 旧图谱 '{old_title}' 已全部完成 "
                             f"({completed}/{total})，新任务 '{title}' 无关，清除后创建新图谱"
@@ -1748,6 +2135,37 @@ class TaskCreatePlanTool(BaseTool):
                         request_id=request.request_id,
                     )
 
+            bound_graph_id = _interaction_store_bound_graph(conversation_id)
+            if bound_graph_id:
+                if load_task_graph_deterministic(
+                    bound_graph_id,
+                    conversation_id=conversation_id,
+                    session_node_id=session_node_id,
+                    claim_unowned=True,
+                ):
+                    return self._create_result(
+                        success=True,
+                        data={
+                            "graph_id": bound_graph_id,
+                            "already_exists": True,
+                            "message": (
+                                f"当前会话已绑定任务图谱 {bound_graph_id}，不能再创建第二张图谱。"
+                                "请在该图谱上追加或更新节点。"
+                            ),
+                        },
+                        execution_time=time.time() - start_time,
+                        request_id=request.request_id,
+                    )
+                return self._create_result(
+                    success=False,
+                    error=(
+                        f"当前会话已绑定任务图谱 {bound_graph_id}，但暂时无法恢复。"
+                        "为避免改绑到新图谱，请先打开原会话图谱或新建会话。"
+                    ),
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
+
             from zulong.l2.task_graph import TaskGraph
             graph_id = f"tg_{int(time.time())}"
             tg = TaskGraph(title=title, graph_id=graph_id)
@@ -1773,8 +2191,44 @@ class TaskCreatePlanTool(BaseTool):
             tg.metadata["workspace_dir"] = workspace_dir
             tg.metadata["project_name"] = project_name
             tg.metadata["target_path"] = target_path
+            bind_task_graph_owner(
+                tg,
+                conversation_id=conversation_id,
+                session_node_id=session_node_id,
+                claim_unowned=True,
+            )
 
-            set_active_task_graph(tg, graph_id, workspace_dir=workspace_dir)
+            set_active_task_graph(
+                tg,
+                graph_id,
+                workspace_dir=workspace_dir,
+                conversation_id=conversation_id,
+                session_node_id=session_node_id,
+                claim_unowned=True,
+            )
+            bound_ok = _bind_conversation_task_graph_once(
+                conversation_id=conversation_id,
+                graph_id=graph_id,
+                title=title,
+                workspace_dir=workspace_dir,
+                session_node_id=session_node_id,
+                metadata={
+                    "user_requirement": root_desc,
+                    "project_name": project_name,
+                    "target_path": target_path,
+                },
+            )
+            if conversation_id and not bound_ok:
+                set_active_task_graph(None, None)
+                return self._create_result(
+                    success=False,
+                    error=(
+                        "当前会话已有任务图谱绑定或绑定写入失败，已拒绝创建新图谱。"
+                        "请打开原会话图谱继续，或新建会话承接新任务。"
+                    ),
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
 
             vscode_open_result = {
                 "ok": False,
@@ -1918,7 +2372,13 @@ class TaskAddNodeTool(BaseTool):
             auto_request = ToolRequest(
                 tool_name="task_create_plan",
                 action="create",
-                parameters={"title": auto_title},
+                parameters={
+                    "title": auto_title,
+                    "conversation_id": request.parameters.get("conversation_id") or request.parameters.get("session_id") or "",
+                    "session_id": request.parameters.get("session_id") or request.parameters.get("conversation_id") or "",
+                    "session_node_id": request.parameters.get("session_node_id") or request.parameters.get("dialogue_session_id") or "",
+                    "dialogue_session_id": request.parameters.get("dialogue_session_id") or request.parameters.get("session_node_id") or "",
+                },
                 request_id=f"auto_{request.request_id}",
             )
             create_tool = TaskCreatePlanTool()
@@ -2798,7 +3258,26 @@ class TaskListSuspendedTool(BaseTool):
                 if hasattr(match, 'task_id'):
                     if match.task_graph:
                         _ws = match.task_graph.metadata.get("workspace_dir", "") if hasattr(match.task_graph, 'metadata') else ""
-                        set_active_task_graph(match.task_graph, match.metadata.get("graph_id", ""), workspace_dir=_ws)
+                        matched_graph_id = normalize_task_graph_id(match.metadata.get("graph_id", ""))
+                        conversation_id, session_node_id = _request_owner_context(request)
+                        restored = set_active_task_graph(
+                            match.task_graph,
+                            matched_graph_id,
+                            workspace_dir=_ws,
+                            conversation_id=conversation_id,
+                            session_node_id=session_node_id,
+                            claim_unowned=_interaction_store_claims_graph(conversation_id, matched_graph_id),
+                        )
+                        if not restored:
+                            return self._create_result(
+                                success=False,
+                                error=(
+                                    f"挂起任务图 {matched_graph_id or '-'} 不属于当前会话，"
+                                    "已拒绝恢复以避免跨会话改绑。"
+                                ),
+                                execution_time=time.time() - start_time,
+                                request_id=request.request_id,
+                            )
                         logger.info(f"[task_list_suspended] 已恢复任务图: {match.task_id}")
 
                     # 确认恢复成功，显式消费（删除）磁盘文件
@@ -3648,10 +4127,16 @@ class TaskAttachFileTool(BaseTool):
                         mg.add_node(fnode, touch=False)
                     # 查找 TaskNode 对应的 MemoryGraph 节点
                     task_mg_id = None
-                    for nid, n in mg._nodes.items():
-                        if nid.endswith(f"/{node_id}") and n.metadata.get("graph_id"):
-                            task_mg_id = nid
-                            break
+                    candidate_task_id = f"task:{tg.id}/{node_id}"
+                    if mg.has_node(candidate_task_id):
+                        task_mg_id = candidate_task_id
+                    else:
+                        for n in mg.get_nodes_by_type(NodeType.TASK):
+                            nid = getattr(n, "node_id", "")
+                            meta = getattr(n, "metadata", {}) or {}
+                            if nid.endswith(f"/{node_id}") and meta.get("graph_id"):
+                                task_mg_id = nid
+                                break
                     if task_mg_id:
                         mg.add_edge(task_mg_id, file_mg_id, EdgeType.REFERENCE, weight=0.8)
             except Exception as e:
@@ -3736,6 +4221,18 @@ class SubmitFinalAnswerTool(BaseTool):
 
         tg = get_active_task_graph()
         if tg is not None:
+            ok, guard_error = ensure_task_graph_owner_for_request(
+                tg,
+                request,
+                operation="submit_final_answer",
+            )
+            if not ok:
+                return self._create_result(
+                    success=False,
+                    error=guard_error,
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
             try:
                 _write_final_answer_to_task_graph(
                     tg,
@@ -3812,6 +4309,8 @@ class TaskResumeByAddressTool(BaseTool):
 
         address = normalize_task_graph_address(address)
         graph_id = normalize_task_graph_id(address)
+        conversation_id, session_node_id = _request_owner_context(request)
+        claim_unowned = _interaction_store_claims_graph(conversation_id, graph_id)
 
         if not graph_id:
             return self._create_result(
@@ -3825,6 +4324,18 @@ class TaskResumeByAddressTool(BaseTool):
         # 检查是否已经是活跃图
         current_tg = get_active_task_graph()
         if current_tg and getattr(current_tg, 'id', '') == graph_id:
+            ok, guard_error = ensure_task_graph_owner_for_request(
+                current_tg,
+                request,
+                operation="task_resume_by_address",
+            )
+            if not ok:
+                return self._create_result(
+                    success=False,
+                    error=guard_error,
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
             try:
                 overview = current_tg.to_planning_table()
             except Exception:
@@ -3854,7 +4365,12 @@ class TaskResumeByAddressTool(BaseTool):
                     f"[TaskResumeByAddress] 地址无法解析: {address}")
                 # 不阻断——仍尝试重建（graph_id 可能有对应的其他节点）
 
-            if load_task_graph_deterministic(graph_id):
+            if load_task_graph_deterministic(
+                graph_id,
+                conversation_id=conversation_id,
+                session_node_id=session_node_id,
+                claim_unowned=claim_unowned,
+            ):
                 rebuilt_tg = get_active_task_graph()
             else:
                 rebuilt_tg = rebuild_task_graph_from_memory(mg, graph_id)
@@ -3867,7 +4383,22 @@ class TaskResumeByAddressTool(BaseTool):
                 )
 
             # 激活
-            set_active_task_graph(rebuilt_tg, graph_id)
+            if not set_active_task_graph(
+                rebuilt_tg,
+                graph_id,
+                conversation_id=conversation_id,
+                session_node_id=session_node_id,
+                claim_unowned=claim_unowned,
+            ):
+                return self._create_result(
+                    success=False,
+                    error=(
+                        f"任务图 {graph_id} 不属于当前会话，已拒绝恢复，"
+                        "避免跨会话改绑。"
+                    ),
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
 
             # 生成概览
             try:

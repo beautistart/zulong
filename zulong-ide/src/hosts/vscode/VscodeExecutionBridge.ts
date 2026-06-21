@@ -1,4 +1,5 @@
 import fs from "node:fs/promises"
+import { existsSync } from "node:fs"
 import path from "node:path"
 import * as vscode from "vscode"
 import { DEFAULT_ZULONG_IDE_WS_URL, ZulongWebSocket, ZulongToolRequest } from "@core/api/transport/zulong-websocket"
@@ -8,6 +9,7 @@ import { getLatestTerminalOutput } from "./terminal/get-latest-output"
 import { StateManager } from "@/core/storage/StateManager"
 import type { ApprovalMode } from "@/shared/ApprovalWhitelist"
 import { Logger } from "@/shared/services/Logger"
+import { getShellForProfile } from "@/utils/shell"
 
 type ToolResult = {
 	callId: string
@@ -20,6 +22,7 @@ export class VscodeExecutionBridge {
 	private transport: ZulongWebSocket
 	private connected = false
 	private terminal: vscode.Terminal | undefined
+	private terminalsByShell = new Map<string, vscode.Terminal>()
 	private checkpointTracker: CheckpointTracker | undefined
 	private checkpointInitPromise: Promise<CheckpointTracker | undefined> | undefined
 	private pendingApprovals = new Map<string, (approved: boolean) => void>()
@@ -127,7 +130,7 @@ export class VscodeExecutionBridge {
 					toolName,
 				)
 				const result = await this.executeTool(toolName, args)
-				this.sendToolResult({ callId, toolName, result })
+				this.sendToolResult({ callId, toolName, result, isError: this.isUserDeniedResult(result) })
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error)
 				this.sendToolResult({ callId, toolName, result: message, isError: true })
@@ -219,15 +222,17 @@ export class VscodeExecutionBridge {
 	private async writeFile(args: Record<string, any>): Promise<string> {
 		const filePath = this.resolvePath(args.path)
 		this.ensureInsideWorkspace(filePath)
-		const content = args.content || ""
+		const chunk = args.content || ""
+		const mode = String(args.mode || args.write_mode || "overwrite").toLowerCase()
 		const existed = await this.fileExists(filePath)
 		const original = existed ? await fs.readFile(filePath, "utf-8") : ""
+		const content = mode === "append" ? `${original}${chunk}` : chunk
 		const approved = await this.confirmFileChange({
 			filePath,
 			original,
 			next: content,
 			operation: existed ? "modify" : "create",
-			summary: existed ? "更新文件内容" : "创建新文件",
+			summary: mode === "append" ? "追加文件内容" : (existed ? "更新文件内容" : "创建新文件"),
 		})
 		if (!approved) {
 			return `用户未应用写入: ${filePath}`
@@ -235,7 +240,7 @@ export class VscodeExecutionBridge {
 		await fs.mkdir(path.dirname(filePath), { recursive: true })
 		await fs.writeFile(filePath, content, "utf-8")
 		this.sendFileChanged(filePath, existed ? "updated" : "created")
-		this.scheduleCheckpoint(`${existed ? "更新" : "创建"} ${path.relative(this.workspaceRoot(), filePath)}`)
+		this.scheduleCheckpoint(`${mode === "append" ? "追加" : (existed ? "更新" : "创建")} ${path.relative(this.workspaceRoot(), filePath)}`)
 		void this.openFile(filePath)
 		return `已应用文件变更: ${filePath}`
 	}
@@ -384,16 +389,61 @@ export class VscodeExecutionBridge {
 		if (!selected) {
 			return `用户未允许执行命令: ${command}`
 		}
-		const terminal = this.terminal || vscode.window.createTerminal({ name: "Zulong", cwd: this.workspaceRoot() })
+		const shellProfile = this.normalizeCommandShell(args.shell || args.shell_type || args.terminal_shell || "auto")
+		const shellPath = this.resolveCommandShellPath(shellProfile)
+		const terminalKey = shellPath || "auto"
+		const existing = this.terminalsByShell.get(terminalKey)
+		const terminal =
+			existing && existing.exitStatus === undefined
+				? existing
+				: vscode.window.createTerminal({
+						name: shellProfile === "auto" ? "Zulong" : `Zulong ${shellProfile}`,
+						cwd: this.workspaceRoot(),
+						shellPath,
+					})
+		this.terminalsByShell.set(terminalKey, terminal)
 		this.terminal = terminal
 		terminal.show(false)
 		terminal.sendText(command, true)
 		this.transport.sendIdeTerminalStatus({
 			workspace_path: this.workspaceRoot(),
 			command,
+			shell: shellProfile,
 			status: "started",
 		})
-		return `命令已在 VS Code 终端执行: ${command}`
+		return `命令已在 VS Code 终端执行: ${command} (shell=${shellProfile})`
+	}
+
+	private normalizeCommandShell(raw: unknown): "auto" | "cmd" | "powershell" | "git_bash" {
+		const value = String(raw || "auto").trim().toLowerCase()
+		if (!value || value === "default" || value === "system") {
+			return "auto"
+		}
+		if (["cmd", "cmd.exe", "windows_cmd", "command_prompt"].includes(value)) {
+			return "cmd"
+		}
+		if (["powershell", "pwsh", "powershell.exe", "ps"].includes(value)) {
+			return "powershell"
+		}
+		if (["git_bash", "git-bash", "gitbash", "bash"].includes(value)) {
+			return "git_bash"
+		}
+		return "auto"
+	}
+
+	private resolveCommandShellPath(shell: "auto" | "cmd" | "powershell" | "git_bash"): string | undefined {
+		switch (shell) {
+			case "cmd":
+				return getShellForProfile("cmd")
+			case "powershell":
+				return existsSync(getShellForProfile("powershell-7"))
+					? getShellForProfile("powershell-7")
+					: getShellForProfile("powershell-legacy")
+			case "git_bash":
+				return getShellForProfile("git-bash")
+			default:
+				return undefined
+		}
 	}
 
 	private async listCodeDefinitionNames(args: Record<string, any>): Promise<string> {
@@ -413,6 +463,20 @@ export class VscodeExecutionBridge {
 			result.result.slice(0, 600),
 			result.toolName,
 		)
+	}
+
+	private isUserDeniedResult(result: string): boolean {
+		const text = String(result || "").toLowerCase()
+		return [
+			"用户未应用",
+			"用户未允许",
+			"用户拒绝",
+			"审批拒绝",
+			"审批超时",
+			"审批未通过",
+			"未应用写入",
+			"未允许",
+		].some((marker) => text.includes(marker.toLowerCase()))
 	}
 
 	private async fileExists(filePath: string): Promise<boolean> {

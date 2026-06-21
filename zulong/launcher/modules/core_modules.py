@@ -89,25 +89,26 @@ class MemoryGraphModule(Module):
     async def start(self) -> None:
         self.progress_message = "正在初始化记忆图谱..."
         from zulong.memory.memory_graph import MemoryGraph
-        from zulong.memory.memory_graph_factory import create_memory_graph, get_memory_graph_type
+        from zulong.memory.memory_graph_factory import (
+            assert_native_memory_graph,
+            create_memory_graph,
+            get_memory_graph_type,
+        )
         from zulong.config.config_manager import get_config
 
         if MemoryGraph._instance is not None:
             mg = MemoryGraph._instance
+            assert_native_memory_graph(mg)
             backend_type = get_memory_graph_type(mg)
-
-            if backend_type == "networkx":
-                raise RuntimeError("MemoryGraph 已禁止使用 NetworkX 单 JSON 后端，请检查启动顺序")
             logger.info(f"[MemoryGraphModule] 单例已存在，使用 {backend_type} 分片后端")
         else:
             mg = create_memory_graph(persist_path="./data/memory_graph")
+            assert_native_memory_graph(mg)
             backend_type = get_memory_graph_type(mg)
             
             # 设置 MemoryGraph 单例引用，防止后续代码创建第二个后端实例（split-brain）
             MemoryGraph._instance = mg
             
-            if backend_type == "networkx":
-                raise RuntimeError("MemoryGraph 工厂返回了已禁用的 NetworkX 单 JSON 后端")
             stats = mg.get_stats() if hasattr(mg, 'get_stats') else {}
             node_count = stats.get('total_nodes', stats.get('node_count', 0))
             logger.info(f"[MemoryGraphModule] {mg.__class__.__name__} 初始化完成 ({backend_type}): {node_count} 节点")

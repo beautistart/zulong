@@ -29,6 +29,8 @@ _SIMPLE_SOCIAL_TEXTS = {
 _FOLLOWUP_TASK_CUES = (
     "继续", "刚才", "上次", "上一个", "那个", "这个",
     "原有", "原来", "原任务", "任务图", "图谱",
+    "当前任务图", "检查", "质量", "覆盖", "节点", "任务进度",
+    "任务地址", "焦点", "压力", "完成门",
     "修改", "改一下", "调整", "补充", "增加", "添加",
     "删除", "保留", "修复", "完善", "更新",
     "index.html", ".py", ".ts", ".tsx", ".js", ".jsx",
@@ -57,8 +59,36 @@ _TASK_GRAPH_EDIT_CUES = (
     "删除", "移除", "修复", "完善", "更新", "继续编辑",
 )
 
+CODING_KEYWORDS = {
+    "代码", "编程", "程序", "函数", "类", "模块", "接口", "脚本",
+    "项目", "文件", "修复", "重构", "实现", "运行", "构建", "测试",
+    "bug", "fix", "refactor", "implement", "code", "python",
+    "typescript", "javascript", "vscode", "npm", "pytest", "tsc",
+}
+
+_CODING_FILE_RE = re.compile(
+    r"\.(?:py|ts|tsx|js|jsx|css|html|json|md|yaml|yml|toml|go|rs|java|cpp|c|h)\b",
+    re.IGNORECASE,
+)
+
 logger = logging.getLogger(__name__)
 _MIRROR_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="zulong-memory-mirror")
+
+
+def _compact_dialogue_id(value: Any) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(value or ""))
+
+
+def _infer_session_node_id(conversation_id: str, explicit_node_id: Any = "") -> str:
+    node_id = str(explicit_node_id or "").strip()
+    if node_id.startswith("dialogue:session_") and "/" not in node_id:
+        return node_id
+    conversation_id = str(conversation_id or "").strip()
+    if not conversation_id:
+        return ""
+    if conversation_id.startswith("dialogue:session_") and "/" not in conversation_id:
+        return conversation_id
+    return f"dialogue:session_{_compact_dialogue_id(conversation_id)}"
 
 
 def _copy_payload_for_background(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -126,23 +156,39 @@ class RouteDecision:
     conversation_id: str
     turn_id: str
     text: str
+    route: str = "general_chat"
+    confidence: float = 1.0
+    reason: str = ""
     source: str = "web_chat"
+    session_node_id: str = ""
     workspace_path: Optional[str] = None
     project_id: Optional[str] = None
     task_graph_id: Optional[str] = None
     referenced_task_graph_id: Optional[str] = None
     task_graph_reference_mode: str = "none"
+    last_task_graph_id: Optional[str] = None
+    task_graph_binding_policy: str = "reference_only"
+    binding_reason: str = ""
 
     def to_payload(self) -> Dict[str, Any]:
         return {
             "conversation_id": self.conversation_id,
+            "session_id": self.conversation_id,
+            "session_node_id": self.session_node_id,
+            "dialogue_session_id": self.session_node_id,
             "turn_id": self.turn_id,
+            "route": self.route,
+            "confidence": self.confidence,
+            "reason": self.reason,
             "source": self.source,
             "workspace_path": self.workspace_path,
             "project_id": self.project_id,
             "task_graph_id": self.task_graph_id,
             "referenced_task_graph_id": self.referenced_task_graph_id,
             "task_graph_reference_mode": self.task_graph_reference_mode,
+            "last_task_graph_id": self.last_task_graph_id,
+            "task_graph_binding_policy": self.task_graph_binding_policy,
+            "binding_reason": self.binding_reason,
         }
 
 
@@ -153,6 +199,64 @@ class ConversationOrchestrator:
 
     def __init__(self, store: Optional[InteractionStore] = None):
         self.store = store or get_interaction_store()
+
+    @staticmethod
+    def _has_local_workspace_signal(workspace_path: Optional[str]) -> bool:
+        return bool(workspace_path)
+
+    @staticmethod
+    def _looks_like_coding(text: str) -> bool:
+        lowered = (text or "").lower()
+        return any(keyword in lowered for keyword in CODING_KEYWORDS) or bool(
+            _CODING_FILE_RE.search(text or "")
+        )
+
+    @staticmethod
+    def _llm_confirm_coding_intent(text: str) -> bool:
+        """Confirm ambiguous coding-like text, falling back to regex trust."""
+        try:
+            from zulong.ide.ide_server import _get_engine
+
+            engine = _get_engine()
+            client = getattr(engine, "vllm_client", None) if engine else None
+            if client is None:
+                return True
+            response = client.chat.completions.create(
+                model=getattr(engine, "model_name", None) or "default",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "判断用户是否在请求代码、项目、文件、构建或测试相关工作。只回答 YES 或 NO。",
+                    },
+                    {"role": "user", "content": text or ""},
+                ],
+                temperature=0,
+                max_tokens=2,
+            )
+            answer = str(response.choices[0].message.content or "").strip().upper()
+            return answer.startswith("YES")
+        except Exception:
+            return True
+
+    def _classify(
+        self,
+        text: str,
+        *,
+        workspace_path: Optional[str] = None,
+        task_graph_id: Optional[str] = None,
+        referenced_nodes: Optional[list] = None,
+    ) -> tuple[str, float, str]:
+        if task_graph_id and _should_bind_existing_task(text, {"task_graph_id": task_graph_id}):
+            return "resume_task", 0.9, "resume_task_graph"
+        if referenced_nodes:
+            return "coding_task", 0.8, "referenced_nodes"
+        if self._looks_like_coding(text):
+            if not self._has_local_workspace_signal(workspace_path):
+                return "general_chat", 0.75, "no_workspace_signal"
+            if self._llm_confirm_coding_intent(text):
+                return "coding_task", 0.8, "coding_keyword_confirmed"
+            return "general_chat", 0.75, "llm_rejected_coding_intent"
+        return "general_chat", 0.75, "default_general_chat"
 
     def prepare_turn(self, data: Dict[str, Any], *, source: str = "web_chat") -> RouteDecision:
         text = (data.get("text") or data.get("task") or "").strip()
@@ -165,8 +269,17 @@ class ConversationOrchestrator:
         workspace_path = data.get("workspace_path") or data.get("cwd")
         project_id = data.get("project_id")
         task_graph_id = data.get("task_graph_id") or data.get("graph_id")
+        session_node_id = _infer_session_node_id(
+            conversation_id,
+            data.get("session_node_id") or data.get("dialogue_session_id"),
+        )
+        if session_node_id:
+            data["session_node_id"] = session_node_id
+            data["dialogue_session_id"] = session_node_id
         referenced_task_graph_id = None
         task_graph_reference_mode = "none"
+        existing = self.store.get_conversation(conversation_id)
+        last_task_graph_id = (existing or {}).get("task_graph_id")
         if task_graph_id:
             try:
                 from zulong.tools.task_tools import normalize_task_graph_id
@@ -181,17 +294,32 @@ class ConversationOrchestrator:
                 data["referenced_task_graph_id"] = task_graph_id
                 data["task_graph_reference_mode"] = task_graph_reference_mode
                 task_graph_id = None
+            else:
+                data["task_graph_id"] = task_graph_id
+                data["graph_id"] = task_graph_id
+                data["task_graph_reference_mode"] = task_graph_reference_mode
 
-        existing = self.store.get_conversation(conversation_id)
         bind_existing_task = _should_bind_existing_task(text, data)
+        task_graph_binding_policy = "reference_only"
+        binding_reason = "no active task binding requested"
         if _is_simple_social_turn(text):
             workspace_path = None
             project_id = None
             task_graph_id = None
+            task_graph_binding_policy = "reference_only"
+            binding_reason = "simple social turn"
         elif existing and bind_existing_task:
             workspace_path = workspace_path or existing.get("workspace_path")
             project_id = project_id or existing.get("project_id")
             task_graph_id = task_graph_id or existing.get("task_graph_id")
+            task_graph_binding_policy = "keep_recent_task_graph"
+            binding_reason = "follow-up/check turn keeps recent task graph"
+        elif referenced_task_graph_id:
+            task_graph_binding_policy = "reference_only"
+            binding_reason = "explicit task graph used as reference"
+        elif any(cue in (text or "").lower() for cue in _NEW_TASK_CUES):
+            task_graph_binding_policy = "clear_for_new_unbound_turn"
+            binding_reason = "new task cue without existing binding"
 
         title = self._make_title(text)
         self.store.upsert_conversation(
@@ -201,6 +329,7 @@ class ConversationOrchestrator:
             workspace_path=workspace_path,
             project_id=project_id,
             task_graph_id=task_graph_id,
+            session_node_id=session_node_id or None,
             metadata={},
             active=True,
         )
@@ -231,11 +360,15 @@ class ConversationOrchestrator:
             turn_id=turn_id,
             text=text,
             source=source,
+            session_node_id=session_node_id,
             workspace_path=workspace_path,
             project_id=project_id,
             task_graph_id=task_graph_id,
             referenced_task_graph_id=referenced_task_graph_id,
             task_graph_reference_mode=task_graph_reference_mode,
+            last_task_graph_id=last_task_graph_id,
+            task_graph_binding_policy=task_graph_binding_policy,
+            binding_reason=binding_reason,
         )
 
     def record_assistant_text(
@@ -246,6 +379,10 @@ class ConversationOrchestrator:
         event_type: str = "assistant_message",
         payload: Optional[Dict[str, Any]] = None,
     ) -> None:
+        payload = dict(payload or {})
+        if decision.session_node_id:
+            payload.setdefault("session_node_id", decision.session_node_id)
+            payload.setdefault("dialogue_session_id", decision.session_node_id)
         self.store.append_event(
             conversation_id=decision.conversation_id,
             turn_id=decision.turn_id,
@@ -253,7 +390,7 @@ class ConversationOrchestrator:
             role="assistant",
             source="system",
             text=text,
-            payload=payload or {},
+            payload=payload,
             workspace_path=decision.workspace_path,
             project_id=decision.project_id,
             task_graph_id=decision.task_graph_id,
@@ -265,7 +402,7 @@ class ConversationOrchestrator:
             text=text,
             event_type=event_type,
             source="system",
-            payload=payload or {},
+            payload=payload,
         )
 
     def record_system_event(
@@ -274,12 +411,16 @@ class ConversationOrchestrator:
         event_type: str,
         payload: Optional[Dict[str, Any]] = None,
     ) -> None:
+        payload = dict(payload or {})
+        if decision.session_node_id:
+            payload.setdefault("session_node_id", decision.session_node_id)
+            payload.setdefault("dialogue_session_id", decision.session_node_id)
         self.store.append_event(
             conversation_id=decision.conversation_id,
             turn_id=decision.turn_id,
             event_type=event_type,
             source="system",
-            payload=payload or {},
+            payload=payload,
             workspace_path=decision.workspace_path,
             project_id=decision.project_id,
             task_graph_id=decision.task_graph_id,
@@ -288,10 +429,10 @@ class ConversationOrchestrator:
             conversation_id=decision.conversation_id,
             turn_id=decision.turn_id,
             role="system",
-            text=(payload or {}).get("message") or event_type,
+            text=payload.get("message") or event_type,
             event_type=event_type,
             source="system",
-            payload=payload or {},
+            payload=payload,
         )
 
     def bind_conversation(self, data: Dict[str, Any]) -> Dict[str, Any]:

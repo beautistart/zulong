@@ -67,6 +67,27 @@ class IDEFCState:
     # 压力 RED: 约束工具列表为仅注意力工具
     pressure_force_attention: bool = False
 
+    # FC 执行纪律增强：导航地图与观察提示去重
+    last_navigation_map_key: str = ""
+    observation_nudge_turn: int = 0
+    observation_nudge_count: int = 0
+
+    # 完成质量评价与有限迭代
+    quality_iteration_count: int = 0
+    quality_last_score: float = 1.0
+    quality_last_reasons: List[str] = field(default_factory=list)
+    quality_last_review_key: str = ""
+    quality_forced_risk_summary: bool = False
+    quality_reviewer_count: int = 0
+    quality_last_reviewer: Dict[str, Any] = field(default_factory=dict)
+    quality_reviewer_health: Dict[str, Any] = field(default_factory=dict)
+
+    # Phase 10: 写文件执行阻断排查运行态证据
+    last_model_raw_summary: Dict[str, Any] = field(default_factory=dict)
+    last_fc_decision_path: str = ""
+    last_fc_root_cause: str = ""
+    fc_root_cause_history: List[Dict[str, Any]] = field(default_factory=list)
+
     # P2: 进度报告 + 自动继续
     progress_reports: List[Dict] = field(default_factory=list)
     last_report_turn: int = 0
@@ -75,6 +96,9 @@ class IDEFCState:
     # 用户显式工具预算：例如“最多调用两个工具”
     tool_call_budget: Optional[int] = None
     tool_calls_used: int = 0
+
+    # 任务生命周期反馈：真实工具调用前缺少 L2 可见步骤说明时，仅允许补发一次
+    step_announce_retry_count: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

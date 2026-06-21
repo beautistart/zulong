@@ -477,7 +477,14 @@ class MemoryEvolutionEngine:
             if mg and self.rag_manager:
                 memory_rag = self.rag_manager.rag_libraries.get("memory")
                 if memory_rag:
-                    for node_id, node in list(mg._nodes.items()):
+                    nodes = []
+                    if hasattr(mg, "list_all_shards"):
+                        for shard_id in mg.list_all_shards():
+                            shard = mg.get_shard(shard_id, load_if_missing=True)
+                            if shard:
+                                nodes.extend(list(shard.properties.iter_nodes()))
+                    for node in nodes:
+                        node_id = getattr(node, "node_id", "")
                         if node.access_count >= 3 and not getattr(node, '_consolidated_to_rag', False):
                             imp = mg.get_importance(node_id) or Importance.NORMAL
                             content = getattr(node, 'content', '') or getattr(node, 'label', '')

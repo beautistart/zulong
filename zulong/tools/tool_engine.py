@@ -160,6 +160,8 @@ class ToolEngine:
         Returns:
             ToolResult: 执行结果
         """
+        parameters = dict(parameters or {})
+
         # 创建调用记录
         call_id = f"call_{int(time.time() * 1000)}"
         call = ToolCall(
@@ -205,6 +207,68 @@ class ToolEngine:
                 request_id=call_id
             )
         
+        # TaskGraph 继承会话节点地址，绑定后不可被其他会话改绑。
+        # 这里统一补入运行时会话身份，并在工具执行前做 owner 守卫。
+        if tool_name.startswith("task_") or tool_name == "submit_final_answer":
+            try:
+                conversation_id = (
+                    parameters.get("conversation_id")
+                    or parameters.get("session_id")
+                    or self.get_context("conversation_id")
+                    or self.get_context("session_id")
+                    or ""
+                )
+                session_node_id = (
+                    parameters.get("session_node_id")
+                    or parameters.get("dialogue_session_id")
+                    or self.get_context("session_node_id")
+                    or self.get_context("dialogue_session_id")
+                    or ""
+                )
+                if conversation_id:
+                    parameters.setdefault("conversation_id", conversation_id)
+                    parameters.setdefault("session_id", conversation_id)
+                if conversation_id or session_node_id:
+                    from zulong.tools.task_tools import (
+                        ensure_task_graph_owner_for_request,
+                        get_active_task_graph,
+                        infer_task_graph_owner_session_node_id,
+                    )
+
+                    owner_node_id = infer_task_graph_owner_session_node_id(
+                        conversation_id,
+                        session_node_id,
+                    )
+                    if owner_node_id:
+                        parameters.setdefault("session_node_id", owner_node_id)
+                        parameters.setdefault("dialogue_session_id", owner_node_id)
+                    owner_guard_exempt = {
+                        "task_create_plan",
+                        "task_list_suspended",
+                        "task_resume_by_address",
+                    }
+                    if tool_name not in owner_guard_exempt:
+                        active_task_graph = get_active_task_graph()
+                        if active_task_graph is not None:
+                            ok, guard_error = ensure_task_graph_owner_for_request(
+                                active_task_graph,
+                                parameters,
+                                operation=tool_name,
+                            )
+                            if not ok:
+                                call.status = "failed"
+                                call.error = guard_error
+                                call.end_time = time.time()
+                                self._record_call(call)
+                                return ToolResult(
+                                    success=False,
+                                    error=guard_error,
+                                    execution_time=call.end_time - call.start_time,
+                                    request_id=call_id,
+                                )
+            except Exception as exc:
+                logger.debug("[ToolEngine] TaskGraph owner guard skipped: %s", exc)
+
         # 创建请求
         request = ToolRequest(
             tool_name=tool_name,

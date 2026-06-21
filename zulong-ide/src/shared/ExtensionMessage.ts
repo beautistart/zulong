@@ -150,6 +150,44 @@ export interface InteractionPayload {
 	progress?: number
 	current_step?: number
 	total_steps?: number
+	channel?: "ledger" | "status" | "final" | "control"
+	source_channel?: "internal_control" | "system_status" | "model_progress" | "model_final"
+	ux_visibility?: "main" | "details" | "hidden"
+	is_background?: boolean
+	tool_category?: "background" | "read" | "write" | "command" | "approval" | "task_graph" | "network" | "other"
+	raw_details?: {
+		tool_name?: string
+		tool_args?: Record<string, any>
+		result_preview?: string
+		event_type?: string
+	}
+	task_graph_binding?: {
+		task_graph_id?: string
+		active_source?: "global" | "session_restore" | "memory_rebuild" | "none"
+		policy?: "keep_recent_task_graph" | "clear_for_new_unbound_turn" | "reference_only"
+		reason?: string
+	}
+	completion_evidence?: {
+		project_name?: string
+		target_paths?: string[]
+		written_paths?: string[]
+		commands?: Array<{
+			cwd?: string
+			command?: string
+			exit_code?: number
+			status?: "succeeded" | "failed" | "unknown"
+			covers_root?: boolean
+			covers_target?: boolean
+		}>
+		failed_commands_uncovered?: string[]
+	}
+	memory_reference_edges?: Array<{
+		from_node_id: string
+		to_node_id: string
+		edge_type: "REFERENCE"
+		reason?: string
+		evidence_text?: string
+	}>
 	progress_items?: Array<{
 		id?: string
 		label: string

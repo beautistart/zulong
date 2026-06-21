@@ -16,21 +16,39 @@ IDE 特有功能：
 import asyncio
 import concurrent.futures
 import atexit
+import hashlib
 import json as _json
 import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from zulong.l2.fc_runner import FCRunner
 from zulong.ide.ide_session import IDEFCState, AgentSession
-from zulong.ide.ide_tool_registry import IDEToolRegistry, IDE_REMOTE_TOOLS
+from zulong.ide.ide_tool_registry import (
+    ANNOUNCE_STEP_TOOL_NAME,
+    IDEToolRegistry,
+    IDE_REMOTE_TOOLS,
+)
 from zulong.ide.ide_format_translator import IDEFormatTranslator
 from zulong.ide.common.error_handler import ErrorHandler, ErrorCode
 from zulong.l2.attention_window import MAX_TOOL_RESULT_CHARS
 from zulong.l2.circuit_breaker import CircuitBreakerState
 from zulong.core.unified_protocol import MessageType
+from zulong.core.message_visibility import (
+    CHANNEL_CONTROL,
+    CHANNEL_FINAL,
+    CHANNEL_LEDGER,
+    CHANNEL_STATUS,
+    UX_DETAILS,
+    UX_HIDDEN,
+    UX_MAIN,
+    internal_control_message,
+    mark_hidden_payload,
+    mark_public_payload,
+)
 from zulong.l2.tool_budget import (
     detect_tool_call_budget,
     engine_tool_budget_exhausted,
@@ -50,8 +68,10 @@ _EMBEDDING_PREWARM_LOCK = threading.Lock()
 
 _FRIENDLY_TOOL_NAMES = {
     "ide_write_file": "写入文件",
+    "exec_write_file": "写入文件",
     "write_to_file": "写入文件",
     "ide_read_file": "读取文件",
+    "exec_read_file": "读取文件",
     "read_file": "读取文件",
     "ide_replace_text": "修改文件",
     "replace_in_file": "修改文件",
@@ -77,7 +97,7 @@ _FRIENDLY_TOOL_NAMES = {
     "attempt_completion": "整理最终回复",
     "recall_memory": "检索记忆",
     "read_memory_node": "读取记忆",
-    "save_memory_note": "保存记忆",
+    "save_memory_note": "保存偏好",
     "discover_related": "发现相关记忆",
     "browser_action": "操作浏览器",
     "web_search": "联网检索",
@@ -89,6 +109,63 @@ _FRIENDLY_TOOL_NAMES = {
     "ide_show_diff": "查看差异",
     "ide_get_context": "获取 IDE 上下文",
 }
+
+_BACKGROUND_TOOLS = frozenset({
+    ANNOUNCE_STEP_TOOL_NAME,
+    "recall_memory",
+    "read_memory_node",
+    "discover_related",
+    "ide_get_context",
+    "request_tool_supplement",
+})
+
+_SUMMARY_ONLY_TOOLS = frozenset({
+    "save_memory_note",
+})
+
+_READ_TOOLS = frozenset({
+    "ide_read_file",
+    "read_file",
+    "list_files",
+    "listFilesTopLevel",
+    "listFilesRecursive",
+    "search_files",
+    "searchFiles",
+    "search_code_symbols",
+    "listCodeDefinitionNames",
+    "zulong_code_query",
+    "get_symbol_context",
+    "get_impact_analysis",
+    "index_code_file",
+})
+
+_WRITE_TOOLS = frozenset({
+    "ide_write_file",
+    "exec_write_file",
+    "write_to_file",
+    "ide_replace_text",
+    "replace_in_file",
+})
+
+_COMMAND_TOOLS = frozenset({
+    "exec_run_command",
+    "execute_command",
+    "ide_open_terminal",
+})
+
+_TASK_GRAPH_TOOLS = frozenset({
+    "task_create_plan",
+    "start_task_plan",
+    "task_view_overview",
+    "task_add_node",
+    "task_mark_status",
+})
+
+_NETWORK_TOOLS = frozenset({
+    "browser_action",
+    "web_search",
+    "webSearch",
+})
 
 
 def _get_shared_intent_filter():
@@ -177,6 +254,96 @@ def _safe_truncate(text: str, max_len: int = 200) -> str:
         return text.encode('utf-8')[:max_len].decode('utf-8', errors='ignore') + "..."
 
 
+_SENSITIVE_ARG_KEYS = frozenset({
+    "api_key", "apikey", "authorization", "body", "content", "cookie", "data",
+    "diff", "file_content", "key", "password", "replacement", "replacements",
+    "secret", "text", "token",
+})
+
+
+def _safe_error_summary(text: Any, max_len: int = 240) -> str:
+    """Return a compact log-safe summary without leaking common secrets."""
+    import re as _re
+
+    summary = " ".join(str(text or "").split())
+    if not summary:
+        return ""
+    summary = _re.sub(
+        r"(?i)(api[_-]?key|authorization|token|password|secret)\s*[:=]\s*['\"]?[^,'\"\s}]+",
+        r"\1=<redacted>",
+        summary,
+    )
+    return _safe_truncate(summary, max_len)
+
+
+def _summarize_usage_for_log(usage: Any) -> Dict[str, Any]:
+    if not usage:
+        return {}
+    if isinstance(usage, dict):
+        raw = usage
+    elif hasattr(usage, "model_dump"):
+        try:
+            raw = usage.model_dump()
+        except Exception:
+            raw = {}
+    elif hasattr(usage, "to_dict"):
+        try:
+            raw = usage.to_dict()
+        except Exception:
+            raw = {}
+    else:
+        raw = {
+            key: getattr(usage, key, None)
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+            if getattr(usage, key, None) is not None
+        }
+    return {
+        key: raw.get(key)
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+        if raw.get(key) is not None
+    }
+
+
+def _summarize_tool_call_for_log(tool_call: Dict[str, Any]) -> Dict[str, Any]:
+    """Summarize a tool call for Phase 10 logs without recording full args."""
+    function = tool_call.get("function", {}) or {}
+    name = str(function.get("name") or "")
+    raw_args = function.get("arguments", "")
+    raw_args_text = raw_args if isinstance(raw_args, str) else _json.dumps(raw_args, ensure_ascii=False, default=str)
+    summary: Dict[str, Any] = {
+        "name": name,
+        "arguments_length": len(raw_args_text or ""),
+    }
+    try:
+        args = _json.loads(raw_args_text or "{}") if isinstance(raw_args_text, str) else raw_args_text
+        if not isinstance(args, dict):
+            summary["arguments_type"] = type(args).__name__
+            return summary
+    except Exception as exc:
+        summary["arguments_parse_error"] = type(exc).__name__
+        summary["arguments_preview"] = _safe_error_summary(raw_args_text, 120)
+        return summary
+
+    keys = sorted(str(key) for key in args.keys())
+    summary["argument_keys"] = keys
+    for path_key in ("path", "file_path", "target_path", "workspace_path", "cwd"):
+        value = args.get(path_key)
+        if value:
+            summary[path_key] = _safe_truncate(str(value), 220)
+    content_lengths: Dict[str, int] = {}
+    redacted_keys: List[str] = []
+    for key, value in args.items():
+        key_text = str(key)
+        if key_text.lower() in _SENSITIVE_ARG_KEYS:
+            redacted_keys.append(key_text)
+            content_lengths[key_text] = len(str(value or ""))
+    if content_lengths:
+        summary["redacted_argument_lengths"] = content_lengths
+    if redacted_keys:
+        summary["redacted_keys"] = sorted(redacted_keys)
+    return summary
+
+
 def _brief_for_feedback(text: str, max_len: int = 80) -> str:
     brief = " ".join(str(text or "").split())
     if len(brief) <= max_len:
@@ -207,8 +374,8 @@ def _plan_steps_for_feedback(
         steps.append("同步任务图状态")
     if any(t in {"exec_write_file", "ide_write_file", "replace_in_file", "exec_run_command", "execute_command"} for t in tools):
         steps.append("涉及写入或命令时先处理风险与审批")
-    if tools:
-        steps.append("按模型实际选择执行工具")
+        if tools:
+            steps.append("按当前任务需要执行具体处理步骤")
     if not steps:
         steps.append("判断是否需要工具，不需要时直接组织回答")
     steps.append("结束前整理完成项、验证项和风险")
@@ -589,7 +756,15 @@ class IDEFCRunner(FCRunner):
         self._execution_events: List[ExecutionEvent] = []
         self._interaction_seq = 0
         self._tool_interaction_pairs: Dict[str, str] = {}
+        self._checklist: List[Dict[str, Any]] = []
+        self._checklist_by_id: Dict[str, Dict[str, Any]] = {}
+        self._current_visible_step_pair_id: str = ""
         self._init_intent_filter()
+
+    def _reset_checklist(self) -> None:
+        self._checklist = []
+        self._checklist_by_id = {}
+        self._current_visible_step_pair_id = ""
 
     def _notify_session_linked(self, task_graph_id: str) -> None:
         """通知监控客户端: 会话已关联到任务图谱，同时更新 InteractionStore。
@@ -679,6 +854,7 @@ class IDEFCRunner(FCRunner):
         loop = asyncio.get_event_loop()
         state = await loop.run_in_executor(None, self._init_state, messages)
         self.session.fc_state = state
+        self._reset_checklist()
         from zulong.ide.ide_server import broadcast_monitor_event
 
         # 设置 FC 循环运行状态为 True（禁止节点审查提交）
@@ -697,39 +873,46 @@ class IDEFCRunner(FCRunner):
         await self._emit_execution_event(
             send_callback,
             "started",
-            f"正在看任务: {_task_brief[:50]}",
+            f"任务已进入后台处理队列: {_task_brief[:50]}",
             event_type="FC_START",
             payload={
                 "max_turns": self._max_fc_turns,
                 "task_graph_policy": _policy,
                 "tool_call_budget": _tool_budget,
                 "user_input": (state.user_input_text or "")[:500],
-                "next_step": "下一步会按上下文决定是否调用工具。",
+                "next_step": "等待 L2 输出可见步骤说明。",
                 "interaction": {
-                    "kind": "plan",
+                    "kind": "progress",
                     "status": "running",
-                    "title": f"先看: {_task_brief}" if _task_brief else "先看任务上下文",
-                    "detail": "\n".join([
-                        "我会先确认目标、当前上下文和可用能力。",
-                        *([f"本轮工具上限: {_tool_budget} 个。"] if _tool_budget is not None else []),
-                        f"任务: {_task_brief}",
-                    ]),
-                    "plan_steps": _plan_steps,
-                    "next_step": "下一步会按上下文决定是否调用工具。",
+                    "title": "任务已接收",
+                    "detail": "系统已收到任务，等待 L2 生成下一步说明。",
+                    "source_channel": "system_status",
+                    "channel": CHANNEL_STATUS,
+                    "ux_visibility": UX_HIDDEN,
+                    "next_step": "等待 L2 输出可见步骤说明。",
                 },
             },
-            send_status=True,
+            send_status=False,
         )
 
         # ── TSD v2.7: 发射 task:plan 和 tool:prediction 消息 ──
         try:
             if _tool_pred:
+                _pred_ctx = _tool_pred.get("context_bundle", {}) or {}
+                _pred_tools = (
+                    _tool_pred.get("predicted_tools")
+                    or _tool_pred.get("suggested_tools")
+                    or []
+                )
                 await send_callback(MessageType.TOOL_PREDICTION, {
                     "prediction": _tool_pred,
-                    "suggested_tools": _tool_pred.get("suggested_tools", []),
+                    "predicted_tools": _pred_tools,
+                    "suggested_tools": _pred_tools,
                     "tool_bag": _tool_pred.get("tool_bag", []),
                     "confidence": _tool_pred.get("confidence", 0),
                     "reason": _tool_pred.get("reason", ""),
+                    "source": _pred_ctx.get("tool_prediction_source"),
+                    "embedding_top_tools": _pred_ctx.get("embedding_top_tools", []),
                     "timestamp": time.time(),
                 })
             await send_callback(MessageType.TASK_PLAN, {
@@ -739,16 +922,14 @@ class IDEFCRunner(FCRunner):
                 "tool_prediction": _tool_pred,
                 "tool_call_budget": _tool_budget,
                 "interaction": {
-                    "kind": "plan",
+                    "kind": "progress",
                     "status": "running",
-                    "title": f"计划跟随任务变化: {_task_brief}" if _task_brief else "计划跟随任务变化",
-                    "detail": "\n".join([
-                        "我会按真实工具返回和任务图状态更新进度。",
-                        *([f"本轮工具上限: {_tool_budget} 个。"] if _tool_budget is not None else []),
-                        f"任务: {_task_brief}",
-                    ]),
-                    "plan_steps": _plan_steps,
-                    "next_step": "下一步会按上下文决定是否调用工具。",
+                    "title": "任务元数据已准备",
+                    "detail": "系统状态已更新，用户可见步骤等待 L2 生成。",
+                    "source_channel": "system_status",
+                    "channel": CHANNEL_STATUS,
+                    "ux_visibility": UX_HIDDEN,
+                    "next_step": "等待 L2 输出可见步骤说明。",
                 },
                 "timestamp": time.time(),
             })
@@ -859,6 +1040,15 @@ class IDEFCRunner(FCRunner):
                         send_callback=send_callback,
                     )
                     if not tc_data:
+                        self._log_fc_decision_path(
+                            state,
+                            path="tool_budget_exhausted",
+                            tool_calls=[],
+                            response_content=resp_content or "",
+                            root_cause="context_pressure",
+                            tool_budget=state.tool_call_budget,
+                            tool_calls_used=state.tool_calls_used,
+                        )
                         await self._emit_execution_event(
                             send_callback,
                             "blocked",
@@ -871,13 +1061,36 @@ class IDEFCRunner(FCRunner):
                         )
                         continue
                     tool_names = [tc["function"]["name"] for tc in tc_data]
+                    self._log_fc_decision_path(
+                        state,
+                        path="tool_calls_dispatch",
+                        tool_calls=tc_data,
+                        response_content=resp_content or "",
+                        tool_names=tool_names,
+                        tool_call_count=len(tc_data),
+                    )
                     await self._emit_execution_event(
                         send_callback,
                         "executing",
                         f"执行工具: {', '.join(tool_names)}",
                         turn=state.fc_turn,
                         event_type="TOOL_CALL",
-                        payload={"tools": tool_names, "count": len(tc_data)},
+                        payload={
+                            "tools": tool_names,
+                            "count": len(tc_data),
+                            "interaction": {
+                                "kind": "progress",
+                                "status": "running",
+                                "title": "工具调度已准备",
+                                "detail": "工具调度已准备，等待模型步骤说明完成后执行。",
+                                "source_channel": "system_status",
+                                "channel": CHANNEL_STATUS,
+                                "ux_visibility": UX_HIDDEN,
+                            },
+                        },
+                        send_progress=False,
+                        send_status=False,
+                        monitor=False,
                     )
                     
                     # CB 模式工具调用计数：防止死循环
@@ -907,8 +1120,24 @@ class IDEFCRunner(FCRunner):
                 # 纯文本回复 → 先评估，再决定是否推送给前端
                 # 避免安全网返回 "continue" 时重复显示 filler 内容
                 final_text = state.last_response_content or resp_content
+                self._log_fc_decision_path(
+                    state,
+                    path="no_tool_call_enter_eval",
+                    tool_calls=[],
+                    response_content=resp_content or "",
+                    response_length=len(resp_content or ""),
+                    cb_force=state.cb_force_no_tools,
+                    null_response_count=state.null_response_count,
+                )
                 verdict = await loop.run_in_executor(
                     None, self._eval_response, state, resp_content or "")
+                self._log_fc_decision_path(
+                    state,
+                    path=f"no_tool_call_verdict_{verdict}",
+                    tool_calls=[],
+                    response_content=resp_content or "",
+                    verdict=verdict,
+                )
 
                 # 🔥 修复：流式推理已在 _call_model 中实时推送，此处不再重复推送
                 # 只发送完成标记即可
@@ -976,6 +1205,7 @@ class IDEFCRunner(FCRunner):
                         final_text=final_text or "",
                         memory_changes=_mem_changes,
                     )
+                    _summary_status = str(_summary_payload.get("status") or "succeeded")
 
                     await self._emit_execution_event(
                         send_callback,
@@ -988,7 +1218,7 @@ class IDEFCRunner(FCRunner):
                             **_summary_payload,
                             "interaction": {
                                 "kind": "summary",
-                                "status": "succeeded",
+                                "status": _summary_status,
                                 "title": "任务完成",
                                 "detail": f"本轮共进行了 {state.fc_turn} 轮推理。",
                                 "progress": 100,
@@ -1015,7 +1245,7 @@ class IDEFCRunner(FCRunner):
                             **_summary_payload,
                             "interaction": {
                                 "kind": "summary",
-                                "status": "succeeded",
+                                "status": _summary_status,
                                 "title": "任务完成",
                                 "detail": f"本轮共进行了 {state.fc_turn} 轮推理。",
                                 "progress": 100,
@@ -1035,10 +1265,11 @@ class IDEFCRunner(FCRunner):
                             },
                             "timestamp": time.time(),
                         })
-                        await send_callback(MessageType.GRAPH_MEMORY_DIFF, {
+                        _graph_diff_payload = mark_hidden_payload({
                             "memory_changes": _mem_changes,
                             "timestamp": time.time(),
                         })
+                        await send_callback(MessageType.GRAPH_MEMORY_DIFF, _graph_diff_payload)
                     except Exception as _e:
                         logger.debug(f"[IDEFCRunner] 发射 task:summary/graph:memory:diff 失败: {_e}")
                     
@@ -1186,6 +1417,80 @@ class IDEFCRunner(FCRunner):
         from zulong.ide.ide_server import broadcast_monitor_event
         fc = state.fc_turn
         msgs = state.messages
+
+        # ── TSD v2.9.3: L2 先说再做 ──
+        model_step_note = " ".join(str(response_content or "").split())
+        announce_calls, real_calls = self._split_announce_step_calls(tool_calls_data)
+        turn_pair_id = f"fc:{self.session.session_id}:{fc}:step"
+        has_real_tools = bool(real_calls)
+
+        # Mark announce_step as background in tool registry classification
+        if announce_calls:
+            for ac in announce_calls:
+                self._tool_interaction_pairs[ac.get("id", "")] = ac.get("id", "")
+            self._append_announce_step_messages(state, announce_calls, response_content, fc, None)
+
+        # Step-note enforcement for real tools
+        if has_real_tools:
+            have_content_step = bool(model_step_note)
+            announce_step = self._first_announce_step(announce_calls)
+            have_announce_step = bool(announce_step.get("message"))
+
+            step_retry_key = f"__step_announce_retry_{fc}"
+            retry_count = getattr(state, "step_announce_retry_count", 0)
+
+            if have_content_step or have_announce_step:
+                # Extract step message: prefer assistant.content, fallback to announce_step
+                step_message = model_step_note if have_content_step else announce_step.get("message", "")
+                expected = announce_step.get("expected_actions") or []
+                await self._emit_model_step_progress(
+                    send_callback,
+                    state=state,
+                    message=step_message,
+                    pair_id=turn_pair_id,
+                    expected_actions=expected,
+                    real_calls=real_calls,
+                    source="assistant.content" if have_content_step else "announce_step",
+                )
+                # Reset retry counter on success
+                state.step_announce_retry_count = 0
+            else:
+                # No step note from L2 → block and request re-generation
+                if retry_count < 1:
+                    state.step_announce_retry_count = retry_count + 1
+                    control_msg = internal_control_message(
+                        "请先用一句普通可见中文说明本步将做什么，再重新发起工具调用；不要输出推理过程。"
+                        "如果当前模型/Provider 不保留 tool_calls 同轮 assistant.content，请先调用 announce_step(message=...) 再调用实际工具。"
+                    )
+                    msgs.append(control_msg)
+                    if self._attn_window:
+                        self._attn_window.register_message(control_msg, turn=fc)
+                    logger.warning(
+                        "[IDEFCRunner] L2 缺少步骤说明 (retry=%d)，注入 internal_control 要求补说明",
+                        retry_count,
+                    )
+                    return None  # Skip this turn, let next FC iteration re-call model
+                else:
+                    # Already retried: keep the real tools blocked instead of
+                    # creating a system-authored task card or executing silently.
+                    logger.warning(
+                        "[IDEFCRunner] L2 步骤说明重试后仍缺失，拦截真实工具调用并转为收敛"
+                    )
+                    control_msg = internal_control_message(
+                        "仍未收到可见步骤说明，本轮真实工具调用已被拦截。"
+                        "请不要继续调用工具，先向用户说明当前受阻原因；如需继续执行，下一轮必须先输出普通可见步骤说明或调用 announce_step(message=...)。"
+                    )
+                    msgs.append(control_msg)
+                    state.cb_force_no_tools = True
+                    if self._attn_window:
+                        self._attn_window.register_message(control_msg, turn=fc)
+                    return None
+
+        # Use only real calls (non-announce_step) for execution
+        tool_calls_data = real_calls
+        if not tool_calls_data:
+            return None
+
         internal, remote = [], []
         for td in tool_calls_data:
             cat = self.tool_registry.classify(td["function"]["name"])
@@ -1212,7 +1517,8 @@ class IDEFCRunner(FCRunner):
                     self._safe_parse_tool_arguments(td["function"].get("arguments", "{}")),
                 )
                 call_id = td.get("id") or self._next_interaction_id("internal_tool")
-                self._tool_interaction_pairs[call_id] = call_id
+                event_pair_id = self._current_visible_step_pair_id or turn_pair_id or call_id
+                self._tool_interaction_pairs[call_id] = event_pair_id
                 await self._emit_execution_event(
                     send_callback,
                     "tool_requested",
@@ -1224,9 +1530,9 @@ class IDEFCRunner(FCRunner):
                         "action_summary": friendly_action,
                         "tool_scope": "internal",
                         "call_id": call_id,
-                        "pair_id": call_id,
+                        "pair_id": event_pair_id,
                         "interaction": {
-                            "pair_id": call_id,
+                            "pair_id": event_pair_id,
                             "kind": "action",
                             "status": "running",
                             "title": f"正在{friendly_action}",
@@ -1250,9 +1556,9 @@ class IDEFCRunner(FCRunner):
                         "action_summary": friendly_action,
                         "tool_scope": "internal",
                         "call_id": call_id,
-                        "pair_id": call_id,
+                        "pair_id": event_pair_id,
                         "interaction": {
-                            "pair_id": call_id,
+                            "pair_id": event_pair_id,
                             "kind": "observation",
                             "status": "succeeded",
                             "title": f"{friendly_action}已完成",
@@ -1273,13 +1579,11 @@ class IDEFCRunner(FCRunner):
                         logger.warning(f"[IDEFCRunner][CB] RED: {cb_r}")
                         state.cb_force_no_tools = True
                         state.cb_trigger_reason = cb_r  # 保存CB原因供_finalize使用
-                        cm = {
-                            "role": "user",
-                            "content": (
-                                f"[Circuit Breaker 强制收敛] {cb_r}\n"
-                                f"你必须立刻基于已有信息生成最终回复，"
-                                f"不允许再调用任何工具。"),
-                        }
+                        cm = internal_control_message(
+                            f"[Circuit Breaker 强制收敛] {cb_r}\n"
+                            "你必须立刻基于已有信息生成最终回复，"
+                            "不允许再调用任何工具。"
+                        )
                         msgs.append(cm)
                         if self._attn_window:
                             self._attn_window.register_message(cm, turn=fc)
@@ -1308,7 +1612,7 @@ class IDEFCRunner(FCRunner):
                                         )
                             except Exception:
                                 pass
-                        ch = {"role": "user", "content": cb_msg}
+                        ch = internal_control_message(cb_msg)
                         msgs.append(ch)
                         if self._attn_window:
                             self._attn_window.register_message(ch, turn=fc)
@@ -1339,6 +1643,15 @@ class IDEFCRunner(FCRunner):
         if remote:
             valid_remote, rejected = self._validate_and_clean_remote_calls(
                 remote)
+            if rejected:
+                self._log_fc_decision_path(
+                    state,
+                    path="invalid_tool_args_remote_rejected",
+                    tool_calls=remote,
+                    root_cause="invalid_tool_args",
+                    rejected_count=len(rejected),
+                    rejected_tools=[r[0]["function"]["name"] for r in rejected],
+                )
             all_calls = valid_remote + [r[0] for r in rejected]
             ra = {
                 "role": "assistant",
@@ -1427,8 +1740,9 @@ class IDEFCRunner(FCRunner):
                 tool_names = [
                     tc["function"]["name"] for tc in valid_remote]
                 group_id = f"tool_group:{self.session.session_id}:{fc}:{int(time.time() * 1000)}"
+                task_pair_id = self._current_visible_step_pair_id or turn_pair_id or group_id
                 for tc in valid_remote:
-                    self._tool_interaction_pairs[tc.get("id", "")] = tc.get("id", "")
+                    self._tool_interaction_pairs[tc.get("id", "")] = task_pair_id
                 logger.info(
                     f"[IDEFCRunner] async 远程工具推送: {tool_names}, call_ids={new_call_ids}")
                 llm_tool_reason = str(response_content or "").strip()
@@ -1460,8 +1774,9 @@ class IDEFCRunner(FCRunner):
                         "parallel": len(valid_remote) > 1,
                         "completed_count": 0,
                         "total_count": len(valid_remote),
+                        "pair_id": task_pair_id,
                         "interaction": {
-                            "pair_id": group_id,
+                            "pair_id": task_pair_id,
                             "kind": "action",
                             "status": "running",
                             "title": f"正在{self._friendly_tool_group(tool_names)}",
@@ -1528,12 +1843,12 @@ class IDEFCRunner(FCRunner):
                             turn=fc,
                             event_type="TASK_BLOCKED",
                             payload={
-                                "tool_name": timeout_tool,
-                                "call_id": call_id,
-                                "pair_id": call_id,
-                                "timeout_seconds": self._remote_tool_timeout,
-                                "interaction": {
-                                    "pair_id": call_id,
+                            "tool_name": timeout_tool,
+                            "call_id": call_id,
+                                "pair_id": task_pair_id,
+                            "timeout_seconds": self._remote_tool_timeout,
+                            "interaction": {
+                                    "pair_id": task_pair_id,
                                     "kind": "progress",
                                     "status": "blocked",
                                     "title": f"{timeout_label}超时，需要确认",
@@ -1618,12 +1933,13 @@ class IDEFCRunner(FCRunner):
                             for r in results
                         ],
                         "group_id": group_id,
+                        "pair_id": task_pair_id,
                         "completed_count": len(results),
                         "total_count": len(valid_remote),
                         "failed_count": failed_count,
                         "succeeded_count": succeeded_count,
                         "interaction": {
-                            "pair_id": group_id,
+                            "pair_id": task_pair_id,
                             "kind": "observation",
                             "status": "failed" if failed_count else "succeeded",
                             "title": result_title,
@@ -1713,7 +2029,17 @@ class IDEFCRunner(FCRunner):
                 self._circuit_breaker = type(cb)(cb_cfg)
             else:
                 from zulong.l2.circuit_breaker import ToolCallCircuitBreaker
-                self._circuit_breaker = ToolCallCircuitBreaker({
+                cb_cfg = {}
+                try:
+                    from zulong.config.config_manager import ConfigManager
+                    cb_cfg = dict(
+                        ConfigManager().get("l2_inference.circuit_breaker", {}) or {}
+                    )
+                except Exception:
+                    cb_cfg = {}
+                cb_cfg["context_window_size"] = getattr(
+                    self.engine, "_context_window_size", 32768)
+                self._circuit_breaker = ToolCallCircuitBreaker(cb_cfg or {
                     "context_window_size": getattr(
                         self.engine, "_context_window_size", 32768),
                 })
@@ -1814,13 +2140,17 @@ class IDEFCRunner(FCRunner):
         self._execution_events.append(event)
         self._persist_execution_event(event)
         cb_payload = event.callback_payload(self._max_fc_turns)
+        public_interaction = not interaction or (
+            interaction.get("ux_visibility") != UX_HIDDEN
+            and interaction.get("channel") != CHANNEL_CONTROL
+        )
 
-        if send_progress:
+        if send_progress and public_interaction:
             try:
                 await send_callback("task_progress", cb_payload)
             except Exception:
                 pass
-        if send_status:
+        if send_status and public_interaction:
             try:
                 await send_callback("status_update", {
                     "protocol_version": "2.0",
@@ -1833,7 +2163,7 @@ class IDEFCRunner(FCRunner):
             except Exception:
                 pass
         # ── TSD v2.7: 统一交互事件 emission (Web Dashboard 独立消费) ──
-        if interaction:
+        if interaction and public_interaction:
             try:
                 await send_callback(MessageType.INTERACTION_EVENT, {
                     "protocol_version": "2.0",
@@ -1845,7 +2175,7 @@ class IDEFCRunner(FCRunner):
                 })
             except Exception:
                 pass
-        if monitor:
+        if monitor and public_interaction:
             try:
                 from zulong.ide.ide_server import broadcast_monitor_event
                 await broadcast_monitor_event(event_type, {
@@ -1883,17 +2213,22 @@ class IDEFCRunner(FCRunner):
         )
         self._execution_events.append(event)
         self._persist_execution_event(event)
-        _broadcast_sync(event_type, {
-            "session_id": self.session.session_id,
-            "conversation_id": getattr(self.ide_session, "conversation_id", None),
-            "turn_id": getattr(self.ide_session, "web_turn_id", None),
-            "workspace_path": getattr(self.ide_session, "cwd", None),
-            "turn": turn,
-            "phase": phase,
-            "message": message,
-            **payload,
-            "interaction": interaction,
-        })
+        public_interaction = not interaction or (
+            interaction.get("ux_visibility") != UX_HIDDEN
+            and interaction.get("channel") != CHANNEL_CONTROL
+        )
+        if public_interaction:
+            _broadcast_sync(event_type, {
+                "session_id": self.session.session_id,
+                "conversation_id": getattr(self.ide_session, "conversation_id", None),
+                "turn_id": getattr(self.ide_session, "web_turn_id", None),
+                "workspace_path": getattr(self.ide_session, "cwd", None),
+                "turn": turn,
+                "phase": phase,
+                "message": message,
+                **payload,
+                "interaction": interaction,
+            })
 
     async def _emit_memory_diff_async(self, send_callback, turn: int) -> None:
         """发射 graph:memory:diff 事件，获取 MemoryGraph 自上次快照以来的变化。
@@ -2168,6 +2503,9 @@ class IDEFCRunner(FCRunner):
             ("risks_summary", "risk"),
             ("next_step", "next_step"),
             ("memory_changes", "memory_changes"),
+            ("completion_evidence", "completion_evidence"),
+            ("memory_reference_edges", "memory_reference_edges"),
+            ("task_graph_binding", "task_graph_binding"),
         )
         for tsd_key, legacy_key in field_pairs:
             if interaction.get(tsd_key) is not None:
@@ -2207,6 +2545,198 @@ class IDEFCRunner(FCRunner):
             item["pair_id"] = pair_id
         item["timestamp"] = time.time()
         return item
+
+    @staticmethod
+    def _split_tool_names(value: Any) -> List[str]:
+        if isinstance(value, dict):
+            name = value.get("name") or value.get("tool_name")
+            return [str(name).strip()] if name else []
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        if isinstance(value, list):
+            names: List[str] = []
+            for item in value:
+                if isinstance(item, dict):
+                    name = item.get("name") or item.get("tool_name")
+                else:
+                    name = item
+                if name:
+                    names.extend(IDEFCRunner._split_tool_names(str(name)))
+            return [name for name in names if name]
+        return [str(value).strip()] if value else []
+
+    @classmethod
+    def _collect_interaction_tool_names(
+        cls,
+        interaction: Dict[str, Any],
+        payload: Dict[str, Any],
+    ) -> List[str]:
+        names: List[str] = []
+        for value in (
+            interaction.get("tool_name"),
+            payload.get("tool_name"),
+            payload.get("tool_names"),
+        ):
+            for name in cls._split_tool_names(value):
+                if name and name not in names:
+                    names.append(name)
+        tools = payload.get("tools")
+        if isinstance(tools, list):
+            for tool in tools:
+                for name in cls._split_tool_names(tool):
+                    if name and name not in names:
+                        names.append(name)
+        results = payload.get("results")
+        if isinstance(results, list):
+            for item in results:
+                if isinstance(item, dict):
+                    for name in cls._split_tool_names(item.get("tool_name")):
+                        if name and name not in names:
+                            names.append(name)
+        return names
+
+    @staticmethod
+    def _is_background_tool(tool_name: Any) -> bool:
+        return str(tool_name or "").strip() in _BACKGROUND_TOOLS
+
+    @classmethod
+    def _classify_tool_category(
+        cls,
+        tool_names: List[str],
+        interaction: Dict[str, Any],
+        payload: Dict[str, Any],
+    ) -> str:
+        kind = str(interaction.get("kind") or "")
+        if kind == "approval" or payload.get("approval_id"):
+            return "approval"
+        names = {str(name or "").strip() for name in tool_names if name}
+        if names and all(name in _BACKGROUND_TOOLS for name in names):
+            return "background"
+        if names and all(name in _SUMMARY_ONLY_TOOLS for name in names):
+            return "summary"
+        if names & _COMMAND_TOOLS:
+            return "command"
+        if names & _WRITE_TOOLS:
+            return "write"
+        if names & _TASK_GRAPH_TOOLS:
+            return "task_graph"
+        if names & _NETWORK_TOOLS:
+            return "network"
+        if names & _READ_TOOLS:
+            return "read"
+        return "other"
+
+    @staticmethod
+    def _classify_source_channel(interaction: Dict[str, Any], payload: Dict[str, Any]) -> str:
+        kind = str(interaction.get("kind") or "")
+        explicit = str(interaction.get("source_channel") or payload.get("source_channel") or "").strip()
+        if explicit:
+            return explicit
+        if kind == "summary":
+            return "model_final"
+        if interaction.get("thought") and kind in {"action", "progress", "plan"}:
+            return "model_progress"
+        if kind == "progress" and payload.get("model_step_note"):
+            return "model_progress"
+        return "system_status"
+
+    @staticmethod
+    def _channel_for_source(source_channel: str) -> str:
+        if source_channel == "model_final":
+            return CHANNEL_FINAL
+        if source_channel == "model_progress":
+            return CHANNEL_LEDGER
+        if source_channel == "internal_control":
+            return CHANNEL_CONTROL
+        return CHANNEL_STATUS
+
+    @staticmethod
+    def _classify_ux_visibility(
+        interaction: Dict[str, Any],
+        tool_category: str,
+        channel: str,
+    ) -> str:
+        explicit = str(interaction.get("ux_visibility") or "").strip().lower()
+        if explicit in {UX_MAIN, UX_DETAILS, UX_HIDDEN}:
+            return explicit
+        kind = str(interaction.get("kind") or "")
+        status = str(interaction.get("status") or "")
+        event_type = str(interaction.get("event_type") or "")
+        if channel == CHANNEL_CONTROL:
+            return UX_HIDDEN
+        if event_type == "GRAPH_MEMORY_DIFF":
+            return UX_HIDDEN
+        if tool_category in {"background", "summary"}:
+            return UX_HIDDEN
+        if kind in {"summary", "plan", "approval", "user_interject"}:
+            return UX_MAIN
+        if status in {"failed", "blocked", "awaiting_approval", "rejected"}:
+            return UX_MAIN
+        if kind in {"action", "observation"}:
+            if tool_category in {"write", "command", "approval"}:
+                return UX_MAIN
+            return UX_DETAILS
+        if kind == "progress":
+            return UX_MAIN
+        return UX_DETAILS
+
+    @classmethod
+    def _build_raw_details(
+        cls,
+        interaction: Dict[str, Any],
+        payload: Dict[str, Any],
+        tool_names: List[str],
+        event_type: str,
+    ) -> Dict[str, Any]:
+        raw_details: Dict[str, Any] = {"event_type": event_type}
+        if tool_names:
+            raw_details["tool_name"] = ",".join(tool_names[:8])
+        raw_args = interaction.get("tool_args") or payload.get("tool_args") or payload.get("args")
+        if isinstance(raw_args, dict):
+            raw_details["tool_args"] = _summarize_tool_args(raw_args)
+        result_preview = payload.get("result_preview")
+        if not result_preview and isinstance(payload.get("results"), list):
+            previews: List[str] = []
+            for item in payload["results"][:4]:
+                if isinstance(item, dict):
+                    preview = item.get("result_preview") or item.get("result") or ""
+                    if preview:
+                        previews.append(str(preview)[:220])
+            if previews:
+                result_preview = "\n".join(previews)
+        if result_preview:
+            raw_details["result_preview"] = str(result_preview)[:800]
+        return raw_details
+
+    def _apply_interaction_visibility(
+        self,
+        interaction: Dict[str, Any],
+        payload: Dict[str, Any],
+        phase: str,
+        event_type: str,
+    ) -> Dict[str, Any]:
+        tool_names = self._collect_interaction_tool_names(interaction, payload)
+        tool_category = self._classify_tool_category(tool_names, interaction, payload)
+        source_channel = self._classify_source_channel(interaction, payload)
+        channel = str(interaction.get("channel") or payload.get("channel") or self._channel_for_source(source_channel))
+        ux_visibility = self._classify_ux_visibility(interaction, tool_category, channel)
+        interaction["channel"] = channel
+        interaction["source_channel"] = source_channel
+        interaction["ux_visibility"] = ux_visibility
+        interaction["tool_category"] = tool_category
+        interaction["is_background"] = bool(tool_category == "background" or ux_visibility == UX_HIDDEN)
+        if "raw_details" not in interaction:
+            raw_details = self._build_raw_details(interaction, payload, tool_names, event_type)
+            if raw_details:
+                interaction["raw_details"] = raw_details
+        if isinstance(payload.get("task_graph_binding"), dict):
+            interaction.setdefault("task_graph_binding", payload["task_graph_binding"])
+        if isinstance(payload.get("completion_evidence"), dict):
+            interaction.setdefault("completion_evidence", payload["completion_evidence"])
+        if isinstance(payload.get("memory_reference_edges"), list):
+            interaction.setdefault("memory_reference_edges", payload["memory_reference_edges"])
+        mark_public_payload(interaction, channel, ux_visibility=ux_visibility)
+        return interaction
 
     @staticmethod
     def _friendly_tool_name(name: Any) -> str:
@@ -2258,6 +2788,183 @@ class IDEFCRunner(FCRunner):
         except Exception:
             return {}
 
+    @staticmethod
+    def _is_announce_step_tool(tool_name: Any) -> bool:
+        return str(tool_name or "").strip() == ANNOUNCE_STEP_TOOL_NAME
+
+    @classmethod
+    def _is_announce_step_call(cls, tool_call: Dict[str, Any]) -> bool:
+        fn = tool_call.get("function") if isinstance(tool_call, dict) else {}
+        return cls._is_announce_step_tool((fn or {}).get("name"))
+
+    @classmethod
+    def _split_announce_step_calls(
+        cls,
+        tool_calls_data: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        announce_calls: List[Dict[str, Any]] = []
+        real_calls: List[Dict[str, Any]] = []
+        for tool_call in tool_calls_data or []:
+            if cls._is_announce_step_call(tool_call):
+                announce_calls.append(tool_call)
+            else:
+                real_calls.append(tool_call)
+        return announce_calls, real_calls
+
+    @classmethod
+    def _announce_step_from_call(cls, tool_call: Dict[str, Any]) -> Dict[str, Any]:
+        fn = tool_call.get("function") if isinstance(tool_call, dict) else {}
+        args = cls._safe_parse_tool_arguments((fn or {}).get("arguments", "{}"))
+        message = " ".join(str(args.get("message") or "").split())
+        if len(message) > 160:
+            message = message[:157].rstrip() + "..."
+        expected_actions: List[str] = []
+        raw_actions = args.get("expected_actions")
+        if isinstance(raw_actions, list):
+            for value in raw_actions[:3]:
+                text = " ".join(str(value or "").split())
+                if text:
+                    expected_actions.append(text[:80])
+        return {
+            "message": message,
+            "expected_actions": expected_actions,
+            "call_id": str(tool_call.get("id") or ""),
+        }
+
+    @classmethod
+    def _first_announce_step(cls, announce_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+        for tool_call in announce_calls or []:
+            step = cls._announce_step_from_call(tool_call)
+            if step.get("message"):
+                return step
+        return {"message": "", "expected_actions": [], "call_id": ""}
+
+    @classmethod
+    def _step_progress_items(
+        cls,
+        *,
+        message: str,
+        expected_actions: Optional[List[str]] = None,
+        real_calls: Optional[List[Dict[str, Any]]] = None,
+        pair_id: str = "",
+    ) -> List[Dict[str, Any]]:
+        labels: List[str] = []
+        for action in expected_actions or []:
+            action_text = " ".join(str(action or "").split())
+            if action_text and action_text not in labels:
+                labels.append(action_text)
+        if not labels:
+            for tool_call in (real_calls or [])[:4]:
+                fn = tool_call.get("function") or {}
+                name = fn.get("name") or ""
+                args = cls._safe_parse_tool_arguments(fn.get("arguments", "{}"))
+                label = cls._friendly_action_summary(name, args)
+                if label and label not in labels:
+                    labels.append(label)
+        if not labels and message:
+            labels.append(message)
+        while len(labels) < 2:
+            labels.append("根据结果判断下一步" if len(labels) == 1 else "汇总结果和风险")
+        items: List[Dict[str, Any]] = []
+        for idx, label in enumerate(labels[:6]):
+            items.append(cls._progress_item(
+                label,
+                "running" if idx == 0 else "pending",
+                source="model_progress",
+                pair_id=f"{pair_id}:step:{idx}" if pair_id else "",
+            ))
+        return items
+
+    async def _emit_model_step_progress(
+        self,
+        send_callback,
+        *,
+        state: IDEFCState,
+        message: str,
+        pair_id: str,
+        expected_actions: Optional[List[str]] = None,
+        real_calls: Optional[List[Dict[str, Any]]] = None,
+        source: str = "assistant.content",
+    ) -> None:
+        note = " ".join(str(message or "").split())
+        if not note:
+            return
+        if len(note) > 500:
+            note = note[:497].rstrip() + "..."
+        self._current_visible_step_pair_id = pair_id
+        await self._emit_execution_event(
+            send_callback,
+            "model_progress",
+            note,
+            turn=state.fc_turn,
+            event_type="MODEL_PROGRESS",
+            payload={
+                "model_step_note": note,
+                "source_text_hash": hashlib.sha256(note.encode("utf-8")).hexdigest()[:16],
+                "source_turn": state.fc_turn,
+                "source_tool_group_id": pair_id,
+                "source": source,
+                "interaction": {
+                    "pair_id": pair_id,
+                    "kind": "progress",
+                    "status": "running",
+                    "title": "当前步骤",
+                    "detail": note,
+                    "source_channel": "model_progress",
+                    "channel": CHANNEL_LEDGER,
+                    "ux_visibility": UX_MAIN,
+                    "progress_items": self._step_progress_items(
+                        message=note,
+                        expected_actions=expected_actions,
+                        real_calls=real_calls,
+                        pair_id=pair_id,
+                    ),
+                    "next_step": "等待这一步返回结果。",
+                },
+            },
+            send_progress=True,
+            send_status=True,
+        )
+
+    def _append_announce_step_messages(
+        self,
+        state: IDEFCState,
+        announce_calls: List[Dict[str, Any]],
+        response_content: str,
+        fc: int,
+        group_id: Any,
+    ) -> None:
+        if not announce_calls:
+            return
+        assistant_msg = {
+            "role": "assistant",
+            "content": response_content or "",
+            "tool_calls": announce_calls,
+        }
+        state.messages.append(assistant_msg)
+        if self._attn_window:
+            self._attn_window.register_message(assistant_msg, turn=fc, group_id=group_id)
+        for tool_call in announce_calls:
+            call_id = str(tool_call.get("id") or "")
+            step = self._announce_step_from_call(tool_call)
+            state.messages.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": _json.dumps({
+                    "ok": True,
+                    "message": step.get("message") or "",
+                    "expected_actions": step.get("expected_actions") or [],
+                    "side_effect": "none",
+                }, ensure_ascii=False),
+            })
+            if self._attn_window:
+                self._attn_window.register_message(
+                    state.messages[-1],
+                    turn=fc,
+                    tool_name=ANNOUNCE_STEP_TOOL_NAME,
+                    group_id=group_id,
+                )
+
     @classmethod
     def _friendly_action_summary(cls, tool_name: Any, tool_args: Any = None) -> str:
         label = cls._friendly_tool_name(tool_name)
@@ -2306,6 +3013,141 @@ class IDEFCRunner(FCRunner):
             return "已收到返回结果。"
         return text[:160]
 
+    def _record_model_raw_output(
+        self,
+        state: IDEFCState,
+        fc: int,
+        *,
+        raw_content: str,
+        final_content: str,
+        tool_calls: Optional[List[Dict]],
+        finish_reason: str = "",
+        usage: Any = None,
+        source: str = "stream",
+    ) -> Dict[str, Any]:
+        """Phase 10 evidence log for what the model actually returned."""
+        tool_calls = tool_calls or []
+        summary = {
+            "turn": fc,
+            "source": source,
+            "assistant_content_length_raw": len(raw_content or ""),
+            "assistant_content_length_final": len(final_content or ""),
+            "tool_call_count": len(tool_calls),
+            "tool_calls": [_summarize_tool_call_for_log(tc) for tc in tool_calls],
+            "finish_reason": finish_reason or "unknown",
+            "usage": _summarize_usage_for_log(usage),
+            "usage_available": bool(_summarize_usage_for_log(usage)),
+        }
+        try:
+            state.last_model_raw_summary = summary
+        except Exception:
+            pass
+        logger.info(
+            "[IDEFCRunner][P10ModelOutput] %s",
+            _json.dumps(summary, ensure_ascii=False, sort_keys=True),
+        )
+        return summary
+
+    def _phase10_root_cause(
+        self,
+        state: IDEFCState,
+        *,
+        path: str,
+        tool_calls: Optional[List[Dict]] = None,
+        response_content: str = "",
+        rejected_count: int = 0,
+    ) -> str:
+        """Classify the current blocking evidence using the Phase 10 enum."""
+        path_text = str(path or "")
+        if rejected_count or "invalid_tool_args" in path_text or "参数验证失败" in str(response_content or ""):
+            return "invalid_tool_args"
+
+        reviewer_health = getattr(state, "quality_reviewer_health", {}) or {}
+        reviewer_status = str(reviewer_health.get("status") or "")
+        if reviewer_status in {"failed", "non_json"} and (
+            "reviewer" in path_text or "quality" in path_text
+        ):
+            return "backup_reviewer_fail"
+
+        if (
+            "quality" in path_text
+            or "completion_gate" in path_text
+            or getattr(state, "quality_iteration_count", 0) > 0
+        ):
+            return "quality_gate_loop"
+
+        recent = list(getattr(state, "tool_results_buffer", []) or [])[-8:]
+        for item in reversed(recent):
+            tool = str(item.get("tool_name") or "")
+            result = str(item.get("result") or "")
+            success = bool(item.get("success", True))
+            if tool in {"write_to_file", "replace_in_file", "ide_write_file", "exec_write_file"} and not success:
+                if any(marker in result for marker in (
+                    "未真实存在", "未应用", "未允许", "内容未应用", "内容不一致", "verified",
+                )):
+                    return "bridge_not_applied"
+
+        cb_reason = str(getattr(state, "cb_trigger_reason", "") or "")
+        attn_ratio = -1.0
+        try:
+            attn_ratio = float(getattr(self._attn_window, "usage_ratio", -1.0))
+        except Exception:
+            attn_ratio = -1.0
+        if (
+            "context_pressure" in cb_reason
+            or "context_pressure" in path_text
+            or getattr(state, "pressure_force_attention", False)
+            or attn_ratio >= 0.60
+        ):
+            return "context_pressure"
+
+        if not tool_calls:
+            return "no_tool_call"
+        return "none"
+
+    def _log_fc_decision_path(
+        self,
+        state: IDEFCState,
+        *,
+        path: str,
+        tool_calls: Optional[List[Dict]] = None,
+        response_content: str = "",
+        root_cause: str = "",
+        **details: Any,
+    ) -> str:
+        """Phase 10 decision-path log: why this turn continued, blocked, or finished."""
+        cause = root_cause or self._phase10_root_cause(
+            state,
+            path=path,
+            tool_calls=tool_calls,
+            response_content=response_content,
+            rejected_count=int(details.get("rejected_count") or 0),
+        )
+        safe_details = {
+            key: value
+            for key, value in details.items()
+            if value is not None
+        }
+        record = {
+            "turn": getattr(state, "fc_turn", 0),
+            "path": path,
+            "root_cause": cause,
+            "details": safe_details,
+        }
+        try:
+            state.last_fc_decision_path = path
+            state.last_fc_root_cause = cause
+            history = list(getattr(state, "fc_root_cause_history", []) or [])
+            history.append(record)
+            state.fc_root_cause_history = history[-80:]
+        except Exception:
+            pass
+        logger.info(
+            "[IDEFCRunner][P10Decision] %s",
+            _json.dumps(record, ensure_ascii=False, default=str, sort_keys=True),
+        )
+        return cause
+
     @staticmethod
     def _normalize_progress_items(raw_items: Any) -> List[Dict[str, Any]]:
         if not isinstance(raw_items, list):
@@ -2345,6 +3187,21 @@ class IDEFCRunner(FCRunner):
         except Exception:
             parsed = None
         if isinstance(parsed, dict):
+            nested = " ".join(
+                str(parsed.get(key) or "")
+                for key in ("result", "error", "message", "reason")
+            ).lower()
+            if any(marker.lower() in nested for marker in (
+                "用户未应用",
+                "用户未允许",
+                "用户拒绝",
+                "审批拒绝",
+                "审批超时",
+                "审批未通过",
+                "未应用写入",
+                "未允许",
+            )):
+                return True
             if parsed.get("is_error") is True or parsed.get("failed") is True:
                 return True
             if parsed.get("is_error") is False or parsed.get("failed") is False:
@@ -2367,6 +3224,222 @@ class IDEFCRunner(FCRunner):
             or "异常" in head
         )
 
+    @staticmethod
+    def _structured_tool_result(result: str) -> Dict[str, Any]:
+        raw = str(result or "").strip()
+        if not raw:
+            return {}
+        try:
+            parsed = _json.loads(raw)
+        except Exception:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        if isinstance(parsed.get("data"), dict):
+            merged = dict(parsed["data"])
+            for key in ("success", "error", "message"):
+                if key in parsed and key not in merged:
+                    merged[key] = parsed[key]
+            return merged
+        return parsed
+
+    @classmethod
+    def _memory_reference_edges_from_result(cls, result: str) -> List[Dict[str, Any]]:
+        parsed = cls._structured_tool_result(result)
+        raw_edges = parsed.get("memory_reference_edges")
+        if not isinstance(raw_edges, list):
+            return []
+        edges: List[Dict[str, Any]] = []
+        seen = set()
+        for raw in raw_edges:
+            if not isinstance(raw, dict):
+                continue
+            source = str(raw.get("source") or raw.get("src") or "").strip()
+            target = str(raw.get("target") or raw.get("dst") or "").strip()
+            relation = str(raw.get("relation") or raw.get("type") or "reference").strip()
+            if not source or not target:
+                continue
+            key = (source, target, relation)
+            if key in seen:
+                continue
+            seen.add(key)
+            edges.append({
+                "source": source,
+                "target": target,
+                "type": str(raw.get("type") or "reference"),
+                "relation": relation,
+                "task_graph_id": str(raw.get("task_graph_id") or ""),
+                "target_role": str(raw.get("target_role") or ""),
+                "created": bool(raw.get("created", False)),
+            })
+        return edges
+
+    def _attention_state(self) -> Tuple[str, str]:
+        """Return the current attention mode/focus without mutating the window."""
+        if not self._attn_window:
+            return "", ""
+        mode = getattr(self._attn_window, "mode", "")
+        mode_value = getattr(mode, "value", str(mode or ""))
+        node_id = str(getattr(self._attn_window, "_current_node_id", "") or "")
+        return mode_value, node_id
+
+    def _task_graph_status_signature(self, tg) -> str:
+        """Compact status fingerprint used only for navigator map de-dup."""
+        try:
+            nodes = [
+                n for n in getattr(tg, "nodes", [])
+                if not str(getattr(n, "id", "")).startswith("crg_")
+            ]
+            counts: Dict[str, int] = {}
+            for node in nodes:
+                status = str(getattr(node, "status", "") or "pending")
+                counts[status] = counts.get(status, 0) + 1
+            return ",".join(f"{k}:{counts[k]}" for k in sorted(counts))
+        except Exception:
+            return ""
+
+    def _task_node_id_from_memory_id(self, raw_id: str, tg) -> str:
+        """Convert MemoryGraph task ids back to TaskGraph local node ids."""
+        if not raw_id or not tg:
+            return ""
+        raw = str(raw_id)
+        try:
+            if tg.get_node(raw):
+                return raw
+        except Exception:
+            pass
+        graph_id = str(getattr(tg, "id", "") or "")
+        candidates: List[str] = []
+        if raw.startswith("task:"):
+            local = raw[5:]
+            if graph_id and local.startswith(f"{graph_id}/"):
+                local = local[len(graph_id) + 1:]
+            candidates.append(local)
+        if raw.startswith("tg:"):
+            parts = raw.split("/")
+            for part in reversed(parts):
+                if part.startswith("task:"):
+                    candidates.append(part[5:])
+                    break
+            if parts:
+                candidates.append(parts[-1])
+        if "/" in raw:
+            candidates.append(raw.rsplit("/", 1)[-1])
+        for candidate in candidates:
+            try:
+                if candidate and tg.get_node(candidate):
+                    return candidate
+            except Exception:
+                continue
+        return ""
+
+    def _task_node_address_from_memory_id(self, raw_id: str, tg) -> str:
+        node_id = self._task_node_id_from_memory_id(raw_id, tg)
+        if node_id and tg:
+            try:
+                return tg.get_node_address(node_id)
+            except Exception:
+                pass
+        return str(raw_id or "unknown")
+
+    def _build_attention_navigation_map(
+        self,
+        state: IDEFCState,
+        fc: int,
+        reason: str,
+        current_node_id: str = "",
+    ) -> Optional[Dict]:
+        """Build one navigator map after a real attention switch.
+
+        The caller is responsible for checking that mode/focus actually changed.
+        This method only de-duplicates the latest map key and never pins the map.
+        """
+        try:
+            tg = self._get_current_task_graph()
+            if not tg or not hasattr(tg, "render_navigator_map"):
+                return None
+            mode, focus_node_id = self._attention_state()
+            focus_node_id = current_node_id or focus_node_id
+            if focus_node_id and not tg.get_node(focus_node_id):
+                focus_node_id = ""
+            if not focus_node_id:
+                in_progress = [
+                    n for n in tg.get_nodes_by_status("in_progress")
+                    if not str(getattr(n, "id", "")).startswith("crg_")
+                ]
+                focus_node_id = in_progress[0].id if in_progress else "req"
+            graph_id = str(getattr(tg, "id", "") or "")
+            signature = self._task_graph_status_signature(tg)
+            key = f"{graph_id}|{mode}|{focus_node_id}|{reason}|{signature}"
+            if key == getattr(state, "last_navigation_map_key", ""):
+                return None
+            state.last_navigation_map_key = key
+            uncovered_node_ids: List[str] = []
+            try:
+                coverage = self._compute_node_coverage(state, tg)
+                uncovered_node_ids = list(coverage.get("uncovered_in_progress") or [])
+            except Exception:
+                uncovered_node_ids = []
+            map_text = tg.render_navigator_map(
+                focus_node_id,
+                uncovered_node_ids=uncovered_node_ids,
+            )
+            return {
+                "role": "system",
+                "content": (
+                    f"[导航地图] reason={reason}; mode={mode}; turn={fc}\n"
+                    f"{map_text}\n"
+                    "请基于当前位置继续推进；没有新的注意力切换时不要请求重复地图。"
+                ),
+            }
+        except Exception as exc:
+            logger.debug(f"[IDEFCRunner] 导航地图构建跳过: {exc}")
+            return None
+
+    def _build_observation_nudge(
+        self,
+        state: IDEFCState,
+        tool_name: str,
+        result_text: str,
+        fc: int,
+    ) -> Optional[Dict]:
+        """Create a short independent nudge for failed or empty observations."""
+        skip_tools = {
+            "task_view_overview", "recall_memory", "read_memory_node",
+            "discover_related", "search_memory", "search_experience",
+            "search_tools", "navigate_attention", "adjust_attention_mode",
+        }
+        if tool_name in skip_tools:
+            return None
+        if getattr(state, "observation_nudge_turn", 0) != fc:
+            state.observation_nudge_turn = fc
+            state.observation_nudge_count = 0
+        if getattr(state, "observation_nudge_count", 0) >= 2:
+            return None
+
+        raw = str(result_text or "").strip()
+        failed = False
+        try:
+            failed = bool(self.engine._tool_result_failed(raw, raw[:200]))
+        except Exception:
+            failed = self._tool_result_failed_text(raw)
+        empty = not raw or raw in {"{}", "[]", "null", "None"} or len(raw) < 8
+        if not failed and not empty:
+            return None
+
+        state.observation_nudge_count += 1
+        if failed:
+            content = (
+                f"[观察分析] {self._friendly_tool_name(tool_name)} 执行失败。"
+                "请先分析失败原因，再选择重试、替代工具或收敛说明风险。"
+            )
+        else:
+            content = (
+                f"[观察分析] {self._friendly_tool_name(tool_name)} 返回空结果。"
+                "请判断这是否足以推进；若不足，请换用更合适的工具。"
+            )
+        return internal_control_message(content)
+
     def _derive_progress_items(
         self,
         interaction: Dict[str, Any],
@@ -2374,36 +3447,75 @@ class IDEFCRunner(FCRunner):
         phase: str,
         message: str,
     ) -> List[Dict[str, Any]]:
-        existing = self._normalize_progress_items(interaction.get("progress_items"))
-        if existing:
-            return existing
+        def snapshot() -> List[Dict[str, Any]]:
+            return [dict(item) for item in self._checklist[:8]]
 
+        def upsert(item: Dict[str, Any]) -> None:
+            item_id = str(item.get("id") or item.get("pair_id") or item.get("label") or "")
+            if not item_id:
+                return
+            item["id"] = item_id
+            if item_id in self._checklist_by_id:
+                self._checklist_by_id[item_id].update(item)
+                return
+            self._checklist_by_id[item_id] = item
+            self._checklist.append(item)
+
+        existing = self._normalize_progress_items(interaction.get("progress_items"))
         kind = interaction.get("kind")
         pair_id = str(interaction.get("pair_id") or payload.get("pair_id") or payload.get("call_id") or "")
+        source_channel = str(interaction.get("source_channel") or payload.get("source_channel") or "")
+        if source_channel == "model_progress" and pair_id:
+            self._current_visible_step_pair_id = pair_id
+        tool_names = self._collect_interaction_tool_names(interaction, payload)
+        tool_category = self._classify_tool_category(tool_names, interaction, payload)
+
+        if tool_category in {"background", "summary"}:
+            return snapshot()
+
+        if existing:
+            for item in existing:
+                if kind in {"action", "observation"} and tool_category in {"read", "task_graph", "network"} and interaction.get("status") not in {"failed", "blocked"}:
+                    continue
+                upsert(item)
+            return snapshot() or existing
 
         if kind == "plan":
             steps = interaction.get("plan_steps") or payload.get("plan_steps") or []
             items: List[Dict[str, Any]] = []
             if isinstance(steps, list):
+                self._checklist = []
+                self._checklist_by_id = {}
                 for idx, step in enumerate(steps[:8]):
-                    items.append(self._progress_item(
+                    item = self._progress_item(
                         str(step),
                         "running" if idx == 0 else "pending",
                         source="plan",
                         pair_id=f"{pair_id}:plan:{idx}" if pair_id else "",
-                    ))
-            return items
+                    )
+                    items.append(item)
+                    upsert(item)
+            return snapshot() or items
 
         if kind == "action":
+            if tool_category in {"read", "task_graph", "network"}:
+                return snapshot()
             label = self._friendly_progress_label(interaction.get("title") or message, "running")
             detail = self._friendly_result_detail(interaction.get("detail") or "", "running")
-            return [self._progress_item(label, "running", detail=detail, source="tool", pair_id=pair_id)]
+            item = self._progress_item(label, "running", detail=detail, source="tool", pair_id=pair_id)
+            upsert(item)
+            self._current_visible_step_pair_id = pair_id
+            return snapshot() or [item]
 
         if kind == "observation":
             status = "failed" if interaction.get("status") == "failed" else "completed"
+            if tool_category in {"read", "task_graph", "network"} and status == "completed":
+                return snapshot()
             label = self._friendly_progress_label(interaction.get("title") or message, status)
             detail = self._friendly_result_detail(interaction.get("result_preview") or interaction.get("detail") or "", status)
-            return [self._progress_item(label, status, detail=detail, source="tool", pair_id=pair_id)]
+            item = self._progress_item(label, status, detail=detail, source="tool", pair_id=pair_id)
+            upsert(item)
+            return snapshot() or [item]
 
         if kind == "summary":
             self._copy_summary_fields(interaction, payload)
@@ -2419,9 +3531,11 @@ class IDEFCRunner(FCRunner):
             return items[:8]
 
         if interaction.get("status") in {"blocked", "failed"}:
-            return [self._progress_item(interaction.get("title") or message, interaction.get("status"), detail=interaction.get("detail") or "", source="heartbeat", pair_id=pair_id)]
+            item = self._progress_item(interaction.get("title") or message, interaction.get("status"), detail=interaction.get("detail") or "", source="heartbeat", pair_id=pair_id)
+            upsert(item)
+            return snapshot() or [item]
 
-        return []
+        return snapshot()
 
     def _apply_tool_call_budget_ide(
         self,
@@ -2432,6 +3546,9 @@ class IDEFCRunner(FCRunner):
         """Enforce explicit user tool-call budgets before IDE tool dispatch."""
         if not tool_calls_data:
             return []
+        announce_calls, real_calls = self._split_announce_step_calls(tool_calls_data)
+        if not real_calls:
+            return announce_calls
         budget = state.tool_call_budget
         if budget is None:
             budget = get_engine_tool_budget(self.engine)
@@ -2442,11 +3559,16 @@ class IDEFCRunner(FCRunner):
         remaining = max(0, int(budget) - used)
         if remaining <= 0:
             self._inject_tool_budget_stop_ide(state, int(budget), used, send_callback=send_callback)
-            return []
-        allowed = tool_calls_data[:remaining]
-        skipped = len(tool_calls_data) - len(allowed)
-        record_engine_tool_calls_used(self.engine, len(allowed))
-        state.tool_calls_used = used + len(allowed)
+            return announce_calls
+        allowed_real = real_calls[:remaining]
+        allowed_ids = {id(item) for item in allowed_real}
+        allowed = [
+            item for item in tool_calls_data
+            if self._is_announce_step_call(item) or id(item) in allowed_ids
+        ]
+        skipped = len(real_calls) - len(allowed_real)
+        record_engine_tool_calls_used(self.engine, len(allowed_real))
+        state.tool_calls_used = used + len(allowed_real)
         if skipped > 0 or engine_tool_budget_exhausted(self.engine):
             self._inject_tool_budget_stop_ide(
                 state,
@@ -2561,7 +3683,7 @@ class IDEFCRunner(FCRunner):
             if merged["kind"] == "summary":
                 self._copy_summary_fields(merged, payload)
             merged["progress_items"] = self._derive_progress_items(merged, payload, phase, message)
-            return merged
+            return self._apply_interaction_visibility(merged, payload, phase, event_type)
 
         kind = "progress"
         status = "running"
@@ -2658,7 +3780,7 @@ class IDEFCRunner(FCRunner):
         if interaction["kind"] == "summary":
             self._copy_summary_fields(interaction, payload)
         interaction["progress_items"] = self._derive_progress_items(interaction, payload, phase, message)
-        return interaction
+        return self._apply_interaction_visibility(interaction, payload, phase, event_type)
 
     def _tool_action_title(self, payload: Dict[str, Any], fallback: str) -> str:
         tools = payload.get("tools")
@@ -2739,6 +3861,8 @@ class IDEFCRunner(FCRunner):
 
         for event in self._execution_events:
             interaction = event.interaction or {}
+            if interaction.get("ux_visibility") == UX_HIDDEN:
+                continue
             kind = interaction.get("kind")
             status = interaction.get("status")
             tool_name = (
@@ -2746,6 +3870,13 @@ class IDEFCRunner(FCRunner):
                 or event.payload.get("tool_name")
                 or ""
             )
+            tool_category = self._classify_tool_category(
+                self._split_tool_names(tool_name),
+                interaction,
+                event.payload,
+            )
+            if tool_category in {"background", "summary"}:
+                continue
             if kind == "action" and tool_name:
                 for name in str(tool_name).split(","):
                     if name.strip() and name.strip() not in tool_names:
@@ -2769,8 +3900,6 @@ class IDEFCRunner(FCRunner):
 
         if tool_names:
             self._append_unique(completed_items, "已完成执行步骤: " + self._friendly_tool_group(tool_names[:6]))
-        if final_text:
-            self._append_unique(completed_items, "已生成最终回复")
         if not completed_items:
             self._append_unique(completed_items, "已完成本轮推理流程")
 
@@ -2780,6 +3909,9 @@ class IDEFCRunner(FCRunner):
             tool = str(item.get("tool_name", "") or "").strip()
             if not tool:
                 continue
+            tool_category = self._classify_tool_category([tool], {}, {})
+            if tool_category in {"background", "summary"}:
+                continue
             if tool not in latest_tool_results:
                 ordered_tools.append(tool)
             latest_tool_results[tool] = item
@@ -2787,7 +3919,11 @@ class IDEFCRunner(FCRunner):
         for tool in ordered_tools:
             item = latest_tool_results.get(tool) or {}
             result = item.get("result", "") or ""
-            if self._tool_result_failed_text(result):
+            tool_failed = (
+                not bool(item.get("success", not self._tool_result_failed_text(result)))
+                or self._tool_result_failed_text(result)
+            )
+            if tool_failed:
                 friendly_tool = self._friendly_tool_name(tool)
                 failed_tools.append(friendly_tool)
                 self._append_unique(pending_items, f"{friendly_tool}需要复核")
@@ -2801,9 +3937,9 @@ class IDEFCRunner(FCRunner):
             pending = progress.get("pending_count", 0) or 0
             running = progress.get("in_progress_count", 0) or 0
             if total:
-                self._append_unique(verified_items, f"任务图进度 {done}/{total}")
+                self._append_unique(completed_items, f"任务清单进度 {done}/{total}")
             if pending or running:
-                self._append_unique(pending_items, f"任务图仍有 {pending + running} 个节点未完成")
+                self._append_unique(pending_items, f"仍有 {pending + running} 个步骤需要继续处理")
 
         if reason != "done":
             self._append_unique(pending_items, f"FC 以 {reason} 状态结束")
@@ -2813,19 +3949,91 @@ class IDEFCRunner(FCRunner):
             risks.append("存在步骤失败或异常: " + "、".join(sorted(set(failed_tools))[:6]))
         if pending_items:
             risks.append("存在未完成或需复核事项")
+        quality_reasons = list(getattr(state, "quality_last_reasons", []) or [])
+        if quality_reasons:
+            risks.append("需要关注: " + "；".join(str(r) for r in quality_reasons[:3]))
         risks_summary = "；".join(risks)
 
         memory_changes = memory_changes or self._get_memory_changes_snapshot()
+        completion_evidence = getattr(state, "completion_last_evidence", {}) or {}
+        completion_evidence_payload = (
+            completion_evidence.get("completion_evidence")
+            if isinstance(completion_evidence, dict)
+            else {}
+        ) or {}
+        evidence_constraints = (
+            completion_evidence.get("constraints", {})
+            if isinstance(completion_evidence, dict)
+            else {}
+        ) or {}
+        evidence_violations = [
+            str(item)
+            for item in evidence_constraints.get("violated_constraints", []) or []
+            if str(item).strip()
+        ]
+        failed_commands_uncovered = [
+            str(item)
+            for item in completion_evidence_payload.get("failed_commands_uncovered", []) or []
+            if str(item).strip()
+        ]
+        if evidence_violations:
+            self._append_unique(
+                pending_items,
+                "完成证据需复核: " + "；".join(evidence_violations[:2]),
+            )
+        if failed_commands_uncovered:
+            self._append_unique(
+                pending_items,
+                "存在失败命令未覆盖: " + "、".join(failed_commands_uncovered[:3]),
+            )
+        memory_reference_edges: List[Dict[str, Any]] = []
+        seen_memory_edges = set()
+        for item in getattr(state, "tool_results_buffer", []) or []:
+            for edge in item.get("memory_reference_edges") or []:
+                if not isinstance(edge, dict):
+                    continue
+                source = str(edge.get("source") or "")
+                target = str(edge.get("target") or "")
+                relation = str(edge.get("relation") or edge.get("type") or "reference")
+                key = (source, target, relation)
+                if not source or not target or key in seen_memory_edges:
+                    continue
+                seen_memory_edges.add(key)
+                memory_reference_edges.append(edge)
         next_step = "等待用户继续补充或提出新调整。"
         if pending_items:
             next_step = "建议先处理未完成项，再继续后续任务。"
+        quality_level = self._quality_level_from_state(state)
+        risks = []
+        if failed_tools:
+            risks.append("存在步骤失败或异常: " + "、".join(sorted(set(failed_tools))[:6]))
+        if pending_items:
+            risks.append("存在未完成或需复核事项")
+        if quality_reasons:
+            risks.append("需要关注: " + "；".join(str(r) for r in quality_reasons[:3]))
+        risks_summary = "；".join(risks)
+        if failed_tools:
+            summary_status = "failed"
+        elif pending_items or reason != "done" or quality_level == "blocked" or evidence_violations:
+            summary_status = "blocked"
+        else:
+            summary_status = "succeeded"
 
         return {
+            "status": summary_status,
             "completed_items": completed_items,
             "verified_items": verified_items,
             "pending_items": pending_items,
             "risks_summary": risks_summary,
+            "quality_score": round(float(getattr(state, "quality_last_score", 1.0) or 0.0), 3),
+            "quality_level": quality_level,
+            "quality_iterations": int(getattr(state, "quality_iteration_count", 0) or 0),
+            "quality_dimensions": (
+                getattr(state, "completion_last_quality", {}) or {}
+            ).get("dimensions") if isinstance(getattr(state, "completion_last_quality", {}), dict) else None,
             "memory_changes": memory_changes,
+            "memory_reference_edges": memory_reference_edges,
+            "completion_evidence": completion_evidence_payload,
             "next_step": next_step,
             # Legacy fields retained for older Web renderers.
             "completed": completed_items,
@@ -3149,18 +4357,26 @@ class IDEFCRunner(FCRunner):
         try:
             from zulong.l1b.tool_predictor import L1BToolPredictor
             _predictor = L1BToolPredictor()
+            _registry = getattr(getattr(self.engine, "tool_engine", None), "registry", None)
             _conv_history = [
                 m for m in messages
                 if isinstance(m, dict) and m.get("role") in ("user", "assistant")
             ]
             state.tool_prediction = _predictor.predict_tools(
-                user_input, _conv_history
+                user_input, _conv_history, registry=_registry
+            )
+            _pred_ctx = state.tool_prediction.get("context_bundle", {}) or {}
+            _pred_tools = (
+                state.tool_prediction.get("predicted_tools")
+                or state.tool_prediction.get("suggested_tools")
+                or []
             )
             logger.debug(
                 f"[IDEFCRunner] L1BToolPredictor: "
-                f"turn_shape={state.tool_prediction.get('context_bundle', {}).get('turn_shape')}, "
+                f"turn_shape={_pred_ctx.get('turn_shape')}, "
+                f"source={_pred_ctx.get('tool_prediction_source')}, "
                 f"policy={state.tool_prediction.get('task_graph_policy')}, "
-                f"suggested={state.tool_prediction.get('suggested_tools')[:5]}"
+                f"suggested={_pred_tools[:5]}"
             )
         except Exception as _e:
             logger.debug(f"[IDEFCRunner] L1BToolPredictor 失败: {_e}")
@@ -3383,8 +4599,27 @@ class IDEFCRunner(FCRunner):
             # 工具结果缓冲（供 InfoGap / Backfill 使用），限制上限
             if len(state.tool_results_buffer) >= _TOOL_RESULTS_BUFFER_MAX:
                 state.tool_results_buffer.pop(0)
+            try:
+                args_dict = _json.loads(func_info.get("arguments", "{}"))
+            except Exception:
+                args_dict = {}
+            memory_reference_edges = self._memory_reference_edges_from_result(content)
             state.tool_results_buffer.append(
-                {"tool_name": tool_name, "result": content[:500]})
+                {
+                    "tool_name": tool_name,
+                    "result": content[:500],
+                    "arguments": args_dict,
+                    "success": not self._tool_result_failed_text(content),
+                    "turn": state.fc_turn,
+                    "memory_reference_edges": memory_reference_edges,
+                })
+            nudge_msg = self._build_observation_nudge(
+                state, tool_name, content, state.fc_turn)
+            if nudge_msg:
+                state.messages.append(nudge_msg)
+                if self._attn_window:
+                    self._attn_window.register_message(
+                        nudge_msg, turn=state.fc_turn, node_id=active_node_id)
 
         # 仅在所有pending结果都已处理后清空
         # pending_call_turns 通过 discard 机制自动管理，无需手动清空
@@ -3467,12 +4702,12 @@ class IDEFCRunner(FCRunner):
             if mg is None:
                 return
 
-            adapter = mg._adapters.get("code_graph")
+            adapter = getattr(mg, "_adapters", {}).get("code_graph")
             if adapter is None:
                 try:
                     from zulong.memory.graph_adapters import register_all_adapters
                     register_all_adapters(mg)
-                    adapter = mg._adapters.get("code_graph")
+                    adapter = getattr(mg, "_adapters", {}).get("code_graph")
                 except Exception:
                     pass
             if adapter is None:
@@ -3498,8 +4733,9 @@ class IDEFCRunner(FCRunner):
                         task_mg_id = candidate
                     else:
                         # 退化：搜索含 active_node_id 后缀的 TASK 节点
-                        for nid, nd in mg._nodes.items():
-                            if nd.node_type == NodeType.TASK and nid.endswith(active_node_id):
+                        for nd in mg.get_nodes_by_type(NodeType.TASK):
+                            nid = getattr(nd, "node_id", "")
+                            if nid.endswith(active_node_id):
                                 task_mg_id = nid
                                 break
 
@@ -3571,12 +4807,15 @@ class IDEFCRunner(FCRunner):
             local_node_ids = {s.node_id for s in result.symbols}
 
             global_sym_index = {}
-            for nid, node in mg._nodes.items():
-                if node.node_type == NodeType.CODE_SYMBOL:
-                    global_sym_index[node.label] = nid
-                    short = node.label.rsplit(".", 1)[-1]
-                    if short not in global_sym_index:
-                        global_sym_index[short] = nid
+            for node in mg.get_nodes_by_type(NodeType.CODE_SYMBOL):
+                nid = getattr(node, "node_id", "")
+                label = getattr(node, "label", "")
+                if not nid or not label:
+                    continue
+                global_sym_index[label] = nid
+                short = label.rsplit(".", 1)[-1]
+                if short not in global_sym_index:
+                    global_sym_index[short] = nid
 
             file_node_id = f"file:{file_path}"
             for imp in result.imports:
@@ -3758,9 +4997,26 @@ class IDEFCRunner(FCRunner):
                 if tc_data:
                     tc_data = self._apply_tool_call_budget_ide(state, tc_data)
                     if not tc_data:
+                        self._log_fc_decision_path(
+                            state,
+                            path="tool_budget_exhausted",
+                            tool_calls=[],
+                            response_content=resp_content or "",
+                            root_cause="context_pressure",
+                            tool_budget=state.tool_call_budget,
+                            tool_calls_used=state.tool_calls_used,
+                        )
                         continue
                     # 模型调用了工具 → 重置独白计数器
                     state.consecutive_text_only_count = 0
+                    self._log_fc_decision_path(
+                        state,
+                        path="tool_calls_dispatch",
+                        tool_calls=tc_data,
+                        response_content=resp_content or "",
+                        tool_names=[tc["function"]["name"] for tc in tc_data],
+                        tool_call_count=len(tc_data),
+                    )
                     self._publish_fc_progress(state, "exec_tools", f"{len(tc_data)} tool calls")
                     remote = self._exec_tools(state, tc_data, resp_content)
                     if remote:
@@ -3770,7 +5026,23 @@ class IDEFCRunner(FCRunner):
                     continue
                 # 模型纯文本回复（无工具调用）→ 递增独白计数器
                 state.consecutive_text_only_count += 1
+                self._log_fc_decision_path(
+                    state,
+                    path="no_tool_call_enter_eval",
+                    tool_calls=[],
+                    response_content=resp_content or "",
+                    response_length=len(resp_content or ""),
+                    cb_force=state.cb_force_no_tools,
+                    null_response_count=state.null_response_count,
+                )
                 verdict = self._eval_response(state, resp_content or "")
+                self._log_fc_decision_path(
+                    state,
+                    path=f"no_tool_call_verdict_{verdict}",
+                    tool_calls=[],
+                    response_content=resp_content or "",
+                    verdict=verdict,
+                )
                 if verdict == "done":
                     state.phase = "done"
                     
@@ -4232,10 +5504,18 @@ class IDEFCRunner(FCRunner):
             first_phase_flush_chars = 24
             first_phase_flush_seconds = 1.5
             first_phase_flush_interval = 0.12
+            finish_reason = ""
+            usage_data: Any = None
             
             for chunk in stream_response:
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage:
+                    usage_data = chunk_usage
                 if chunk.choices:
                     choice = chunk.choices[0]
+                    choice_finish = getattr(choice, "finish_reason", None)
+                    if choice_finish:
+                        finish_reason = str(choice_finish)
                     # 累积文本内容
                     if choice.delta.content:
                         token = choice.delta.content
@@ -4341,7 +5621,14 @@ class IDEFCRunner(FCRunner):
                 if tc:
                     logger.info(f"[IDEFCRunner] Turn {fc}: {len(tc)} 工具调用 (流式)")
                     for t in tc:
-                        logger.info(f"[IDEFCRunner]   FC tool: {t['function']['name']} args={_safe_truncate(t['function']['arguments'])}")
+                        logger.info(
+                            "[IDEFCRunner]   FC tool summary: %s",
+                            _json.dumps(
+                                _summarize_tool_call_for_log(t),
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            ),
+                        )
             
             # 返回完整内容供后续处理
             # 注意：task_complete在run_loop_async中统一发送，避免重复
@@ -4370,10 +5657,18 @@ class IDEFCRunner(FCRunner):
                     sentence_buffer = ""
                     sent_count = 0
                     retry_tool_calls = []  # 累积工具调用片段
+                    retry_finish_reason = ""
+                    retry_usage_data: Any = None
                     
                     for chunk in retry_stream:
+                        chunk_usage = getattr(chunk, "usage", None)
+                        if chunk_usage:
+                            retry_usage_data = chunk_usage
                         if chunk.choices:
                             choice = chunk.choices[0]
+                            choice_finish = getattr(choice, "finish_reason", None)
+                            if choice_finish:
+                                retry_finish_reason = str(choice_finish)
                             if choice.delta.content:
                                 token = choice.delta.content
                                 full_content += token
@@ -4439,11 +5734,28 @@ class IDEFCRunner(FCRunner):
                         if tc:
                             logger.info(f"[IDEFCRunner] Turn {fc}: {len(tc)} 工具调用 (429重试成功)")
                             for t in tc:
-                                logger.info(f"[IDEFCRunner]   FC tool: {t['function']['name']} args={_safe_truncate(t['function']['arguments'])}")
+                                logger.info(
+                                    "[IDEFCRunner]   FC tool summary: %s",
+                                    _json.dumps(
+                                        _summarize_tool_call_for_log(t),
+                                        ensure_ascii=False,
+                                        sort_keys=True,
+                                    ),
+                                )
                         else:
                             logger.info(f"[IDEFCRunner] Turn {fc}: 文本回复 len={len(rc)} (429重试成功)")
                     else:
                         logger.info(f"[IDEFCRunner] Turn {fc}: 文本回复 len={len(rc)} (429重试成功)")
+                    self._record_model_raw_output(
+                        state,
+                        fc,
+                        raw_content=rc,
+                        final_content=rc,
+                        tool_calls=tc,
+                        finish_reason=retry_finish_reason,
+                        usage=retry_usage_data,
+                        source="stream_retry_429",
+                    )
                     return tc, rc
                 except Exception as retry_err:
                     logger.warning(f"[IDEFCRunner] Turn {fc} 429重试仍失败: {retry_err}")
@@ -4463,6 +5775,16 @@ class IDEFCRunner(FCRunner):
                         stream=False, **self.engine._get_llm_extra_kwargs())
                     c = br.choices[0].message.content or ""
                     state.last_response_content = c
+                    self._record_model_raw_output(
+                        state,
+                        fc,
+                        raw_content=c,
+                        final_content=c,
+                        tool_calls=None,
+                        finish_reason=getattr(br.choices[0], "finish_reason", "") or "",
+                        usage=getattr(br, "usage", None),
+                        source="backup_after_primary_error",
+                    )
                     return None, c
             except Exception as be:
                 logger.warning(f"[IDEFCRunner] 备用也失败: {be}")
@@ -4475,11 +5797,19 @@ class IDEFCRunner(FCRunner):
         # 这里只需要处理 XML 工具调用回退
         
         # 检查是否包含 XML 格式的工具调用
+        raw_rc_before_xml = rc
         xml_tc = self.translator.parse_xml_tool_calls(rc)
         if xml_tc:
             logger.info(f"[IDEFCRunner] Turn {fc}: {len(xml_tc)} 工具调用 (XML 回退解析)")
             for xt in xml_tc:
-                logger.info(f"[IDEFCRunner]   XML tool: {xt['function']['name']} args={_safe_truncate(xt['function']['arguments'])}")
+                logger.info(
+                    "[IDEFCRunner]   XML tool summary: %s",
+                    _json.dumps(
+                        _summarize_tool_call_for_log(xt),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                )
             tc = xml_tc
             # 从内容中移除 XML 工具标签，保留前置文本
             rc = self._strip_xml_tool_tags(rc)
@@ -4492,6 +5822,16 @@ class IDEFCRunner(FCRunner):
                 # 调试：记录文本前 300 字符
                 snippet = rc[:300].replace('\n', '\\n')
                 logger.info(f"[IDEFCRunner] Turn {fc} 文本预览: {snippet}")
+        self._record_model_raw_output(
+            state,
+            fc,
+            raw_content=raw_rc_before_xml,
+            final_content=rc,
+            tool_calls=tc,
+            finish_reason=finish_reason,
+            usage=usage_data,
+            source="stream",
+        )
         
         return tc, rc
 
@@ -4600,6 +5940,35 @@ class IDEFCRunner(FCRunner):
         """执行工具 + 分流。混合批次拆分为两个 assistant 消息避免 orphaned tool_call IDs。"""
         fc = state.fc_turn
         msgs = state.messages
+        model_step_note = " ".join(str(response_content or "").split())
+        announce_calls, real_calls = self._split_announce_step_calls(tool_calls_data)
+        if announce_calls:
+            self._append_announce_step_messages(state, announce_calls, response_content, fc, None)
+        if real_calls and not model_step_note and not self._first_announce_step(announce_calls).get("message"):
+            retry_count = getattr(state, "step_announce_retry_count", 0)
+            if retry_count < 1:
+                state.step_announce_retry_count = retry_count + 1
+                control_msg = internal_control_message(
+                    "请先用一句普通可见中文说明本步将做什么，再重新发起工具调用；不要输出推理过程。"
+                    "如果当前模型/Provider 不保留 tool_calls 同轮 assistant.content，请先调用 announce_step(message=...) 再调用实际工具。"
+                )
+                msgs.append(control_msg)
+                if self._attn_window:
+                    self._attn_window.register_message(control_msg, turn=fc)
+            else:
+                state.cb_force_no_tools = True
+                control_msg = internal_control_message(
+                    "仍未收到可见步骤说明，本轮真实工具调用已被拦截。请不要继续调用工具，先说明当前受阻原因。"
+                )
+                msgs.append(control_msg)
+                if self._attn_window:
+                    self._attn_window.register_message(control_msg, turn=fc)
+            return None
+        if real_calls:
+            state.step_announce_retry_count = 0
+        tool_calls_data = real_calls
+        if not tool_calls_data:
+            return None
         internal, remote = [], []
         for td in tool_calls_data:
             (remote if self.tool_registry.classify(td["function"]["name"]) == "remote" else internal).append(td)
@@ -4620,8 +5989,9 @@ class IDEFCRunner(FCRunner):
                         logger.warning(f"[IDEFCRunner][CB] RED: {cb_r}")
                         state.cb_force_no_tools = True
                         state.cb_trigger_reason = cb_r  # 保存CB原因供_finalize使用
-                        cm = {"role": "user", "content":
-                              f"[Circuit Breaker 强制收敛] {cb_r}\n你必须立刻基于已有信息生成最终回复，不允许再调用任何工具。"}
+                        cm = internal_control_message(
+                            f"[Circuit Breaker 强制收敛] {cb_r}\n你必须立刻基于已有信息生成最终回复，不允许再调用任何工具。"
+                        )
                         msgs.append(cm)
                         if self._attn_window:
                             self._attn_window.register_message(cm, turn=fc)
@@ -4632,8 +6002,9 @@ class IDEFCRunner(FCRunner):
                         remote = []
                     elif cb_s == CircuitBreakerState.YELLOW:
                         logger.warning(f"[IDEFCRunner][CB] YELLOW: {cb_r}")
-                        ch = {"role": "user", "content":
-                              f"[Circuit Breaker 警告] {cb_r}\n请尽快总结当前信息并回复用户，避免继续调用更多工具。"}
+                        ch = internal_control_message(
+                            f"[Circuit Breaker 警告] {cb_r}\n请尽快总结当前信息并回复用户，避免继续调用更多工具。"
+                        )
                         msgs.append(ch)
                         if self._attn_window:
                             self._attn_window.register_message(ch, turn=fc)
@@ -4649,6 +6020,15 @@ class IDEFCRunner(FCRunner):
 
         if remote:
             valid_remote, rejected = self._validate_and_clean_remote_calls(remote)
+            if rejected:
+                self._log_fc_decision_path(
+                    state,
+                    path="invalid_tool_args_remote_rejected",
+                    tool_calls=remote,
+                    root_cause="invalid_tool_args",
+                    rejected_count=len(rejected),
+                    rejected_tools=[r[0]["function"]["name"] for r in rejected],
+                )
             all_calls = valid_remote + [r[0] for r in rejected]
             ra = {"role": "assistant", "content": "" if internal else (response_content or ""),
                   "tool_calls": all_calls}
@@ -4673,10 +6053,47 @@ class IDEFCRunner(FCRunner):
     def _exec_internal(self, state: IDEFCState, td: Dict, fc: int, grp: Optional[int]) -> None:
         tn = td["function"]["name"]
         ta = {}
+        parse_error = ""
         try:
             ta = _json.loads(td["function"]["arguments"] or "{}")
-        except Exception:
-            pass
+        except Exception as exc:
+            parse_error = str(exc)
+        if parse_error:
+            rt = _json.dumps({
+                "error": f"工具参数解析失败: {parse_error}",
+                "recoverable": True,
+                "reason": "tool_arguments_json_invalid",
+                "tool_name": tn,
+            }, ensure_ascii=False)
+            logger.error("[IDEFCRunner] 内部工具 %s 参数解析失败: %s", tn, parse_error)
+            self._log_fc_decision_path(
+                state,
+                path="invalid_tool_args_internal_parse_error",
+                tool_calls=[td],
+                response_content=rt,
+                root_cause="invalid_tool_args",
+                tool_name=tn,
+                error=_safe_error_summary(parse_error),
+            )
+            tm = {"role": "tool", "tool_call_id": td["id"], "content": rt}
+            state.messages.append(tm)
+            if self._attn_window:
+                self._attn_window.register_message(
+                    tm, turn=fc, tool_name=tn, group_id=grp)
+            if len(state.tool_results_buffer) >= _TOOL_RESULTS_BUFFER_MAX:
+                state.tool_results_buffer.pop(0)
+            state.tool_results_buffer.append({
+                "tool_name": tn,
+                "result": rt,
+                "arguments": {"_parse_error": parse_error},
+                "success": False,
+                "turn": fc,
+            })
+            if self._circuit_breaker:
+                self._circuit_breaker.record_call(
+                    tn, {"_parse_error": parse_error}, rt)
+            return
+        attn_before = self._attention_state()
         if self._attn_window:
             self._attn_window.observe_tool_call(tn, ta)
             if tn == "navigate_attention":
@@ -4741,6 +6158,7 @@ class IDEFCRunner(FCRunner):
             if state.pressure_force_attention:
                 state.pressure_force_attention = False
                 logger.info(f"[IDEFCRunner][Pressure] 注意力工具 {tn} 已执行，恢复正常工具列表")
+        attn_after = self._attention_state()
         if self._circuit_breaker:
             self._circuit_breaker.record_call(tn, ta, rt)
             if tn in ("task_create_plan", "start_task_plan", "task_add_node"):
@@ -4756,7 +6174,46 @@ class IDEFCRunner(FCRunner):
                 node_id=ta.get("node_id") or ta.get("target_node_id"), group_id=grp)
         if len(state.tool_results_buffer) >= _TOOL_RESULTS_BUFFER_MAX:
             state.tool_results_buffer.pop(0)
-        state.tool_results_buffer.append({"tool_name": tn, "result": rt})
+        tool_success = not self._tool_result_failed_text(rt)
+        memory_reference_edges = self._memory_reference_edges_from_result(rt)
+        state.tool_results_buffer.append({
+            "tool_name": tn,
+            "result": rt,
+            "arguments": ta,
+            "success": tool_success,
+            "turn": fc,
+            "memory_reference_edges": memory_reference_edges,
+        })
+        nudge_msg = self._build_observation_nudge(state, tn, rt, fc)
+        if nudge_msg:
+            state.messages.append(nudge_msg)
+            if self._attn_window:
+                self._attn_window.register_message(
+                    nudge_msg, turn=fc,
+                    node_id=ta.get("node_id") or ta.get("target_node_id"),
+                    group_id=grp)
+        if attn_before != attn_after and tn in (
+            "navigate_attention", "adjust_attention_mode", "task_mark_status"
+        ):
+            current_node_id = attn_after[1]
+            if tn == "task_mark_status" and (ta.get("new_status") or ta.get("status")) in ("completed", "skipped"):
+                try:
+                    task_graph = self._get_current_task_graph()
+                    parent_id = task_graph.get_parent(ta.get("node_id") or "") if task_graph else ""
+                    if parent_id and (not current_node_id or current_node_id == ta.get("node_id")):
+                        current_node_id = parent_id
+                except Exception:
+                    pass
+            reason = "attention_changed" if tn in ("navigate_attention", "adjust_attention_mode") else "status_auto_navigate"
+            nav_msg = self._build_attention_navigation_map(
+                state, fc, reason=reason, current_node_id=current_node_id)
+            if nav_msg:
+                state.messages.append(nav_msg)
+                if self._attn_window:
+                    self._attn_window.register_message(
+                        nav_msg, turn=fc,
+                        node_id=current_node_id,
+                        group_id=grp)
         self.engine._publish_task_graph_event("agent_tool_call", fc, tn, rt)
         # 记录子对话到 MemoryGraph
         self._record_sub_dialogue(state, tool_name=tn, result=rt)
@@ -4803,13 +6260,15 @@ class IDEFCRunner(FCRunner):
             "file_path": "path", "filepath": "path", "file": "path",
             "filename": "path", "file_name": "path",
             "file_content": "content", "text": "content", "data": "content",
+            "write_mode": "mode",
         },
         "replace_in_file": {
             "file_path": "path", "filepath": "path",
             "changes": "diff", "replacement": "diff", "replacements": "diff",
         },
         "execute_command": {
-            "cmd": "command", "shell_command": "command", "shell": "command",
+            "cmd": "command", "shell_command": "command",
+            "shell_type": "shell", "terminal_shell": "shell", "terminal": "shell",
         },
         "search_files": {
             "directory": "path", "dir": "path", "folder": "path",
@@ -4889,6 +6348,37 @@ class IDEFCRunner(FCRunner):
                 logger.info(
                     f"[IDEFCRunner] 参数默认值填充 {fn}: {', '.join(defaulted)}")
 
+            if fn == "write_to_file":
+                mode = str(args.get("mode") or "overwrite").strip().lower()
+                if mode not in {"overwrite", "append"}:
+                    mode = "overwrite"
+                args["mode"] = mode
+                if mode == "append":
+                    path_value = str(args.get("path") or "")
+                    content_value = str(args.get("content") or "")
+                    try:
+                        target = Path(path_value)
+                        if not target.is_absolute():
+                            try:
+                                from zulong.tools.task_tools import get_active_workspace_dir
+                                workspace = get_active_workspace_dir()
+                            except Exception:
+                                workspace = ""
+                            if workspace:
+                                target = Path(workspace) / target
+                        if target.is_absolute() and target.exists() and target.is_file():
+                            args["content"] = target.read_text(encoding="utf-8") + content_value
+                            args["mode"] = "overwrite"
+                            logger.info(
+                                "[IDEFCRunner] write_to_file append 已预展开为覆盖完整内容: %s",
+                                target,
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "[IDEFCRunner] write_to_file append 预展开失败，交给客户端处理: %s",
+                            exc,
+                        )
+
             # ── 路径矫正：list_code_definition_names 的 path 必须是目录 ──
             # IDE 扩展将 path 用作子进程 cwd，传入文件路径会报错
             # "The cwd option must be a path to a directory"
@@ -4963,6 +6453,11 @@ class IDEFCRunner(FCRunner):
                         return "continue"
             except Exception:
                 pass
+            gate_verdict, resp = self._completion_quality_gate(state, resp)
+            if gate_verdict:
+                logger.info(f"[IDEFCRunner][EvalChain] turn={fc} path=cb_quality_{gate_verdict}")
+                return gate_verdict
+            state.last_response_content = resp
             logger.info(f"[IDEFCRunner][CB] 强制回复, len={len(resp)}")
             logger.info(f"[IDEFCRunner][EvalChain] turn={fc} path=cb_force_done")
             return "done"
@@ -5373,6 +6868,11 @@ class IDEFCRunner(FCRunner):
                     f"'{resp[:50]}', greeting={is_greeting}")
                 return "continue"
 
+        gate_verdict, resp = self._completion_quality_gate(state, resp)
+        if gate_verdict:
+            logger.info(f"[IDEFCRunner][EvalChain] turn={fc} path=quality_{gate_verdict}")
+            return gate_verdict
+
         state.last_response_content = resp
         logger.info(f"[IDEFCRunner][EvalChain] turn={fc} path=default_done")
         return "done"
@@ -5558,6 +7058,949 @@ class IDEFCRunner(FCRunner):
             pass
         return self.engine._get_fallback_response(state.user_input_text)
 
+    def _detect_completion_intent(
+        self,
+        state: IDEFCState,
+        resp: str,
+        tool_call: Optional[Dict] = None,
+    ) -> Dict[str, Any]:
+        """Detect whether the current turn is trying to complete an FC task."""
+        tg = self._get_current_task_graph()
+        if not tg:
+            return {
+                "should_check": False,
+                "intent": "chat_only",
+                "reason": "no_active_task_graph",
+                "active_graph_id": "",
+                "high_risk": False,
+            }
+
+        graph_id = str(getattr(tg, "id", "") or "")
+        if tool_call:
+            fn = str(tool_call.get("function", {}).get("name", "") or "")
+            if fn in {"submit_final_answer", "attempt_completion"}:
+                return {
+                    "should_check": True,
+                    "intent": "completion_tool",
+                    "reason": fn,
+                    "active_graph_id": graph_id,
+                    "high_risk": True,
+                }
+
+        if state.cb_force_no_tools or state.cb_trigger_reason or state.tool_call_budget is not None:
+            return {
+                "should_check": True,
+                "intent": "forced_converge",
+                "reason": state.cb_trigger_reason or "forced_no_tools_or_budget",
+                "active_graph_id": graph_id,
+                "high_risk": True,
+            }
+
+        resp_text = str(resp or "").strip()
+        if not resp_text:
+            return {
+                "should_check": True,
+                "intent": "final_text",
+                "reason": "empty_final_text",
+                "active_graph_id": graph_id,
+                "high_risk": True,
+            }
+
+        return {
+            "should_check": True,
+            "intent": "final_text",
+            "reason": "text_without_tool_calls",
+            "active_graph_id": graph_id,
+            "high_risk": self._task_or_response_high_risk(state, resp_text),
+        }
+
+    def _task_or_response_high_risk(self, state: IDEFCState, resp: str) -> bool:
+        text = f"{state.user_input_text or ''}\n{resp or ''}".lower()
+        return any(term in text for term in (
+            "删除", "支付", "财务", "密钥", "secret", "token", "api key",
+            "deploy", "生产", "数据库", "迁移", "权限", "安全", "rm -rf",
+        ))
+
+    def _compute_node_coverage(self, state: IDEFCState, tg) -> Dict[str, Any]:
+        """Compute structured node visibility from AttentionWindow envelopes."""
+        covered = set()
+        try:
+            if self._attn_window:
+                cached_visible = {
+                    str(node_id)
+                    for node_id in getattr(self._attn_window, "_last_visible_node_ids", set()) or set()
+                    if str(node_id)
+                }
+                if cached_visible:
+                    covered.update(cached_visible)
+                else:
+                    current = str(getattr(self._attn_window, "_current_node_id", "") or "")
+                    if current:
+                        covered.add(current)
+                        try:
+                            covered.update(
+                                str(getattr(node, "id", "") or "")
+                                for node in tg.get_ancestor_chain(current)
+                            )
+                        except Exception:
+                            pass
+                    for env in getattr(self._attn_window, "envelopes", []) or []:
+                        node_id = str(getattr(env, "node_id", "") or "")
+                        if node_id:
+                            covered.add(node_id)
+        except Exception:
+            covered = set()
+
+        all_node_ids = {
+            n.id for n in getattr(tg, "nodes", [])
+            if not str(getattr(n, "id", "")).startswith("crg_")
+        }
+        uncovered = sorted(all_node_ids - covered) if covered else []
+        uncovered_in_progress = []
+        if covered:
+            for node in getattr(tg, "nodes", []):
+                node_id = str(getattr(node, "id", "") or "")
+                if (node_id in all_node_ids
+                        and getattr(node, "status", "") == "in_progress"
+                        and node_id not in covered):
+                    uncovered_in_progress.append(node_id)
+        ratio = (len(all_node_ids) - len(uncovered)) / max(len(all_node_ids), 1)
+        return {
+            "covered": sorted(covered & all_node_ids),
+            "uncovered": uncovered,
+            "coverage_ratio": ratio,
+            "uncovered_in_progress": uncovered_in_progress,
+        }
+
+    def _pre_completion_verify(self, state: IDEFCState, resp: str) -> Optional[str]:
+        """Hard gate before final completion. Returns a concrete nudge or None."""
+        if getattr(state, "quality_forced_risk_summary", False):
+            return None
+        tg = self._get_current_task_graph()
+        if not tg:
+            return None
+        reasons: List[str] = []
+
+        try:
+            leaves = [
+                n for n in tg.get_leaf_nodes()
+                if not str(getattr(n, "id", "")).startswith("crg_")
+            ]
+            in_progress = [
+                n for n in leaves
+                if getattr(n, "status", "") == "in_progress"
+            ]
+            for node in in_progress[:3]:
+                reasons.append(f"{tg.get_node_address(node.id)} 仍为 in_progress")
+        except Exception:
+            pass
+
+        recent = list(getattr(state, "tool_results_buffer", []) or [])[-5:]
+        resp_lower = str(resp or "").lower()
+        mentions_risk = any(term in resp_lower for term in (
+            "失败", "错误", "异常", "未验证", "风险", "受阻",
+            "failed", "error", "exception", "unverified", "risk", "blocked",
+        ))
+        failed_recent = [
+            item for item in recent
+            if not item.get("success", not self._tool_result_failed_text(item.get("result", "")))
+        ]
+        if failed_recent and not mentions_risk:
+            names = "、".join(
+                self._friendly_tool_name(item.get("tool_name", "工具"))
+                for item in failed_recent[:3]
+            )
+            reasons.append(f"最近工具结果包含失败但最终回复未说明: {names}")
+
+        coverage = self._compute_node_coverage(state, tg)
+        if coverage.get("uncovered_in_progress"):
+            addrs = [
+                tg.get_node_address(nid)
+                for nid in coverage["uncovered_in_progress"][:3]
+            ]
+            reasons.append("当前窗口不可见的进行中节点: " + "、".join(addrs))
+
+        last_mark = next(
+            (
+                item for item in reversed(getattr(state, "tool_results_buffer", []) or [])
+                if item.get("tool_name") == "task_mark_status"
+                and (item.get("arguments", {}).get("new_status")
+                     or item.get("arguments", {}).get("status")) == "completed"
+            ),
+            None,
+        )
+        if last_mark:
+            node_id = last_mark.get("arguments", {}).get("node_id") or ""
+            node = tg.get_node(node_id) if node_id else None
+            if not last_mark.get("success", True) or not node or node.status != "completed":
+                addr = tg.get_node_address(node_id) if node_id else "unknown"
+                reasons.append(f"最近完成标记未被 TaskGraph 真实确认: {addr}")
+
+        evidence = self._collect_completion_evidence(state, resp)
+        for violated in (evidence.get("constraints", {}) or {}).get("violated_constraints", [])[:5]:
+            if violated not in reasons:
+                reasons.append(violated)
+
+        if not reasons:
+            return None
+        listed = "\n".join(f"{idx}. {reason}" for idx, reason in enumerate(reasons[:5], 1))
+        return (
+            "[完成前验证]\n"
+            "不能直接结束，必须先处理以下阻塞项:\n"
+            f"{listed}\n"
+            "请继续 FC 循环，只处理上述问题；如无法继续，请输出 partial/blocked summary 并列明风险。"
+        )
+
+    def _collect_completion_evidence(
+        self,
+        state: IDEFCState,
+        resp: str,
+        intent: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        tg = self._get_current_task_graph()
+        task_coverage: Dict[str, Any] = {
+            "leaf_status_counts": {},
+            "unfinished_leaf_addresses": [],
+            "completed_leaf_addresses": [],
+        }
+        coverage = {}
+        if tg:
+            leaves = [
+                n for n in tg.get_leaf_nodes()
+                if not str(getattr(n, "id", "")).startswith("crg_")
+            ]
+            counts: Dict[str, int] = {}
+            unfinished = []
+            completed = []
+            for node in leaves:
+                status = str(getattr(node, "status", "") or "pending")
+                counts[status] = counts.get(status, 0) + 1
+                addr = tg.get_node_address(node.id)
+                if status in ("completed", "skipped"):
+                    completed.append(addr)
+                else:
+                    unfinished.append(addr)
+            task_coverage = {
+                "leaf_status_counts": counts,
+                "unfinished_leaf_addresses": unfinished,
+                "completed_leaf_addresses": completed,
+                "total_leaves": len(leaves),
+            }
+            coverage = self._compute_node_coverage(state, tg)
+
+        recent = list(getattr(state, "tool_results_buffer", []) or [])[-10:]
+        failed_tools = [
+            item for item in recent
+            if not item.get("success", not self._tool_result_failed_text(item.get("result", "")))
+        ]
+        empty_tools = [
+            item for item in recent
+            if not str(item.get("result", "") or "").strip()
+            or str(item.get("result", "") or "").strip() in {"{}", "[]", "null", "None"}
+        ]
+        write_ops = [
+            item for item in recent
+            if str(item.get("tool_name", "")) in {
+                "write_to_file", "replace_in_file", "ide_write_file",
+                "ide_replace_text", "create_file", "insert_code_block",
+            }
+        ]
+        verify_ops = [
+            item for item in recent
+            if str(item.get("tool_name", "")) in {
+                "exec_run_command", "execute_command", "browser_action",
+                "read_file", "ide_read_file", "search_code_symbols",
+            }
+        ]
+        tests_run = []
+        for item in verify_ops:
+            args_text = _json.dumps(item.get("arguments", {}), ensure_ascii=False).lower()
+            if any(term in args_text for term in ("test", "pytest", "npm run", "tsc", "lint", "build", "检查", "测试")):
+                tests_run.append(item)
+
+        hard_constraints = self._extract_lightweight_constraints(state.user_input_text)
+        target_constraints = self._extract_target_constraints(state.user_input_text)
+        written_paths = self._collect_written_paths(write_ops)
+        command_evidence = self._collect_command_evidence(verify_ops)
+        violated_constraints = self._target_constraint_violations(
+            target_constraints,
+            written_paths,
+            command_evidence,
+        )
+        latest_commands: Dict[str, Dict[str, Any]] = {}
+        for cmd in command_evidence:
+            key = " ".join(str(cmd.get("command") or "").lower().split()) or str(cmd.get("cwd") or "")
+            latest_commands[key] = cmd
+        failed_commands_uncovered = [
+            cmd.get("command", "")
+            for cmd in latest_commands.values()
+            if cmd.get("status") == "failed"
+        ][:5]
+        mentioned_constraints = [
+            c for c in hard_constraints
+            if c.lower() in str(resp or "").lower()
+        ]
+
+        return {
+            "intent": intent or {},
+            "task_coverage": task_coverage,
+            "verification": {
+                "write_ops": [i.get("tool_name") for i in write_ops],
+                "verify_ops": [i.get("tool_name") for i in verify_ops],
+                "tests_run": [i.get("tool_name") for i in tests_run],
+                "has_write_ops": bool(write_ops),
+                "has_verify_ops": bool(verify_ops),
+                "has_tests_run": bool(tests_run),
+                "written_paths": written_paths,
+                "commands": command_evidence,
+            },
+            "tool_handling": {
+                "recent_tool_results": [i.get("tool_name") for i in recent],
+                "failed_tool_results": [i.get("tool_name") for i in failed_tools],
+                "empty_tool_results": [i.get("tool_name") for i in empty_tools],
+            },
+            "constraints": {
+                "hard_constraints": hard_constraints,
+                "mentioned_constraints": mentioned_constraints,
+                "violated_constraints": violated_constraints,
+                "target_paths": target_constraints.get("target_paths", []),
+                "project_name": target_constraints.get("project_name", ""),
+                "requires_root_command": target_constraints.get("requires_root_command", False),
+            },
+            "completion_evidence": {
+                "project_name": target_constraints.get("project_name", ""),
+                "target_paths": target_constraints.get("target_paths", []),
+                "written_paths": written_paths,
+                "commands": command_evidence,
+                "failed_commands_uncovered": failed_commands_uncovered,
+            },
+            "risks": {
+                "response_mentions_risk": any(term in str(resp or "").lower() for term in (
+                    "风险", "未验证", "失败", "受阻", "risk", "unverified", "failed", "blocked",
+                )),
+                "high_risk": bool((intent or {}).get("high_risk")),
+            },
+            "attention": coverage,
+            "memory_closure": {
+                "memory_changes": self._get_memory_changes_snapshot(),
+                "task_nodes_synced": None,
+            },
+        }
+
+    @staticmethod
+    def _extract_target_constraints(user_text: str) -> Dict[str, Any]:
+        import os as _os
+        import re as _re
+
+        text = str(user_text or "")
+        win_paths = _re.findall(r"[A-Za-z]:[\\/][^\s，。；;,\n\r\"'`]+", text)
+        posix_paths = _re.findall(r"/(?:[^\s，。；;,\n\r\"'`]+)", text)
+        target_paths: List[str] = []
+        for path in [*win_paths, *posix_paths]:
+            clean = path.strip().rstrip("。；;,，")
+            if clean and clean not in target_paths:
+                target_paths.append(clean)
+        project_name = ""
+        project_match = _re.search(r"(?:项目名|项目|目录名|文件夹名)[:：\s]+([\w\-.]+)", text)
+        if project_match:
+            project_name = project_match.group(1).strip("。；;,，")
+        elif target_paths:
+            project_name = _os.path.basename(target_paths[-1].replace("\\", "/").rstrip("/"))
+        requires_root_command = any(
+            term in text for term in ("根目录", "仓库根目录", "项目根目录", "repo root", "repository root")
+        )
+        return {
+            "target_paths": target_paths[:6],
+            "project_name": project_name,
+            "requires_root_command": requires_root_command,
+        }
+
+    @staticmethod
+    def _normalize_path_text(value: Any) -> str:
+        return str(value or "").replace("\\", "/").rstrip("/").lower()
+
+    @classmethod
+    def _collect_written_paths(cls, write_ops: List[Dict[str, Any]]) -> List[str]:
+        paths: List[str] = []
+        for item in write_ops:
+            args = item.get("arguments", {}) if isinstance(item, dict) else {}
+            if not isinstance(args, dict):
+                continue
+            for key in ("path", "file_path", "target_path", "workspace_path"):
+                value = str(args.get(key) or "").strip()
+                if value and value not in paths:
+                    paths.append(value)
+        return paths[:20]
+
+    def _collect_command_evidence(self, verify_ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        commands: List[Dict[str, Any]] = []
+        default_cwd = str(getattr(self, "cwd", "") or "")
+        for item in verify_ops:
+            tool_name = str(item.get("tool_name", ""))
+            if tool_name not in {"exec_run_command", "execute_command", "browser_action"}:
+                continue
+            args = item.get("arguments", {}) if isinstance(item, dict) else {}
+            if not isinstance(args, dict):
+                args = {}
+            command = str(args.get("command") or args.get("cmd") or "").strip()
+            cwd = str(args.get("cwd") or args.get("workspace_path") or default_cwd).strip()
+            success = bool(item.get("success", not self._tool_result_failed_text(item.get("result", ""))))
+            result_text = str(item.get("result", "") or "")
+            exit_code = 0 if success else 1
+            try:
+                parsed = _json.loads(result_text)
+                if isinstance(parsed, dict):
+                    data = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
+                    if isinstance(data.get("returncode"), int):
+                        exit_code = data["returncode"]
+            except Exception:
+                pass
+            commands.append({
+                "cwd": cwd,
+                "command": command or tool_name,
+                "exit_code": exit_code,
+                "status": "succeeded" if success else "failed",
+                "covers_root": bool(default_cwd and self._normalize_path_text(cwd) == self._normalize_path_text(default_cwd)),
+                "covers_target": False,
+            })
+        return commands[:20]
+
+    @classmethod
+    def _target_constraint_violations(
+        cls,
+        target_constraints: Dict[str, Any],
+        written_paths: List[str],
+        command_evidence: List[Dict[str, Any]],
+    ) -> List[str]:
+        violations: List[str] = []
+        targets = list(target_constraints.get("target_paths") or [])
+        normalized_written = [cls._normalize_path_text(path) for path in written_paths]
+        for target in targets:
+            normalized_target = cls._normalize_path_text(target)
+            if normalized_target and not any(path.startswith(normalized_target) or normalized_target in path for path in normalized_written):
+                violations.append(f"用户指定目标目录缺少写入证据: {target}")
+        project_name = str(target_constraints.get("project_name") or "").strip()
+        if project_name and written_paths:
+            pn = project_name.lower()
+            if not any(pn in cls._normalize_path_text(path).split("/") for path in written_paths):
+                violations.append(f"用户指定项目名缺少写入证据: {project_name}")
+        if target_constraints.get("requires_root_command"):
+            if not any(cmd.get("covers_root") and cmd.get("status") == "succeeded" for cmd in command_evidence):
+                violations.append("用户要求根目录验证，但缺少根目录成功命令证据")
+        latest_by_command: Dict[str, Dict[str, Any]] = {}
+        for cmd in command_evidence:
+            key = " ".join(str(cmd.get("command") or "").lower().split()) or str(cmd.get("cwd") or "")
+            latest_by_command[key] = cmd
+        failed_commands = [cmd for cmd in latest_by_command.values() if cmd.get("status") == "failed"]
+        if failed_commands:
+            violations.append("存在失败命令未被后续成功命令覆盖: " + "、".join(
+                str(cmd.get("command") or "命令")[:80] for cmd in failed_commands[:3]
+            ))
+        return violations[:8]
+
+    @staticmethod
+    def _extract_lightweight_constraints(user_text: str) -> List[str]:
+        text = str(user_text or "")
+        constraints = []
+        for token in ("不要", "必须", "只能", "不超过", "最多", "路径", "TSD", "中文", "英文"):
+            if token in text:
+                constraints.append(token)
+        return constraints[:8]
+
+    def _score_completion_quality(self, evidence: Dict[str, Any]) -> Dict[str, Any]:
+        task = evidence.get("task_coverage", {}) or {}
+        verification = evidence.get("verification", {}) or {}
+        handling = evidence.get("tool_handling", {}) or {}
+        constraints = evidence.get("constraints", {}) or {}
+        risks = evidence.get("risks", {}) or {}
+        attention = evidence.get("attention", {}) or {}
+
+        reasons: List[str] = []
+        risk_reasons: List[str] = []
+
+        total = int(task.get("total_leaves", 0) or 0)
+        unfinished = list(task.get("unfinished_leaf_addresses", []) or [])
+        if total == 0:
+            task_score = 0.75
+            risk_reasons.append("未发现可核验的 TaskGraph 叶子节点")
+        elif not unfinished:
+            task_score = 1.0
+        else:
+            done = len(task.get("completed_leaf_addresses", []) or [])
+            task_score = max(0.0, min(0.8, done / max(total, 1)))
+            reasons.append(f"仍有 {len(unfinished)} 个任务叶子未完成")
+
+        if attention.get("uncovered_in_progress"):
+            task_score = min(task_score, 0.55)
+            reasons.append("存在当前窗口不可见的进行中节点")
+
+        if verification.get("has_write_ops"):
+            if verification.get("has_tests_run"):
+                verify_score = 1.0
+            elif verification.get("has_verify_ops"):
+                verify_score = 0.75
+                risk_reasons.append("已有核验工具结果，但未发现明确测试/构建证据")
+            else:
+                verify_score = 0.35
+                reasons.append("检测到写入/修改操作，但缺少后续验证证据")
+        else:
+            verify_score = 0.85
+
+        failed = list(handling.get("failed_tool_results", []) or [])
+        empty = list(handling.get("empty_tool_results", []) or [])
+        if failed:
+            handling_score = 0.35 if not risks.get("response_mentions_risk") else 0.65
+            reasons.append("存在失败工具结果未完全消化")
+        elif empty:
+            handling_score = 0.75
+            risk_reasons.append("存在空工具结果，需要确认是否影响结论")
+        else:
+            handling_score = 1.0
+
+        violated = list(constraints.get("violated_constraints", []) or [])
+        constraint_score = 0.4 if violated else 1.0
+        for item in violated[:3]:
+            reasons.append(f"用户硬约束可能未满足: {item}")
+
+        has_known_risk = bool(reasons or risk_reasons or failed or unfinished)
+        if has_known_risk and not risks.get("response_mentions_risk"):
+            risk_score = 0.45
+            if not reasons:
+                risk_reasons.append("存在未完全核验事项，但最终回复未主动说明")
+        else:
+            risk_score = 1.0
+
+        dimensions = {
+            "task_coverage": task_score,
+            "verification_evidence": verify_score,
+            "tool_result_handling": handling_score,
+            "constraint_alignment": constraint_score,
+            "risk_transparency": risk_score,
+        }
+        score = (
+            task_score * 0.30
+            + verify_score * 0.25
+            + handling_score * 0.20
+            + constraint_score * 0.15
+            + risk_score * 0.10
+        )
+        if score >= 0.80:
+            level = "pass"
+        elif score >= 0.60:
+            level = "warn"
+        else:
+            level = "iterate"
+        return {
+            "score": round(score, 3),
+            "level": level,
+            "dimensions": dimensions,
+            "blocking_reasons": reasons[:8],
+            "risk_reasons": risk_reasons[:8],
+        }
+
+    def _build_quality_review_nudge(
+        self,
+        evidence: Dict[str, Any],
+        quality: Dict[str, Any],
+    ) -> str:
+        reasons = list(quality.get("blocking_reasons") or [])
+        if not reasons:
+            reasons = list(quality.get("risk_reasons") or [])
+        if not reasons:
+            reasons = ["缺少足够结构化证据确认任务已完成"]
+        listed = "\n".join(f"{idx}. {reason}" for idx, reason in enumerate(reasons[:5], 1))
+        return (
+            "[质量复核]\n"
+            f"当前完成质量分: {quality.get('score', 0):.2f}，未达到 0.80。\n"
+            "必须先处理:\n"
+            f"{listed}\n"
+            "请继续 FC 循环，只处理上述阻塞项；不要重新规划无关任务。"
+        )
+
+    def _maybe_quality_iterate(
+        self,
+        state: IDEFCState,
+        evidence: Dict[str, Any],
+        quality: Dict[str, Any],
+    ) -> Optional[str]:
+        state.quality_last_score = float(quality.get("score", 0.0) or 0.0)
+        state.quality_last_reasons = list(
+            quality.get("blocking_reasons") or quality.get("risk_reasons") or []
+        )
+        if getattr(state, "quality_forced_risk_summary", False):
+            return None
+        if quality.get("level") in {"pass", "warn"}:
+            return None
+
+        review_key = _json.dumps({
+            "unfinished": evidence.get("task_coverage", {}).get("unfinished_leaf_addresses", [])[:5],
+            "failed": evidence.get("tool_handling", {}).get("failed_tool_results", [])[:5],
+            "empty": evidence.get("tool_handling", {}).get("empty_tool_results", [])[:5],
+            "score": quality.get("score"),
+        }, ensure_ascii=False, sort_keys=True)
+
+        if state.quality_iteration_count >= 2 or (
+            review_key == getattr(state, "quality_last_review_key", "")
+            and state.quality_iteration_count >= 1
+        ):
+            state.quality_forced_risk_summary = True
+            return (
+                "[质量复核] 已达到迭代上限或复核问题未变化。"
+                "请输出 partial/blocked summary，明确列出完成项、未完成项、未验证项和风险。"
+            )
+
+        state.quality_iteration_count += 1
+        state.quality_last_review_key = review_key
+        return self._build_quality_review_nudge(evidence, quality)
+
+    def _quality_level_from_state(self, state: IDEFCState) -> str:
+        if getattr(state, "quality_forced_risk_summary", False):
+            return "blocked"
+        score = float(getattr(state, "quality_last_score", 1.0) or 0.0)
+        if score >= 0.80:
+            return "pass"
+        if score >= 0.60:
+            return "warn"
+        return "iterate"
+
+    def _quality_risk_appendix(self, quality: Dict[str, Any]) -> str:
+        reasons = list(quality.get("risk_reasons") or quality.get("blocking_reasons") or [])
+        if not reasons:
+            return ""
+        listed = "；".join(str(r) for r in reasons[:3])
+        return f"\n\n[质量复核] 当前质量等级为 warn，需注意: {listed}"
+
+    @staticmethod
+    def _parse_reviewer_json(text: str) -> Dict[str, Any]:
+        raw = str(text or "").strip()
+        if not raw:
+            return {}
+        try:
+            data = _json.loads(raw)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            pass
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                data = _json.loads(raw[start:end + 1])
+                return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def _maybe_run_completion_reviewer(
+        self,
+        state: IDEFCState,
+        evidence: Dict[str, Any],
+        quality: Dict[str, Any],
+        resp: str,
+    ) -> Optional[str]:
+        """Use L2-BACKUP as an optional structured reviewer for high-risk finishes."""
+        score = float(quality.get("score", 1.0) or 0.0)
+        if score >= 0.80:
+            state.quality_reviewer_health = {
+                "status": "skipped_high_local_score",
+                "score": score,
+            }
+            return None
+        if getattr(state, "quality_reviewer_count", 0) >= 1:
+            state.quality_reviewer_health = {
+                "status": "skipped_limit_reached",
+                "score": score,
+                "count": getattr(state, "quality_reviewer_count", 0),
+            }
+            return None
+        risks = evidence.get("risks", {}) or {}
+        intent = evidence.get("intent", {}) or {}
+        task = evidence.get("task_coverage", {}) or {}
+        handling = evidence.get("tool_handling", {}) or {}
+        is_complex = int(task.get("total_leaves", 0) or 0) >= 6
+        is_high_risk = bool(
+            risks.get("high_risk")
+            or intent.get("high_risk")
+            or handling.get("failed_tool_results")
+            or is_complex
+        )
+        if not is_high_risk:
+            state.quality_reviewer_health = {
+                "status": "skipped_not_high_risk",
+                "score": score,
+                "total_leaves": int(task.get("total_leaves", 0) or 0),
+            }
+            return None
+        engine = getattr(self, "engine", None)
+        backup_client = getattr(engine, "backup_client", None)
+        if not backup_client:
+            state.quality_reviewer_health = {
+                "status": "not_configured",
+                "reason": "backup_client_missing",
+                "score": score,
+            }
+            logger.info(
+                "[IDEFCRunner][QualityReviewer] L2-BACKUP 外审未配置: backup_client_missing"
+            )
+            return None
+        LLM_MODEL_ID_BACKUP = (
+            getattr(engine, "backup_model_id", None)
+            or getattr(engine, "l2_backup_model_id", None)
+            or getattr(backup_client, "model", None)
+            or getattr(backup_client, "model_name", None)
+        )
+        if not LLM_MODEL_ID_BACKUP:
+            try:
+                import sys
+
+                container_mod = sys.modules.get("zulong.models.container")
+                LLM_MODEL_ID_BACKUP = getattr(container_mod, "LLM_MODEL_ID_BACKUP", "") if container_mod else ""
+            except Exception:
+                LLM_MODEL_ID_BACKUP = ""
+        if not LLM_MODEL_ID_BACKUP and backup_client:
+            LLM_MODEL_ID_BACKUP = "backup-model"
+        if not LLM_MODEL_ID_BACKUP:
+            state.quality_reviewer_health = {
+                "status": "not_configured",
+                "reason": "backup_model_id_missing",
+                "score": score,
+            }
+            logger.info(
+                "[IDEFCRunner][QualityReviewer] L2-BACKUP 外审未配置: backup_model_id_missing"
+            )
+            return None
+
+        state.quality_reviewer_count += 1
+        payload = {
+            "local_quality": quality,
+            "evidence": evidence,
+            "final_response_preview": str(resp or "")[:3000],
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是祖龙 FC 完成质量外审器。只依据用户任务、结构化证据和最终回复预览评审；"
+                    "不得调用工具，不得替代最终答案。只输出 JSON 对象，字段为 "
+                    "score_delta, missed_constraints, missing_evidence, suggested_next_actions。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": _json.dumps(payload, ensure_ascii=False, default=str),
+            },
+        ]
+        try:
+            review = backup_client.chat.completions.create(
+                model=LLM_MODEL_ID_BACKUP,
+                messages=messages,
+                max_tokens=800,
+                temperature=0.0,
+                stream=False,
+            )
+            text = review.choices[0].message.content or ""
+            data = self._parse_reviewer_json(text)
+            if not data:
+                state.quality_reviewer_health = {
+                    "status": "non_json",
+                    "raw_length": len(text),
+                    "raw_preview": _safe_error_summary(text, 240),
+                    "score": score,
+                }
+                logger.info(
+                    "[IDEFCRunner][QualityReviewer] L2-BACKUP 返回非 JSON，降级本地评分: len=%s preview=%s",
+                    len(text),
+                    _safe_error_summary(text, 160),
+                )
+                state.quality_last_reviewer = {"raw": text[:1000]}
+                return None
+            state.quality_last_reviewer = data
+        except Exception as exc:
+            state.quality_reviewer_health = {
+                "status": "failed",
+                "error": _safe_error_summary(exc),
+                "score": score,
+            }
+            logger.info(
+                "[IDEFCRunner][QualityReviewer] L2-BACKUP 外审失败，降级本地评分: %s",
+                exc,
+            )
+            return None
+
+        reasons: List[str] = []
+        for key in ("missed_constraints", "missing_evidence", "suggested_next_actions"):
+            values = data.get(key) or []
+            if isinstance(values, str):
+                values = [values]
+            for value in values[:3]:
+                if value:
+                    reasons.append(str(value))
+        try:
+            score_delta = float(data.get("score_delta", 0.0) or 0.0)
+        except Exception:
+            score_delta = 0.0
+        if not reasons and score_delta >= 0:
+            state.quality_reviewer_health = {
+                "status": "pass",
+                "score": score,
+                "score_delta": score_delta,
+            }
+            logger.info(
+                "[IDEFCRunner][QualityReviewer] L2-BACKUP 外审未要求继续: score_delta=%.3f",
+                score_delta,
+            )
+            return None
+        if not reasons:
+            reasons.append("外审认为当前完成质量仍低于本地评分，需要补充验证或风险说明")
+
+        reviewer_reasons = [f"L2-BACKUP: {reason}" for reason in reasons[:5]]
+        merged = list(getattr(state, "quality_last_reasons", []) or [])
+        for reason in reviewer_reasons:
+            if reason not in merged:
+                merged.append(reason)
+        state.quality_last_reasons = merged[:8]
+
+        listed = "\n".join(f"{idx}. {reason}" for idx, reason in enumerate(reasons[:5], 1))
+        state.quality_reviewer_health = {
+            "status": "iterate",
+            "score": score,
+            "score_delta": score_delta,
+            "reason_count": len(reasons),
+        }
+        logger.info(
+            "[IDEFCRunner][QualityReviewer] L2-BACKUP 要求继续迭代: score_delta=%.3f reasons=%s",
+            score_delta,
+            len(reasons),
+        )
+        return (
+            "[质量外审]\n"
+            "L2-BACKUP 结构化复核认为当前完成仍需处理:\n"
+            f"{listed}\n"
+            "请继续 FC 循环，只补齐上述证据或风险说明；不要让外审内容直接替代最终答案。"
+        )
+
+    def _completion_quality_gate(
+        self,
+        state: IDEFCState,
+        resp: str,
+    ) -> Tuple[Optional[str], str]:
+        """Run hard completion gate and local quality scoring before final done."""
+        intent = self._detect_completion_intent(state, resp)
+        if not intent.get("should_check"):
+            return None, resp
+
+        verify_hint = self._pre_completion_verify(state, resp)
+        if verify_hint and state.null_response_count < 3:
+            assistant_msg = {"role": "assistant", "content": resp}
+            user_msg = internal_control_message(verify_hint)
+            state.messages.append(assistant_msg)
+            state.messages.append(user_msg)
+            if self._attn_window:
+                self._attn_window.register_message(assistant_msg, turn=state.fc_turn)
+                self._attn_window.register_message(user_msg, turn=state.fc_turn)
+            state.null_response_count += 1
+            logger.info(
+                "[IDEFCRunner][CompletionGate] hard gate blocked: %s",
+                verify_hint[:180],
+            )
+            self._log_fc_decision_path(
+                state,
+                path="completion_gate_hard_blocked",
+                tool_calls=[],
+                response_content=resp,
+                root_cause="quality_gate_loop",
+                verify_hint=_safe_error_summary(verify_hint),
+            )
+            return ("cb_force" if state.null_response_count >= 4 else "continue"), resp
+        if verify_hint:
+            state.quality_forced_risk_summary = True
+
+        evidence = self._collect_completion_evidence(state, resp, intent)
+        quality = self._score_completion_quality(evidence)
+        try:
+            state.completion_last_evidence = evidence
+            state.completion_last_quality = quality
+        except Exception:
+            pass
+        state.quality_last_score = float(quality.get("score", 0.0) or 0.0)
+        state.quality_last_reasons = list(
+            quality.get("blocking_reasons") or quality.get("risk_reasons") or []
+        )
+        if getattr(state, "quality_forced_risk_summary", False) and quality.get("level") != "pass":
+            quality["level"] = "blocked"
+            forced_note = (
+                "[质量复核] 已达到迭代上限，请输出 partial/blocked summary，"
+                "明确列出完成项、未完成项、未验证项和风险。"
+            )
+            if forced_note not in resp:
+                resp = str(resp or "").rstrip() + "\n\n" + forced_note
+
+        reviewer_hint = self._maybe_run_completion_reviewer(state, evidence, quality, resp)
+        if reviewer_hint:
+            assistant_msg = {"role": "assistant", "content": resp}
+            user_msg = internal_control_message(reviewer_hint)
+            state.messages.append(assistant_msg)
+            state.messages.append(user_msg)
+            if self._attn_window:
+                self._attn_window.register_message(assistant_msg, turn=state.fc_turn)
+                self._attn_window.register_message(user_msg, turn=state.fc_turn)
+            state.null_response_count += 1
+            logger.info(
+                "[IDEFCRunner][CompletionGate] reviewer iterate score=%.3f",
+                state.quality_last_score,
+            )
+            self._log_fc_decision_path(
+                state,
+                path="completion_gate_reviewer_iterate",
+                tool_calls=[],
+                response_content=resp,
+                score=state.quality_last_score,
+            )
+            return ("cb_force" if state.null_response_count >= 4 else "continue"), resp
+
+        iterate_hint = self._maybe_quality_iterate(state, evidence, quality)
+        if iterate_hint:
+            assistant_msg = {"role": "assistant", "content": resp}
+            user_msg = internal_control_message(iterate_hint)
+            state.messages.append(assistant_msg)
+            state.messages.append(user_msg)
+            if self._attn_window:
+                self._attn_window.register_message(assistant_msg, turn=state.fc_turn)
+                self._attn_window.register_message(user_msg, turn=state.fc_turn)
+            state.null_response_count += 1
+            logger.info(
+                "[IDEFCRunner][CompletionGate] quality iterate score=%.3f",
+                state.quality_last_score,
+            )
+            self._log_fc_decision_path(
+                state,
+                path="completion_gate_quality_iterate",
+                tool_calls=[],
+                response_content=resp,
+                root_cause="quality_gate_loop",
+                score=state.quality_last_score,
+                quality_level=quality.get("level"),
+            )
+            return ("cb_force" if state.null_response_count >= 4 else "continue"), resp
+
+        if quality.get("level") == "warn":
+            appendix = self._quality_risk_appendix(quality)
+            if appendix and appendix not in resp:
+                resp = str(resp or "").rstrip() + appendix
+        logger.info(
+            "[IDEFCRunner][CompletionGate] pass level=%s score=%.3f",
+            quality.get("level"),
+            state.quality_last_score,
+        )
+        self._log_fc_decision_path(
+            state,
+            path=f"completion_gate_{quality.get('level') or 'pass'}",
+            tool_calls=[],
+            response_content=resp,
+            score=state.quality_last_score,
+            quality_level=quality.get("level"),
+        )
+        return None, resp
+
     def _run_backfill(self, state: IDEFCState, response: str, is_cb_path: bool) -> None:
         try:
             from zulong.tools.task_tools import get_active_task_graph as _gtg_bf, _save_active_backup
@@ -5637,6 +8080,7 @@ class IDEFCRunner(FCRunner):
             return
 
         msgs = state.messages
+        task_graph = self._get_current_task_graph()
 
         if tier == "yellow":
             # ── Yellow: 注入引导提示 + BFS 推荐焦点 ──
@@ -5658,9 +8102,15 @@ class IDEFCRunner(FCRunner):
                 ]
                 if candidates:
                     top_nid, top_score = max(candidates, key=lambda x: x[1])
+                    top_task_node_id = self._task_node_id_from_memory_id(top_nid, task_graph)
+                    top_display = (
+                        task_graph.get_node_address(top_task_node_id)
+                        if task_graph and top_task_node_id
+                        else top_nid
+                    )
                     parts.append(
-                        f"  - navigate_attention(direction='jump', target_node_id='{top_nid}') "
-                        f"[BFS推荐，激活分={top_score:.2f}]"
+                        f"  - navigate_attention(direction='jump', target_node_id='{top_task_node_id or top_nid}') "
+                        f"[BFS推荐 {top_display}，激活分={top_score:.2f}]"
                     )
 
             hint = {"role": "system", "content": "\n".join(parts)}
@@ -5690,9 +8140,15 @@ class IDEFCRunner(FCRunner):
                 ]
                 if candidates:
                     top_nid, top_score = max(candidates, key=lambda x: x[1])
+                    top_task_node_id = self._task_node_id_from_memory_id(top_nid, task_graph)
+                    top_display = (
+                        task_graph.get_node_address(top_task_node_id)
+                        if task_graph and top_task_node_id
+                        else top_nid
+                    )
                     parts.append(
-                        f"  - navigate_attention(direction='jump', target_node_id='{top_nid}') "
-                        f"[推荐焦点，激活分={top_score:.2f}]"
+                        f"  - navigate_attention(direction='jump', target_node_id='{top_task_node_id or top_nid}') "
+                        f"[推荐焦点 {top_display}，激活分={top_score:.2f}]"
                     )
 
             hint = {"role": "system", "content": "\n".join(parts)}
@@ -5736,10 +8192,10 @@ class IDEFCRunner(FCRunner):
             try:
                 from zulong.memory.memory_graph import NodeType as _NT
                 recent_code = [
-                    nid for nid, n in mg._nodes.items()
-                    if n.node_type == _NT.CODE_SYMBOL
-                    and n.last_accessed
-                    and (time.time() - n.last_accessed) < 120  # 2 分钟内触碰的
+                    getattr(n, "node_id", "")
+                    for n in mg.get_nodes_by_type(_NT.CODE_SYMBOL)
+                    if getattr(n, "last_accessed", 0)
+                    and (time.time() - getattr(n, "last_accessed", 0)) < 120  # 2 分钟内触碰的
                 ]
                 if recent_code:
                     seeds.extend(recent_code[:10])  # 限制数量避免 BFS 爆炸
@@ -5772,13 +8228,15 @@ class IDEFCRunner(FCRunner):
                     fc = mg.get_last_focus_context()
                     cf = fc.get("focused_task_node_id", "") if fc else ""
                     top = max(acts, key=acts.get)
+                    top_task_node_id = self._task_node_id_from_memory_id(top, tg)
                     if top != cf and acts[top] > 0.6 and top not in valid:
                         logger.info(
                             f"[IDEFCRunner][BFS] 焦点切换: {cf} → {top} "
                             f"(score={acts[top]:.3f})")
                         mg.update_focus_to_node(top)
-                        if self._attn_window:
-                            self._attn_window.on_navigate_attention(direction="jump", target_node_id=top)
+                        if self._attn_window and top_task_node_id:
+                            self._attn_window.on_navigate_attention(
+                                direction="jump", target_node_id=top_task_node_id)
                 else:
                     logger.info(
                         f"[IDEFCRunner][BFS] turn={fc_turn} seeds={len(valid)}, "
@@ -5806,10 +8264,10 @@ class IDEFCRunner(FCRunner):
             try:
                 from zulong.memory.memory_graph import NodeType as _NT
                 recent_code = [
-                    nid for nid, n in mg._nodes.items()
-                    if n.node_type == _NT.CODE_SYMBOL
-                    and n.last_accessed
-                    and (time.time() - n.last_accessed) < 120
+                    getattr(n, "node_id", "")
+                    for n in mg.get_nodes_by_type(_NT.CODE_SYMBOL)
+                    if getattr(n, "last_accessed", 0)
+                    and (time.time() - getattr(n, "last_accessed", 0)) < 120
                 ]
                 if recent_code:
                     seeds.extend(recent_code[:10])

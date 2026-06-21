@@ -1,9 +1,4 @@
-"""
-MemoryGraph 工厂方法 - 运行态统一使用分片 Hybrid 存储。
-
-旧的 NetworkX + 单 JSON 存储已退出运行链路。MemoryGraph 类中的枚举、
-GraphNode 数据结构和部分兼容方法仍被工具层复用，但不再作为持久化后端。
-"""
+"""MemoryGraph 工厂方法 - 运行态唯一使用原生分片存储。"""
 
 import logging
 from typing import Optional, Any, Dict
@@ -87,14 +82,24 @@ def create_memory_graph(persist_path: str = "./data/memory_graph", config: Optio
     )
 
 
-def get_memory_graph_type(graph_instance) -> str:
-    """获取图谱实例的类型"""
+def assert_native_memory_graph(graph_instance) -> None:
+    """确保传入实例是原生分片 MemoryGraph 后端。"""
     class_name = graph_instance.__class__.__name__
-    if 'Sharded' in class_name:
+    if class_name == "ShardedMemoryGraph":
+        return
+    raise RuntimeError(
+        f"MemoryGraph 只允许原生分片后端，当前实例为 {class_name}"
+    )
+
+
+def get_memory_graph_type(graph_instance) -> str:
+    """获取原生图谱实例类型；非分片后端直接拒绝。"""
+    class_name = graph_instance.__class__.__name__
+    if class_name == "ShardedMemoryGraph":
         return "sharded"
-    if 'Hybrid' in class_name:
-        return "hybrid"
-    return "networkx"
+    raise RuntimeError(
+        f"MemoryGraph 只允许原生分片后端，当前实例为 {class_name}"
+    )
 
 
 def get_memory_graph_stats(graph_instance) -> Dict[str, Any]:

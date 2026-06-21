@@ -37,13 +37,16 @@ class ToolCallRecord:
     """单次工具调用记录"""
 
     def __init__(self, function_name: str, params_hash: str, result_hash: str,
-                 result_len: int, timestamp: float, query: str = ""):
+                 result_len: int, timestamp: float, query: str = "",
+                 result_preview: str = "", normalized_result_hash: str = ""):
         self.function_name = function_name
         self.params_hash = params_hash
         self.result_hash = result_hash
         self.result_len = result_len
         self.timestamp = timestamp
         self.query = query
+        self.result_preview = result_preview
+        self.normalized_result_hash = normalized_result_hash or result_hash
 
 
 class ToolCallCircuitBreaker:
@@ -109,7 +112,7 @@ class ToolCallCircuitBreaker:
         self._no_progress_yellow = cfg.get("no_progress_yellow", 5)
         self._no_progress_red = cfg.get("no_progress_red", 8)
 
-        self._max_yellow_before_red = cfg.get("max_yellow_before_red", 4)
+        self._max_yellow_before_red = cfg.get("max_yellow_before_red", 5)
 
         self._call_history: List[ToolCallRecord] = []
         self._start_time: float = 0.0
@@ -162,12 +165,16 @@ class ToolCallCircuitBreaker:
         self._pattern_window = cfg.get("pattern_window", 10)
         self._pattern_yellow_count = cfg.get("pattern_yellow_count", 8)
         self._pattern_red_count = cfg.get("pattern_red_count", 10)
-        self._max_yellow_before_red = cfg.get("max_yellow_before_red", 4)
+        self._max_yellow_before_red = cfg.get("max_yellow_before_red", 5)
         logger.info(f"[CircuitBreaker] 已重置: hard_cap={self._safety_hard_cap}")
 
     def record_call(self, function_name: str, params_dict: Dict, result_content: str):
         params_hash = self._hash_dict(params_dict)
         result_hash = self._hash_text(result_content)
+        result_preview = str(result_content or "")[:200]
+        normalized_result_hash = self._hash_text(
+            self._normalize_result_text(result_content)
+        )
         query = ""
         if function_name.lower() in self.SEARCH_TOOL_NAMES or "search" in function_name.lower():
             for key in self.SEARCH_QUERY_KEYS:
@@ -181,6 +188,8 @@ class ToolCallCircuitBreaker:
             result_len=len(result_content),
             timestamp=time.time(),
             query=query,
+            result_preview=result_preview,
+            normalized_result_hash=normalized_result_hash,
         )
         self._call_history.append(record)
 
@@ -194,6 +203,9 @@ class ToolCallCircuitBreaker:
             self._signal_context_pressure(messages, attn_usage_ratio=attn_usage_ratio),
             self._signal_elapsed_time(),
             self._signal_no_progress(),
+            self._signal_repeating_result(),
+            self._signal_alternating_results(),
+            self._signal_consecutive_errors(),
         ]
 
         reds = [(s, r) for s, r in signals if s == CircuitBreakerState.RED]
@@ -382,6 +394,71 @@ class ToolCallCircuitBreaker:
             )
         return CircuitBreakerState.GREEN, ""
 
+    # ==================== 信号 7-9: 语义级结果模式 ====================
+
+    def _signal_repeating_result(self) -> Tuple[CircuitBreakerState, str]:
+        if len(self._call_history) < 4:
+            return CircuitBreakerState.GREEN, ""
+        window = self._call_history[-6:]
+        counts = Counter(
+            (r.function_name, r.normalized_result_hash)
+            for r in window
+            if r.normalized_result_hash
+        )
+        if not counts:
+            return CircuitBreakerState.GREEN, ""
+        (tool_name, _), count = counts.most_common(1)[0]
+        if count >= 6:
+            return CircuitBreakerState.RED, (
+                f"结果重复: {tool_name} 最近 6 次返回语义等价结果"
+            )
+        if count >= 4:
+            return CircuitBreakerState.YELLOW, (
+                f"结果重复警告: {tool_name} 最近 6 次中 {count} 次返回语义等价结果"
+            )
+        return CircuitBreakerState.GREEN, ""
+
+    def _signal_alternating_results(self) -> Tuple[CircuitBreakerState, str]:
+        if len(self._call_history) < 6:
+            return CircuitBreakerState.GREEN, ""
+
+        def signature(record: ToolCallRecord) -> Tuple[str, str]:
+            return (record.function_name, record.normalized_result_hash)
+
+        for size, is_red in ((8, True), (6, False)):
+            if len(self._call_history) < size:
+                continue
+            window = self._call_history[-size:]
+            even = [signature(r) for r in window[0::2]]
+            odd = [signature(r) for r in window[1::2]]
+            if len(set(even)) == 1 and len(set(odd)) == 1 and even[0] != odd[0]:
+                pairs = size // 2
+                state = CircuitBreakerState.RED if is_red else CircuitBreakerState.YELLOW
+                return state, (
+                    f"交替循环: 最近 {size} 次工具结果呈 A/B 交替模式 ({pairs} 对)"
+                )
+        return CircuitBreakerState.GREEN, ""
+
+    def _signal_consecutive_errors(self) -> Tuple[CircuitBreakerState, str]:
+        if len(self._call_history) < 3:
+            return CircuitBreakerState.GREEN, ""
+        count = 0
+        last_tool = ""
+        for record in reversed(self._call_history[-6:]):
+            if not self._is_error_result(record.result_preview):
+                break
+            count += 1
+            last_tool = record.function_name
+        if count >= 4:
+            return CircuitBreakerState.RED, (
+                f"连续错误: 最近 {count} 次工具调用均失败，最后工具={last_tool}"
+            )
+        if count >= 3:
+            return CircuitBreakerState.YELLOW, (
+                f"连续错误警告: 最近 {count} 次工具调用均失败，请先分析原因"
+            )
+        return CircuitBreakerState.GREEN, ""
+
     # ==================== 辅助诊断方法 ====================
 
     def _get_call_history_summary(self) -> str:
@@ -400,7 +477,10 @@ class ToolCallCircuitBreaker:
 
     def _get_signal_scores(self, signals: List[Tuple[CircuitBreakerState, str]]) -> str:
         """生成各信号得分摘要"""
-        signal_names = ["pattern_loop", "context_pressure", "elapsed_time", "no_progress"]
+        signal_names = [
+            "pattern_loop", "context_pressure", "elapsed_time", "no_progress",
+            "repeating_result", "alternating_results", "consecutive_errors",
+        ]
         parts = []
         for i, (state, _) in enumerate(signals):
             name = signal_names[i] if i < len(signal_names) else f"sig{i}"
@@ -419,6 +499,8 @@ class ToolCallCircuitBreaker:
                     "result_len": r.result_len,
                     "timestamp": r.timestamp,
                     "query": r.query,
+                    "result_preview": r.result_preview,
+                    "normalized_result_hash": r.normalized_result_hash,
                 }
                 for r in self._call_history
             ],
@@ -454,6 +536,67 @@ class ToolCallCircuitBreaker:
     @staticmethod
     def _hash_text(text: str) -> str:
         return hashlib.md5(text.encode("utf-8")).hexdigest()[:16]
+
+    @classmethod
+    def _normalize_result_text(cls, text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return "empty"
+
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                status = data.get("status") or data.get("state") or ""
+                success = data.get("success", data.get("ok", None))
+                error = data.get("error") or data.get("message") or data.get("detail") or ""
+                changed = data.get("changed", data.get("modified", None))
+                if success is False or status in {"error", "failed", "failure"}:
+                    return "error:" + cls._scrub_result_noise(str(error or status or "failed"))[:300]
+                if changed is False:
+                    return "no_change:" + cls._scrub_result_noise(str(status or "unchanged"))[:200]
+                if success is True or status in {"ok", "success", "succeeded"}:
+                    keys = sorted(str(k) for k in data.keys())[:12]
+                    return "success:" + ",".join(keys)
+        except Exception:
+            pass
+
+        scrubbed = cls._scrub_result_noise(raw.lower())
+        if cls._contains_error_terms(scrubbed):
+            return "error:" + scrubbed[:500]
+        if any(term in scrubbed for term in ("no change", "unchanged", "未改变", "无需修改", "没有变化")):
+            return "no_change:" + scrubbed[:300]
+        if any(term in scrubbed for term in ("success", "succeeded", "ok", "完成", "成功")):
+            return "success:" + scrubbed[:500]
+        if len(scrubbed) < 30:
+            return "short:" + scrubbed
+        return "content:" + scrubbed[:500]
+
+    @staticmethod
+    def _scrub_result_noise(text: str) -> str:
+        scrubbed = text
+        scrubbed = re.sub(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "<uuid>", scrubbed, flags=re.I)
+        scrubbed = re.sub(r"\b[0-9a-f]{24,64}\b", "<hex>", scrubbed, flags=re.I)
+        scrubbed = re.sub(r"\b\d{4}-\d{2}-\d{2}[ t]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:?\d{2})?\b", "<timestamp>", scrubbed)
+        scrubbed = re.sub(r"\b\d+(?:\.\d+)?\s*(?:ms|s|sec|seconds|秒|毫秒)\b", "<duration>", scrubbed, flags=re.I)
+        scrubbed = re.sub(r"(?:line|行|lineno)[:= ]+\d+", "line:<n>", scrubbed, flags=re.I)
+        scrubbed = re.sub(r"(?:col|column|列)[:= ]+\d+", "col:<n>", scrubbed, flags=re.I)
+        scrubbed = re.sub(r"[a-z]:[\\/][^\s\"']+", "<path>", scrubbed, flags=re.I)
+        scrubbed = re.sub(r"/(?:tmp|var|private|users|home)/[^\s\"']+", "<path>", scrubbed, flags=re.I)
+        scrubbed = re.sub(r"\b\d{5,}\b", "<num>", scrubbed)
+        scrubbed = re.sub(r"\s+", " ", scrubbed).strip()
+        return scrubbed
+
+    @classmethod
+    def _is_error_result(cls, text: str) -> bool:
+        return cls._contains_error_terms(str(text or "").lower())
+
+    @staticmethod
+    def _contains_error_terms(text: str) -> bool:
+        return any(term in text for term in (
+            "error", "failed", "failure", "exception", "traceback",
+            "not found", "permission denied", "timeout", "timed out",
+            "失败", "错误", "异常", "不存在", "未找到", "拒绝", "超时",
+        ))
 
     @staticmethod
     def _query_jaccard(a: str, b: str) -> float:

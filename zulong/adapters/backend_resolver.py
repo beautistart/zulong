@@ -6,7 +6,7 @@ using the existing OpenAI-compatible client path.
 
 支持的后端类型：
 - 本地推理：ollama, vllm, sglang, llamacpp, lmstudio
-- 云端 API：openai, siliconflow
+- 云端 API：openai, siliconflow, deepseek
 - 中转站/代理：openrouter, oneapi, custom (通用 OpenAI 兼容端点)
 
 Ollama 增强功能：
@@ -35,6 +35,7 @@ OPENAI_COMPATIBLE_BACKENDS = {
     "lmstudio",
     "openai",
     "siliconflow",
+    "deepseek",
     "openrouter",
     "oneapi",
     "custom",
@@ -46,6 +47,7 @@ PROXY_BACKENDS = {
     "openrouter",
     "oneapi",
     "siliconflow",
+    "deepseek",
 }
 
 PLATFORM_DEFAULT_BACKEND = {
@@ -150,6 +152,8 @@ def default_base_url(backend: str) -> str:
         return "https://api.openai.com/v1"
     if backend == "siliconflow":
         return "https://api.siliconflow.cn/v1"
+    if backend == "deepseek":
+        return "https://api.deepseek.com"
     if backend == "openrouter":
         return "https://openrouter.ai/api/v1"
     if backend == "oneapi":
@@ -161,6 +165,8 @@ def default_base_url(backend: str) -> str:
 
 def default_api_key(backend: str) -> str:
     if backend == "openai":
+        return ""
+    if backend == "deepseek":
         return ""
     if backend == "openrouter":
         return ""  # 需要用户自行配置
@@ -176,6 +182,8 @@ def default_model_id(backend: str) -> str:
         return "gpt-4o-mini"
     if backend == "siliconflow":
         return "deepseek-ai/DeepSeek-V4-Flash"
+    if backend == "deepseek":
+        return "deepseek-v4-pro"
     if backend == "openrouter":
         return "openai/gpt-4o-mini"
     if backend == "oneapi":

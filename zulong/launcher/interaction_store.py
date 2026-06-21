@@ -8,6 +8,7 @@ fast, durable, and independent from whichever reasoning path handles a turn.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -15,6 +16,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def _project_root() -> Path:
@@ -127,6 +130,10 @@ class InteractionStore:
         active: bool = True,
     ) -> Dict[str, Any]:
         now = time.time()
+        if task_graph_id is not None and not str(task_graph_id).strip():
+            task_graph_id = None
+        if session_node_id is not None and not str(session_node_id).strip():
+            session_node_id = None
         with self._lock, self._connect() as conn:
             existing = conn.execute(
                 "SELECT * FROM conversation WHERE conversation_id = ?",
@@ -135,6 +142,20 @@ class InteractionStore:
             if active:
                 conn.execute("UPDATE conversation SET active = 0 WHERE active = 1")
             if existing:
+                existing_task_graph_id = str(existing["task_graph_id"] or "").strip()
+                incoming_task_graph_id = str(task_graph_id or "").strip()
+                if (
+                    existing_task_graph_id
+                    and incoming_task_graph_id
+                    and incoming_task_graph_id != existing_task_graph_id
+                ):
+                    logger.warning(
+                        "[InteractionStore] 会话图谱已绑定，忽略改绑请求: conversation=%s existing=%s incoming=%s",
+                        conversation_id,
+                        existing_task_graph_id,
+                        incoming_task_graph_id,
+                    )
+                    task_graph_id = None
                 old_meta = {}
                 try:
                     old_meta = json.loads(existing["metadata_json"] or "{}")
@@ -373,12 +394,16 @@ class InteractionStore:
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT conversation_id, turn_id, workspace_path, project_id,
-                       task_graph_id, source, created_at
-                FROM interaction_event
-                WHERE turn_id = ?
-                  AND conversation_id IS NOT NULL
-                ORDER BY created_at DESC
+                SELECT e.conversation_id, e.turn_id,
+                       COALESCE(e.workspace_path, c.workspace_path) AS workspace_path,
+                       COALESCE(e.project_id, c.project_id) AS project_id,
+                       COALESCE(e.task_graph_id, c.task_graph_id) AS task_graph_id,
+                       e.source, e.created_at, c.session_node_id
+                FROM interaction_event e
+                LEFT JOIN conversation c ON c.conversation_id = e.conversation_id
+                WHERE e.turn_id = ?
+                  AND e.conversation_id IS NOT NULL
+                ORDER BY e.created_at DESC
                 LIMIT 1
                 """,
                 (turn_id,),
@@ -433,11 +458,10 @@ class InteractionStore:
                     UPDATE conversation
                     SET last_active_at = ?, updated_at = ?,
                         workspace_path = COALESCE(?, workspace_path),
-                        project_id = COALESCE(?, project_id),
-                        task_graph_id = COALESCE(?, task_graph_id)
+                        project_id = COALESCE(?, project_id)
                     WHERE conversation_id = ?
                     """,
-                    (now, now, workspace_path, project_id, task_graph_id, conversation_id),
+                    (now, now, workspace_path, project_id, conversation_id),
                 )
         return event_id
 

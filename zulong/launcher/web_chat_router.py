@@ -30,6 +30,13 @@ from zulong.launcher.conversation_orchestrator import (
     get_conversation_orchestrator,
 )
 from zulong.launcher.interaction_store import get_interaction_store
+from zulong.core.message_visibility import (
+    CHANNEL_FINAL,
+    CHANNEL_LEDGER,
+    CHANNEL_STATUS,
+    is_public_payload,
+    mark_public_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -344,8 +351,10 @@ def _build_task_status_interaction(status: Dict[str, Any]) -> Dict[str, Any]:
         pair_id = str(approval.get("approval_id") or approval.get("approvalId") or pair_id)
     else:
         approval = {}
-    progress_items = status.get("progress_items")
-    if not isinstance(progress_items, list) or not progress_items:
+    raw_progress_items = status.get("progress_items")
+    has_explicit_progress_items = isinstance(raw_progress_items, list) and bool(raw_progress_items)
+    progress_items = raw_progress_items if has_explicit_progress_items else None
+    if not progress_items:
         item_status = "running"
         if state in {"completed", "succeeded"}:
             item_status = "completed"
@@ -360,6 +369,15 @@ def _build_task_status_interaction(status: Dict[str, Any]) -> Dict[str, Any]:
             "source": "heartbeat" if phase in {"heartbeat", "stalled_watch"} else "task_graph",
             "timestamp": status.get("last_progress_at") or time.time(),
         }]
+    ux_visibility = "hidden"
+    if status.get("awaiting_approval"):
+        ux_visibility = "main"
+    elif state in {"blocked", "possibly_stalled", "stalled", "failed"}:
+        ux_visibility = "main"
+    elif has_explicit_progress_items and phase not in {"heartbeat", "stalled_watch"}:
+        # TASK_EXECUTION_STATUS is a status bar signal, not the source of the
+        # main task checklist. User-facing model/task-plan events render cards.
+        ux_visibility = "details"
     interaction = {
         "interaction_id": pair_id,
         "pair_id": pair_id,
@@ -370,6 +388,11 @@ def _build_task_status_interaction(status: Dict[str, Any]) -> Dict[str, Any]:
         "tool_name": approval.get("tool_name") or status.get("tool_name") or "",
         "progress_items": progress_items[:8],
         "next_step": status.get("next_step") or "",
+        "source_channel": "system_status",
+        "channel": CHANNEL_STATUS,
+        "ux_visibility": ux_visibility,
+        "is_background": ux_visibility != "main",
+        "tool_category": "background" if ux_visibility != "main" else "",
         "timestamp": time.time(),
     }
     for key in (
@@ -541,12 +564,14 @@ def _task_status_snapshot() -> Dict[str, Any]:
 
 
 def _broadcast_task_execution_status(snapshot: Dict[str, Any]) -> None:
+    snapshot = mark_public_payload(dict(snapshot), CHANNEL_STATUS)
     message = {
         "type": "TASK_EXECUTION_STATUS",
         **snapshot,
         "payload": snapshot,
         "_persisted": True,
     }
+    mark_public_payload(message, CHANNEL_STATUS)
     _schedule_broadcast(message)
 
 
@@ -710,11 +735,46 @@ def _resolve_conversation_binding(message: dict) -> Dict[str, Optional[str]]:
     binding: Dict[str, Optional[str]] = {
         "conversation_id": explicit_conversation_id,
         "turn_id": turn_id,
+        "session_node_id": (
+            message.get("session_node_id")
+            or message.get("dialogue_session_id")
+            or payload.get("session_node_id")
+            or payload.get("dialogue_session_id")
+        ),
         "workspace_path": message.get("workspace_path") or payload.get("workspace_path") or payload.get("cwd"),
         "project_id": message.get("project_id") or payload.get("project_id"),
         "task_graph_id": message.get("task_graph_id") or payload.get("task_graph_id"),
     }
     task_fallback_allowed = True
+
+    if explicit_conversation_id:
+        try:
+            explicit_conversation = store.get_conversation(explicit_conversation_id)
+        except Exception:
+            explicit_conversation = None
+        if explicit_conversation:
+            message_has_task_binding = bool(
+                binding.get("workspace_path")
+                or binding.get("project_id")
+                or binding.get("task_graph_id")
+            )
+            explicit_has_task_binding = bool(
+                explicit_conversation.get("workspace_path")
+                or explicit_conversation.get("project_id")
+                or explicit_conversation.get("task_graph_id")
+            )
+            binding["workspace_path"] = binding["workspace_path"] or explicit_conversation.get("workspace_path")
+            binding["project_id"] = binding["project_id"] or explicit_conversation.get("project_id")
+            binding["task_graph_id"] = binding["task_graph_id"] or explicit_conversation.get("task_graph_id")
+            binding["session_node_id"] = binding["session_node_id"] or explicit_conversation.get("session_node_id")
+            if not message_has_task_binding and not explicit_has_task_binding:
+                task_fallback_allowed = False
+        elif not (
+            binding.get("workspace_path")
+            or binding.get("project_id")
+            or binding.get("task_graph_id")
+        ):
+            task_fallback_allowed = False
 
     if turn_id:
         try:
@@ -748,6 +808,7 @@ def _resolve_conversation_binding(message: dict) -> Dict[str, Optional[str]]:
             binding["workspace_path"] = binding["workspace_path"] or turn_binding.get("workspace_path")
             binding["project_id"] = binding["project_id"] or turn_binding.get("project_id")
             binding["task_graph_id"] = binding["task_graph_id"] or turn_binding.get("task_graph_id")
+            binding["session_node_id"] = binding["session_node_id"] or turn_binding.get("session_node_id")
             if not message_has_task_binding and not turn_has_task_binding:
                 task_fallback_allowed = False
 
@@ -759,8 +820,16 @@ def _resolve_conversation_binding(message: dict) -> Dict[str, Optional[str]]:
                 binding["workspace_path"] = binding["workspace_path"] or active.get("workspace_path")
                 binding["project_id"] = binding["project_id"] or active.get("project_id")
                 binding["task_graph_id"] = binding["task_graph_id"] or active.get("task_graph_id")
+                binding["session_node_id"] = binding["session_node_id"] or active.get("session_node_id")
         except Exception:
             binding["conversation_id"] = None
+
+    if binding.get("conversation_id") and not binding.get("session_node_id"):
+        conv_id = str(binding.get("conversation_id") or "")
+        binding["session_node_id"] = (
+            conv_id if _is_dialogue_session_node_id(conv_id)
+            else f"dialogue:session_{_compact_dialogue_id(conv_id)}"
+        )
 
     status_request_id = str(_task_execution_status.get("request_id") or "")
     status_conversation_id = str(
@@ -795,7 +864,11 @@ def _resolve_conversation_binding(message: dict) -> Dict[str, Optional[str]]:
             or None
         )
 
-    if task_fallback_allowed and (not binding.get("workspace_path") or not binding.get("task_graph_id")):
+    if (
+        task_fallback_allowed
+        and not explicit_conversation_id
+        and (not binding.get("workspace_path") or not binding.get("task_graph_id"))
+    ):
         active_binding = _active_task_graph_binding()
         if active_binding:
             binding["workspace_path"] = (
@@ -819,6 +892,12 @@ def _persist_web_visible_message(message: dict) -> None:
     bridge keeps assistant outputs and important tool/status cards recoverable
     after refresh without introducing another event channel.
     """
+    if not is_public_payload(message):
+        logger.debug(
+            "[WebChatRouter] 跳过内部控制消息持久化: type=%s",
+            message.get("type"),
+        )
+        return
     if message.get("_persisted"):
         return
     original_payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
@@ -845,6 +924,10 @@ def _persist_web_visible_message(message: dict) -> None:
         payload["conversation_id"] = conversation_id
     if conversation_id and not payload.get("session_id"):
         payload["session_id"] = conversation_id
+    if binding.get("session_node_id") and not payload.get("session_node_id"):
+        payload["session_node_id"] = binding["session_node_id"]
+    if binding.get("session_node_id") and not payload.get("dialogue_session_id"):
+        payload["dialogue_session_id"] = binding["session_node_id"]
     if binding.get("turn_id") and not payload.get("turn_id"):
         payload["turn_id"] = binding["turn_id"]
     if binding.get("turn_id") and not payload.get("request_id"):
@@ -982,6 +1065,53 @@ def _is_dialogue_session_node(node: Any) -> bool:
     )
 
 
+def _normalize_dialogue_title(value: Any) -> str:
+    text = str(value or "")
+    text = re.sub(r"\s*\[记忆\]\s*$", "", text)
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return text
+
+
+def _looks_corrupt_dialogue_title(value: Any) -> bool:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return False
+    question_count = text.count("?")
+    return question_count >= 5 and (question_count / max(len(text), 1)) > 0.25
+
+
+def _safe_dialogue_title(value: Any, fallback: str = "对话记录") -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text or _looks_corrupt_dialogue_title(text):
+        text = re.sub(r"\s+", " ", str(fallback or "")).strip()
+    if not text or _looks_corrupt_dialogue_title(text):
+        return "对话记录"
+    return text
+
+
+def _session_candidate_text(session: Dict[str, Any]) -> str:
+    return _normalize_dialogue_title(
+        session.get("title")
+        or session.get("preview")
+        or session.get("topic_summary")
+        or ""
+    )
+
+
+def _graph_session_has_dialogue_round(mg: Any, session_id: str) -> bool:
+    if not mg or not session_id:
+        return False
+    try:
+        if not mg.has_node(session_id):
+            return False
+        for child in (mg.get_children(session_id) or []):
+            if child and _memory_node_metadata(child).get("sub_type") == "round":
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def _safe_has_memory_node(mg: Any, node_id: str) -> bool:
     if not mg or not node_id:
         return False
@@ -1050,19 +1180,7 @@ def _memory_children_ids(mg: Any, node_id: str) -> List[str]:
             if _memory_node_id(child)
         ]
     except Exception:
-        pass
-    try:
-        graph = getattr(mg, "_graph", None)
-        if graph is not None and node_id in graph:
-            children = []
-            for child_id in list(graph.successors(node_id)):
-                edge_data = graph[node_id].get(child_id, {}) or {}
-                edge_type = str(getattr(edge_data.get("edge_type"), "value", edge_data.get("edge_type", "")))
-                if edge_type == "hierarchy":
-                    children.append(str(child_id))
-            return children
-    except Exception:
-        pass
+        return []
     return []
 
 
@@ -1215,7 +1333,12 @@ def _delete_dialogue_session_cascade(session_id: str, *, cascade: bool = True) -
         _save_memory_graph_if_possible(mg)
 
     deleted_ids = [item["node_id"] for item in deleted]
-    _cleanup_dialogue_session_indexes(session_id, session_node_id)
+    removed_sessions = _cleanup_dialogue_session_indexes(session_id, session_node_id)
+    session_ids = []
+    for value in (session_id, session_node_id, *removed_sessions):
+        value = str(value or "").strip()
+        if value and value not in session_ids:
+            session_ids.append(value)
     ide_session_cleared = _cleanup_runtime_session(session_id)
     if session_node_id and session_node_id != session_id:
         _cleanup_runtime_session(session_node_id)
@@ -1224,6 +1347,7 @@ def _delete_dialogue_session_cascade(session_id: str, *, cascade: bool = True) -
     return {
         "session_id": session_id,
         "session_node_id": session_node_id,
+        "session_ids": session_ids,
         "deleted": True,
         "mg_nodes_deleted": len(deleted),
         "nodes_deleted": len(deleted),
@@ -1376,7 +1500,6 @@ def _collect_dialogue_sessions(limit: int = 200) -> Dict[str, Any]:
     store = get_conversation_orchestrator().store
     store_sessions = []
     mg = None
-    graph_session_ids: Set[str] = set()
     try:
         if _launcher_ready_for_memory_backfill():
             mg = _get_active_memory_graph()
@@ -1387,11 +1510,6 @@ def _collect_dialogue_sessions(limit: int = 200) -> Dict[str, Any]:
         for conv in store.list_conversations(limit=limit):
             conv_id = conv.get("conversation_id") or ""
             session_node_id = conv.get("session_node_id")
-            try:
-                last_active_at = float(conv.get("last_active_at") or conv.get("updated_at") or 0)
-            except Exception:
-                last_active_at = 0.0
-            stale_enough_for_inferred_cleanup = time.time() - last_active_at > 30.0
             inferred_session_node_id = session_node_id
             if mg and not inferred_session_node_id and conv_id:
                 try:
@@ -1404,33 +1522,16 @@ def _collect_dialogue_sessions(limit: int = 200) -> Dict[str, Any]:
                         conv_id if _is_dialogue_session_node_id(conv_id)
                         else f"dialogue:session_{_compact_dialogue_id(conv_id)}"
                     )
-            if mg and session_node_id and not _safe_has_memory_node(mg, session_node_id):
-                try:
-                    store.delete_conversation(conv_id)
-                except Exception:
-                    pass
-                continue
-            if (
-                mg
-                and inferred_session_node_id
-                and not _safe_has_memory_node(mg, inferred_session_node_id)
-                and (
-                    session_node_id
-                    or _is_dialogue_session_node_id(conv_id)
-                    or (
-                        stale_enough_for_inferred_cleanup
-                        and (conv.get("source") or "") in {"web_chat", "interaction_store", "workspace"}
-                    )
+            if not inferred_session_node_id and conv_id:
+                inferred_session_node_id = (
+                    conv_id if _is_dialogue_session_node_id(conv_id)
+                    else f"dialogue:session_{_compact_dialogue_id(conv_id)}"
                 )
-            ):
-                try:
-                    store.delete_conversation(conv_id)
-                except Exception:
-                    pass
-                continue
+            # InteractionStore 是 Web 窗口身份账本。MemoryGraph 节点可能异步创建、
+            # 延迟加载或被修复流程重建；列表阶段不能因为图节点暂缺删除窗口记录。
             store_sessions.append({
                 "id": conv_id,
-                "title": conv.get("title") or "对话记录",
+                "title": _safe_dialogue_title(conv.get("title"), "对话记录"),
                 "created_at": conv.get("created_at") or 0,
                 "last_active_at": conv.get("last_active_at") or conv.get("created_at") or 0,
                 "preview": "",
@@ -1446,38 +1547,14 @@ def _collect_dialogue_sessions(limit: int = 200) -> Dict[str, Any]:
     except Exception as store_err:
         logger.debug(f"[WebChatRouter] interaction store session list skipped: {store_err}")
 
+    # 会话窗口列表以 InteractionStore 的窗口账本为准。
+    # MemoryGraph session 是记忆地址，不能反向升级成聊天窗口，否则 Web 窗口 ID
+    # 和图谱 session ID 会分裂，产生空的 [记忆] 会话。
     sessions = store_sessions
-    try:
-        if mg:
-            from zulong.memory.graph_adapters import DialogueAdapter
-
-            graph_sessions = DialogueAdapter.list_sessions(mg)
-            for graph_session in graph_sessions:
-                graph_session["source"] = graph_session.get("source") or "memory_graph"
-                graph_session["dialogue_session_id"] = graph_session.get("id")
-                graph_session["session_node_id"] = graph_session.get("id")
-                graph_session_ids.add(str(graph_session.get("id") or ""))
-            known = {
-                str(s.get("id") or "")
-                for s in store_sessions
-            } | {
-                str(s.get("dialogue_session_id") or s.get("session_node_id") or "")
-                for s in store_sessions
-            }
-            sessions = store_sessions + [
-                s for s in graph_sessions
-                if str(s.get("id") or "") not in known
-            ]
-    except Exception as mg_err:
-        logger.debug(f"[WebChatRouter] memory graph session list skipped: {mg_err}")
 
     active = None
     try:
         active = store.find_active_conversation(max_age_seconds=86400)
-        if active and mg:
-            active_node_id = active.get("session_node_id")
-            if active_node_id and not _safe_has_memory_node(mg, active_node_id):
-                active = None
     except Exception:
         active = None
 
@@ -1659,6 +1736,12 @@ def _schedule_broadcast(message: dict) -> None:
     """从非 asyncio 线程安全地调度广播到所有 /ws 客户端"""
     loop = _event_loop
     msg_type = message.get("type", "?")
+    if not is_public_payload(message):
+        logger.debug(
+            "[WebChatRouter] _schedule_broadcast 跳过内部控制消息: type=%s",
+            msg_type,
+        )
+        return
     noisy_key = str(msg_type) if msg_type in _NOISY_BROADCAST_TYPES else ""
     if noisy_key:
         now = time.monotonic()
@@ -1708,6 +1791,9 @@ def _schedule_broadcast(message: dict) -> None:
 async def _broadcast(message: dict) -> None:
     """向所有 /ws 客户端广播消息，根据各自协议版本自动选择格式"""
     msg_type = message.get("type", "?")
+    if not is_public_payload(message):
+        logger.debug("[WebChatRouter] 跳过内部控制消息广播: type=%s", msg_type)
+        return
     _persist_web_visible_message(message)
     if not _ws_clients:
         logger.warning(f"[WebChatRouter] _broadcast: type={msg_type}, 无客户端连接")
@@ -1771,6 +1857,9 @@ async def _send_broadcast_to_client(ws: WebSocket, message: dict, msg_type: str)
 
 def _on_l2_output(event) -> None:
     payload = event.payload or {}
+    if not is_public_payload(payload):
+        logger.debug("[WebChatRouter] 丢弃内部 L2_OUTPUT 控制消息")
+        return
     text = payload.get("display_text") or payload.get("text", "")
     speech_text = payload.get("speech_text") or ""
     request_id = payload.get("request_id")
@@ -1826,7 +1915,7 @@ def _on_l2_output(event) -> None:
             message = "任务已返回最终回复。"
             item_label = "生成最终回复"
             item_status = "completed"
-        _schedule_broadcast({
+        chat_message = {
             "type": "CHAT_RESPONSE",
             "text": text,
             "display_text": text,
@@ -1838,7 +1927,9 @@ def _on_l2_output(event) -> None:
             "project_id": binding.get("project_id"),
             "task_graph_id": binding.get("task_graph_id"),
             "_persisted": True,
-        })
+        }
+        mark_public_payload(chat_message, CHANNEL_FINAL)
+        _schedule_broadcast(chat_message)
         update_task_execution_status(
             state=state,
             phase=phase,
@@ -1889,18 +1980,22 @@ def _on_l2_output(event) -> None:
 
 
 def _on_l2_output_stream(event) -> None:
-    text = event.payload.get("text", "")
-    chunk = event.payload.get("chunk", "")
-    request_id = event.payload.get("request_id")
+    payload = event.payload or {}
+    if not is_public_payload(payload):
+        logger.debug("[WebChatRouter] 丢弃内部 L2_OUTPUT_STREAM 控制消息")
+        return
+    text = payload.get("text", "")
+    chunk = payload.get("chunk", "")
+    request_id = payload.get("request_id")
     binding = _resolve_conversation_binding({
         "request_id": request_id,
-        "turn_id": event.payload.get("turn_id"),
-        "conversation_id": event.payload.get("conversation_id"),
-        "session_id": event.payload.get("session_id"),
-        "workspace_path": event.payload.get("workspace_path"),
-        "project_id": event.payload.get("project_id"),
-        "task_graph_id": event.payload.get("task_graph_id"),
-        "payload": event.payload,
+        "turn_id": payload.get("turn_id"),
+        "conversation_id": payload.get("conversation_id"),
+        "session_id": payload.get("session_id"),
+        "workspace_path": payload.get("workspace_path"),
+        "project_id": payload.get("project_id"),
+        "task_graph_id": payload.get("task_graph_id"),
+        "payload": payload,
     })
     conversation_id = binding.get("conversation_id")
     if chunk or text:
@@ -1922,7 +2017,7 @@ def _on_l2_output_stream(event) -> None:
             task_graph_id=binding.get("task_graph_id"),
             broadcast=False,
         )
-        _schedule_broadcast({
+        stream_message = {
             "type": "STREAMING_RESPONSE",
             "text": text,
             "chunk": chunk,
@@ -1932,16 +2027,117 @@ def _on_l2_output_stream(event) -> None:
             "workspace_path": binding.get("workspace_path"),
             "project_id": binding.get("project_id"),
             "task_graph_id": binding.get("task_graph_id"),
-        })
+        }
+        mark_public_payload(stream_message, CHANNEL_FINAL)
+        _schedule_broadcast(stream_message)
 
 
 def _on_l2_thinking_step(event) -> None:
     payload = event.payload
+    if payload and not is_public_payload(payload):
+        logger.debug("[WebChatRouter] 丢弃内部 L2_THINKING_STEP 控制消息")
+        return
     if payload:
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        step_type = str(payload.get("step_type") or "")
+        if step_type == "graph.task_update" and isinstance(data.get("graph"), dict):
+            graph_payload = {
+                "type": "TASK_GRAPH_UPDATE",
+                "request_id": payload.get("request_id"),
+                "turn_id": payload.get("turn_id") or payload.get("request_id"),
+                "session_id": payload.get("session_id") or payload.get("conversation_id"),
+                "conversation_id": payload.get("conversation_id") or payload.get("session_id"),
+                "workspace_path": payload.get("workspace_path"),
+                "project_id": payload.get("project_id"),
+                "task_graph_id": data.get("task_graph_id"),
+                "graph_id": data.get("task_graph_id"),
+                "graph": data.get("graph"),
+                "payload": {
+                    "request_id": payload.get("request_id"),
+                    "turn_id": payload.get("turn_id") or payload.get("request_id"),
+                    "session_id": payload.get("session_id") or payload.get("conversation_id"),
+                    "conversation_id": payload.get("conversation_id") or payload.get("session_id"),
+                    "workspace_path": payload.get("workspace_path"),
+                    "project_id": payload.get("project_id"),
+                    "task_graph_id": data.get("task_graph_id"),
+                    "graph_id": data.get("task_graph_id"),
+                    "graph": data.get("graph"),
+                    "progress": data.get("progress"),
+                    "update_type": data.get("update_type") or "pipeline",
+                    "node_count": data.get("node_count"),
+                    "edge_count": data.get("edge_count"),
+                },
+            }
+            mark_public_payload(graph_payload, CHANNEL_LEDGER)
+            _schedule_broadcast(graph_payload)
+        elif step_type == "attention.update":
+            attention_payload = {
+                "type": "ATTENTION_UPDATE",
+                "request_id": payload.get("request_id"),
+                "turn_id": payload.get("turn_id") or payload.get("request_id"),
+                "session_id": payload.get("session_id") or payload.get("conversation_id"),
+                "conversation_id": payload.get("conversation_id") or payload.get("session_id"),
+                "workspace_path": payload.get("workspace_path"),
+                "project_id": payload.get("project_id"),
+                "task_graph_id": data.get("task_graph_id"),
+                "mode": data.get("mode"),
+                "turn": data.get("turn"),
+                "focus_node_id": data.get("focus_node_id"),
+                "budget_usage": data.get("budget_usage"),
+                "context_pressure": data.get("context_pressure"),
+                "pressure_tier": data.get("pressure_tier"),
+                "payload": {
+                    "request_id": payload.get("request_id"),
+                    "turn_id": payload.get("turn_id") or payload.get("request_id"),
+                    "session_id": payload.get("session_id") or payload.get("conversation_id"),
+                    "conversation_id": payload.get("conversation_id") or payload.get("session_id"),
+                    "workspace_path": payload.get("workspace_path"),
+                    "project_id": payload.get("project_id"),
+                    "task_graph_id": data.get("task_graph_id"),
+                    "mode": data.get("mode"),
+                    "turn": data.get("turn"),
+                    "focus_node_id": data.get("focus_node_id"),
+                    "budget_usage": data.get("budget_usage"),
+                    "context_pressure": data.get("context_pressure"),
+                    "pressure_tier": data.get("pressure_tier"),
+                    "progress": data.get("progress"),
+                },
+            }
+            mark_public_payload(attention_payload, CHANNEL_STATUS)
+            _schedule_broadcast(attention_payload)
         message = data.get("message") or payload.get("message") or payload.get("step_type") or "任务执行中。"
         interaction = data.get("interaction") if isinstance(data, dict) else None
         progress_items = interaction.get("progress_items") if isinstance(interaction, dict) else data.get("progress_items")
+        if isinstance(interaction, dict) and is_public_payload({"interaction": interaction}):
+            interaction_payload = {
+                "type": "INTERACTION_EVENT",
+                "request_id": payload.get("request_id"),
+                "turn_id": payload.get("turn_id") or payload.get("request_id"),
+                "session_id": payload.get("session_id") or payload.get("conversation_id"),
+                "conversation_id": payload.get("conversation_id") or payload.get("session_id"),
+                "workspace_path": payload.get("workspace_path"),
+                "project_id": payload.get("project_id"),
+                "task_graph_id": payload.get("task_graph_id") or data.get("task_graph_id"),
+                "step_type": payload.get("step_type"),
+                "interaction": interaction,
+                "payload": {
+                    "interaction": interaction,
+                    "request_id": payload.get("request_id"),
+                    "turn_id": payload.get("turn_id") or payload.get("request_id"),
+                    "session_id": payload.get("session_id") or payload.get("conversation_id"),
+                    "conversation_id": payload.get("conversation_id") or payload.get("session_id"),
+                    "workspace_path": payload.get("workspace_path"),
+                    "project_id": payload.get("project_id"),
+                    "task_graph_id": payload.get("task_graph_id") or data.get("task_graph_id"),
+                    "step_type": payload.get("step_type"),
+                },
+            }
+            mark_public_payload(
+                interaction_payload,
+                str(interaction.get("channel") or CHANNEL_LEDGER),
+                str(interaction.get("ux_visibility") or "main"),
+            )
+            _schedule_broadcast(interaction_payload)
         update_task_execution_status(
             state="running",
             phase=str(payload.get("step_type") or "thinking"),
@@ -1952,10 +2148,12 @@ def _on_l2_thinking_step(event) -> None:
             workspace_path=payload.get("workspace_path"),
             project_id=payload.get("project_id"),
             task_graph_id=payload.get("task_graph_id"),
-            progress_items=progress_items if isinstance(progress_items, list) else None,
+            progress_items=progress_items if isinstance(progress_items, list) and progress_items else None,
             broadcast=False,
         )
-        _schedule_broadcast({"type": "THINKING_STEP", **payload})
+        thinking_message = {"type": "THINKING_STEP", **payload}
+        mark_public_payload(thinking_message, CHANNEL_LEDGER)
+        _schedule_broadcast(thinking_message)
 
 
 def _compact_memory_graph_update(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2099,31 +2297,44 @@ async def _handle_chat_message(ws: WebSocket, data: dict) -> None:
     data["conversation_id"] = decision.conversation_id
     data["request_id"] = decision.turn_id
     data["turn_id"] = decision.turn_id
+    binding_policy = getattr(decision, "task_graph_binding_policy", "") or "reference_only"
+    clear_active_graph_for_turn = binding_policy == "clear_for_new_unbound_turn"
+    if clear_active_graph_for_turn:
+        data["clear_active_graph"] = True
+        data["active_graph_policy"] = "clear"
+        try:
+            from zulong.tools.task_tools import set_active_task_graph
+
+            set_active_task_graph(None, None)
+            logger.info(
+                "[WebChatRouter] 未绑定任务图的会话消息，发送前清空 active graph: session=%s request=%s",
+                decision.conversation_id,
+                decision.turn_id,
+            )
+        except Exception as exc:
+            logger.debug(f"[WebChatRouter] unbound turn active graph clear skipped: {exc}")
+    else:
+        data["active_graph_policy"] = binding_policy
+        data["task_graph_binding"] = {
+            "task_graph_id": decision.task_graph_id or getattr(decision, "last_task_graph_id", None),
+            "policy": binding_policy,
+            "reason": getattr(decision, "binding_reason", ""),
+            "active_source": "session_restore" if decision.task_graph_id else "none",
+        }
 
     await _send_turn_accepted(ws, decision)
     update_task_execution_status(
         state="running",
         phase="accepted",
-        message="任务已接收，正在交给 L1-B/L2 主链处理。",
+        message="任务已接收，正在准备执行。",
         request_id=decision.turn_id,
         conversation_id=decision.conversation_id,
         session_id=decision.conversation_id,
         workspace_path=decision.workspace_path,
         project_id=decision.project_id,
-        task_graph_id=decision.task_graph_id,
+        task_graph_id=decision.task_graph_id or "",
         tool_name="",
         awaiting_approval=False,
-        progress_items=[{
-            "label": "任务已接收",
-            "status": "completed",
-            "source": "plan",
-            "timestamp": time.time(),
-        }, {
-            "label": "L1-B/L2 正在处理",
-            "status": "running",
-            "source": "plan",
-            "timestamp": time.time(),
-        }],
     )
 
     logger.info(
@@ -2139,6 +2350,7 @@ async def _handle_chat_message(ws: WebSocket, data: dict) -> None:
         decision.conversation_id,
         referenced_nodes,
         decision=decision,
+        clear_active_graph=clear_active_graph_for_turn,
     )
 
 async def _send_turn_accepted(ws: WebSocket, decision: RouteDecision) -> None:
@@ -2153,7 +2365,7 @@ async def _send_turn_accepted(ws: WebSocket, decision: RouteDecision) -> None:
     await _send_to_ws(ws, msg)
 
 
-async def _chat_via_eventbus(ws, text, request_id, session_id, referenced_nodes, decision=None):
+async def _chat_via_eventbus(ws, text, request_id, session_id, referenced_nodes, decision=None, clear_active_graph=False):
     """Full 模式: 发布 USER_TEXT 到核心 EventBus → L1-B → L2"""
     try:
         from zulong.core.event_bus import event_bus
@@ -2170,14 +2382,26 @@ async def _chat_via_eventbus(ws, text, request_id, session_id, referenced_nodes,
         if decision:
             payload.update({
                 "conversation_id": decision.conversation_id,
+                "session_id": decision.conversation_id,
+                "session_node_id": decision.session_node_id,
+                "dialogue_session_id": decision.session_node_id,
                 "turn_id": decision.turn_id,
                 "workspace_path": decision.workspace_path,
                 "project_id": decision.project_id,
                 "task_graph_id": decision.task_graph_id,
                 "referenced_task_graph_id": decision.referenced_task_graph_id,
                 "task_graph_reference_mode": decision.task_graph_reference_mode,
+                "task_graph_binding": {
+                    "task_graph_id": decision.task_graph_id or getattr(decision, "last_task_graph_id", None),
+                    "policy": getattr(decision, "task_graph_binding_policy", "reference_only"),
+                    "reason": getattr(decision, "binding_reason", ""),
+                    "active_source": "session_restore" if decision.task_graph_id else "none",
+                },
                 "source": decision.source,
             })
+        if clear_active_graph:
+            payload["clear_active_graph"] = True
+            payload["active_graph_policy"] = "clear"
         if payload.get("task_graph_id") or payload.get("graph_id"):
             try:
                 from zulong.tools.task_tools import normalize_task_graph_id
@@ -2215,21 +2439,15 @@ async def _chat_via_eventbus(ws, text, request_id, session_id, referenced_nodes,
         update_task_execution_status(
             state="running",
             phase="running",
-            message="任务执行中：L1-B 已接收，L2/FC 正在推进。",
+            message="任务执行中，祖龙正在推进下一步。",
             request_id=request_id,
             conversation_id=session_id,
             session_id=session_id,
             workspace_path=payload.get("workspace_path"),
             project_id=payload.get("project_id"),
-            task_graph_id=payload.get("task_graph_id"),
+            task_graph_id=payload.get("task_graph_id") or "",
             tool_name="",
             awaiting_approval=False,
-            progress_items=[{
-                "label": "任务进入执行链路",
-                "status": "running",
-                "source": "plan",
-                "timestamp": time.time(),
-            }],
         )
         logger.info("[WebChatRouter] USER_TEXT 已发布到 EventBus (via executor)")
     except Exception as e:
@@ -2457,7 +2675,8 @@ async def _handle_stop_generation(data: dict) -> None:
 
 
 async def _handle_conversation_switch(data: dict) -> None:
-    conversation_id = data.get("conversation_id") or data.get("session_id")
+    payload = data.get("payload") if isinstance(data.get("payload"), dict) else data
+    conversation_id = payload.get("conversation_id") or payload.get("session_id") or data.get("session_id")
     if not conversation_id:
         return
     try:
@@ -2465,14 +2684,75 @@ async def _handle_conversation_switch(data: dict) -> None:
     except Exception as e:
         logger.debug(f"[WebChatRouter] conversation switch skipped: {e}")
 
+    raw_graph_id = payload.get("task_graph_id") or payload.get("graph_id") or ""
+    workspace_path = payload.get("workspace_path") or payload.get("cwd") or ""
+    session_node_id = payload.get("session_node_id") or payload.get("dialogue_session_id") or ""
+    clear_requested = bool(payload.get("clear_active_graph") or payload.get("is_new_session"))
+    try:
+        from zulong.tools.task_tools import (
+            _interaction_store_claims_graph,
+            infer_task_graph_owner_session_node_id,
+            load_task_graph_deterministic,
+            normalize_task_graph_id,
+            set_active_task_graph,
+        )
+
+        graph_id = normalize_task_graph_id(raw_graph_id)
+        session_node_id = infer_task_graph_owner_session_node_id(conversation_id, session_node_id)
+        if clear_requested and payload.get("is_new_session"):
+            set_active_task_graph(None, None)
+            logger.info(
+                "[WebChatRouter] 新会话切换优先清空 active graph: session=%s",
+                conversation_id,
+            )
+        elif graph_id:
+            claim_unowned = _interaction_store_claims_graph(conversation_id, graph_id)
+            loaded = load_task_graph_deterministic(
+                graph_id,
+                workspace_dir=workspace_path or None,
+                conversation_id=conversation_id,
+                session_node_id=session_node_id,
+                claim_unowned=claim_unowned,
+            )
+            if loaded:
+                logger.info(
+                    "[WebChatRouter] 会话切换激活任务图: session=%s graph=%s workspace=%s",
+                    conversation_id,
+                    graph_id,
+                    workspace_path or "-",
+                )
+            else:
+                set_active_task_graph(None, None)
+                logger.warning(
+                    "[WebChatRouter] 会话切换拒绝/未能激活任务图，已清空 active graph: session=%s graph=%s",
+                    conversation_id,
+                    graph_id,
+                )
+        elif clear_requested:
+            set_active_task_graph(None, None)
+            logger.info(
+                "[WebChatRouter] 新会话/空会话切换，已清空 active graph: session=%s",
+                conversation_id,
+            )
+    except Exception as e:
+        logger.debug(f"[WebChatRouter] conversation active graph sync skipped: {e}")
+
 
 async def _handle_chat_visible_message(data: dict) -> None:
     payload = data.get("payload") if isinstance(data.get("payload"), dict) else data
     conversation_id = payload.get("conversation_id") or payload.get("session_id")
+    session_node_id = payload.get("session_node_id") or payload.get("dialogue_session_id") or ""
     text = (payload.get("text") or "").strip()
     role = payload.get("role") or "assistant"
     if not conversation_id or not text or role not in ("user", "assistant", "tool"):
         return
+    if not session_node_id:
+        session_node_id = (
+            conversation_id if _is_dialogue_session_node_id(conversation_id)
+            else f"dialogue:session_{_compact_dialogue_id(conversation_id)}"
+        )
+    payload["session_node_id"] = session_node_id
+    payload["dialogue_session_id"] = session_node_id
     try:
         get_interaction_store().upsert_conversation(
             conversation_id,
@@ -2481,6 +2761,7 @@ async def _handle_chat_visible_message(data: dict) -> None:
             workspace_path=payload.get("workspace_path") or payload.get("cwd"),
             project_id=payload.get("project_id"),
             task_graph_id=payload.get("task_graph_id"),
+            session_node_id=session_node_id,
             active=True,
         )
         get_interaction_store().append_event(
@@ -2738,17 +3019,6 @@ def _serialize_memory_edge_for_snapshot(src: str, dst: str, edge_type: Any, edge
     }
 
 
-def _collect_execution_edges_networkx(mg: Any, execution_ids: Set[str]) -> List[Dict[str, Any]]:
-    graph = getattr(mg, "_graph", None)
-    if graph is None or not hasattr(graph, "edges"):
-        return []
-    edges: List[Dict[str, Any]] = []
-    for src, dst, data in graph.edges(data=True):
-        if src in execution_ids or dst in execution_ids:
-            edges.append(_serialize_memory_edge_for_snapshot(str(src), str(dst), data.get("edge_type"), data))
-    return edges
-
-
 def _collect_execution_edges_sharded(mg: Any, execution_ids: Set[str]) -> List[Dict[str, Any]]:
     if not hasattr(mg, "list_all_shards") or not hasattr(mg, "get_shard"):
         return []
@@ -2852,8 +3122,7 @@ def _collect_execution_edges_for_visible_nodes(
     if not execution_ids:
         return []
     if not hasattr(mg, "list_all_shards") or not hasattr(mg, "get_shard"):
-        edges = _collect_execution_edges_networkx(mg, execution_ids)
-        return edges[:max_edges]
+        return []
 
     collected: List[Dict[str, Any]] = []
     seen: Set[tuple] = set()
@@ -3531,40 +3800,29 @@ async def _handle_list_dialogue_sessions(ws: WebSocket) -> None:
 async def _handle_get_session_messages(ws: WebSocket, session_id: str) -> None:
     """获取指定会话的完整消息列表"""
     try:
+        messages = []
+        events = []
         try:
-            store_messages = get_conversation_orchestrator().store.get_messages(session_id)
+            store = get_conversation_orchestrator().store
+            store_messages = store.get_messages(session_id)
             if store_messages:
-                await _send_to_ws(ws, {
-                    "type": "SESSION_MESSAGES",
-                    "ts": time.time(),
-                    "session_id": session_id,
-                    "messages": store_messages,
-                })
-                return
+                messages = store_messages
+            raw_events = store.get_events(session_id, limit=1500, include_system=True)
+            if raw_events:
+                events = raw_events
         except Exception as store_err:
             logger.debug(f"[WebChatRouter] interaction store messages skipped: {store_err}")
 
-        from zulong.memory.graph_adapters import DialogueAdapter
-
-        mg = _get_active_memory_graph()
-        if not mg:
-            await _send_to_ws(ws, {
-                "type": "SESSION_MESSAGES",
-                "ts": time.time(),
-                "session_id": session_id,
-                "messages": [],
-            })
-            return
-
-        messages = DialogueAdapter.get_session_messages(mg, session_id)
         await _send_to_ws(ws, {
             "type": "SESSION_MESSAGES",
             "ts": time.time(),
             "session_id": session_id,
             "messages": messages,
+            "events": events,
         })
         logger.info(
-            f"[WebChatRouter] SESSION_MESSAGES: {session_id} → {len(messages)} 条消息")
+            f"[WebChatRouter] SESSION_MESSAGES: {session_id} -> "
+            f"{len(messages)} messages, {len(events)} raw events")
     except Exception as e:
         logger.error(f"[WebChatRouter] GET_SESSION_MESSAGES 失败: {e}", exc_info=True)
         try:
@@ -3573,6 +3831,7 @@ async def _handle_get_session_messages(ws: WebSocket, session_id: str) -> None:
             "ts": time.time(),
             "session_id": session_id,
             "messages": [],
+            "events": [],
             "error": str(e),
             })
         except Exception:
@@ -3588,6 +3847,7 @@ async def _handle_delete_dialogue_session(ws: WebSocket, session_id: str) -> Non
             "ts": time.time(),
             "session_id": session_id,
             "session_node_id": result.get("session_node_id") or "",
+            "session_ids": result.get("session_ids") or [session_id],
             "nodes_deleted": result.get("mg_nodes_deleted", 0),
             "deleted_node_ids": result.get("deleted_node_ids") or [],
         })
@@ -3621,6 +3881,7 @@ async def delete_session_rest(session_id: str, cascade: bool = True):
         "ts": time.time(),
         "session_id": session_id,
         "session_node_id": result.get("session_node_id") or "",
+        "session_ids": result.get("session_ids") or [session_id],
         "nodes_deleted": result.get("mg_nodes_deleted", 0),
         "deleted_node_ids": result.get("deleted_node_ids") or [],
     })
@@ -3654,6 +3915,12 @@ async def _send_to_ws(ws: WebSocket, message: dict, *, persist: bool = True) -> 
     统一协议客户端收到 `{msg_id, type: ns:action, session_id, ts, payload}` 格式。
     旧客户端收到传统的 `{type: UPPER_CASE, ...fields}` 格式。
     """
+    if not is_public_payload(message):
+        logger.debug(
+            "[WebChatRouter] 跳过内部控制消息发送: type=%s",
+            message.get("type"),
+        )
+        return True
     ws_id = id(ws)
     protocol = _ws_protocols.get(ws_id, "legacy")
     client_type = _ws_client_types.get(ws_id, "unknown")

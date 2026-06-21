@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import logging
 import re
 import time
 from pathlib import Path
 from typing import Any, Dict
 
 from .base import BaseTool, ToolCategory, ToolRequest, ToolResult
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_log_summary(value: Any, max_len: int = 240) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "..."
 
 
 def _resolve_ide_target_path(file_path: str, workspace_path: str, result: Dict[str, Any]) -> Path:
@@ -43,6 +54,27 @@ def _extract_applied_path(result: Dict[str, Any]) -> Path | None:
     return Path(match.group(1).strip().strip('"'))
 
 
+def _ide_result_not_applied(result: Dict[str, Any]) -> bool:
+    """Return True when the IDE bridge reports an unapplied protected change."""
+    haystack = " ".join(
+        str(result.get(key) or "")
+        for key in ("result", "error", "message", "detail")
+    ).lower()
+    if not haystack:
+        return False
+    markers = (
+        "用户未应用",
+        "用户未允许",
+        "用户拒绝",
+        "审批拒绝",
+        "审批超时",
+        "审批未通过",
+        "未应用写入",
+        "未允许",
+    )
+    return any(marker.lower() in haystack for marker in markers)
+
+
 def _nearest_existing_parent(path: Path) -> Path | None:
     current = path
     while current and current != current.parent:
@@ -74,6 +106,144 @@ def _normalize_workspace_for_target(file_path: str, workspace_path: str) -> str:
             return workspace_path
     except Exception:
         return workspace_path
+
+
+def _active_or_explicit_workspace(workspace_path: str) -> str:
+    candidates = []
+    try:
+        from zulong.tools.task_tools import get_active_workspace_dir
+
+        candidates.append(get_active_workspace_dir())
+    except Exception:
+        pass
+    candidates.append(workspace_path)
+    for candidate in candidates:
+        if candidate:
+            try:
+                return str(Path(str(candidate)).resolve())
+            except Exception:
+                return str(candidate)
+    return ""
+
+
+def _coerce_target_into_workspace(
+    file_path: str,
+    workspace_path: str,
+    *,
+    create_directory: bool,
+) -> tuple[str, str, bool, str]:
+    workspace = _active_or_explicit_workspace(workspace_path)
+    if not workspace:
+        return file_path, workspace_path, False, ""
+    try:
+        workspace_resolved = Path(workspace).resolve()
+        target = Path(file_path)
+        if not target.is_absolute():
+            return file_path, str(workspace_resolved), False, ""
+        target_resolved = target.resolve()
+        try:
+            target_resolved.relative_to(workspace_resolved)
+            return str(target_resolved), str(workspace_resolved), False, ""
+        except Exception:
+            pass
+        if create_directory and target_resolved.name.lower() == workspace_resolved.name.lower():
+            return str(workspace_resolved), str(workspace_resolved), True, (
+                "absolute directory target was redirected to the active task workspace"
+            )
+        if target_resolved.name:
+            return target_resolved.name, str(workspace_resolved), True, (
+                "absolute target outside the active task workspace was redirected inside the workspace"
+            )
+    except Exception:
+        pass
+    return file_path, workspace_path, False, ""
+
+
+def _ide_bridge_available(workspace_path: str) -> bool:
+    try:
+        from zulong.ide import ide_server
+
+        selector = getattr(ide_server, "_select_ide_bridge", None)
+        if callable(selector):
+            return bool(selector(workspace_path))
+    except Exception:
+        pass
+    return False
+
+
+def _local_workspace_write(
+    *,
+    file_path: str,
+    workspace_path: str,
+    content: str,
+    effective_content: str,
+    create_directory: bool,
+    write_mode: str,
+    reason: str,
+    content_bytes: int,
+    effective_content_bytes: int,
+    content_hash: str,
+) -> Dict[str, Any]:
+    workspace = _active_or_explicit_workspace(workspace_path)
+    if not workspace:
+        return {
+            "ok": False,
+            "status": "workspace_required",
+            "error": "workspace_path is required for local Web write fallback",
+            "applied": False,
+            "verified": False,
+        }
+    try:
+        workspace_resolved = Path(workspace).resolve()
+        workspace_resolved.mkdir(parents=True, exist_ok=True)
+        target = _resolve_ide_target_path(file_path, str(workspace_resolved), {})
+        target = target.resolve()
+        try:
+            target.relative_to(workspace_resolved)
+        except Exception:
+            return {
+                "ok": False,
+                "status": "path_outside_workspace",
+                "error": f"target path must stay inside the active task workspace: {target}",
+                "workspace_path": str(workspace_resolved),
+                "resolved_path": str(target),
+                "applied": False,
+                "verified": False,
+            }
+        if create_directory:
+            target.mkdir(parents=True, exist_ok=True)
+            verified = target.is_dir()
+            actual_bytes = 0
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(effective_content, encoding="utf-8")
+            verified = target.is_file() and target.read_text(encoding="utf-8") == effective_content
+            actual_bytes = target.stat().st_size if target.exists() else -1
+        return {
+            "ok": bool(verified),
+            "status": "local_workspace_write",
+            "message": reason or "written by Web task local workspace fallback",
+            "workspace_path": str(workspace_resolved),
+            "cwd": str(workspace_resolved),
+            "resolved_path": str(target),
+            "file_path": str(target),
+            "write_mode": write_mode,
+            "content_bytes": content_bytes,
+            "effective_content_bytes": effective_content_bytes,
+            "content_sha256_12": content_hash,
+            "actual_bytes": actual_bytes,
+            "applied": bool(target.exists()),
+            "verified": bool(verified),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "local_workspace_write_failed",
+            "error": str(exc),
+            "workspace_path": workspace,
+            "applied": False,
+            "verified": False,
+        }
 
 
 class IdeOpenWorkspaceTool(BaseTool):
@@ -162,9 +332,10 @@ class IdeWriteFileTool(BaseTool):
     def __init__(self):
         super().__init__(name="ide_write_file", category=ToolCategory.CODE)
         self.description = (
-            "通过 VS Code 后台桥创建或覆写宿主机文件，或创建文件夹/目录。"
+            "通过 VS Code 后台桥创建、覆写或追加宿主机文件，或创建文件夹/目录。"
             "适合用户明确要求在某个项目目录或绝对路径创建文件、文件夹、目录时使用。"
             "创建文件夹时必须设置 create_directory=true。"
+            "长文件请按 800-1200 字符分片写入：第一片 mode=overwrite，后续 mode=append。"
             "创建新的项目根目录时不得自动回退到父目录作为 VS Code 工作区；"
             "应先由 task_create_plan 创建并绑定任务工作区，或显式传入已有 workspace_path。"
             "该工具会走 VS Code 插件的用户确认和 checkpoint。"
@@ -202,6 +373,12 @@ class IdeWriteFileTool(BaseTool):
             )
 
         content = params.get("content", "")
+        if content is None:
+            content = ""
+        content = str(content)
+        write_mode = str(params.get("mode") or params.get("write_mode") or "overwrite").lower()
+        if write_mode not in {"overwrite", "append"}:
+            write_mode = "overwrite"
         create_directory = bool(
             params.get("create_directory")
             or params.get("is_directory")
@@ -227,12 +404,40 @@ class IdeWriteFileTool(BaseTool):
             workspace_path = _infer_workspace_from_path(file_path, create_directory=create_directory)
         else:
             workspace_path = _normalize_workspace_for_target(file_path, workspace_path)
+        file_path, workspace_path, redirected_path, redirect_reason = _coerce_target_into_workspace(
+            file_path,
+            workspace_path,
+            create_directory=create_directory,
+        )
 
         tool_name = "create_directory" if create_directory else "write_to_file"
+        effective_content = content
+        if not create_directory and write_mode == "append":
+            append_target = _resolve_ide_target_path(file_path, workspace_path, {})
+            try:
+                if append_target.exists():
+                    if append_target.is_dir():
+                        return self._create_result(
+                            success=False,
+                            error=f"append 目标是目录，不能写入文件: {append_target}",
+                            execution_time=time.time() - start,
+                            request_id=request.request_id,
+                        )
+                    existing = append_target.read_text(encoding="utf-8")
+                else:
+                    existing = ""
+            except Exception as exc:
+                return self._create_result(
+                    success=False,
+                    error=f"append 前无法读取现有文件内容: {append_target} ({exc})",
+                    execution_time=time.time() - start,
+                    request_id=request.request_id,
+                )
+            effective_content = existing + content
         tool_args: Dict[str, Any] = (
             {"path": file_path}
             if create_directory
-            else {"path": file_path, "content": content}
+            else {"path": file_path, "content": effective_content}
         )
         payload = {
             "workspace_path": workspace_path,
@@ -244,13 +449,91 @@ class IdeWriteFileTool(BaseTool):
             "bridge_timeout": params.get("bridge_timeout", 180),
             "timeout": params.get("timeout", 180),
         }
+        content_bytes = len(content.encode("utf-8")) if not create_directory else 0
+        effective_content_bytes = len(effective_content.encode("utf-8")) if not create_directory else 0
+        content_hash = (
+            hashlib.sha256(effective_content.encode("utf-8")).hexdigest()[:12]
+            if not create_directory
+            else ""
+        )
+        logger.info(
+            "[ide_write_file][P10] request path=%s workspace=%s tool=%s mode=%s create_directory=%s content_bytes=%s effective_content_bytes=%s content_sha256_12=%s",
+            file_path,
+            workspace_path or "<empty>",
+            tool_name,
+            write_mode,
+            create_directory,
+            content_bytes,
+            effective_content_bytes,
+            content_hash or "<none>",
+        )
+        if redirected_path:
+            logger.warning(
+                "[ide_write_file][P10] redirected target into active workspace: %s",
+                redirect_reason,
+            )
+        if not _ide_bridge_available(workspace_path):
+            result = _local_workspace_write(
+                file_path=file_path,
+                workspace_path=workspace_path,
+                content=content,
+                effective_content=effective_content,
+                create_directory=create_directory,
+                write_mode=write_mode,
+                reason=redirect_reason or "VS Code bridge unavailable; wrote inside active task workspace",
+                content_bytes=content_bytes,
+                effective_content_bytes=effective_content_bytes,
+                content_hash=content_hash,
+            )
+            logger.info(
+                "[ide_write_file][P10] local fallback path=%s resolved_path=%s applied=%s verified=%s reason=%s",
+                file_path,
+                result.get("resolved_path", ""),
+                result.get("applied"),
+                result.get("verified"),
+                _safe_log_summary(result.get("error") or result.get("message") or ""),
+            )
+            return self._create_result(
+                success=bool(result.get("ok")),
+                data=result,
+                error=None if result.get("ok") else result.get("error", "local workspace write failed"),
+                execution_time=time.time() - start,
+                request_id=request.request_id,
+            )
         try:
             result = _run_async_request("ide:execute_tool", payload)
+            target: Path | None = None
+            if _ide_result_not_applied(result):
+                result = {
+                    **result,
+                    "ok": False,
+                    "error": result.get("error") or result.get("result") or "IDE 写入未应用",
+                    "verified": False,
+                    "applied": False,
+                }
             verified = False
             try:
                 target = _resolve_ide_target_path(file_path, workspace_path, result)
-                verified = target.is_dir() if create_directory else target.is_file()
-                if not verified:
+                if result.get("ok"):
+                    verified = target.is_dir() if create_directory else target.is_file()
+                if result.get("ok") and verified and not create_directory:
+                    try:
+                        actual = target.read_text(encoding="utf-8")
+                        if actual != effective_content:
+                            verified = False
+                            result = {
+                                **result,
+                                "ok": False,
+                                "error": (
+                                    "IDE 工具返回成功，但目标文件内容未应用为本次写入内容: "
+                                    f"{file_path}"
+                                ),
+                                "verified": False,
+                                "applied": False,
+                            }
+                    except Exception:
+                        pass
+                if result.get("ok") and not verified:
                     applied_target = _extract_applied_path(result)
                     if applied_target:
                         verified = (
@@ -273,14 +556,49 @@ class IdeWriteFileTool(BaseTool):
                         "IDE 工具返回成功，但目标路径未真实存在: "
                         f"{file_path}（workspace={workspace_path or '<empty>'}）"
                     ),
+                    "applied": False,
                     "verified": False,
                 }
+            if not result.get("ok") and workspace_path:
+                fallback = _local_workspace_write(
+                    file_path=file_path,
+                    workspace_path=workspace_path,
+                    content=content,
+                    effective_content=effective_content,
+                    create_directory=create_directory,
+                    write_mode=write_mode,
+                    reason="IDE bridge did not apply the write; used active task workspace fallback",
+                    content_bytes=content_bytes,
+                    effective_content_bytes=effective_content_bytes,
+                    content_hash=content_hash,
+                )
+                if fallback.get("ok"):
+                    result = {
+                        **fallback,
+                        "bridge": result,
+                        "status": "local_fallback_after_bridge_failure",
+                    }
             else:
                 result = {
                     **result,
                     "verified": verified,
-                    "resolved_path": result.get("resolved_path") or str(target),
+                    "write_mode": write_mode,
+                    "content_bytes": content_bytes,
+                    "effective_content_bytes": effective_content_bytes,
+                    "resolved_path": result.get("resolved_path") or (str(target) if target else ""),
                 }
+            logger.info(
+                "[ide_write_file][P10] result path=%s resolved_path=%s bridge_ok=%s applied=%s verified=%s mode=%s content_bytes=%s effective_content_bytes=%s error=%s",
+                file_path,
+                result.get("resolved_path") or (str(target) if target else ""),
+                bool(result.get("ok")),
+                result.get("applied", result.get("ok")),
+                bool(result.get("verified")),
+                write_mode,
+                content_bytes,
+                effective_content_bytes,
+                _safe_log_summary(result.get("error") or result.get("message") or result.get("result") or ""),
+            )
             return self._create_result(
                 success=bool(result.get("ok")),
                 data=result,
@@ -289,6 +607,13 @@ class IdeWriteFileTool(BaseTool):
                 request_id=request.request_id,
             )
         except Exception as exc:
+            logger.info(
+                "[ide_write_file][P10] exception path=%s workspace=%s content_bytes=%s error=%s",
+                file_path,
+                workspace_path or "<empty>",
+                content_bytes,
+                _safe_log_summary(exc),
+            )
             return self._create_result(
                 success=False,
                 error=str(exc),
@@ -306,7 +631,12 @@ class IdeWriteFileTool(BaseTool):
                 },
                 "content": {
                     "type": "string",
-                    "description": "文件内容。创建空文件时传空字符串。创建文件夹/目录时可省略或传空字符串。",
+                    "description": "本次写入的文件内容。长文件不要一次性传完整内容，单片建议 800-1200 字符。创建空文件时传空字符串。创建文件夹/目录时可省略或传空字符串。",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["overwrite", "append"],
+                    "description": "写入模式。默认 overwrite 覆盖整个文件；append 会先读取现有文件并追加本次 content 后再通过 IDE 桥写入完整文件。",
                 },
                 "workspace_path": {
                     "type": "string",
@@ -380,6 +710,14 @@ def _infer_workspace_from_path(file_path: str, *, create_directory: bool = False
                         pass
                 return str(p)
             return str(p.parent)
+        try:
+            from zulong.tools.task_tools import get_active_workspace_dir
+
+            active_workspace = get_active_workspace_dir()
+        except Exception:
+            active_workspace = ""
+        if active_workspace:
+            return str(Path(active_workspace).resolve())
     except Exception:
         pass
     return ""

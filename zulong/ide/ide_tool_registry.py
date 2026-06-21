@@ -54,6 +54,36 @@ _CONTINUE_GRAPH_EXCLUDED_INTERNAL_TOOLS = {
     "task_add_node",
 }
 
+ANNOUNCE_STEP_TOOL_NAME = "announce_step"
+
+ANNOUNCE_STEP_TOOL_SCHEMA: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": ANNOUNCE_STEP_TOOL_NAME,
+        "description": (
+            "零副作用步骤说明工具。准备调用真实工具前，如果 assistant.content "
+            "无法保留普通可见说明，先调用本工具用一句中文告诉用户本步将做什么。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "8-80 个中文字符优先，最多 160 字；只说明本步将做什么，不写推理过程。",
+                    "maxLength": 160,
+                },
+                "expected_actions": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": 48},
+                    "description": "可选，最多 3 项，用于生成用户可见清单。",
+                    "maxItems": 3,
+                },
+            },
+            "required": ["message"],
+        },
+    },
+}
+
 
 @dataclass
 class CachedSchema:
@@ -154,12 +184,20 @@ _IDE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "write_to_file",
-            "description": "将内容写入文件。如果文件不存在则创建，存在则覆盖。",
+            "description": (
+                "将内容写入文件。默认覆盖；长文件必须按 800-1200 字符分片写入："
+                "第一片 mode=overwrite，后续 mode=append。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "文件绝对路径"},
-                    "content": {"type": "string", "description": "文件完整内容"},
+                    "content": {"type": "string", "description": "本次写入的内容。长文件不要一次性传完整内容，单片建议 800-1200 字符。"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["overwrite", "append"],
+                        "description": "写入模式。默认 overwrite 覆盖；append 会追加到现有内容后再写入。",
+                    },
                 },
                 "required": ["path", "content"],
             },
@@ -206,6 +244,11 @@ _IDE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "requires_approval": {
                         "type": "boolean",
                         "description": "是否需要用户批准（默认 true）",
+                    },
+                    "shell": {
+                        "type": "string",
+                        "enum": ["auto", "cmd", "powershell", "git_bash"],
+                        "description": "可选。指定终端 shell：auto/cmd/powershell/git_bash。",
                     },
                 },
                 "required": ["command"],
@@ -456,7 +499,7 @@ class IDEToolRegistry:
         """合并祖龙内部工具 + IDE 远程工具的 OpenAI FC schema"""
         internal = self._get_filtered_internal_tools()
         remote = list(_IDE_TOOL_SCHEMAS)
-        combined = internal + remote
+        combined = [ANNOUNCE_STEP_TOOL_SCHEMA] + internal + remote
         logger.info(
             f"[IDEToolRegistry] 合并工具定义: "
             f"内部={len(internal)}, 远程={len(remote)}, 总计={len(combined)}"
@@ -494,7 +537,7 @@ class IDEToolRegistry:
             extra_exclude=extra_exclude,
         )
         remote = list(_IDE_TOOL_SCHEMAS)
-        combined = internal + remote
+        combined = [ANNOUNCE_STEP_TOOL_SCHEMA] + internal + remote
         logger.info(
             "[IDEToolRegistry] 策略工具定义: policy=%s, 内部=%s, 远程=%s, 总计=%s",
             task_graph_policy,

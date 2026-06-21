@@ -60,13 +60,35 @@ class IDEServerModule(Module):
         except Exception as e:
             logger.warning(f"[IDEServerModule] Embedding 模型预热失败（非致命）: {e}")
 
-        # 4.5 后台预热 TTS，避免首次语音回复阻塞在 Kokoro/HF 加载。
+        # 4.5 TTS 默认按需加载，避免 Web 编程链路启动时被 Kokoro/HF 预热拖垮。
+        def _as_bool(value, default: bool = False) -> bool:
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
         try:
-            from zulong.l3.tts_expert_node import prewarm_tts_expert_async
-            prewarm_tts_expert_async()
-            logger.info("[IDEServerModule] TTS 模型后台预热已启动")
-        except Exception as e:
-            logger.warning(f"[IDEServerModule] TTS 预热启动失败（非致命）: {e}")
+            from zulong.config.config_manager import get_config
+
+            tts_prewarm = _as_bool(get_config("audio.tts.prewarm_on_launch", False))
+        except Exception:
+            tts_prewarm = False
+
+        env_tts_prewarm = os.environ.get("ZULONG_TTS_PREWARM")
+        if env_tts_prewarm is not None:
+            tts_prewarm = _as_bool(env_tts_prewarm)
+
+        if tts_prewarm:
+            try:
+                from zulong.l3.tts_expert_node import prewarm_tts_expert_async
+
+                prewarm_tts_expert_async()
+                logger.info("[IDEServerModule] TTS 模型后台预热已启动")
+            except Exception as e:
+                logger.warning(f"[IDEServerModule] TTS 预热启动失败（非致命）: {e}")
+        else:
+            logger.info("[IDEServerModule] TTS 模型后台预热已跳过（按需加载）")
 
         # 5. 标记 IDE 就绪（Launcher 用此切换根路由）
         self._context["ide_ready"] = True

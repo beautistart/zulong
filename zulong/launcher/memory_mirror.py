@@ -332,7 +332,16 @@ def mirror_interaction_to_memory_graph(
         safe_turn_id = _compact_id(turn_id)
         safe_role = _compact_id(role or "system")
         safe_event_type = _compact_id(event_type or "message")
-        session_id = f"dialogue:session_{safe_conversation_id}"
+        payload = payload or {}
+        explicit_session_id = str(
+            payload.get("session_node_id")
+            or payload.get("dialogue_session_id")
+            or ""
+        ).strip()
+        if explicit_session_id.startswith("dialogue:session_") and "/" not in explicit_session_id:
+            session_id = explicit_session_id
+        else:
+            session_id = f"dialogue:session_{safe_conversation_id}"
         round_id = f"{session_id}/round_{safe_turn_id}"
         message_id = f"{round_id}/{safe_role}_{safe_event_type}"
         changes: List[Dict[str, Any]] = []
@@ -490,7 +499,7 @@ def mirror_interaction_to_memory_graph(
             "role": role,
             "source": source,
             "content": text,
-            "payload": payload or {},
+            "payload": payload,
             "created_at": now,
             "parent_round": round_id,
             "parent_session": session_id,

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from zulong.tools.base import BaseTool, ToolCategory
 
@@ -143,6 +143,8 @@ ALWAYS_AVAILABLE_TOOLS = {
     "search_tools",
 }
 
+_EMBEDDING_TOOL_CACHE: Dict[Tuple[Any, ...], Tuple[List[str], List[str], Any]] = {}
+
 
 @dataclass
 class ToolBagEntry:
@@ -227,6 +229,7 @@ def predict_tools_for_turn(
     referenced_nodes: Optional[Sequence[Any]] = None,
     has_task_graph: bool = False,
     max_prompt_tools: Optional[int] = None,
+    embedding_provider: Optional[Any] = None,
 ) -> ToolPrediction:
     """Predict concrete tools/context for L2 without hard-routing the turn."""
     text = (text or "").strip()
@@ -353,6 +356,33 @@ def predict_tools_for_turn(
         add(["vscode_manage_extension"], "用户要求管理 VS Code 扩展")
         risk_notes.append("扩展安装/卸载涉及系统权限，需用户审批。")
 
+    if registry is not None:
+        rule_predicted = list(predicted)
+        semantic_tools, semantic_reasons = _predict_tools_with_embeddings(
+            text,
+            registry=registry,
+            context_bundle=context_bundle,
+            task_graph_policy=task_graph_policy,
+            intent_result=intent_result,
+            max_results=max_prompt_tools,
+            embedding_provider=embedding_provider,
+        )
+        if semantic_tools:
+            predicted = []
+            add(semantic_tools, semantic_reasons[0] if semantic_reasons else "基于 embedding 语义检索匹配工具")
+            for reason in semantic_reasons[1:]:
+                if reason not in reasons:
+                    reasons.append(reason)
+            _add_rule_guards(
+                predicted,
+                rule_predicted,
+                context_bundle=context_bundle,
+                task_graph_policy=task_graph_policy,
+            )
+            context_bundle["tool_prediction_source"] = "embedding"
+        else:
+            context_bundle["tool_prediction_source"] = "rule_fallback"
+
     return _finalize_prediction(predicted, context_bundle, reasons, risk_notes, task_graph_policy, registry, max_prompt_tools)
 
 
@@ -462,11 +492,13 @@ def summarize_tool_bundle(prediction: Dict[str, Any], *, limit: int = 1600) -> s
             lines.append(
                 "- 文件写入提示: 用户给出了宿主机绝对路径。若任务需要新建项目/多步开发，"
                 "先建立 TaskGraph/workspace 绑定，再调用 ide_write_file 写具体文件；"
+                "长文件按 800-1200 字符分片，第一片 mode='overwrite'，后续 mode='append'；"
                 "不要只用自然语言声称创建成功。"
             )
         else:
             lines.append(
                 "- 文件写入提示: 用户给出了宿主机绝对路径，优先调用 ide_write_file，"
+                "长文件按 800-1200 字符分片，第一片 mode='overwrite'，后续 mode='append'；"
                 "不要只用自然语言声称创建成功。"
             )
     if ctx.get("needs_directory_create"):
@@ -530,6 +562,256 @@ def _finalize_prediction(
         risk_notes=risk_notes,
         task_graph_policy=task_graph_policy,
     )
+
+
+def _predict_tools_with_embeddings(
+    text: str,
+    *,
+    registry,
+    context_bundle: Dict[str, Any],
+    task_graph_policy: str,
+    intent_result: Optional[Dict[str, Any]],
+    max_results: Optional[int],
+    embedding_provider: Optional[Any],
+) -> Tuple[List[str], List[str]]:
+    """Rank active tools by embedding similarity against the current turn."""
+    try:
+        import numpy as np
+    except Exception:
+        return [], ["embedding 依赖不可用，使用规则兜底"]
+
+    bag = build_tool_bag(registry)
+    if not bag:
+        return [], ["工具袋为空，使用规则兜底"]
+
+    provider = embedding_provider or _load_default_tool_embedding_provider()
+    if provider is None:
+        return [], ["embedding 模型不可用，使用规则兜底"]
+
+    names = sorted(bag.keys())
+    catalog_signature = _tool_catalog_signature(bag, names)
+    cache_key = (id(provider), catalog_signature)
+    cached = _EMBEDDING_TOOL_CACHE.get(cache_key)
+    if cached:
+        cached_names, docs, doc_vectors = cached
+    else:
+        cached_names = names
+        docs = [_tool_embedding_text(bag[name]) for name in cached_names]
+        try:
+            doc_vectors = _encode_documents(provider, docs)
+        except Exception:
+            return [], ["工具 embedding 编码失败，使用规则兜底"]
+        _EMBEDDING_TOOL_CACHE[cache_key] = (cached_names, docs, doc_vectors)
+
+    query_text = _build_tool_embedding_query(
+        text,
+        context_bundle=context_bundle,
+        task_graph_policy=task_graph_policy,
+        intent_result=intent_result,
+    )
+    try:
+        query_vector = _encode_query(provider, query_text)
+    except Exception:
+        return [], ["查询 embedding 编码失败，使用规则兜底"]
+
+    doc_matrix = np.asarray(doc_vectors, dtype="float32")
+    query = np.asarray(query_vector, dtype="float32").reshape(-1)
+    if doc_matrix.ndim != 2 or query.size == 0:
+        return [], ["embedding 向量形状异常，使用规则兜底"]
+    if doc_matrix.shape[1] != query.shape[0]:
+        return [], ["embedding 维度不匹配，使用规则兜底"]
+
+    denom = (np.linalg.norm(doc_matrix, axis=1) * np.linalg.norm(query)) + 1e-8
+    scores = (doc_matrix @ query) / denom
+    ranked_indices = list(np.argsort(-scores))
+    limit = max_results or _default_embedding_tool_limit(context_bundle, task_graph_policy)
+
+    selected: List[str] = []
+    score_rows: List[Dict[str, Any]] = []
+    for idx in ranked_indices:
+        name = cached_names[int(idx)]
+        score = float(scores[int(idx)])
+        if not _semantic_tool_allowed(name, context_bundle, text):
+            continue
+        if name not in selected:
+            selected.append(name)
+            score_rows.append({"name": name, "score": round(score, 4)})
+        if len(selected) >= limit:
+            break
+
+    if not selected:
+        return [], ["embedding 未选出可用工具，使用规则兜底"]
+
+    context_bundle["embedding_top_tools"] = score_rows[:8]
+    return selected, ["基于 embedding 语义相似度匹配首轮工具"]
+
+
+def _load_default_tool_embedding_provider() -> Optional[Any]:
+    try:
+        from zulong.models.embedding_model import embedding_model
+
+        if getattr(embedding_model, "model", None) is None:
+            embedding_model.load()
+        return embedding_model
+    except Exception:
+        return None
+
+
+def _tool_catalog_signature(bag: Dict[str, ToolBagEntry], names: Sequence[str]) -> Tuple[Any, ...]:
+    return tuple(
+        (
+            name,
+            bag[name].category,
+            bag[name].description[:240],
+            tuple(bag[name].inputs),
+        )
+        for name in names
+    )
+
+
+def _tool_embedding_text(entry: ToolBagEntry) -> str:
+    return "\n".join(
+        [
+            f"tool_name: {entry.name}",
+            f"category: {entry.category}",
+            f"description: {entry.description}",
+            f"inputs: {', '.join(entry.inputs) if entry.inputs else 'none'}",
+            f"risk: {entry.risk}",
+            f"examples: {'; '.join(entry.examples)}",
+        ]
+    )
+
+
+def _build_tool_embedding_query(
+    text: str,
+    *,
+    context_bundle: Dict[str, Any],
+    task_graph_policy: str,
+    intent_result: Optional[Dict[str, Any]],
+) -> str:
+    parts = [text or ""]
+    if intent_result:
+        intent = intent_result.get("intent") or intent_result.get("label")
+        if intent:
+            parts.append(f"intent: {intent}")
+    if context_bundle.get("needs_realtime"):
+        parts.append("need realtime web search current latest online information")
+    if context_bundle.get("needs_memory_write"):
+        parts.append("need save long term memory note recall memory node related memories")
+    elif context_bundle.get("needs_memory"):
+        parts.append("need recall memory read memory node discover related experience")
+    if context_bundle.get("needs_project_context"):
+        parts.append("need read analyze project code files symbols impact module index")
+    if context_bundle.get("needs_ide_file_write"):
+        parts.append("need write file through ide bridge vscode workspace approval")
+    if context_bundle.get("needs_ide_workspace"):
+        parts.append("need open switch vscode ide workspace folder")
+    if context_bundle.get("needs_vscode_command"):
+        parts.append("need vscode command format refactor git test task")
+    if context_bundle.get("needs_diagnostics"):
+        parts.append("need diagnostics lint compile errors problems warnings")
+    if task_graph_policy != "none":
+        parts.append("need task graph plan progress resume node status final answer")
+    return "\n".join(part for part in parts if part)
+
+
+def _encode_query(provider: Any, query: str):
+    if hasattr(provider, "encode_query"):
+        return provider.encode_query(query)
+    if hasattr(provider, "encode"):
+        values = provider.encode([query])
+        return values[0]
+    raise TypeError("embedding provider lacks encode_query/encode")
+
+
+def _encode_documents(provider: Any, documents: List[str]):
+    if hasattr(provider, "encode_documents"):
+        return provider.encode_documents(documents)
+    if hasattr(provider, "encode"):
+        return provider.encode(documents)
+    raise TypeError("embedding provider lacks encode_documents/encode")
+
+
+def _default_embedding_tool_limit(
+    context_bundle: Dict[str, Any],
+    task_graph_policy: str,
+) -> int:
+    if context_bundle.get("needs_project_context") or task_graph_policy != "none":
+        return 18
+    if context_bundle.get("needs_memory") or context_bundle.get("needs_memory_write"):
+        return 8
+    return 10
+
+
+def _semantic_tool_allowed(name: str, context_bundle: Dict[str, Any], text: str) -> bool:
+    if _has_read_only_constraint(text) and name in WRITE_TOOL_NAMES:
+        return False
+    if context_bundle.get("needs_memory_write"):
+        blocked = (WRITE_TOOL_NAMES | CODE_TOOL_NAMES | TERMINAL_TOOL_NAMES) - MEMORY_TOOL_NAMES
+        if name in blocked:
+            return False
+    return True
+
+
+def _add_rule_guards(
+    predicted: List[str],
+    rule_predicted: Sequence[str],
+    *,
+    context_bundle: Dict[str, Any],
+    task_graph_policy: str,
+) -> None:
+    """Add minimal deterministic guard tools after semantic ranking."""
+
+    def has_any(names: Set[str]) -> bool:
+        return any(name in names for name in predicted)
+
+    def add_names(names: Iterable[str]) -> None:
+        available = set(rule_predicted) if rule_predicted else set()
+        for name in names:
+            if available and name not in available:
+                continue
+            if name not in predicted:
+                predicted.append(name)
+
+    if context_bundle.get("needs_memory_write"):
+        add_names(["save_memory_note", "recall_memory", "read_memory_node", "discover_related", "search_experience"])
+    elif context_bundle.get("needs_memory") and not has_any(MEMORY_TOOL_NAMES):
+        add_names(["recall_memory", "read_memory_node", "discover_related", "search_experience"])
+
+    if context_bundle.get("needs_project_context") and not has_any(PROJECT_READ_TOOL_NAMES):
+        add_names([
+            "read_file",
+            "zulong_code_query",
+            "search_code_symbols",
+            "get_symbol_context",
+            "get_impact_analysis",
+            "index_code_file",
+            "index_project",
+            "analyze_module",
+        ])
+
+    if context_bundle.get("needs_ide_file_write") and not has_any(WRITE_TOOL_NAMES):
+        add_names(["ide_write_file", "task_attach_file", "zulong_memory_write_with_code"])
+    elif any(name in WRITE_TOOL_NAMES for name in rule_predicted) and not has_any(WRITE_TOOL_NAMES):
+        add_names([name for name in rule_predicted if name in WRITE_TOOL_NAMES])
+
+    if any(name in TERMINAL_TOOL_NAMES for name in rule_predicted) and not has_any(TERMINAL_TOOL_NAMES):
+        add_names(["exec_run_command"])
+
+    if task_graph_policy != "none" and not has_any(TASK_TOOL_NAMES):
+        add_names([
+            "search_experience",
+            "task_view_overview",
+            "task_get_detail",
+            "task_create_plan",
+            "task_add_node",
+            "task_mark_status",
+            "task_update_node",
+            "task_list_suspended",
+            "task_resume_by_address",
+            "task_suspend",
+            "submit_final_answer",
+        ])
 
 
 def _safe_schema(tool: BaseTool) -> Dict[str, Any]:

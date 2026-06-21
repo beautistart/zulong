@@ -34,19 +34,20 @@ class AttentionConfig:
         Returns:
             AttentionConfig实例
         """
-        if config_path is None:
-            project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-            config_path = os.path.join(project_root, "config", "zulong_config.yaml")
-        
         default_config = cls()
-        
-        if not os.path.exists(config_path):
-            logger.warning(f"[AttentionConfig] 配置文件不存在: {config_path}，使用默认配置")
-            return default_config
-        
+
         try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config_data = yaml.safe_load(f)
+            if config_path is None:
+                from zulong.config.config_manager import ConfigManager
+                config_data = ConfigManager().config
+            else:
+                if not os.path.exists(config_path):
+                    logger.warning(f"[AttentionConfig] 配置文件不存在: {config_path}，使用默认配置")
+                    return default_config
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    raw_config = yaml.safe_load(f)
+                from zulong.config.config_manager import ConfigManager
+                config_data = ConfigManager(config_path)._substitute_env_variables(raw_config)
             
             if not config_data:
                 logger.warning(f"[AttentionConfig] 配置文件为空，使用默认配置")
@@ -57,17 +58,45 @@ class AttentionConfig:
             if not attention_config:
                 logger.info(f"[AttentionConfig] 未找到attention_selection配置段，使用默认配置")
                 return default_config
+
+            def _get_float(key: str, default: float) -> float:
+                value = attention_config.get(key, default)
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        f"[AttentionConfig] {key}={value!r} 无法解析为数字，使用默认值 {default}"
+                    )
+                    return default
+
+            def _get_int(key: str, default: int) -> int:
+                value = attention_config.get(key, default)
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        f"[AttentionConfig] {key}={value!r} 无法解析为整数，使用默认值 {default}"
+                    )
+                    return default
+
+            def _get_bool(key: str, default: bool) -> bool:
+                value = attention_config.get(key, default)
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, str):
+                    return value.strip().lower() in {"1", "true", "yes", "on"}
+                return bool(value)
             
             config = cls(
-                enabled=attention_config.get("enabled", default_config.enabled),
-                pressure_threshold_high=attention_config.get("pressure_threshold_high", default_config.pressure_threshold_high),
-                pressure_threshold_medium=attention_config.get("pressure_threshold_medium", default_config.pressure_threshold_medium),
-                cooldown_base_seconds=attention_config.get("cooldown_base_seconds", default_config.cooldown_base_seconds),
+                enabled=_get_bool("enabled", default_config.enabled),
+                pressure_threshold_high=_get_float("pressure_threshold_high", default_config.pressure_threshold_high),
+                pressure_threshold_medium=_get_float("pressure_threshold_medium", default_config.pressure_threshold_medium),
+                cooldown_base_seconds=_get_float("cooldown_base_seconds", default_config.cooldown_base_seconds),
                 fallback_mode=attention_config.get("fallback_mode", default_config.fallback_mode),
-                decision_timeout_ms=attention_config.get("decision_timeout_ms", default_config.decision_timeout_ms),
-                oscillation_detection_window=attention_config.get("oscillation_detection_window", default_config.oscillation_detection_window),
-                max_switch_history=attention_config.get("max_switch_history", default_config.max_switch_history),
-                min_confidence_threshold=attention_config.get("min_confidence_threshold", default_config.min_confidence_threshold),
+                decision_timeout_ms=_get_int("decision_timeout_ms", default_config.decision_timeout_ms),
+                oscillation_detection_window=_get_int("oscillation_detection_window", default_config.oscillation_detection_window),
+                max_switch_history=_get_int("max_switch_history", default_config.max_switch_history),
+                min_confidence_threshold=_get_float("min_confidence_threshold", default_config.min_confidence_threshold),
             )
             
             logger.info(f"[AttentionConfig] 配置加载成功: enabled={config.enabled}, "
@@ -87,18 +116,27 @@ class AttentionConfig:
         """
         is_valid = True
         
-        if not (0.5 <= self.pressure_threshold_high <= 1.5):
+        if not (0.01 <= self.pressure_threshold_high <= 1.5):
             old_value = self.pressure_threshold_high
-            self.pressure_threshold_high = max(0.5, min(1.5, self.pressure_threshold_high))
-            logger.warning(f"[AttentionConfig] pressure_threshold_high超出范围[0.5, 1.5]，"
+            self.pressure_threshold_high = max(0.01, min(1.5, self.pressure_threshold_high))
+            logger.warning(f"[AttentionConfig] pressure_threshold_high超出范围[0.01, 1.5]，"
                           f"从{old_value}修正为{self.pressure_threshold_high}")
             is_valid = False
         
-        if not (0.3 <= self.pressure_threshold_medium <= 1.0):
+        if not (0.01 <= self.pressure_threshold_medium <= 1.0):
             old_value = self.pressure_threshold_medium
-            self.pressure_threshold_medium = max(0.3, min(1.0, self.pressure_threshold_medium))
-            logger.warning(f"[AttentionConfig] pressure_threshold_medium超出范围[0.3, 1.0]，"
+            self.pressure_threshold_medium = max(0.01, min(1.0, self.pressure_threshold_medium))
+            logger.warning(f"[AttentionConfig] pressure_threshold_medium超出范围[0.01, 1.0]，"
                           f"从{old_value}修正为{self.pressure_threshold_medium}")
+            is_valid = False
+
+        if self.pressure_threshold_medium > self.pressure_threshold_high:
+            old_value = self.pressure_threshold_medium
+            self.pressure_threshold_medium = self.pressure_threshold_high
+            logger.warning(
+                f"[AttentionConfig] pressure_threshold_medium 高于 high，"
+                f"从{old_value}修正为{self.pressure_threshold_medium}"
+            )
             is_valid = False
         
         if not (10.0 <= self.cooldown_base_seconds <= 300.0):

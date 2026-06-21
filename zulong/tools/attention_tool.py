@@ -17,7 +17,7 @@ import logging
 
 import time
 
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 
 
@@ -26,6 +26,119 @@ from .base import BaseTool, ToolCategory, ToolRequest, ToolResult
 
 
 logger = logging.getLogger(__name__)
+
+
+def _node_type_value(node: Any) -> str:
+    node_type = getattr(node, "node_type", "")
+    return str(getattr(node_type, "value", node_type) or "")
+
+
+def _focus_path_summary(memory_graph: Any) -> str:
+    """Return a compact focus path summary for MemoryGraph and ShardedMemoryGraph."""
+    if hasattr(memory_graph, "get_focus_path_summary"):
+        try:
+            return memory_graph.get_focus_path_summary() or ""
+        except Exception:
+            pass
+
+    ctx = {}
+    try:
+        ctx = memory_graph.get_last_focus_context() or {}
+    except Exception:
+        ctx = {}
+    focus_path = list(ctx.get("focus_path") or [])
+    if not focus_path:
+        return ""
+
+    lines = ["【思维导航】"]
+    for idx, node_id in enumerate(focus_path[-8:]):
+        node = None
+        try:
+            node = memory_graph.get_node(node_id)
+        except Exception:
+            node = None
+        label = (getattr(node, "label", "") if node else "") or node_id
+        type_label = _node_type_value(node) if node else "node"
+        cursor = " ← 当前焦点" if idx == min(len(focus_path), 8) - 1 else ""
+        indent = "  " * idx
+        prefix = "└─ " if idx else ""
+        short_id = node_id if len(node_id) <= 56 else node_id[:26] + "..." + node_id[-24:]
+        lines.append(
+            f"{indent}{prefix}L{idx + 1} [{type_label}] {str(label)[:40]} @{short_id}{cursor}"
+        )
+    lines.append("提示: navigate_attention deeper/broader/jump 调整注意力焦点")
+    return "\n".join(lines)[:500]
+
+
+def _sync_task_graph_to_memory(memory_graph: Any, task_graph: Any) -> None:
+    if not task_graph:
+        return
+    try:
+        from zulong.memory.graph_adapters import TaskGraphAdapter
+        TaskGraphAdapter().sync(memory_graph, task_graph)
+    except Exception as exc:
+        logger.debug(f"[NavigateAttention] TaskGraph 同步到 MemoryGraph 跳过: {exc}")
+
+
+def _resolve_focus_node_id(memory_graph: Any, target_node_id: str) -> Optional[str]:
+    """Resolve raw MemoryGraph id or TaskGraph node id to a graph-memory node id."""
+    if not target_node_id:
+        return None
+
+    try:
+        if memory_graph.has_node(target_node_id):
+            return target_node_id
+    except Exception:
+        pass
+
+    task_graph = None
+    try:
+        from zulong.tools.task_tools import get_active_task_graph
+        task_graph = get_active_task_graph()
+    except Exception:
+        task_graph = None
+
+    graph_id = getattr(task_graph, "id", "") if task_graph else ""
+    if task_graph:
+        try:
+            if not task_graph.get_node(target_node_id):
+                task_graph = None
+        except Exception:
+            task_graph = None
+
+    if task_graph:
+        _sync_task_graph_to_memory(memory_graph, task_graph)
+        candidates = []
+        if graph_id:
+            candidates.extend([
+                f"task:{graph_id}/{target_node_id}",
+                f"task:{graph_id}" if target_node_id in {"req", graph_id} else "",
+            ])
+        candidates.append(f"task:{target_node_id}")
+        for candidate in [c for c in candidates if c]:
+            try:
+                if memory_graph.has_node(candidate):
+                    return candidate
+            except Exception:
+                pass
+
+    try:
+        nodes = memory_graph.get_nodes_by_type("task")
+    except Exception:
+        nodes = []
+    for node in nodes or []:
+        node_id = getattr(node, "node_id", "")
+        meta = getattr(node, "metadata", {}) or {}
+        if graph_id and meta.get("graph_id") and meta.get("graph_id") != graph_id:
+            continue
+        if node_id == target_node_id or node_id.endswith(f"/{target_node_id}"):
+            return node_id
+        if meta.get("backend_ref", "").endswith(f"/{target_node_id}"):
+            return node_id
+        if meta.get("graph_address", "").endswith(f"task:{target_node_id}"):
+            return node_id
+
+    return None
 
 
 
@@ -173,7 +286,9 @@ class NavigateAttentionTool(BaseTool):
 
                 # 跳转到指定节点
 
-                if not mg.has_node(target_node_id):
+                resolved_target_id = _resolve_focus_node_id(mg, target_node_id)
+
+                if not resolved_target_id:
 
                     return self._create_result(
 
@@ -187,7 +302,7 @@ class NavigateAttentionTool(BaseTool):
 
                     )
 
-                success = mg.update_focus_to_node(target_node_id)
+                success = mg.update_focus_to_node(resolved_target_id)
 
 
 
@@ -219,7 +334,7 @@ class NavigateAttentionTool(BaseTool):
 
                             "message": "当前焦点无子节点，已处于最深层",
 
-                            "focus_path_summary": mg.get_focus_path_summary(),
+                            "focus_path_summary": _focus_path_summary(mg),
 
                         },
 
@@ -265,7 +380,7 @@ class NavigateAttentionTool(BaseTool):
 
                             "message": "当前焦点已在最顶层，无法再上浮",
 
-                            "focus_path_summary": mg.get_focus_path_summary(),
+                            "focus_path_summary": _focus_path_summary(mg),
 
                         },
 
@@ -297,7 +412,7 @@ class NavigateAttentionTool(BaseTool):
 
             # 返回更新后的焦点路径
 
-            new_summary = mg.get_focus_path_summary()
+            new_summary = _focus_path_summary(mg)
 
             new_ctx = mg.get_last_focus_context() or {}
 
@@ -319,7 +434,7 @@ class NavigateAttentionTool(BaseTool):
 
                 data={
 
-                    "message": f"注意力焦点已{{'deeper': '深入', 'broader': '上浮', 'jump': '跳转'}}[direction]",
+                    "message": f"注意力焦点已{ {'deeper': '深入', 'broader': '上浮', 'jump': '跳转'}[direction] }",
 
                     "direction": direction,
 

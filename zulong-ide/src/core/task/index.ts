@@ -938,13 +938,18 @@ export class Task {
 			throw new Error("Zulong instance aborted")
 		}
 
+		const sayTs = Date.now()
+		if (interaction.channel === "control" || interaction.ux_visibility === "hidden") {
+			this.taskState.lastMessageTs = sayTs
+			return sayTs
+		}
+
 		const providerInfo = this.getCurrentProviderInfo()
 		const modelInfo: ZulongMessageModelInfo = {
 			providerId: providerInfo.providerId,
 			modelId: providerInfo.model.id,
 			mode: providerInfo.mode,
 		}
-		const sayTs = Date.now()
 		this.taskState.lastMessageTs = sayTs
 		const zulongMessages = this.messageStateHandler.getZulongMessages()
 		const existingIndex = findLastIndex(zulongMessages, (message) => {
@@ -981,6 +986,9 @@ export class Task {
 			await this.postStateToWebview()
 			return zulongMessages[existingIndex].ts
 		}
+		if (interaction.ux_visibility === "details") {
+			return sayTs
+		}
 		await this.messageStateHandler.addToZulongMessages({
 			ts: sayTs,
 			type: "say",
@@ -1007,6 +1015,15 @@ export class Task {
 			approval_mode: incoming.approval_mode ?? previous.approval_mode,
 			action_summary: incoming.action_summary || previous.action_summary,
 			next_step: incoming.next_step || previous.next_step,
+			channel: incoming.channel || previous.channel,
+			source_channel: incoming.source_channel || previous.source_channel,
+			ux_visibility: incoming.ux_visibility || previous.ux_visibility,
+			is_background: incoming.is_background ?? previous.is_background,
+			tool_category: incoming.tool_category || previous.tool_category,
+			raw_details: incoming.raw_details ?? previous.raw_details,
+			task_graph_binding: incoming.task_graph_binding ?? previous.task_graph_binding,
+			completion_evidence: incoming.completion_evidence ?? previous.completion_evidence,
+			memory_reference_edges: incoming.memory_reference_edges ?? previous.memory_reference_edges,
 		}
 
 		if (

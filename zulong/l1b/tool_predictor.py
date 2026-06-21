@@ -163,8 +163,9 @@ TOOL_BAG_FULL = [
 class L1BToolPredictor:
     """L1-B 工具预判器
 
-    使用关键词+规则快速预判用户可能需要哪些工具，
-    返回预判工具集合 + 完整工具袋让 L2 自主选择。
+    有 registry 时优先复用 tool_bag 的 embedding 语义预判，返回预判工具
+    集合 + 完整工具袋让 L2 自主选择。无 registry 或 embedding 不可用时才
+    使用关键词规则作为显式降级兜底。
 
     ALBERT 其余 12 类（含语音交互识别）不受影响。
     """
@@ -235,6 +236,9 @@ class L1BToolPredictor:
         self,
         prompt: str,
         conversation_history: Optional[list] = None,
+        registry=None,
+        intent_result: Optional[Dict[str, Any]] = None,
+        embedding_provider: Optional[Any] = None,
     ) -> dict:
         """
         分析用户 prompt + 对话历史，预判可能需要的工具。
@@ -253,7 +257,20 @@ class L1BToolPredictor:
                 "task_graph_policy": "inspect_or_create",
             }
         """
-        # 1. 关键词 + 规则快速预判
+        if registry is not None:
+            try:
+                result = self._predict_with_tool_bag(
+                    prompt,
+                    registry=registry,
+                    intent_result=intent_result,
+                    embedding_provider=embedding_provider,
+                )
+                if result:
+                    return result
+            except Exception as exc:
+                logger.warning("[L1BToolPredictor] embedding 预判失败，降级到规则兜底: %s", exc)
+
+        # 1. 无 registry/embedding 不可用时，关键词 + 规则兜底预判
         suggested = set()
 
         for pattern, tools in self.KEYWORDS_MAP.items():
@@ -275,11 +292,57 @@ class L1BToolPredictor:
 
         return {
             "suggested_tools": list(suggested),
+            "predicted_tools": list(suggested),
             "tool_bag": TOOL_BAG_FULL,
             "confidence": self._calc_confidence(suggested, prompt),
             "reason": self._explain_prediction(suggested, turn_shape, task_graph_policy),
-            "context_bundle": {"turn_shape": turn_shape},
+            "context_bundle": {
+                "turn_shape": turn_shape,
+                "tool_prediction_source": "rule_fallback",
+            },
             "task_graph_policy": task_graph_policy,
+            "reasons": [self._explain_prediction(suggested, turn_shape, task_graph_policy)],
+            "risk_notes": [],
+        }
+
+    def _predict_with_tool_bag(
+        self,
+        prompt: str,
+        *,
+        registry,
+        intent_result: Optional[Dict[str, Any]] = None,
+        embedding_provider: Optional[Any] = None,
+    ) -> dict:
+        """调用 tool_bag embedding 主路径，并返回旧 UI 兼容字段。"""
+        from zulong.tools.tool_bag import build_tool_bag, predict_tools_for_turn
+
+        detailed = predict_tools_for_turn(
+            prompt,
+            registry=registry,
+            intent_result=intent_result,
+            embedding_provider=embedding_provider,
+        ).to_dict()
+        tools = list(detailed.get("predicted_tools") or [])
+        context_bundle = detailed.get("context_bundle") or {}
+        source = context_bundle.get("tool_prediction_source") or "rule_fallback"
+        reasons = detailed.get("reasons") or []
+        task_graph_policy = detailed.get("task_graph_policy", "none")
+        bag = build_tool_bag(registry)
+        confidence = 0.86 if source == "embedding" else self._calc_confidence(set(tools), prompt)
+        turn_shape = context_bundle.get("turn_shape", "tool_augmented")
+        reason = reasons[0] if reasons else self._explain_prediction(set(tools), turn_shape, task_graph_policy)
+
+        return {
+            "suggested_tools": tools,
+            "predicted_tools": tools,
+            "tool_bag": [entry.to_dict() for entry in bag.values()],
+            "confidence": confidence,
+            "reason": reason,
+            "context_bundle": context_bundle,
+            "task_graph_policy": task_graph_policy,
+            "reasons": reasons,
+            "risk_notes": detailed.get("risk_notes", []),
+            "detailed_prediction": detailed,
         }
 
     def _detect_turn_shape(self, prompt: str) -> str:
@@ -339,36 +402,12 @@ def predict_from_tool_bag(
     """
     使用 L1BToolPredictor 进行快速预判，如果 tool_bag 可用则整合其详细结果。
 
-    这是一个桥接函数：优先使用 L1BToolPredictor 的简化流程，
-    当 registry 可用时补充详细信息。
+    这是一个桥接函数：registry 可用时直接走 tool_bag embedding 主路径；
+    否则使用 L1BToolPredictor 的规则兜底。
     """
     predictor = L1BToolPredictor()
-    result = predictor.predict_tools(prompt)
-
-    # 如果 registry 可用，用 tool_bag 的详细预测增强结果
-    if registry is not None:
-        try:
-            from zulong.tools.tool_bag import predict_tools_for_turn
-
-            detailed = predict_tools_for_turn(
-                prompt,
-                registry=registry,
-                intent_result=intent_result,
-            ).to_dict()
-
-            # 合并 tool_bag 的详细结果
-            result["detailed_prediction"] = detailed
-            result["risk_notes"] = detailed.get("risk_notes", [])
-            result["task_graph_policy"] = detailed.get("task_graph_policy", "none")
-
-            logger.info(
-                "[L1BToolPredictor] 整合 tool_bag 详细预测: %d 工具, policy=%s",
-                len(detailed.get("predicted_tools", [])),
-                detailed.get("task_graph_policy"),
-            )
-        except ImportError:
-            logger.debug("[L1BToolPredictor] tool_bag 不可用，使用简化预测")
-        except Exception as e:
-            logger.warning(f"[L1BToolPredictor] tool_bag 整合失败: {e}")
-
-    return result
+    return predictor.predict_tools(
+        prompt,
+        registry=registry,
+        intent_result=intent_result,
+    )

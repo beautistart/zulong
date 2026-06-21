@@ -33,6 +33,7 @@ from .memory_graph import MemoryGraph, get_memory_graph
 from .task_search_index import HistoricalTaskIndex, get_task_search_index
 
 from .memory_graph_factory import (
+    assert_native_memory_graph,
     create_memory_graph,
     get_memory_graph_type,
     get_memory_graph_stats
@@ -60,6 +61,7 @@ __all__ = [
     "get_memory_graph",
     "HistoricalTaskIndex",
     "get_task_search_index",
+    "assert_native_memory_graph",
     "create_memory_graph",
     "get_memory_graph_type",
     "get_memory_graph_stats",

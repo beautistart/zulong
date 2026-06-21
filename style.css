@@ -1,0 +1,184 @@
+/* ========================================
+   坦克大战 - 像素风样式
+   ======================================== */
+
+@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    background: #1a1a2e;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    font-family: 'Press Start 2P', 'Courier New', monospace;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+}
+
+.game-wrapper {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+}
+
+/* 标题 */
+.game-header {
+    text-align: center;
+}
+
+.pixel-title {
+    font-size: 28px;
+    color: #f0c040;
+    text-shadow:
+        3px 3px 0 #8b4513,
+        -1px -1px 0 #8b4513,
+        1px -1px 0 #8b4513,
+        -1px 1px 0 #8b4513;
+    letter-spacing: 4px;
+    line-height: 1.6;
+}
+
+/* 信息栏 */
+.info-bar {
+    display: flex;
+    gap: 24px;
+    background: #16213e;
+    border: 4px solid #4a6fa5;
+    padding: 12px 24px;
+    box-shadow:
+        inset -3px -3px 0 #0a0a1a,
+        inset 3px 3px 0 #2a3a5e;
+}
+
+.info-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+}
+
+.info-label {
+    font-size: 10px;
+    color: #a0b8d8;
+    text-transform: uppercase;
+}
+
+.info-value {
+    font-size: 18px;
+    color: #f0c040;
+    text-shadow: 2px 2px 0 #8b4513;
+}
+
+/* 画布 */
+#gameCanvas {
+    border: 6px solid #4a6fa5;
+    box-shadow:
+        0 0 0 4px #1a1a2e,
+        0 0 0 10px #4a6fa5,
+        0 0 20px rgba(74, 111, 165, 0.5);
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    background: #0a0a1a;
+}
+
+/* 操作提示 */
+.controls-hint {
+    display: flex;
+    gap: 20px;
+    color: #7a8aa8;
+    font-size: 10px;
+}
+
+.hint-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.key {
+    display: inline-block;
+    background: #2a3a5e;
+    color: #f0c040;
+    padding: 3px 8px;
+    border: 2px solid #4a6fa5;
+    box-shadow: inset -2px -2px 0 #0a0a1a;
+    font-size: 9px;
+}
+
+/* 弹窗 */
+.modal {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.8);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 100;
+}
+
+.modal.hidden {
+    display: none;
+}
+
+.modal-content {
+    background: #16213e;
+    border: 6px solid #4a6fa5;
+    padding: 40px;
+    text-align: center;
+    box-shadow:
+        inset -4px -4px 0 #0a0a1a,
+        inset 4px 4px 0 #2a3a5e,
+        0 0 40px rgba(0, 0, 0, 0.6);
+    min-width: 360px;
+}
+
+.modal-content h2 {
+    font-size: 24px;
+    color: #f0c040;
+    margin-bottom: 20px;
+}
+
+.modal-content p {
+    font-size: 12px;
+    color: #c0d0e8;
+    margin-bottom: 24px;
+    line-height: 1.8;
+}
+
+.pixel-btn {
+    font-family: 'Press Start 2P', 'Courier New', monospace;
+    font-size: 14px;
+    background: #c84c2c;
+    color: #fff;
+    border: 4px solid #8b2a1a;
+    padding: 14px 28px;
+    cursor: pointer;
+    box-shadow:
+        inset -3px -3px 0 #6a1a0a,
+        inset 3px 3px 0 #e86c4c;
+    transition: all 0.05s;
+}
+
+.pixel-btn:hover {
+    background: #e85c3c;
+    box-shadow:
+        inset -3px -3px 0 #8b2a1a,
+        inset 3px 3px 0 #f08c6c;
+}
+
+.pixel-btn:active {
+    box-shadow:
+        inset 3px 3px 0 #6a1a0a,
+        inset -3px -3px 0 #e86c4c;
+    transform: translateY(2px);
+}

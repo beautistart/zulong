@@ -156,28 +156,21 @@ except Exception as e:
 # 🧠 [BOOTSTRAP] 初始化 MemoryGraph (记忆图谱)
 logger.info("🧠 [BOOTSTRAP] 初始化 MemoryGraph...")
 try:
-    from zulong.memory.memory_graph_factory import create_memory_graph, get_memory_graph_type
+    from zulong.memory.memory_graph_factory import (
+        assert_native_memory_graph,
+        create_memory_graph,
+        get_memory_graph_type,
+    )
     _memory_graph = create_memory_graph(persist_path="./data/memory_graph")
+    assert_native_memory_graph(_memory_graph)
     backend_type = get_memory_graph_type(_memory_graph)
-    
-    if backend_type == "networkx":
-        from zulong.memory.graph_adapters import register_all_adapters
-        register_all_adapters(_memory_graph)
-        logger.info(f"✅ [BOOTSTRAP] MemoryGraph 初始化完成: {_memory_graph.stats['total_nodes']} 节点")
-        
-        # 全量同步各适配器数据到 MemoryGraph
-        try:
-            _memory_graph.sync_all()
-            logger.info(f"✅ [BOOTSTRAP] MemoryGraph 全量同步完成")
-        except Exception as sync_err:
-            logger.warning(f"⚠️ [BOOTSTRAP] MemoryGraph sync_all 失败: {sync_err}")
-    else:
-        # Hybrid/Sharded 后端：适配器不适用
-        from zulong.memory.memory_graph import MemoryGraph
-        MemoryGraph._instance = _memory_graph  # 设置单例引用，供其他模块使用
-        stats = _memory_graph.get_stats() if hasattr(_memory_graph, 'get_stats') else {}
-        node_count = stats.get('total_nodes', stats.get('node_count', 0))
-        logger.info(f"✅ [BOOTSTRAP] {_memory_graph.__class__.__name__} 初始化完成 ({backend_type}): {node_count} 节点")
+
+    # Hybrid/Sharded 后端：运行态唯一权威后端
+    from zulong.memory.memory_graph import MemoryGraph
+    MemoryGraph._instance = _memory_graph  # 设置单例引用，供其他模块使用
+    stats = _memory_graph.get_stats() if hasattr(_memory_graph, 'get_stats') else {}
+    node_count = stats.get('total_nodes', stats.get('node_count', 0))
+    logger.info(f"✅ [BOOTSTRAP] {_memory_graph.__class__.__name__} 初始化完成 ({backend_type}): {node_count} 节点")
     
 except Exception as e:
     logger.warning(f"⚠️ [BOOTSTRAP] MemoryGraph 初始化失败 (降级运行): {e}")
@@ -653,7 +646,7 @@ class SystemBootstrap:
                         f"({stats.get('total_nodes', 0)} 节点, {stats.get('total_edges', 0)} 边)"
                     )
                 else:
-                    logger.info("   ⚠️ MemoryGraph 当前实例不是分片后端，跳过旧单 JSON 保存")
+                    logger.error("   ❌ MemoryGraph 当前实例不是分片后端，已拒绝非分片持久化")
         except Exception as e:
             logger.error(f"❌ 保存持久化数据失败：{e}", exc_info=True)
         

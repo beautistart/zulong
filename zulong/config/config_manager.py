@@ -263,6 +263,13 @@ class ConfigManager:
                 'ollama': {
                     'base_url': 'http://localhost:11434/v1',
                     'model_id': 'qwen3.5:4b',
+                },
+                'deepseek': {
+                    'backend': 'deepseek',
+                    'base_url': 'https://api.deepseek.com',
+                    'api_key': '${DEEPSEEK_API_KEY}',
+                    'model_id': 'deepseek-v4-pro',
+                    'num_ctx': 131072,
                 }
             }
         }

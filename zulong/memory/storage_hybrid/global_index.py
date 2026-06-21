@@ -272,6 +272,47 @@ class GlobalMemoryIndex:
     def has_cross_edge(self, src_id: str, dst_id: str) -> bool:
         return any(edge.get("dst_id") == dst_id for edge in self.get_cross_edges_from(src_id))
 
+    def delete_cross_edge(
+        self,
+        src_id: str,
+        dst_id: str,
+        edge_type: Optional[str] = None,
+        sync: bool = False,
+    ) -> bool:
+        edge_type_value = getattr(edge_type, "value", edge_type)
+        if not src_id or not dst_id:
+            return False
+
+        matched = [
+            edge for edge in self.get_cross_edges_from(src_id)
+            if edge.get("dst_id") == dst_id
+            and (edge_type_value is None or edge.get("edge_type") == edge_type_value)
+        ]
+        if not matched:
+            return False
+
+        with self.env.begin(write=True) as txn:
+            self._remove_edge_list_item(
+                txn,
+                self.cross_edges_by_src_db,
+                src_id,
+                compare_field="dst_id",
+                compare_value=dst_id,
+                edge_type=edge_type_value,
+            )
+            self._remove_edge_list_item(
+                txn,
+                self.cross_edges_by_dst_db,
+                dst_id,
+                compare_field="src_id",
+                compare_value=src_id,
+                edge_type=edge_type_value,
+            )
+
+        if sync:
+            self.env.sync()
+        return True
+
     def count_cross_edges(self, txn=None) -> int:
         count = 0
         own_txn = txn is None

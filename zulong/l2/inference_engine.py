@@ -10,6 +10,34 @@ import re
 import numpy as np
 from typing import Optional, Callable, List, Any, Dict, Set
 
+
+def _load_project_dotenv() -> None:
+    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    for env_path in (
+        os.path.join(root_dir, "config", ".env"),
+        os.path.join(root_dir, ".env"),
+    ):
+        if not os.path.exists(env_path):
+            continue
+        try:
+            with open(env_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    raw = line.strip()
+                    if not raw or raw.startswith("#") or "=" not in raw:
+                        continue
+                    if raw.startswith("export "):
+                        raw = raw[len("export "):].strip()
+                    key, value = raw.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+        except Exception:
+            pass
+
+
+_load_project_dotenv()
+
 from zulong.core.event_bus import event_bus
 from zulong.core.state_manager import state_manager
 from zulong.core.types import EventType, EventPriority, ZulongEvent, L2Status
@@ -33,12 +61,48 @@ from zulong.l2.timeout_event_logger import TimeoutEventLogger
 from zulong.l2.smart_degradation_handler import (
     SmartDegradationHandler, DegradationContext, TimeoutPhase,
 )
+from zulong.core.message_visibility import (
+    CHANNEL_FINAL,
+    CHANNEL_LEDGER,
+    CHANNEL_STATUS,
+    mark_public_payload,
+    strip_llm_message_metadata,
+)
 
 # 导入配置管理器
 from zulong.config.config_manager import get_l2_inference_config
 
 import logging
 logger = logging.getLogger(__name__)
+
+
+def _compact_log_line(text: str, max_len: int = 240) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= max_len:
+        return compact
+    return compact[: max_len - 3].rstrip() + "..."
+
+
+def _summarize_llm_usage_for_log(usage: Any) -> Dict[str, Any]:
+    if not usage:
+        return {}
+    keys = (
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+    )
+    summary: Dict[str, Any] = {}
+    for key in keys:
+        value = None
+        if isinstance(usage, dict):
+            value = usage.get(key)
+        else:
+            value = getattr(usage, key, None)
+        if value is not None:
+            summary[key] = value
+    return summary
 
 # 🔥 LLM 后端支持（vLLM / Ollama / LM Studio / OpenAI 云端）
 try:
@@ -69,7 +133,21 @@ except ImportError:
 # 线程安全的 request_id 追踪（替代 self._current_request_id 避免竞态）
 _current_request_id_var = contextvars.ContextVar('current_request_id', default=None)
 _current_session_id_var = contextvars.ContextVar('current_session_id', default=None)
+_current_session_node_id_var = contextvars.ContextVar('current_session_node_id', default=None)
 _current_user_turn_id_var = contextvars.ContextVar('current_user_turn_id', default=None)
+
+
+def _infer_dialogue_session_node_id(conversation_id: str, session_node_id: str = "") -> str:
+    raw_node = str(session_node_id or "").strip()
+    if raw_node.startswith("dialogue:session_") and "/" not in raw_node:
+        return raw_node
+    raw = str(conversation_id or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("dialogue:session_") and "/" not in raw:
+        return raw
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in raw)
+    return f"dialogue:session_{safe}"
 
 
 class InferenceEngine:
@@ -145,6 +223,9 @@ class InferenceEngine:
             
             # 活跃任务图 ID 跟踪（用于地址继承）
             self._active_task_graph_id: Optional[str] = None
+            self._current_session_id: str = ""
+            self._current_session_node_id: str = ""
+            self._current_workspace_path: str = ""
             self._current_user_input_for_feedback: str = ""
             self._current_tool_prediction_for_feedback: Dict[str, Any] = {}
             self._current_tool_bundle_for_feedback: List[str] = []
@@ -402,10 +483,15 @@ class InferenceEngine:
                     ollama_options["mirostat"] = 0  # 默认关闭 mirostat
             except Exception:
                 pass
+            extra_body = {
+                # Ollama thinking models use `think`; Qwen-compatible
+                # backends commonly use `enable_thinking`.
+                "think": False,
+                "enable_thinking": False,
+            }
             if ollama_options:
-                extra_kw["extra_body"] = {"options": ollama_options}
-            else:
-                extra_kw["extra_body"] = {"enable_thinking": False}
+                extra_body["options"] = ollama_options
+            extra_kw["extra_body"] = extra_body
 
         # OpenRouter 后端：添加 HTTP Referer 和 App Name 头
         elif backend == "openrouter":
@@ -424,6 +510,10 @@ class InferenceEngine:
             except Exception:
                 pass
             extra_kw["extra_body"] = {"enable_thinking": False}
+
+        # DeepSeek API：使用官方 thinking 参数禁用思考模式
+        elif backend == "deepseek":
+            extra_kw["extra_body"] = {"thinking": {"type": "disabled"}}
 
         # 中转站/代理后端：通用处理
         elif backend in {"siliconflow", "oneapi", "custom", "openai_compatible"}:
@@ -549,9 +639,24 @@ class InferenceEngine:
             return
 
         # 2. 检查是否与当前活跃图匹配
-        from zulong.tools.task_tools import get_active_task_graph, set_active_task_graph
+        from zulong.tools.task_tools import (
+            _interaction_store_claims_graph,
+            get_active_task_graph,
+            infer_task_graph_owner_session_node_id,
+            set_active_task_graph,
+        )
         current_tg = get_active_task_graph()
         current_graph_id = current_tg.id if current_tg else None
+        current_session_id = (
+            _current_session_id_var.get()
+            or getattr(self, "_current_session_id", "")
+            or ""
+        )
+        current_session_node_id = (
+            _current_session_node_id_var.get()
+            or getattr(self, "_current_session_node_id", "")
+            or infer_task_graph_owner_session_node_id(current_session_id)
+        )
 
         # 取第一个引用的 graph_id（通常用户只引用同一个任务图的节点）
         target_graph_id = next(iter(referenced_graph_ids))
@@ -609,9 +714,21 @@ class InferenceEngine:
             if target_task_id:
                 state = _run_async_safe(mgr.resume_task(target_task_id))
                 if state and state.task_graph:
-                    set_active_task_graph(state.task_graph, target_graph_id)
-                    logger.info(f"[GraphSwitch] 已从挂起任务恢复图 {target_graph_id} (task_id={target_task_id})")
-                    return
+                    restored = set_active_task_graph(
+                        state.task_graph,
+                        target_graph_id,
+                        conversation_id=current_session_id,
+                        session_node_id=current_session_node_id,
+                        claim_unowned=_interaction_store_claims_graph(current_session_id, target_graph_id),
+                    )
+                    if restored:
+                        logger.info(f"[GraphSwitch] 已从挂起任务恢复图 {target_graph_id} (task_id={target_task_id})")
+                        return
+                    logger.warning(
+                        "[GraphSwitch] 引用图谱不属于当前会话，跳过 active 切换: graph=%s session=%s",
+                        target_graph_id,
+                        current_session_id or "-",
+                    )
                 else:
                     logger.warning(f"[GraphSwitch] 挂起任务 {target_task_id} 无有效 TaskGraph")
 
@@ -619,8 +736,21 @@ class InferenceEngine:
             from zulong.tools.task_tools import load_graph_from_backup
             backup_tg = load_graph_from_backup(target_graph_id)
             if backup_tg:
-                set_active_task_graph(backup_tg, target_graph_id)
-                logger.info(f"[GraphSwitch] 已从磁盘备份恢复图 {target_graph_id}")
+                restored = set_active_task_graph(
+                    backup_tg,
+                    target_graph_id,
+                    conversation_id=current_session_id,
+                    session_node_id=current_session_node_id,
+                    claim_unowned=_interaction_store_claims_graph(current_session_id, target_graph_id),
+                )
+                if restored:
+                    logger.info(f"[GraphSwitch] 已从磁盘备份恢复图 {target_graph_id}")
+                    return
+                logger.warning(
+                    "[GraphSwitch] 备份图谱不属于当前会话，跳过 active 切换: graph=%s session=%s",
+                    target_graph_id,
+                    current_session_id or "-",
+                )
                 return
 
             # 5. 所有来源都找不到 → 标记图丢失，供后续流程处理
@@ -783,12 +913,12 @@ class InferenceEngine:
         func_name = tool_call.function.name
         if (
             getattr(self, "_approval_block_active", False)
-            and func_name in {"exec_write_file", "exec_run_command", "ide_write_file", "write_to_file", "replace_in_file", "delete_file", "execute_command", "create_directory"}
+            and func_name in {"exec_write_file", "exec_run_command"}
         ):
             return json.dumps({
                 "error": (
-                    "审批拒绝或审批超时后，本轮已进入 blocked；"
-                    f"拒绝继续执行受保护工具 {func_name}，防止绕过审批。"
+                    "审批拒绝或审批超时后，本轮已进入审批边界保护；"
+                    f"拒绝继续执行本地变更工具 {func_name}，防止绕过审批。"
                 ),
                 "blocked": True,
                 "reason": "approval_blocked",
@@ -797,7 +927,14 @@ class InferenceEngine:
             arguments = json.loads(tool_call.function.arguments)
         except (json.JSONDecodeError, AttributeError) as e:
             logger.error(f"[FC] 工具 {func_name} 参数解析失败: {e}")
-            return json.dumps({"error": f"参数解析失败: {e}"}, ensure_ascii=False)
+            payload = {"error": f"参数解析失败: {e}"}
+            if func_name in {"ide_write_file", "exec_write_file", "write_to_file"}:
+                payload["recovery_hint"] = (
+                    "工具参数疑似被模型输出长度截断。下一轮不要一次性写完整大文件；"
+                    "请只生成 800-1200 字符的小片段，首次 mode='overwrite'，"
+                    "后续 mode='append'，逐块写入并在最后验证。"
+                )
+            return json.dumps(payload, ensure_ascii=False)
         
         logger.info(f"[FC] 执行工具: {func_name}, 参数: {arguments}")
         
@@ -882,17 +1019,40 @@ class InferenceEngine:
             if func_name == "search_tools":
                 self._ensure_search_tools_tool_rag_bound()
 
+            if func_name.startswith("task_") or func_name == "submit_final_answer":
+                current_session_id = (
+                    _current_session_id_var.get()
+                    or getattr(self, "_current_session_id", "")
+                    or ""
+                )
+                if current_session_id:
+                    arguments.setdefault("conversation_id", current_session_id)
+                    arguments.setdefault("session_id", current_session_id)
+                    try:
+                        from zulong.tools.task_tools import infer_task_graph_owner_session_node_id
+
+                        owner_node_id = (
+                            _current_session_node_id_var.get()
+                            or getattr(self, "_current_session_node_id", "")
+                            or infer_task_graph_owner_session_node_id(current_session_id)
+                        )
+                        if owner_node_id:
+                            arguments.setdefault("session_node_id", owner_node_id)
+                            arguments.setdefault("dialogue_session_id", owner_node_id)
+                    except Exception as exc:
+                        logger.debug("[FC] 会话 owner 参数注入跳过: %s", exc)
+
             result = self.tool_engine.call_tool(
                 tool_name=func_name,
                 action=action,
                 parameters=arguments,
                 timeout=30.0,
             )
-            if (
-                func_name in {"ide_write_file", "write_to_file", "replace_in_file", "delete_file", "execute_command", "create_directory"}
-                and self._looks_like_approval_denial(str(result.error or result.data or ""))
-            ):
-                self._approval_block_active = True
+            if func_name in {"ide_write_file", "write_to_file", "replace_in_file", "delete_file", "execute_command", "create_directory"}:
+                if self._looks_like_approval_denial(str(result.error or result.data or "")):
+                    self._approval_block_active = True
+                elif result.success:
+                    self._approval_block_active = False
             
             if result.success:
                 data = result.data
@@ -989,25 +1149,25 @@ class InferenceEngine:
                     or "active"
                 )
                 task_graph_id = self._active_task_graph_id or f"pipeline-{request_key}"
-                graph_data = {
-                    "id": task_graph_id,
-                    "title": "当前执行任务",
-                    "nodes": [],
-                    "hEdges": [],
-                    "dEdges": [],
-                    "activeNodeId": "",
-                    "fallback_reason": "no_active_task_graph",
-                }
+                graph_data = self._fallback_task_graph_for_feedback(
+                    task_graph_id=task_graph_id,
+                    pipeline_type=pipeline_type,
+                    fc_turn=fc_turn,
+                )
                 progress = {
-                    "total": 0,
-                    "completed": 0,
+                    "total": max(1, len(graph_data.get("nodes") or []) - 1),
+                    "completed": sum(
+                        1
+                        for node in graph_data.get("nodes", [])
+                        if node.get("id") != "req" and node.get("status") == "completed"
+                    ),
                     "running": 1 if pipeline_type not in ("agent_done", "agent_error") else 0,
                     "blocked": 0,
                     "percent": 100 if pipeline_type == "agent_done" else 0,
                 }
-                tool_count = 0
-                h_edge_count = 0
-                d_edge_count = 0
+                tool_count = len(graph_data.get("nodes") or [])
+                h_edge_count = len(graph_data.get("hEdges") or [])
+                d_edge_count = len(graph_data.get("dEdges") or [])
                 logger.info(
                     f"[图谱推送] 无活跃任务图，使用事件 fallback 发布 {pipeline_type}"
                 )
@@ -1018,6 +1178,10 @@ class InferenceEngine:
                 "tool": tool_name,
                 "tool_call_id": tool_call_id,
                 "task_graph_id": task_graph_id,
+                "session_id": _current_session_id_var.get() or getattr(self, "_current_session_id", ""),
+                "conversation_id": _current_session_id_var.get() or getattr(self, "_current_session_id", ""),
+                "workspace_path": getattr(self, "_current_workspace_path", ""),
+                "project_id": getattr(self, "_current_workspace_path", ""),
                 "tool_count": tool_count,
                 "progress": progress,
             }
@@ -1045,6 +1209,24 @@ class InferenceEngine:
 
             step_type = f"pipeline.{pipeline_type}"
             self._send_thinking_step(step_type, event_data)
+            self._send_task_graph_update(event_data)
+            self._send_attention_update(
+                task_graph_id=task_graph_id,
+                graph_data=graph_data,
+                progress=progress,
+                fc_turn=fc_turn,
+            )
+            if pipeline_type == "pipeline_start":
+                user_plan = dict(event_data)
+                user_plan["interaction"] = self._build_pipeline_interaction(
+                    pipeline_type="user_task_plan",
+                    fc_turn=fc_turn,
+                    tool_name=tool_name,
+                    tool_result=tool_result,
+                    tool_call_id=tool_call_id,
+                    progress=progress,
+                )
+                self._send_thinking_step("pipeline.user_task_plan", user_plan)
 
             logger.info(
                 f"[图谱推送] {pipeline_type} → {step_type}, "
@@ -1053,6 +1235,150 @@ class InferenceEngine:
         except Exception as e:
             import traceback
             logger.warning(f"[图谱推送] {pipeline_type} 失败: {e}\n{traceback.format_exc()}")
+
+    def _fallback_task_graph_for_feedback(
+        self,
+        *,
+        task_graph_id: str,
+        pipeline_type: str,
+        fc_turn: int,
+    ) -> Dict[str, Any]:
+        """Build a minimal user-facing graph when no formal TaskGraph exists yet."""
+        owner_conversation_id = _current_session_id_var.get() or getattr(self, "_current_session_id", "")
+        owner_session_node_id = _current_session_node_id_var.get() or getattr(self, "_current_session_node_id", "")
+        user_text = re.sub(
+            r"\s+",
+            " ",
+            str(getattr(self, "_current_user_input_for_feedback", "") or ""),
+        ).strip()
+        steps = self._pipeline_plan_steps_for_feedback()
+        active_index = 0
+        if pipeline_type == "agent_tool_call":
+            active_index = min(1, max(0, len(steps) - 1))
+        elif pipeline_type == "agent_done":
+            active_index = len(steps)
+        elif pipeline_type == "agent_error":
+            active_index = max(0, len(steps) - 1)
+
+        nodes: List[Dict[str, Any]] = [{
+            "id": "req",
+            "label": "本轮用户任务",
+            "type": "requirement",
+            "status": "completed" if pipeline_type == "agent_done" else "in_progress",
+            "desc": user_text[:520] or "当前 Web 端用户任务",
+            "result": "",
+            "address": f"tg:{task_graph_id}/req",
+        }]
+        h_edges: List[List[str]] = []
+        for idx, step in enumerate(steps[:6], start=1):
+            node_id = f"plan_{idx}"
+            if pipeline_type == "agent_error" and idx - 1 == active_index:
+                status = "blocked"
+            elif idx - 1 < active_index or pipeline_type == "agent_done":
+                status = "completed"
+            elif idx - 1 == active_index:
+                status = "in_progress"
+            else:
+                status = "pending"
+            nodes.append({
+                "id": node_id,
+                "label": step,
+                "type": "task",
+                "status": status,
+                "desc": step,
+                "result": "",
+                "address": f"tg:{task_graph_id}/{node_id}",
+            })
+            h_edges.append(["req", node_id])
+
+        active_node = "req"
+        for node in nodes:
+            if node.get("status") == "in_progress":
+                active_node = str(node.get("id") or "req")
+                break
+
+        return {
+            "id": task_graph_id,
+            "graph_id": task_graph_id,
+            "title": "当前执行任务",
+            "nodes": nodes,
+            "hEdges": h_edges,
+            "dEdges": [],
+            "activeNodeId": active_node,
+            "fallback_reason": "no_active_task_graph",
+            "owner_conversation_id": owner_conversation_id,
+            "owner_session_node_id": owner_session_node_id,
+            "conversation_id": owner_conversation_id,
+            "session_node_id": owner_session_node_id,
+            "workspace_dir": getattr(self, "_current_workspace_path", ""),
+            "workspace_path": getattr(self, "_current_workspace_path", ""),
+            "metadata": {
+                "source": "l2_pipeline_feedback",
+                "fc_turn": fc_turn,
+                "owner_conversation_id": owner_conversation_id,
+                "owner_session_node_id": owner_session_node_id,
+                "workspace_dir": getattr(self, "_current_workspace_path", ""),
+            },
+        }
+
+    def _context_pressure_ratio_for_feedback(self) -> float:
+        try:
+            attn_window = getattr(self, "_attn_window", None)
+            if attn_window is not None and hasattr(attn_window, "usage_ratio"):
+                return max(0.0, float(attn_window.usage_ratio or 0.0))
+        except Exception:
+            pass
+        return 0.0
+
+    def _send_task_graph_update(self, event_data: Dict[str, Any]) -> None:
+        """Publish a direct task graph update for Web clients that do not inspect pipeline data."""
+        graph_data = event_data.get("graph") if isinstance(event_data, dict) else None
+        if not isinstance(graph_data, dict):
+            return
+        try:
+            payload = dict(event_data)
+            payload.setdefault("graph", graph_data)
+            payload["node_count"] = len(graph_data.get("nodes") or [])
+            payload["edge_count"] = len(graph_data.get("hEdges") or []) + len(graph_data.get("dEdges") or [])
+            payload["update_type"] = "pipeline"
+            self._send_thinking_step("graph.task_update", payload)
+        except Exception as exc:
+            logger.debug(f"[图谱推送] TASK_GRAPH_UPDATE fallback 发送跳过: {exc}")
+
+    def _send_attention_update(
+        self,
+        *,
+        task_graph_id: str,
+        graph_data: Dict[str, Any],
+        progress: Dict[str, Any],
+        fc_turn: int,
+    ) -> None:
+        """Publish attention/pressure telemetry over the Web-visible EventBus path."""
+        try:
+            ratio = self._context_pressure_ratio_for_feedback()
+            active_node_id = str(graph_data.get("activeNodeId") or "req")
+            mode = "global"
+            attn_window = getattr(self, "_attn_window", None)
+            if attn_window is not None and getattr(attn_window, "mode", None):
+                mode = str(getattr(attn_window.mode, "value", "") or mode)
+            if ratio >= 0.60:
+                tier = "red"
+            elif ratio >= 0.50:
+                tier = "yellow"
+            else:
+                tier = "green"
+            self._send_thinking_step("attention.update", {
+                "mode": mode,
+                "turn": fc_turn,
+                "focus_node_id": active_node_id,
+                "task_graph_id": task_graph_id,
+                "budget_usage": round(ratio * 100, 1),
+                "context_pressure": round(ratio, 3),
+                "pressure_tier": tier,
+                "progress": progress,
+            })
+        except Exception as exc:
+            logger.debug(f"[图谱推送] attention:update fallback 发送跳过: {exc}")
 
     def _task_graph_progress(self, tg) -> Dict[str, Any]:
         """Return compact TaskGraph progress for TSD frontend cards."""
@@ -1092,6 +1418,48 @@ class InferenceEngine:
         text = re.sub(r"\s+", " ", str(text or "")).strip()
         if text and text not in items and len(items) < limit:
             items.append(text)
+
+    def _feedback_request_key(self) -> str:
+        return str(
+            _current_request_id_var.get()
+            or _current_user_turn_id_var.get()
+            or getattr(self, "_current_user_turn_id", None)
+            or "active"
+        )
+
+    @staticmethod
+    def _is_hidden_feedback_tool(tool_name: str) -> bool:
+        return str(tool_name or "").strip() in {
+            "recall_memory",
+            "read_memory_node",
+            "discover_related",
+            "save_memory_note",
+            "ide_get_context",
+            "request_tool_supplement",
+        }
+
+    @staticmethod
+    def _is_summary_noise_feedback_tool(tool_name: str) -> bool:
+        tool_name = str(tool_name or "").strip()
+        return InferenceEngine._is_hidden_feedback_tool(tool_name) or tool_name in {
+            "task_create_plan",
+            "task_add_node",
+            "task_update_node",
+            "task_remove_node",
+            "task_revise_node",
+            "task_mark_status",
+            "task_view_overview",
+            "task_get_detail",
+            "task_update_content",
+            "task_attach_file",
+            "task_add_dependency",
+            "task_suspend",
+            "task_list_suspended",
+            "task_resume_by_address",
+            "zulong_task_link_code",
+            "adjust_attention_mode",
+            "navigate_attention",
+        }
 
     @staticmethod
     def _feedback_progress_item(
@@ -1162,31 +1530,110 @@ class InferenceEngine:
         names: List[str] = []
         for name in tools:
             text = str(name or "").strip()
+            if self._is_hidden_feedback_tool(text):
+                continue
             if text and text not in names:
                 names.append(text)
         return names
 
-    def _pipeline_plan_steps_for_feedback(self) -> List[str]:
-        prediction = getattr(self, "_current_tool_prediction_for_feedback", {}) or {}
-        context = prediction.get("context_bundle") or {}
-        policy = prediction.get("task_graph_policy") or ""
-        tools = self._pipeline_tools_for_feedback()
-        steps: List[str] = []
+    @staticmethod
+    def _friendly_pipeline_tool_name(tool_name: str) -> str:
+        key = str(tool_name or "").strip()
+        lower = key.lower()
+        mapping = {
+            "ide_write_file": "写入文件",
+            "exec_write_file": "写入文件",
+            "write_to_file": "写入文件",
+            "ide_read_file": "读取文件",
+            "exec_read_file": "读取文件",
+            "read_file": "读取文件",
+            "ide_replace_text": "修改文件",
+            "replace_in_file": "修改文件",
+            "exec_run_command": "执行命令",
+            "execute_command": "执行命令",
+            "browser_action": "浏览器验证",
+            "web_search": "联网检索",
+        }
+        return mapping.get(key) or mapping.get(lower) or ("处理任务步骤" if "_" in key else (key or "处理任务步骤"))
 
-        if context.get("needs_memory") or any("memory" in t for t in tools):
-            steps.append("先取相关记忆，避免重复走弯路")
-        if context.get("needs_project_context") or any(t in tools for t in ("read_file", "search_code_symbols", "index_project", "analyze_module")):
-            steps.append("读取或检索项目代码，确认真实实现")
-        if policy in {"reuse", "inspect", "inspect_or_create", "continue"} or any(t.startswith("task_") for t in tools):
-            steps.append("同步任务图状态，避免和已有进度脱节")
-        if any(t in tools for t in ("exec_write_file", "ide_write_file", "replace_in_file", "exec_run_command", "execute_command")):
-            steps.append("遇到写入或命令执行时先处理风险与审批")
-        if tools:
-            steps.append("按模型真实选择执行工具，并把返回结果回填")
+    def _pipeline_plan_steps_for_feedback(self) -> List[str]:
+        steps: List[str] = []
+        user_text = re.sub(
+            r"\s+",
+            " ",
+            str(getattr(self, "_current_user_input_for_feedback", "") or ""),
+        ).strip()
+        user_text_l = user_text.lower()
+
+        def add(text: str) -> None:
+            self._append_feedback_item(steps, text, limit=6)
+
+        def mentions(pattern: str) -> bool:
+            return bool(re.search(pattern, user_text, re.I))
+
+        def has_any(words: List[str]) -> bool:
+            return any(word.lower() in user_text_l for word in words)
+
+        if (
+            mentions(r"(searxng|searx|元搜索|搜索聚合)")
+            and mentions(r"(docker|compose|容器|windows|win|8101)")
+        ):
+            add("检查 Windows Docker 与 Compose 状态")
+            add("准备独立 SearXNG compose 与 settings 配置")
+            add("启动或复用 8101 端口容器并处理冲突")
+            add("验证 HTML 首页可访问并可搜索")
+            add("验证 format=json 搜索接口返回结果")
+            add("写入验收报告并记录失败、修复和复测证据")
+        elif re.search(r"(web|网页|页面|前端|html|浏览器|localhost)", user_text, re.I):
+            if mentions(r"(俄罗斯方块|tetris)"):
+                add("创建俄罗斯方块单页结构和游戏区域")
+                add("实现方块生成、下落、移动、旋转和锁定")
+                add("实现消行、得分、速度变化和失败重开")
+                add("加入可爱视觉风格、动效和键盘/触控提示")
+            elif mentions(r"(坦克|tank)"):
+                add("创建坦克游戏页面、画布和资源结构")
+                add("实现坦克移动、瞄准、射击和碰撞判定")
+                add("加入敌人、关卡节奏、得分和失败重开")
+                if mentions(r"(唯美|多面体|低多边形|low|poly|three|3d|光照|粒子|视觉)"):
+                    add("完善低多边形视觉、光效和操作提示")
+            elif mentions(r"(任务审计|任务看板|todo|待办|localStorage|过滤|统计)"):
+                add("创建单页任务看板结构和本地数据模型")
+                add("实现添加任务、完成切换和删除/清理操作")
+                add("实现全部/待办/完成过滤与底部统计")
+                add("接入 localStorage 持久化并验证刷新保留")
+            elif mentions(r"(计数|counter|按钮|点击)"):
+                add("创建计数器页面结构和按钮状态")
+                add("实现点击递增与按钮文案实时更新")
+                add("完善黑灰视觉样式和移动端适配")
+            elif mentions(r"(游戏|game|射击|敌人|碰撞|wasd|鼠标|动画|波次)"):
+                add("创建游戏页面、画布/棋盘和状态面板")
+                add("实现核心规则、输入控制和反馈")
+                add("加入得分、失败重开、动画和操作提示")
+            else:
+                add("创建页面结构、样式和脚本入口")
+                add("实现用户要求的主要交互和状态反馈")
+                add("补齐响应式布局、可读文案和基础异常处理")
+            add("在浏览器中验证页面可打开、可操作")
+        elif re.search(r"(代码|实现|修复|测试|脚本|函数|模块|接口|api|后端|前端)", user_text, re.I):
+            add("明确改动目标和验收约束")
+            add("审查相关实现和调用链路")
+            add("完成必要代码修改")
+            add("运行针对性验证并整理结果")
+
+        # The main task card is a user-facing plan, not an execution trace.
+        # Tool prediction, context recovery, TaskGraph reuse checks, and bridge
+        # handoff belong to status/detail channels; they must not appear as
+        # checklist items such as "确认当前任务状态" or "进入执行链路".
         if not steps:
-            steps.append("先判断是否需要工具；不需要时直接组织回答")
-        steps.append("结束前整理完成项、验证项和仍需留意的地方")
-        return steps[:5]
+            if has_any(["写", "创建", "生成", "做", "实现"]):
+                add("拆解用户要求中的交付物和验收点")
+                add("完成交付物的核心内容")
+                add("检查结果并整理可继续调整的事项")
+            else:
+                add("确认用户目标和当前上下文")
+                add("处理当前请求的核心事项")
+                add("整理结果和后续可选动作")
+        return steps[:6]
 
     def _tool_result_preview_for_feedback(self, tool_result: str, max_len: int = 260) -> str:
         preview = re.sub(r"\s+", " ", str(tool_result or "")).strip()
@@ -1221,6 +1668,8 @@ class InferenceEngine:
         tool_result: str,
         tool_call_id: str,
     ) -> None:
+        if self._is_hidden_feedback_tool(tool_name):
+            return
         pair_id = tool_call_id or f"tool-{fc_turn}-{tool_name or 'unknown'}"
         ledger = getattr(self, "_pipeline_tool_ledger", None)
         if ledger is None:
@@ -1256,6 +1705,12 @@ class InferenceEngine:
             except Exception:
                 parsed = None
         if isinstance(parsed, dict):
+            nested = " ".join(
+                str(parsed.get(key) or "")
+                for key in ("result", "error", "message", "reason")
+            )
+            if InferenceEngine._looks_like_approval_denial(nested):
+                return True
             if parsed.get("is_error") is True or parsed.get("failed") is True:
                 return True
             if parsed.get("is_error") is False or parsed.get("failed") is False:
@@ -1308,18 +1763,19 @@ class InferenceEngine:
         ledger = getattr(self, "_pipeline_tool_ledger", []) or []
 
         for item in ledger:
-            tool_name = item.get("tool_name") or "未知工具"
+            raw_tool_name = item.get("tool_name") or "未知工具"
+            if self._is_summary_noise_feedback_tool(raw_tool_name):
+                continue
+            tool_name = self._friendly_pipeline_tool_name(raw_tool_name)
             if item.get("failed"):
                 failed_tools.append(tool_name)
-                self._append_feedback_item(pending_items, f"{tool_name} 返回异常，需要复核")
+                self._append_feedback_item(pending_items, f"{tool_name}需要复核")
             elif item.get("finished"):
                 self._append_feedback_item(completed_items, f"{tool_name} 已完成")
                 self._append_feedback_item(verified_items, f"{tool_name} 已返回结果")
             else:
                 self._append_feedback_item(pending_items, f"{tool_name} 已发起但尚未看到结果")
 
-        if final_text:
-            self._append_feedback_item(completed_items, "已形成本轮最终回复")
         if fc_turn and not completed_items:
             self._append_feedback_item(completed_items, f"完成 {fc_turn} 轮推理")
         if progress.get("total"):
@@ -1332,7 +1788,7 @@ class InferenceEngine:
 
         risks: List[str] = []
         if failed_tools:
-            risks.append("存在工具失败或异常: " + ", ".join(sorted(set(failed_tools))[:6]))
+            risks.append("存在步骤失败或异常: " + "、".join(sorted(set(failed_tools))[:6]))
         if pending_items:
             risks.append("存在未完成或需复核事项")
         return {
@@ -1356,30 +1812,101 @@ class InferenceEngine:
     ) -> Dict[str, Any]:
         """Build the TSD v2.7 interaction payload rendered by the Web UI."""
         percent = progress.get("percent", 0)
+        request_key = self._feedback_request_key()
         if pipeline_type == "pipeline_start":
             brief = self._feedback_brief(getattr(self, "_current_user_input_for_feedback", ""))
-            tools = self._pipeline_tools_for_feedback()
-            prediction = getattr(self, "_current_tool_prediction_for_feedback", {}) or {}
-            reasons = prediction.get("reasons") or []
             detail_lines = []
             if brief:
-                detail_lines.append(f"我先看这件事的目标和上下文：{brief}")
-            if tools:
-                detail_lines.append("候选工具: " + ", ".join(tools[:6]))
-            if reasons:
-                detail_lines.append("依据: " + "；".join(str(r) for r in reasons[:2]))
+                detail_lines.append(f"任务已接收，正在确认目标和上下文：{brief}")
+            plan_steps = self._pipeline_plan_steps_for_feedback()
             return {
-                "pair_id": f"pipeline-start-{fc_turn}",
+                "pair_id": f"pipeline-plan-{request_key}",
                 "kind": "plan",
                 "status": "running",
-                "title": ("先梳理: " + brief) if brief else "先梳理任务上下文",
-                "detail": "\n".join(detail_lines) or "我会先确认目标、上下文和可用能力，再决定是否需要工具。",
+                "title": "任务已接收",
+                "detail": "\n".join(detail_lines) or "任务已接收，正在确认目标和上下文。",
+                "source_channel": "system_status",
+                "channel": CHANNEL_STATUS,
+                "ux_visibility": "details",
+                "is_background": True,
+                "tool_category": "background",
                 "progress": percent,
-                "plan_steps": self._pipeline_plan_steps_for_feedback(),
-                "progress_items": self._pipeline_progress_items_for_feedback(pipeline_type),
+                "plan_steps": plan_steps,
+                "progress_items": [
+                    self._feedback_progress_item(
+                        step,
+                        "running" if idx == 0 else "pending",
+                        source="system_status",
+                        pair_id=f"pipeline-plan-{request_key}:{idx}",
+                    )
+                    for idx, step in enumerate(plan_steps)
+                ],
                 "next_step": "",
             }
+        if pipeline_type == "user_task_plan":
+            brief = self._feedback_brief(getattr(self, "_current_user_input_for_feedback", ""), 160)
+            plan_steps = self._pipeline_plan_steps_for_feedback()
+            return {
+                "pair_id": f"pipeline-user-plan-{request_key}",
+                "kind": "plan",
+                "status": "running",
+                "title": "任务计划",
+                "detail": f"我会按这些步骤推进：{brief}" if brief else "我会按这些步骤推进当前任务。",
+                "source_channel": "model_progress",
+                "channel": CHANNEL_LEDGER,
+                "ux_visibility": "main",
+                "progress": percent,
+                "plan_steps": plan_steps,
+                "progress_items": [
+                    self._feedback_progress_item(
+                        step,
+                        "running" if idx == 0 else "pending",
+                        source="model_progress",
+                        pair_id=f"pipeline-user-plan-{request_key}:{idx}",
+                    )
+                    for idx, step in enumerate(plan_steps)
+                ],
+                "next_step": plan_steps[0] if plan_steps else "",
+                "raw_details": {
+                    "source": "l2.user_task_plan",
+                    "source_tool_call_id": tool_call_id,
+                },
+            }
+        if pipeline_type == "model_progress":
+            note = self._feedback_brief(tool_result, 500)
+            return {
+                "pair_id": f"pipeline-current-step-{request_key}",
+                "kind": "progress",
+                "status": "running",
+                "title": "当前步骤",
+                "detail": note or "正在推进当前步骤。",
+                "source_channel": "model_progress",
+                "channel": CHANNEL_LEDGER,
+                "ux_visibility": "main",
+                "progress": percent,
+                "progress_items": [],
+                "next_step": "",
+                "raw_details": {
+                    "source": "assistant.content",
+                    "source_tool_call_id": tool_call_id,
+                },
+            }
         if pipeline_type == "agent_tool_call":
+            if self._is_hidden_feedback_tool(tool_name):
+                return {
+                    "pair_id": tool_call_id or f"tool-{fc_turn}-{tool_name or 'unknown'}",
+                    "kind": "observation" if tool_result else "action",
+                    "status": "succeeded" if tool_result else "running",
+                    "title": "",
+                    "detail": "",
+                    "tool_name": tool_name,
+                    "tool_category": "background",
+                    "channel": "control",
+                    "source_channel": "internal_control",
+                    "ux_visibility": "hidden",
+                    "is_background": True,
+                    "progress": percent,
+                }
             preview = self._tool_result_preview_for_feedback(tool_result)
             failed = self._tool_result_failed(tool_result, preview) if tool_result else False
             title = (
@@ -1402,6 +1929,15 @@ class InferenceEngine:
                 "detail": detail,
                 "thought": "",
                 "tool_name": tool_name,
+                "channel": CHANNEL_LEDGER,
+                "source_channel": "system_status",
+                "ux_visibility": "details",
+                "tool_category": "other",
+                "raw_details": {
+                    "tool_name": tool_name,
+                    "result_preview": preview,
+                    "event_type": "pipeline.agent_tool_call",
+                },
                 "progress": percent,
                 "progress_items": [
                     self._feedback_progress_item(
@@ -1426,6 +1962,9 @@ class InferenceEngine:
                 "kind": "summary",
                 "status": "succeeded",
                 "title": "这轮处理完成",
+                "source_channel": "model_final",
+                "channel": CHANNEL_FINAL,
+                "ux_visibility": "main",
                 "detail": (
                     f"共推进 {fc_turn} 轮；"
                     f"任务图完成 {progress.get('completed', 0)}/{progress.get('total', 0)} 个节点。"
@@ -1446,6 +1985,9 @@ class InferenceEngine:
                 "kind": "summary",
                 "status": "failed",
                 "title": "任务执行异常",
+                "source_channel": "model_final",
+                "channel": CHANNEL_FINAL,
+                "ux_visibility": "main",
                 "detail": tool_result or "工具循环报告异常。",
                 "progress": percent,
                 "progress_items": [
@@ -1463,6 +2005,9 @@ class InferenceEngine:
             "status": "running",
             "title": "任务进度更新",
             "detail": pipeline_type,
+            "source_channel": "system_status",
+            "channel": CHANNEL_STATUS,
+            "ux_visibility": "main",
             "progress": percent,
             "progress_items": self._pipeline_progress_items_for_feedback(pipeline_type),
         }
@@ -1506,11 +2051,16 @@ class InferenceEngine:
             payload = {
                 "request_id": request_id,
                 "turn_id": user_turn_id or request_id,
+                "session_id": _current_session_id_var.get() or getattr(self, "_current_session_id", ""),
+                "conversation_id": _current_session_id_var.get() or getattr(self, "_current_session_id", ""),
+                "workspace_path": getattr(self, "_current_workspace_path", ""),
+                "project_id": getattr(self, "_current_workspace_path", ""),
                 "step_type": step_type,
                 "data": data,
                 "timestamp": time.time(),
                 "iteration": data.get("turn", 0),
             }
+            mark_public_payload(payload, CHANNEL_LEDGER)
 
             event = ZulongEvent(
                 type=EventType.L2_THINKING_STEP,
@@ -1543,10 +2093,12 @@ class InferenceEngine:
             # 🔥 新增：超时保护（30 秒）
             import concurrent.futures
             
+            messages_for_llm = strip_llm_message_metadata(messages)
+
             def call_vllm():
                 return self.vllm_client.chat.completions.create(
                     model=vllm_model_id,
-                    messages=messages,
+                    messages=messages_for_llm,
                     max_tokens=1024,
                     temperature=0.3,
                     top_p=0.85,
@@ -1781,7 +2333,8 @@ class InferenceEngine:
             "model": model_id,
             "messages": (
                 self._attn_window.apply_window()
-                if getattr(self, "_attn_window", None) else messages
+                if getattr(self, "_attn_window", None)
+                else strip_llm_message_metadata(messages)
             ),
             "max_tokens": response_max_tokens,
             "temperature": 0.3,
@@ -1855,10 +2408,42 @@ class InferenceEngine:
         finally:
             executor.shutdown(wait=False)
 
-        msg = api_response.choices[0].message
+        choice = api_response.choices[0]
+        msg = choice.message
         response_content = msg.content or ""
         tool_calls_data = None
-        if getattr(msg, "tool_calls", None):
+        raw_tool_calls = getattr(msg, "tool_calls", None) or []
+        finish_reason = getattr(choice, "finish_reason", None)
+        usage_summary = _summarize_llm_usage_for_log(
+            getattr(api_response, "usage", None)
+        )
+        tool_call_names = [
+            str(getattr(getattr(tc, "function", None), "name", "") or "")
+            for tc in raw_tool_calls
+        ]
+        logger.info(
+            "[L2][SingleDecision][LLMReturn] model=%s finish_reason=%r "
+            "content_len=%s content_preview=%r tool_calls=%s tool_names=%s usage=%s",
+            model_id,
+            finish_reason,
+            len(response_content),
+            _compact_log_line(response_content),
+            len(raw_tool_calls),
+            tool_call_names,
+            usage_summary,
+        )
+        if not response_content and not raw_tool_calls:
+            logger.warning(
+                "[L2][SingleDecision][EmptyLLMReturn] model=%s finish_reason=%r "
+                "usage=%s messages=%s tools=%s tool_choice=%r",
+                model_id,
+                finish_reason,
+                usage_summary,
+                len(api_kwargs.get("messages") or []),
+                len(tool_definitions or []),
+                api_kwargs.get("tool_choice"),
+            )
+        if raw_tool_calls:
             tool_calls_data = [
                 {
                     "id": tc.id,
@@ -1868,7 +2453,7 @@ class InferenceEngine:
                         "arguments": tc.function.arguments,
                     },
                 }
-                for tc in msg.tool_calls
+                for tc in raw_tool_calls
             ]
             logger.info(
                 "[L2] 单次决策返回工具调用: %s",
@@ -1931,10 +2516,12 @@ class InferenceEngine:
             
             import concurrent.futures
             
+            messages_for_llm = strip_llm_message_metadata(messages)
+
             def call_backup():
                 return self.backup_client.chat.completions.create(
                     model=LLM_MODEL_ID_BACKUP,
-                    messages=messages,
+                    messages=messages_for_llm,
                     max_tokens=1024,
                     temperature=0.3,
                     top_p=0.85,
@@ -2034,9 +2621,18 @@ class InferenceEngine:
             _current_user_turn_id_var.set(request_id)
             self._current_user_turn_id = request_id
         session_id = event.payload.get("session_id") or event.payload.get("conversation_id")
+        session_node_id = _infer_dialogue_session_node_id(
+            session_id,
+            event.payload.get("session_node_id") or event.payload.get("dialogue_session_id") or "",
+        )
         if session_id:
             _current_session_id_var.set(session_id)
             self._current_session_id = session_id
+        if session_node_id:
+            _current_session_node_id_var.set(session_node_id)
+            self._current_session_node_id = session_node_id
+            event.payload["session_node_id"] = session_node_id
+            event.payload["dialogue_session_id"] = session_node_id
 
         if self._is_cancelled_context(request_id, session_id):
             logger.info(
@@ -2121,16 +2717,26 @@ class InferenceEngine:
                 explicit_workspace_path = os.path.abspath(os.path.expanduser(os.path.expandvars(str(explicit_workspace_path))))
             except Exception:
                 explicit_workspace_path = event.payload.get("workspace_path") or event.payload.get("cwd")
+            self._current_workspace_path = str(explicit_workspace_path)
 
         explicit_task_graph_id = ""
         explicit_graph_loaded = False
         referenced_task_graph_id = ""
         task_graph_reference_mode = str(event.payload.get("task_graph_reference_mode") or "none")
         self._locked_task_graph_id = ""
+        _clear_active_graph_flag = str(event.payload.get("clear_active_graph") or "").lower()
+        _active_graph_policy = str(event.payload.get("active_graph_policy") or "").lower()
+        clear_active_graph_requested = (
+            event.payload.get("clear_active_graph") is True
+            or _clear_active_graph_flag in {"1", "true", "yes", "clear"}
+            or _active_graph_policy == "clear"
+        )
         try:
             from zulong.tools.task_tools import (
                 normalize_task_graph_id,
                 load_task_graph_deterministic,
+                set_active_task_graph,
+                _interaction_store_claims_graph,
             )
             referenced_task_graph_id = normalize_task_graph_id(
                 event.payload.get("referenced_task_graph_id") or ""
@@ -2138,10 +2744,26 @@ class InferenceEngine:
             explicit_task_graph_id = normalize_task_graph_id(
                 event.payload.get("task_graph_id") or event.payload.get("graph_id")
             )
+            if clear_active_graph_requested and not explicit_task_graph_id and not referenced_task_graph_id:
+                set_active_task_graph(None, None)
+                self._active_task_graph_id = None
+                self._locked_task_graph_id = ""
+                logger.info(
+                    "[L2] clear_active_graph 请求已清空旧活跃任务图: session=%s request=%s",
+                    session_id or "-",
+                    request_id or "-",
+                )
             if explicit_task_graph_id:
+                claim_unowned_graph = _interaction_store_claims_graph(
+                    session_id,
+                    explicit_task_graph_id,
+                )
                 explicit_graph_loaded = load_task_graph_deterministic(
                     explicit_task_graph_id,
                     workspace_dir=explicit_workspace_path,
+                    conversation_id=session_id,
+                    session_node_id=event.payload.get("session_node_id") or event.payload.get("dialogue_session_id") or "",
+                    claim_unowned=claim_unowned_graph,
                 )
                 if explicit_graph_loaded:
                     self._active_task_graph_id = explicit_task_graph_id
@@ -2181,8 +2803,13 @@ class InferenceEngine:
                         explicit_workspace_path or "-",
                     )
                 else:
+                    set_active_task_graph(None, None)
+                    self._active_task_graph_id = None
+                    self._locked_task_graph_id = ""
+                    event.payload["task_graph_id"] = ""
+                    event.payload["graph_id"] = ""
                     logger.warning(
-                        "[L2] 显式 task_graph_id 未能加载: %s",
+                        "[L2] 显式 task_graph_id 未能加载/owner不匹配，已清空 active graph: %s",
                         explicit_task_graph_id,
                     )
             if referenced_task_graph_id and not explicit_task_graph_id:
@@ -2277,6 +2904,7 @@ class InferenceEngine:
                     pre_retrieved_memory,
                     request_id,
                     session_id,
+                    session_node_id,
                     tool_prediction,
                     tool_bundle,
                     task_graph_policy,
@@ -2394,6 +3022,7 @@ class InferenceEngine:
             'deep_analysis': deep_analysis,
             'request_id': _current_request_id_var.get()
         }
+        mark_public_payload(payload, CHANNEL_FINAL)
         
         # 如果期望 JSON，尝试解析
         if response.strip().startswith('{') and response.strip().endswith('}'):
@@ -2419,6 +3048,7 @@ class InferenceEngine:
     def _process_with_memory(self, user_input: str, priority: EventPriority, voice_mode: str = "TEXT_ONLY",
                             pre_retrieved_memory: str = None,
                             request_id: str = None, session_id: str = None,
+                            session_node_id: str = None,
                             tool_prediction: Optional[Dict[str, Any]] = None,
                             tool_bundle: Optional[List[str]] = None,
                             task_graph_policy: Optional[str] = None,
@@ -2432,6 +3062,7 @@ class InferenceEngine:
             pre_retrieved_memory: L1-B 预检索的记忆上下文，如果提供则跳过重复检索
             request_id: 请求 ID（用于前端响应关联）
             session_id: 会话 ID（用于停止/恢复关联）
+            session_node_id: MemoryGraph 会话根节点 ID（图谱地址，不等同于 Web 窗口 ID）
             tool_prediction: L1-B 工具预判结果
             tool_bundle: L1-B 建议注入 L2 的工具名
             task_graph_policy: L1-B 建议的任务图策略
@@ -2446,6 +3077,10 @@ class InferenceEngine:
         if session_id:
             _current_session_id_var.set(session_id)
             self._current_session_id = session_id
+        session_node_id = _infer_dialogue_session_node_id(session_id or "", session_node_id or "")
+        if session_node_id:
+            _current_session_node_id_var.set(session_node_id)
+            self._current_session_node_id = session_node_id
 
         if self._is_cancelled_context(request_id, session_id):
             logger.info(
@@ -2741,6 +3376,10 @@ class InferenceEngine:
             # 注入运行时上下文到 ToolEngine（供工具访问当前会话信息）
             self.tool_engine.set_context(
                 user_input=user_input,
+                session_id=session_id or "",
+                conversation_id=session_id or "",
+                session_node_id=getattr(self, "_current_session_node_id", "") or "",
+                dialogue_session_id=getattr(self, "_current_session_node_id", "") or "",
                 voice_mode=voice_mode,
                 has_visual=visual_context is not None,
                 tool_prediction=tool_prediction or {},
@@ -3158,24 +3797,26 @@ class InferenceEngine:
             
             self._update_memory(user_input, response, fc_turn=fc_turn)
             
+            output_payload = {
+                "text": response,
+                "display_text": response,
+                "raw_text": raw_response,
+                "speech_text": cleaned_response,
+                "input_text": user_input,
+                "has_rag_context": rag_context is not None,
+                "history_length": len(self._recent_turns_cache),
+                "visual_context": None,
+                "session_id": _current_session_id_var.get() or getattr(self, '_current_session_id', ""),
+                "conversation_id": _current_session_id_var.get() or getattr(self, '_current_session_id', ""),
+                "request_id": request_id,
+                "timestamp": time.time()
+            }
+            mark_public_payload(output_payload, CHANNEL_FINAL)
             output_event = ZulongEvent(
                 type=EventType.L2_OUTPUT,
                 priority=EventPriority.NORMAL,
                 source="InferenceEngine",
-                payload={
-                    "text": response,
-                    "display_text": response,
-                    "raw_text": raw_response,
-                    "speech_text": cleaned_response,
-                    "input_text": user_input,
-                    "has_rag_context": rag_context is not None,
-                    "history_length": len(self._recent_turns_cache),
-                    "visual_context": None,
-                    "session_id": _current_session_id_var.get() or getattr(self, '_current_session_id', ""),
-                    "conversation_id": _current_session_id_var.get() or getattr(self, '_current_session_id', ""),
-                    "request_id": request_id,
-                    "timestamp": time.time()
-                }
+                payload=output_payload
             )
             event_bus.publish(output_event)
             
@@ -3381,10 +4022,48 @@ class InferenceEngine:
             if task_graph_dict:
                 try:
                     from zulong.l2.task_graph import TaskGraph
-                    from zulong.tools.task_tools import set_active_task_graph
+                    from zulong.tools.task_tools import (
+                        infer_task_graph_owner_session_node_id,
+                        normalize_task_graph_id,
+                        set_active_task_graph,
+                    )
                     tg = TaskGraph.deserialize(task_graph_dict)
-                    set_active_task_graph(tg)
-                    logger.info(f"[L2] TaskGraph 已恢复: {tg.title}")
+                    tg_meta = getattr(tg, "metadata", {}) or {}
+                    snapshot_meta = getattr(snapshot, "metadata", {}) or {}
+                    graph_id = normalize_task_graph_id(
+                        getattr(tg, "id", "")
+                        or getattr(tg, "graph_id", "")
+                        or snapshot_meta.get("task_graph_id")
+                        or snapshot_meta.get("graph_id")
+                        or task_id
+                    )
+                    conversation_id = str(
+                        tg_meta.get("owner_conversation_id")
+                        or tg_meta.get("conversation_id")
+                        or snapshot_meta.get("conversation_id")
+                        or snapshot_meta.get("session_id")
+                        or ""
+                    ).strip()
+                    session_node_id = infer_task_graph_owner_session_node_id(
+                        conversation_id,
+                        tg_meta.get("owner_session_node_id")
+                        or tg_meta.get("session_node_id")
+                        or tg_meta.get("dialogue_session_id")
+                        or snapshot_meta.get("session_node_id")
+                        or snapshot_meta.get("dialogue_session_id")
+                        or "",
+                    )
+                    restored = set_active_task_graph(
+                        tg,
+                        graph_id,
+                        conversation_id=conversation_id,
+                        session_node_id=session_node_id,
+                        claim_unowned=bool(conversation_id),
+                    )
+                    if restored:
+                        logger.info(f"[L2] TaskGraph 已恢复: {tg.title}")
+                    else:
+                        logger.warning("[L2] TaskGraph 恢复被 owner 规则拒绝: %s", graph_id)
                 except Exception as tg_err:
                     logger.warning(f"[L2] TaskGraph 恢复失败: {tg_err}")
             
@@ -3470,20 +4149,22 @@ class InferenceEngine:
             
             # 正常完成：发送响应
             if response:
+                output_payload = {
+                    "text": response,
+                    "display_text": response,
+                    "input_text": original_input,
+                    "resumed_task": True,
+                    "session_id": _current_session_id_var.get() or getattr(self, '_current_session_id', ""),
+                    "conversation_id": _current_session_id_var.get() or getattr(self, '_current_session_id', ""),
+                    "request_id": _current_request_id_var.get(),
+                    "timestamp": time.time()
+                }
+                mark_public_payload(output_payload, CHANNEL_FINAL)
                 output_event = ZulongEvent(
                     type=EventType.L2_OUTPUT,
                     priority=EventPriority.NORMAL,
                     source="InferenceEngine/Resume",
-                    payload={
-                        "text": response,
-                        "display_text": response,
-                        "input_text": original_input,
-                        "resumed_task": True,
-                        "session_id": _current_session_id_var.get() or getattr(self, '_current_session_id', ""),
-                        "conversation_id": _current_session_id_var.get() or getattr(self, '_current_session_id', ""),
-                        "request_id": _current_request_id_var.get(),
-                        "timestamp": time.time()
-                    }
+                    payload=output_payload
                 )
                 event_bus.publish(output_event)
                 logger.info(f"[L2] 恢复任务响应已发布")
@@ -3735,7 +4416,7 @@ class InferenceEngine:
                 mg_results = _run_async_bridge(
                     _mg.retrieve_context(
                         user_input, top_k=8,
-                        session_id=getattr(self, '_current_session_id', ""),
+                        session_id=getattr(self, '_current_session_node_id', ""),
                     )
                 )
                 if mg_results:
@@ -3843,12 +4524,26 @@ class InferenceEngine:
                         session_id=None,
                     )
                 
-                # L2 负责 Session 分配（Embedding 相似度匹配）
+                # Web 会话已经有固定窗口身份时，优先挂到该 session 节点。
+                # 只有没有窗口锚点的旧入口才降级到 Embedding 相似度分配。
+                conversation_id = _current_session_id_var.get() or ""
+                preferred_session_id = (
+                    _current_session_node_id_var.get()
+                    or getattr(self, "_current_session_node_id", "")
+                    or (
+                        adapter.session_node_id_for_conversation(conversation_id)
+                        if conversation_id else None
+                    )
+                )
                 session_id = adapter.assign_session_by_similarity(
                     mg, round_id, user_input, response,
+                    preferred_session_id=preferred_session_id,
+                    conversation_id=conversation_id,
                 )
-                # 缓存 session_id，供 retrieve_context 检索时做会话优先匹配
-                self._current_session_id = session_id or ""
+                # 缓存 MemoryGraph session 节点，Web 窗口 ID 继续保留在 _current_session_id。
+                self._current_session_node_id = session_id or preferred_session_id or ""
+                if self._current_session_node_id:
+                    _current_session_node_id_var.set(self._current_session_node_id)
                 
                 # 添加 bot 回复为 sub_dialogue
                 adapter.add_sub_dialogue(
@@ -4432,7 +5127,7 @@ class InferenceEngine:
                     _mg.set_rag_manager(self.rag_manager)
                 mg_results = await _mg.retrieve_context(
                     user_input, top_k=8,
-                    session_id=getattr(self, '_current_session_id', ""),
+                    session_id=getattr(self, '_current_session_node_id', ""),
                 )
                 if mg_results:
                     memory_sections = []
@@ -4553,12 +5248,26 @@ class InferenceEngine:
                         session_id=None,
                     )
                 
-                # L2 负责 Session 分配（Embedding 相似度匹配）
+                # Web 会话已经有固定窗口身份时，优先挂到该 session 节点。
+                # 只有没有窗口锚点的旧入口才降级到 Embedding 相似度分配。
+                conversation_id = _current_session_id_var.get() or ""
+                preferred_session_id = (
+                    _current_session_node_id_var.get()
+                    or getattr(self, "_current_session_node_id", "")
+                    or (
+                        adapter.session_node_id_for_conversation(conversation_id)
+                        if conversation_id else None
+                    )
+                )
                 session_id = adapter.assign_session_by_similarity(
                     mg, round_id, user_input, response,
+                    preferred_session_id=preferred_session_id,
+                    conversation_id=conversation_id,
                 )
-                # 缓存 session_id，供 retrieve_context 检索时做会话优先匹配
-                self._current_session_id = session_id or ""
+                # 缓存 MemoryGraph session 节点，Web 窗口 ID 继续保留在 _current_session_id。
+                self._current_session_node_id = session_id or preferred_session_id or ""
+                if self._current_session_node_id:
+                    _current_session_node_id_var.set(self._current_session_node_id)
                 
                 # 将 bot 回复写入 sub_dialogue
                 adapter.add_sub_dialogue(

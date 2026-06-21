@@ -259,6 +259,7 @@ def build_unified_system_prompt(
         "5. 工具调用中的 label、desc、result 等字段必须使用与用户相同的语言。\n"
         "6. 内容型子任务写入工作目录时，优先使用相对 file_path。\n"
         "7. 如信息不足，先调用记忆/任务/工具补充类工具增量补齐；确实无法继续时再向用户追问。\n"
+        "8. ⚠️ **先说再做**: 准备调用工具执行任务时，必须先给用户一句普通可见的步骤说明——只说本步将做什么，不输出推理过程，不写\"我在思考/我会分析\"。如果工具调用格式允许 assistant.content，请把这句话放在 assistant.content；如果当前模型/Provider 不保留 tool_calls 同轮 content，请先调用 announce_step(message=...) 再调用实际工具。\n"
     )
 
     if l1b_context_pack:

@@ -6,8 +6,8 @@ attention_selection:
   max_switch_history: 50
   min_confidence_threshold: 0.3
   oscillation_detection_window: 10
-  pressure_threshold_high: 0.6
-  pressure_threshold_medium: 0.5
+  pressure_threshold_high: '0.6'
+  pressure_threshold_medium: '0.5'
 audio:
   asr:
     backend: sensevoice
@@ -27,6 +27,14 @@ audio:
     sample_rate: 44100
   tts:
     backend: kokoro
+    cosyvoice:
+      code_path: ./models/CosyVoice
+      integrated_python_path: python
+      model_dir: ./models/iic/CosyVoice2-0.5B
+      model_path: ./models/CosyVoice3-0.5B/FunAudioLLM/Fun-CosyVoice3-0___5B-2512
+      prompt_audio: ./models/CosyVoice/asset/zero_shot_prompt.wav
+      server_url: http://localhost:50000
+      ttsfrd_path: ./models/iic/CosyVoice-ttsfrd
     device: auto
     model_path: ./models/hexgrad/Kokoro-82M
     sample_rate: 24000
@@ -47,7 +55,7 @@ environments:
         enabled: false
   production:
     llm:
-      backend: ollama
+      backend: deepseek
     monitoring:
       performance:
         enabled: true
@@ -118,25 +126,21 @@ intent_classification:
   backend: albert
   enabled: true
 l2_inference:
-  backup_model: ${ZULONG_L2_BACKUP_MODEL:gpt-5.5}
+  backup_model: deepseek-v4-pro
   circuit_breaker:
     bfs_min_interval: 3
-    # 信号2: 模式循环
-    pattern_window: 10
-    pattern_yellow_count: 8
-    pattern_red_count: 10
-    query_similarity_threshold: 0.85
-    # 信号4: 上下文窗口压力
+    context_red_ratio: '0.6'
     context_window_size: 131072
-    context_yellow_ratio: 0.5
-    context_red_ratio: 0.6
-    # 信号6: 无进度空转
+    context_yellow_ratio: '0.5'
+    enabled: true
+    max_yellow_before_red: 4
     no_progress_red: 8
     no_progress_yellow: 5
-    # 通用
-    enabled: true
+    pattern_red_count: 10
+    pattern_window: 10
+    pattern_yellow_count: 8
+    query_similarity_threshold: 0.85
     safety_hard_cap: 100
-    max_yellow_before_red: 4
     time_red_seconds: 120
     time_yellow_seconds: 60
   core_model: qwen3.5:cloud
@@ -217,7 +221,18 @@ launcher:
   host: 127.0.0.1
   port: 8090
 llm:
-  backend: ollama
+  backend: deepseek
+  custom:
+    api_key: EMPTY
+    backend: custom
+    base_url: http://localhost:11434/v1
+    model_id: qwen3.5:4b
+  deepseek:
+    api_key: sk-61976bdc19c94dd3be8a1373cc0355ee
+    backend: deepseek
+    base_url: https://api.deepseek.com
+    model_id: deepseek-v4-pro
+    num_ctx: 131072
   llamaccp:
     api_key: EMPTY
     backend: llamaccp
@@ -233,16 +248,20 @@ llm:
     model_id: qwen3.5-4b
   ollama:
     api_key: EMPTY
+    auto_discover: 'true'
     backend: ollama
     backup_model_id: qwen3.5:4b
     base_url: http://localhost:11434/v1
+    health_check_interval: '30'
+    keep_alive: 5m
     model_id: deepseek-v4-pro:cloud
     num_ctx: 1048576
     num_predict: 1024
-    # Ollama 增强配置
-    auto_discover: true          # 启动时自动发现已安装的模型
-    health_check_interval: 30    # 健康检查间隔（秒），0 表示禁用
-    keep_alive: 5m               # 模型在内存中保持的时间（如 5m, 1h, -1 表示永久）
+  oneapi:
+    api_key: ${ONEAPI_API_KEY}
+    backend: oneapi
+    base_url: http://localhost:3000/v1
+    model_id: gpt-4o-mini
   openai:
     api_key: ${OPENAI_API_KEY}
     backend: openai
@@ -253,28 +272,15 @@ llm:
     model_id: gpt-4o-mini
   openrouter:
     api_key: ${OPENROUTER_API_KEY}
+    app_name: zulong
     backend: openrouter
     base_url: https://openrouter.ai/api/v1
-    model_id: openai/gpt-4o-mini
-    # OpenRouter 特定选项
-    app_name: zulong              # 应用名称（用于统计）
-    http_referer: ""              # 可选 HTTP Referer
-    fallback_models:              # 备用模型列表
+    fallback_models:
     - openai/gpt-4o-mini
     - anthropic/claude-3.5-haiku
     - google/gemini-2.0-flash-001
-  oneapi:
-    api_key: ${ONEAPI_API_KEY}
-    backend: oneapi
-    base_url: http://localhost:3000/v1
-    model_id: gpt-4o-mini
-  custom:
-    api_key: ${CUSTOM_LLM_API_KEY:EMPTY}
-    backend: custom
-    base_url: ${CUSTOM_LLM_BASE_URL:http://localhost:11434/v1}
-    model_id: ${CUSTOM_LLM_MODEL_ID:qwen3.5:4b}
-    # 通用的 OpenAI 兼容中转站配置
-    # 可用于对接任意 OpenAI API 兼容的中转站/代理服务
+    http_referer: ''
+    model_id: openai/gpt-4o-mini
   preload:
     enabled: true
     timeout: 300
@@ -284,7 +290,7 @@ llm:
     backend: sglang
     base_url: http://localhost:30000/v1
     mem_fraction_static: 0.8
-    model_id: ${ZULONG_SGLANG_MODEL_ID:./models/Qwen/Qwen3___5-0.8B-AWQ}
+    model_id: ./models/Qwen/Qwen3___5-0.8B-AWQ
     schedule_conservativeness: 1.0
     schedule_policy: lpm
     tp_size: 1
@@ -314,7 +320,7 @@ llm:
     max_model_len: 4096
     max_num_batched_tokens: 2048
     max_num_seqs: 256
-    model_id: ${ZULONG_VLLM_MODEL_ID:./models/Qwen/Qwen3___5-0.8B-AWQ}
+    model_id: ./models/Qwen/Qwen3___5-0.8B-AWQ
     tensor_parallel_size: 1
     tool_call_parser: qwen3_xml
 memory:
@@ -322,6 +328,11 @@ memory:
     consolidation_threshold: 0.5
     max_episodes: 10
     review_enabled: true
+  event_persistence:
+    batch_size: 100
+    db_path: ./data/events.db
+    enabled: true
+    retention_days: 30
   experience:
     db_path: ./data/experience_db/experiences.db
     enabled: true
@@ -338,12 +349,12 @@ memory:
     local_index_map_size_mb: 64
     map_size_gb: 10
     max_active_shards: 3
-    max_nodes_per_shard: 150000
-    max_shard_property_mb_warning: 150
-    max_shard_property_mb_split: 200
-    max_shard_topology_mb_warning: 64
-    max_shard_topology_delta_mb_compact: 32
     max_active_skeleton_nodes: 50000
+    max_nodes_per_shard: 150000
+    max_shard_property_mb_split: 200
+    max_shard_property_mb_warning: 150
+    max_shard_topology_delta_mb_compact: 32
+    max_shard_topology_mb_warning: 64
     shard_size_check_interval_nodes: 100
     shard_strategy: month
     use_sharding: true
@@ -360,11 +371,6 @@ memory:
     persistence_enabled: true
     persistence_path: ./data/short_term_memory
     ttl: 3600
-  event_persistence:
-    enabled: true
-    db_path: ./data/events.db
-    retention_days: 30
-    batch_size: 100
 monitoring:
   debug:
     backup_count: 5
@@ -394,11 +400,11 @@ security:
     requests_per_minute: 60
 system:
   cache_dir: ./cache
-  data_dir: ./data
+  data_dir: D:/AI/project/zulong_beta5/data
   debug_mode: false
   environment: production
   log_level: INFO
-  models_dir: ./models
+  models_dir: D:/AI/project/zulong_beta5/models
   name: ZULONG
   version: 2.0.0
 tools:
@@ -425,7 +431,8 @@ vision:
     min_frames_required: 10
     short_term_duration: 5
   camera:
-    device_index: 1
+    backend: auto
+    device_index: 0
     enabled: false
     fps: 30
     resolution:
@@ -465,9 +472,9 @@ web:
     static_dir: ./web/static
 workspace:
   auto_open_vscode: false
-  root: ${ZULONG_WORKSPACE:./workspace}
+  root: C:\Users\HiWin11/Zulong/workspace
   vscode_command: code
+  vscode_extensions_dir: C:\Users\HiWin11/.vscode/extensions
   vscode_isolated_user_data: true
-  vscode_user_data_dir: ${ZULONG_VSCODE_USER_DATA_DIR:./data/vscode-user-data}
-  vscode_extensions_dir: ${ZULONG_VSCODE_EXTENSIONS_DIR:./data/vscode-extensions}
   vscode_restore_windows: none
+  vscode_user_data_dir: C:\Users\HiWin11\AppData\Local/Zulong/vscode-user-data

@@ -674,19 +674,20 @@ async def start_agent_run_from_web(run: AgentRunSession) -> Dict[str, Any]:
     # Level C: MemoryGraph BFS 扩散 (TSD §23.11.3: 窗口即绑定)
     if not _effective_graph_id and run.conversation_id:
         try:
-            from zulong.memory.memory_graph import get_memory_graph
+            from zulong.memory.memory_graph import NodeType, get_memory_graph
             _mg = get_memory_graph()
             if _mg:
                 # 从会话 ID 查找 DIALOGUE/SESSION 节点
                 _session_nodes = []
-                for _nid, _node in _mg._nodes.items():
-                    if (_node.metadata.get("session_id") == run.conversation_id
-                            and _node.metadata.get("task_graph_id")):
+                for _node in _mg.get_nodes_by_type(NodeType.DIALOGUE):
+                    _meta = getattr(_node, "metadata", {}) or {}
+                    if (_meta.get("session_id") == run.conversation_id
+                            and _meta.get("task_graph_id")):
                         try:
                             from zulong.tools.task_tools import normalize_task_graph_id
-                            _tgid = normalize_task_graph_id(_node.metadata["task_graph_id"])
+                            _tgid = normalize_task_graph_id(_meta["task_graph_id"])
                         except Exception:
-                            _tgid = _node.metadata["task_graph_id"]
+                            _tgid = _meta["task_graph_id"]
                         if _tgid and _tgid not in _session_nodes:
                             _session_nodes.append(_tgid)
                 if _session_nodes:
@@ -864,6 +865,64 @@ async def request_ide_action(action: str, payload: Dict[str, Any]) -> Dict[str, 
                 "ok": False,
                 "error": (
                     "未检测到 VS Code 后台桥连接，且无法通过本机 code 命令打开 VS Code："
+                    + launched.get("error", "unknown")
+                ),
+                **launched,
+            }
+        if action in (MessageType.IDE_OPEN_FILE, "ide_open_file", "ide:open_file"):
+            file_path = payload.get("active_file") or payload.get("file_path") or payload.get("path")
+            file_candidate = ""
+            if file_path:
+                try:
+                    candidate = os.path.expanduser(os.path.expandvars(str(file_path)))
+                    if not os.path.isabs(candidate) and workspace_path:
+                        candidate = os.path.join(workspace_path, candidate)
+                    candidate = os.path.abspath(candidate)
+                    if os.path.exists(candidate):
+                        file_candidate = candidate
+                except Exception:
+                    file_candidate = ""
+
+            workspace_for_file = workspace_path
+            if file_candidate:
+                if os.path.isdir(file_candidate):
+                    workspace_for_file = file_candidate
+                else:
+                    within_workspace = False
+                    if workspace_path:
+                        try:
+                            within_workspace = os.path.commonpath([workspace_path, file_candidate]) == workspace_path
+                        except ValueError:
+                            within_workspace = False
+                    if not workspace_path or not within_workspace:
+                        workspace_for_file = os.path.dirname(file_candidate)
+
+            if not workspace_for_file:
+                return {
+                    "ok": False,
+                    "status": "workspace_required",
+                    "error": "缺少当前任务工作目录或可打开的文件路径，拒绝回退打开祖龙项目目录。",
+                }
+
+            launched = _launch_vscode_workspace(
+                workspace_for_file,
+                vscode_command,
+                active_file=file_candidate or file_path,
+                line=payload.get("line") or payload.get("start_line"),
+                column=payload.get("column") or payload.get("start_column"),
+            )
+            if launched.get("ok"):
+                return {
+                    "ok": True,
+                    "action": action,
+                    "status": "launched_without_bridge",
+                    "message": "未检测到 VS Code 后台桥，已尝试直接打开 VS Code 文件。",
+                    **launched,
+                }
+            return {
+                "ok": False,
+                "error": (
+                    "未检测到 VS Code 后台桥连接，且无法通过本机 code 命令打开文件："
                     + launched.get("error", "unknown")
                 ),
                 **launched,
@@ -1056,7 +1115,8 @@ async def _request_ide_tool_execution(payload: Dict[str, Any]) -> Dict[str, Any]
         if item.get("call_id") == call_id:
             for other in skipped:
                 await session.tool_result_queue.put(other)
-            is_error = bool(item.get("is_error"))
+            result_text = item.get("result", "")
+            is_error = bool(item.get("is_error")) or _tool_result_not_applied(result_text)
             _notify_web_task_execution_status(
                 state="failed" if is_error else "running",
                 phase="tool_result",
@@ -1081,8 +1141,8 @@ async def _request_ide_tool_execution(payload: Dict[str, Any]) -> Dict[str, Any]
                 "ide_session_id": session.session_id,
                 "tool_name": tool_name,
                 "call_id": call_id,
-                "result": item.get("result", ""),
-                "error": item.get("result", "") if is_error else None,
+                "result": result_text,
+                "error": result_text if is_error else None,
             }
         skipped.append(item)
 
@@ -1115,6 +1175,23 @@ async def _request_ide_tool_execution(payload: Dict[str, Any]) -> Dict[str, Any]
         "call_id": call_id,
         "error": f"等待 VS Code 工具结果超时（{timeout:.0f}s）",
     }
+
+
+def _tool_result_not_applied(result: Any) -> bool:
+    text = str(result or "").lower()
+    if not text:
+        return False
+    markers = (
+        "用户未应用",
+        "用户未允许",
+        "用户拒绝",
+        "审批拒绝",
+        "审批超时",
+        "审批未通过",
+        "未应用写入",
+        "未允许",
+    )
+    return any(marker.lower() in text for marker in markers)
 
 
 def _resolve_vscode_command(override: Optional[str] = None) -> Dict[str, Any]:
@@ -1696,7 +1773,12 @@ async def _handle_audio_end(session: IDESession, _payload: Dict) -> None:
         await session.ws.send_json(msg)
 
 
-def _load_graph_deterministic(graph_id: str, workspace_dir: str = None) -> bool:
+def _load_graph_deterministic(
+    graph_id: str,
+    workspace_dir: str = None,
+    conversation_id: str = "",
+    session_node_id: str = "",
+) -> bool:
     """确定性三级加载 TaskGraph: 内存 → 磁盘 → MemoryGraph
 
     TSD §23.11.3: 恢复时传入 workspace_dir，确保工作目录一致性。
@@ -1705,12 +1787,19 @@ def _load_graph_deterministic(graph_id: str, workspace_dir: str = None) -> bool:
     """
     try:
         from zulong.tools.task_tools import (
+            _interaction_store_claims_graph,
             load_task_graph_deterministic,
             normalize_task_graph_id,
         )
 
         graph_id = normalize_task_graph_id(graph_id)
-        return load_task_graph_deterministic(graph_id, workspace_dir=workspace_dir)
+        return load_task_graph_deterministic(
+            graph_id,
+            workspace_dir=workspace_dir,
+            conversation_id=conversation_id,
+            session_node_id=session_node_id,
+            claim_unowned=_interaction_store_claims_graph(conversation_id, graph_id),
+        )
     except Exception as e:
         logger.warning(f"[ZulongIDE] 确定性恢复失败: {graph_id}: {e}")
         return False
@@ -1767,7 +1856,12 @@ async def _handle_session_resume(session: IDESession, payload: Dict) -> None:
     # 恢复活跃 TaskGraph (TSD §23.11.3: 传入 workspace_dir 保持工作目录一致)
     if graph_id:
         # 确定性恢复路径
-        _load_graph_deterministic(graph_id, workspace_dir=cwd)
+        _load_graph_deterministic(
+            graph_id,
+            workspace_dir=cwd,
+            conversation_id=session.conversation_id or "",
+            session_node_id=payload.get("session_node_id") or payload.get("dialogue_session_id") or "",
+        )
     else:
         message = (
             "已收到显式恢复请求，但没有明确的 task_graph_id。"
@@ -1854,10 +1948,15 @@ def _task_graph_change_callback(event_type: str, data: dict) -> None:
         from zulong.tools.task_tools import get_active_task_graph
         tg = get_active_task_graph()
         if tg:
+            metadata = getattr(tg, "metadata", {}) or {}
             payload = {
                 "event": event_type,
                 "detail": data,
                 "graph": tg.to_frontend_dict(),
+                "conversation_id": metadata.get("owner_conversation_id") or metadata.get("conversation_id") or "",
+                "session_id": metadata.get("owner_conversation_id") or metadata.get("conversation_id") or "",
+                "session_node_id": metadata.get("owner_session_node_id") or metadata.get("session_node_id") or "",
+                "dialogue_session_id": metadata.get("owner_session_node_id") or metadata.get("dialogue_session_id") or "",
             }
             _broadcast_sync("TASK_GRAPH_UPDATE", payload)
     except Exception:
@@ -2691,7 +2790,7 @@ async def get_llm_config_api():
 
     # 所有可用后端
     backends = {}
-    for name in ['ollama', 'siliconflow', 'vllm', 'sglang', 'llamacpp', 'lmstudio', 'openai']:
+    for name in ['ollama', 'siliconflow', 'deepseek', 'vllm', 'sglang', 'llamacpp', 'lmstudio', 'openai']:
         cfg = cm.get_dict(f'llm.{name}', {})
         if cfg:
             backends[name] = {
@@ -2887,7 +2986,7 @@ async def get_model_layers():
 
     # 可用后端列表
     available_backends = []
-    for name in ['ollama', 'siliconflow', 'vllm', 'sglang', 'llamacpp', 'lmstudio', 'openai']:
+    for name in ['ollama', 'siliconflow', 'deepseek', 'vllm', 'sglang', 'llamacpp', 'lmstudio', 'openai']:
         cfg = cm.get_dict(f'llm.{name}', {})
         if cfg:
             available_backends.append(name)
@@ -3025,8 +3124,9 @@ async def get_chat_sessions():
                 "title": conv.get("title") or "对话记录",
                 "messages": [],
                 "createdAt": int((conv.get("created_at") or 0) * 1000),
-                "source": "memory_graph",
-                "dialogue_session_id": conv.get("conversation_id"),
+                "source": conv.get("source") or "interaction_store",
+                "dialogue_session_id": conv.get("session_node_id") or conv.get("conversation_id"),
+                "session_node_id": conv.get("session_node_id") or conv.get("conversation_id"),
                 "last_active_at": conv.get("last_active_at") or conv.get("created_at") or 0,
                 "workspace_path": conv.get("workspace_path"),
                 "project_id": conv.get("project_id"),
@@ -3097,39 +3197,62 @@ async def delete_chat_message(session_id: str, message_id: str):
 
 
 @ide_router.get("/api/task-graph/active")
-async def get_active_task_graph_snapshot(task_graph_id: Optional[str] = None, workspace_path: Optional[str] = None):
+async def get_active_task_graph_snapshot(
+    task_graph_id: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    session_node_id: Optional[str] = None,
+    dialogue_session_id: Optional[str] = None,
+):
     """获取当前活跃任务图谱快照（前端按需拉取/重建用）"""
     try:
         from zulong.tools.task_tools import (
+            _interaction_store_claims_graph,
+            bind_task_graph_owner,
             get_active_task_graph,
+            infer_task_graph_owner_session_node_id,
             load_task_graph_deterministic,
             normalize_task_graph_id,
             _active_graph_id,
         )
 
         requested_graph_id = normalize_task_graph_id(task_graph_id)
-        if not requested_graph_id:
-            try:
-                from zulong.launcher.web_chat_router import _task_execution_status
-
-                requested_graph_id = normalize_task_graph_id(
-                    _task_execution_status.get("task_graph_id")
-                )
-                workspace_path = workspace_path or _task_execution_status.get("workspace_path")
-            except Exception:
-                requested_graph_id = ""
+        owner_conversation_id = str(conversation_id or session_id or "").strip()
+        owner_session_node_id = infer_task_graph_owner_session_node_id(
+            owner_conversation_id,
+            session_node_id or dialogue_session_id or "",
+        )
 
         tg = get_active_task_graph(workspace_dir=workspace_path) if workspace_path else get_active_task_graph()
         if requested_graph_id and (
             not tg or normalize_task_graph_id(getattr(tg, "id", "")) != requested_graph_id
         ):
-            if load_task_graph_deterministic(requested_graph_id, workspace_dir=workspace_path):
+            if load_task_graph_deterministic(
+                requested_graph_id,
+                workspace_dir=workspace_path,
+                conversation_id=owner_conversation_id,
+                session_node_id=owner_session_node_id,
+                claim_unowned=_interaction_store_claims_graph(
+                    owner_conversation_id,
+                    requested_graph_id,
+                ),
+            ):
                 tg = get_active_task_graph(workspace_dir=workspace_path) if workspace_path else get_active_task_graph()
 
         if not tg:
             return {"status": "ok", "graph": None, "graph_id": None}
-        graph_data = tg.to_frontend_dict()
         graph_id = normalize_task_graph_id(getattr(tg, "id", "") or _active_graph_id)
+        if owner_conversation_id or owner_session_node_id:
+            owner_ok = bind_task_graph_owner(
+                tg,
+                conversation_id=owner_conversation_id,
+                session_node_id=owner_session_node_id,
+                claim_unowned=_interaction_store_claims_graph(owner_conversation_id, graph_id),
+            )
+            if not owner_ok:
+                return {"status": "ok", "graph": None, "graph_id": None}
+        graph_data = tg.to_frontend_dict()
         return {
             "status": "ok",
             "graph": graph_data,
@@ -3182,6 +3305,8 @@ async def bind_task_graph_file(body: Dict[str, Any]):
 
         from zulong.l2.task_graph import TaskGraph
         from zulong.tools.task_tools import (
+            bind_task_graph_owner,
+            infer_task_graph_owner_session_node_id,
             normalize_task_graph_id,
             set_active_task_graph,
             _backup_graph_to_disk,
@@ -3210,6 +3335,11 @@ async def bind_task_graph_file(body: Dict[str, Any]):
             graph_id = f"tg_{int(time.time())}"
             tg.id = graph_id
             tg.graph_id = graph_id
+        conversation_id = str(body.get("session_id") or body.get("conversation_id") or "").strip()
+        session_node_id = infer_task_graph_owner_session_node_id(
+            conversation_id,
+            body.get("session_node_id") or body.get("dialogue_session_id") or "",
+        )
 
         workspace_dir = str(body.get("workspace_path") or body.get("cwd") or "").strip()
         if not workspace_dir:
@@ -3225,12 +3355,57 @@ async def bind_task_graph_file(body: Dict[str, Any]):
             body.get("empty_graph", True)
             and len(getattr(tg, "_nodes", {}) or {}) <= 1
         )
-        tg.metadata["conversation_id"] = body.get("session_id") or body.get("conversation_id") or ""
+        if conversation_id:
+            try:
+                from zulong.launcher.interaction_store import get_interaction_store
 
-        set_active_task_graph(tg, graph_id, workspace_dir=workspace_dir)
+                existing_conv = get_interaction_store().get_conversation(conversation_id)
+                existing_graph_id = normalize_task_graph_id((existing_conv or {}).get("task_graph_id"))
+                if existing_graph_id and existing_graph_id != graph_id:
+                    return JSONResponse(
+                        {
+                            "status": "error",
+                            "message": (
+                                f"当前会话已绑定任务图谱 {existing_graph_id}，"
+                                f"不能再改绑到 {graph_id}。请新建会话或打开原会话。"
+                            ),
+                        },
+                        status_code=409,
+                    )
+            except Exception as exc:
+                logger.debug("[TaskGraph] 会话既有绑定检查跳过: %s", exc)
+
+        if not bind_task_graph_owner(
+            tg,
+            conversation_id=conversation_id,
+            session_node_id=session_node_id,
+            claim_unowned=True,
+        ):
+            return JSONResponse(
+                {
+                    "status": "error",
+                    "message": "该任务图谱已绑定到其他会话，不能在当前会话中激活。",
+                },
+                status_code=409,
+            )
+
+        if not set_active_task_graph(
+            tg,
+            graph_id,
+            workspace_dir=workspace_dir,
+            conversation_id=conversation_id,
+            session_node_id=session_node_id,
+            claim_unowned=True,
+        ):
+            return JSONResponse(
+                {
+                    "status": "error",
+                    "message": "该任务图谱不属于当前会话，已拒绝激活。",
+                },
+                status_code=409,
+            )
         _backup_graph_to_disk(tg, graph_id)
 
-        conversation_id = str(body.get("session_id") or body.get("conversation_id") or "").strip()
         if conversation_id:
             try:
                 from zulong.launcher.interaction_store import get_interaction_store
@@ -3240,7 +3415,12 @@ async def bind_task_graph_file(body: Dict[str, Any]):
                     source="web_chat",
                     workspace_path=workspace_dir,
                     task_graph_id=graph_id,
-                    metadata={"task_graph_file_path": file_path},
+                    session_node_id=session_node_id or None,
+                    metadata={
+                        "task_graph_file_path": file_path,
+                        "owner_conversation_id": conversation_id,
+                        "owner_session_node_id": session_node_id,
+                    },
                     active=True,
                 )
             except Exception as exc:
@@ -3257,6 +3437,8 @@ async def bind_task_graph_file(body: Dict[str, Any]):
             "task_graph_file_path": file_path,
             "conversation_id": conversation_id,
             "session_id": conversation_id,
+            "session_node_id": session_node_id,
+            "dialogue_session_id": session_node_id,
         }
         _broadcast_sync("TASK_GRAPH_UPDATE", payload)
 
@@ -3268,6 +3450,10 @@ async def bind_task_graph_file(body: Dict[str, Any]):
             "task_graph_id": graph_id,
             "workspace_path": workspace_dir,
             "task_graph_file_path": file_path,
+            "conversation_id": conversation_id,
+            "session_id": conversation_id,
+            "session_node_id": session_node_id,
+            "dialogue_session_id": session_node_id,
         }
     except Exception as e:
         logger.error(f"[TaskGraph] 绑定图谱文件失败: {e}", exc_info=True)

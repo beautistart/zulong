@@ -2,7 +2,7 @@
 	"name": "zulong-ide",
 	"displayName": "Zulong IDE",
 	"description": "Zulong multi-layer adaptive intelligent agent for VS Code. Powered by MemoryGraph, TaskGraph, AttentionWindow and CircuitBreaker.",
-	"version": "2.1.0"
+	"version": "2.1.0",
 	"icon": "assets/icons/icon.png",
 	"workspaces": [
 		".",

@@ -116,6 +116,136 @@ def _safe_get_shard_id(mg: Any, node_id: str, node: Any = None, item: Optional[D
     return ""
 
 
+_PREFERENCE_HINTS = (
+    "偏好", "喜欢", "倾向", "习惯", "希望", "优先", "默认",
+    "不要", "别再", "避免", "prefer", "preference", "likes",
+    "usually", "by default",
+)
+
+
+def _looks_like_preference_note(label: str, content: str, importance: str = "") -> bool:
+    """判断保存的笔记是否属于用户偏好类记忆。"""
+    text = f"{label or ''}\n{content or ''}".lower()
+    if "preference" in str(importance or "").lower():
+        return True
+    return any(hint.lower() in text for hint in _PREFERENCE_HINTS)
+
+
+def _active_task_memory_targets(mg: Any, focus_node_id: str = "") -> List[Dict[str, str]]:
+    """返回当前任务在 MemoryGraph 中可引用的稳定节点。"""
+    targets: List[Dict[str, str]] = []
+
+    def _append(node_id: str, role: str, graph_id: str = "") -> None:
+        node_id = str(node_id or "").strip()
+        if not node_id:
+            return
+        try:
+            if not mg.has_node(node_id):
+                return
+        except Exception:
+            return
+        if any(item.get("node_id") == node_id for item in targets):
+            return
+        targets.append({
+            "node_id": node_id,
+            "role": role,
+            "task_graph_id": graph_id,
+        })
+
+    graph_id = ""
+    try:
+        from zulong.tools.task_tools import get_active_task_graph, normalize_task_graph_id
+
+        tg = get_active_task_graph()
+        graph_id = normalize_task_graph_id(
+            getattr(tg, "id", "") or getattr(tg, "graph_id", "")
+        ) if tg else ""
+    except Exception:
+        graph_id = ""
+
+    if graph_id:
+        _append(f"task:{graph_id}/req", "task_root", graph_id)
+        _append(f"task:{graph_id}", "task_root_legacy", graph_id)
+        try:
+            from zulong.memory.memory_graph import NodeType
+
+            for node in mg.get_nodes_by_type(NodeType.TASK):
+                meta = _node_metadata(node)
+                if meta.get("graph_id") != graph_id:
+                    continue
+                nid = str(getattr(node, "node_id", "") or "")
+                if (
+                    meta.get("sub_type") == "task_root"
+                    or nid.endswith("/req")
+                    or str(meta.get("graph_address") or "").endswith("/task:req")
+                ):
+                    _append(nid, "task_root", graph_id)
+                    break
+        except Exception:
+            pass
+
+    _append(focus_node_id, "focused_task", graph_id)
+    return targets
+
+
+def _add_preference_task_reference_edges(
+    mg: Any,
+    note_node_id: str,
+    *,
+    label: str,
+    content: str,
+    importance: str,
+    focus_node_id: str = "",
+) -> List[Dict[str, Any]]:
+    if not _looks_like_preference_note(label, content, importance):
+        return []
+    try:
+        from zulong.memory.memory_graph import EdgeType
+    except Exception:
+        return []
+
+    created: List[Dict[str, Any]] = []
+    for target in _active_task_memory_targets(mg, focus_node_id):
+        task_node_id = target.get("node_id", "")
+        if not task_node_id:
+            continue
+        try:
+            already_exists = bool(mg.has_edge(task_node_id, note_node_id))
+        except Exception:
+            already_exists = False
+        if not already_exists:
+            try:
+                mg.add_edge(
+                    task_node_id,
+                    note_node_id,
+                    EdgeType.REFERENCE,
+                    weight=0.72,
+                    metadata={
+                        "relation": "task_preference_context",
+                        "source": "save_memory_note",
+                        "memory_kind": "preference",
+                    },
+                )
+            except Exception as exc:
+                logger.debug(
+                    "[save_memory_note] 偏好任务引用边写入跳过 %s -> %s: %s",
+                    task_node_id,
+                    note_node_id,
+                    exc,
+                )
+                continue
+        created.append({
+            "source": task_node_id,
+            "target": note_node_id,
+            "type": "reference",
+            "relation": "task_preference_context",
+            "task_graph_id": target.get("task_graph_id", ""),
+            "target_role": target.get("role", ""),
+            "created": not already_exists,
+        })
+    return created
+
+
 def _build_memory_address(
     mg: Any,
     node_id: str,
@@ -269,13 +399,57 @@ def _safe_get_neighbors(mg: Any, node_id: str, max_depth: int = 1) -> List[Any]:
     return nodes
 
 
+def _edge_type_of(edge: Optional[Dict[str, Any]]) -> str:
+    if not edge:
+        return ""
+    return str(edge.get("edge_type") or edge.get("type") or "").lower()
+
+
+def _edge_metadata(edge: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not edge:
+        return {}
+    meta = edge.get("metadata")
+    return dict(meta or {}) if isinstance(meta, dict) else {}
+
+
+def _reference_edges_for_node(mg: Any, node_id: str, max_items: int = 12) -> List[Dict[str, Any]]:
+    """Return compact REFERENCE edges touching a node for explainable recall."""
+    refs: List[Dict[str, Any]] = []
+    seen = set()
+    for neighbor in _safe_get_neighbors(mg, node_id, max_depth=1):
+        neighbor_id = str(getattr(neighbor, "node_id", "") or "")
+        if not neighbor_id or neighbor_id == node_id:
+            continue
+        candidates = [
+            ("out", node_id, neighbor_id, _safe_get_edge(mg, node_id, neighbor_id)),
+            ("in", neighbor_id, node_id, _safe_get_edge(mg, neighbor_id, node_id)),
+        ]
+        for direction, source, target, edge in candidates:
+            if _edge_type_of(edge) != "reference":
+                continue
+            key = (source, target)
+            if key in seen:
+                continue
+            seen.add(key)
+            meta = _edge_metadata(edge)
+            refs.append({
+                "source": source,
+                "target": target,
+                "type": "reference",
+                "direction": direction,
+                "relation": str(meta.get("relation") or ""),
+                "memory_kind": str(meta.get("memory_kind") or ""),
+                "source_label": getattr(mg.get_node(source), "label", source) if hasattr(mg, "get_node") else source,
+                "target_label": getattr(mg.get_node(target), "label", target) if hasattr(mg, "get_node") else target,
+                "neighbor": _brief_node(mg, neighbor),
+            })
+            if len(refs) >= max_items:
+                return refs
+    return refs
+
+
 def _iter_memory_nodes(mg: Any) -> List[Any]:
-    """兼容 NetworkX MemoryGraph 和 ShardedMemoryGraph 的节点遍历。"""
-    if hasattr(mg, "_nodes"):
-        try:
-            return list(mg._nodes.values())
-        except Exception:
-            pass
+    """遍历原生分片 MemoryGraph 节点。"""
     nodes = []
     try:
         for shard_id in mg.list_all_shards():
@@ -786,6 +960,7 @@ class ReadMemoryNodeTool(BaseTool):
                 "parent": parent_info,
                 "children_count": len(children),
                 "children": children_info,
+                "reference_edges": _reference_edges_for_node(mg, node_id),
                 "neighbor_count": subgraph.get("neighbor_count", 0),
             }
             _attach_address_fields(result_data, mg, node_id, node=node)
@@ -956,6 +1131,7 @@ class SaveMemoryNoteTool(BaseTool):
             focus_node_id = (ctx or {}).get("focused_task_node_id")
 
             created_nodes = []
+            memory_reference_edges: List[Dict[str, Any]] = []
             semantic_total = 0
             from zulong.memory.memory_graph import EdgeType
             for index, spec in enumerate(node_specs, start=1):
@@ -963,6 +1139,7 @@ class SaveMemoryNoteTool(BaseTool):
                 if not item_content:
                     continue
                 item_label = str(spec.get("label") or label or item_content[:50]).strip()[:120]
+                is_preference = _looks_like_preference_note(item_label, item_content, imp_level.value)
                 suffix = f":{index:03d}" if batch_entries else ""
                 node_id = f"note:{int(now * 1000)}{suffix}"
                 node = GraphNode(
@@ -979,6 +1156,7 @@ class SaveMemoryNoteTool(BaseTool):
                         "source": "model_note_batch_entry" if batch_entries else "model_note",
                         "batch_root_id": batch_root_id,
                         "batch_index": spec.get("source_index") or str(index),
+                        "memory_kind": "preference" if is_preference else "note",
                     },
                 )
 
@@ -990,6 +1168,15 @@ class SaveMemoryNoteTool(BaseTool):
                     mg.add_edge(batch_root_id, node_id, EdgeType.HIERARCHY, weight=1.0, protected=True)
                 if focus_node_id:
                     mg.add_edge(focus_node_id, node_id, EdgeType.REFERENCE, weight=0.6)
+                if is_preference:
+                    memory_reference_edges.extend(_add_preference_task_reference_edges(
+                        mg,
+                        node_id,
+                        label=item_label,
+                        content=item_content,
+                        importance=imp_level.value,
+                        focus_node_id=focus_node_id,
+                    ))
 
                 logger.info(f"[save_memory_note] 保存节点 {node_id}: {item_label}")
 
@@ -1011,6 +1198,7 @@ class SaveMemoryNoteTool(BaseTool):
                     "memory_address": _build_memory_address(mg, node_id, node=node_obj),
                     "label": item_label,
                     "importance": imp_level.value,
+                    "memory_kind": "preference" if is_preference else "note",
                     "semantic_links": _semantic_count,
                 })
 
@@ -1037,6 +1225,7 @@ class SaveMemoryNoteTool(BaseTool):
                     "created_count": len(created_nodes),
                     "batch_root_id": batch_root_id,
                     "nodes": created_nodes,
+                    "memory_reference_edges": memory_reference_edges,
                     "message": f"已保存 {len(created_nodes)} 条记忆到记忆图",
                 },
                 execution_time=time.time() - start_time,
@@ -1188,6 +1377,7 @@ class DiscoverRelatedTool(BaseTool):
                     "seed_memory_address": _build_memory_address(mg, node_id, node=mg.get_node(node_id)),
                     "count": len(related),
                     "related": related[:20],
+                    "reference_edges": _reference_edges_for_node(mg, node_id, max_items=20),
                 },
                 execution_time=time.time() - start_time,
                 request_id=request.request_id,
@@ -1593,19 +1783,23 @@ class DeleteMemoryEdgeTool(BaseTool):
                         request_id=request.request_id,
                     )
             elif node_id:
-                neighbors_in = list(mg._graph.predecessors(node_id)) if mg._graph.has_node(node_id) else []
-                neighbors_out = list(mg._graph.successors(node_id)) if mg._graph.has_node(node_id) else []
-                if not neighbors_in and not neighbors_out:
+                neighbors = _safe_get_neighbors(mg, node_id, max_depth=1)
+                if not neighbors:
                     return self._create_result(
                         success=True,
                         data={"deleted_count": 0, "deleted_edges": [], "message": f"节点 {node_id} 无关联边"},
                         execution_time=time.time() - start_time,
                         request_id=request.request_id,
                     )
-                for src in neighbors_in:
+                for neighbor in neighbors:
+                    src = getattr(neighbor, "node_id", "")
+                    if not src or src == node_id:
+                        continue
                     if mg.remove_edge(src, node_id):
                         deleted_edges.append({"source": src, "target": node_id})
-                for tgt in neighbors_out:
+                    tgt = getattr(neighbor, "node_id", "")
+                    if not tgt or tgt == node_id:
+                        continue
                     if mg.remove_edge(node_id, tgt):
                         deleted_edges.append({"source": node_id, "target": tgt})
 

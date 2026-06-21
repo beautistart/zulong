@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>坦克大战 - 像素风</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="game-wrapper">
+        <!-- 游戏标题 -->
+        <div class="game-header">
+            <h1 class="pixel-title">🛡️ 坦 克 大 战 🛡️</h1>
+        </div>
+
+        <!-- 游戏信息栏 -->
+        <div class="info-bar">
+            <div class="info-item">
+                <span class="info-label">🟢 生命</span>
+                <span id="lives" class="info-value">3</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">💀 击杀</span>
+                <span id="score" class="info-value">0</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">🏴 剩余敌人</span>
+                <span id="enemies-left" class="info-value">20</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">🎯 关卡</span>
+                <span id="stage" class="info-value">1</span>
+            </div>
+        </div>
+
+        <!-- 游戏画布 -->
+        <canvas id="gameCanvas" width="624" height="624"></canvas>
+
+        <!-- 操作提示 -->
+        <div class="controls-hint">
+            <div class="hint-row">
+                <span class="key">W A S D</span> 移动坦克
+            </div>
+            <div class="hint-row">
+                <span class="key">J</span> 或 <span class="key">空格</span> 开火
+            </div>
+            <div class="hint-row">
+                <span class="key">R</span> 重新开始
+            </div>
+        </div>
+
+        <!-- 游戏结束弹窗 -->
+        <div id="gameOverModal" class="modal hidden">
+            <div class="modal-content">
+                <h2 id="modalTitle" class="pixel-title">游戏结束</h2>
+                <p id="modalMessage"></p>
+                <button id="restartBtn" class="pixel-btn">🔄 再来一局</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="game.js"></script>
+</body>
+</html>

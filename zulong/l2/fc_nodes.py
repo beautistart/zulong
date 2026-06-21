@@ -32,6 +32,10 @@ from zulong.l2.tool_budget import (
     get_engine_tool_budget,
     get_engine_tool_calls_used,
 )
+from zulong.core.message_visibility import (
+    internal_control_message,
+    strip_llm_message_metadata,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +54,14 @@ _LOCAL_MUTATION_TOOLS = {
     "exec_run_command",
 }
 
+_WRITE_CONTENT_TOOLS = {
+    "exec_write_file",
+    "ide_write_file",
+    "write_to_file",
+}
+
+_MAX_WRITE_CHUNK_CHARS = 1800
+
 _APPROVAL_DENIAL_MARKERS = (
     "用户未",
     "用户拒绝",
@@ -66,6 +78,14 @@ _APPROVAL_DENIAL_MARKERS = (
 )
 
 
+def _looks_like_approval_denial_text(result_text: str) -> bool:
+    raw = str(result_text or "")
+    if not raw:
+        return False
+    lowered = raw.lower()
+    return any(marker.lower() in lowered for marker in _APPROVAL_DENIAL_MARKERS)
+
+
 def _tool_result_failed(result_text: str) -> bool:
     """Return True when a tool result is structurally or textually failed."""
     raw = str(result_text or "").strip()
@@ -76,6 +96,12 @@ def _tool_result_failed(result_text: str) -> bool:
     except Exception:
         parsed = None
     if isinstance(parsed, dict):
+        nested = " ".join(
+            str(parsed.get(key) or "")
+            for key in ("result", "error", "message", "reason")
+        )
+        if _looks_like_approval_denial_text(nested):
+            return True
         if parsed.get("ok") is True or parsed.get("success") is True:
             return False
         if parsed.get("ok") is False or parsed.get("success") is False:
@@ -93,29 +119,60 @@ def _tool_result_failed(result_text: str) -> bool:
 
 
 def _is_protected_mutation_block(tool_name: str, result_text: str) -> bool:
-    """Detect write/command approval denials that must stop the FC loop.
+    """Detect write/command approval denials.
 
-    TSD §23.4 requires approval to be an execution gate. If VS Code rejects or
-    times out while a mutation is pending, L2 must not switch to an internal
-    write/command tool to bypass the user's decision. A normal non-zero command
-    result is only an observation; it should remain recoverable by later nodes.
+    TSD requires approval to be an execution gate. A denial must prevent
+    bypassing through local mutation tools, but it should not end the whole FC
+    loop immediately: the model may retry the same approved channel after the
+    user changes approval mode, or ask for approval explicitly.
     """
     if tool_name not in _PROTECTED_MUTATION_TOOLS:
         return False
     raw = str(result_text or "")
     if not raw:
         return False
-    lowered = raw.lower()
-    return any(marker.lower() in lowered for marker in _APPROVAL_DENIAL_MARKERS)
+    return _looks_like_approval_denial_text(raw)
 
 
 def _approval_block_response(tool_name: str, result_text: str) -> str:
     preview = " ".join(str(result_text or "").split())[:260]
     return (
-        "任务已暂停并标记为 blocked：受保护的写入/命令操作未获得用户审批"
+        "任务正在等待用户审批/应用受保护的写入或命令"
         f"（工具：{tool_name}）。"
-        "为遵循审批边界，祖龙不会改用内部写文件或命令工具绕过本次拒绝。"
+        "祖龙不会改用内部写文件或命令工具绕过审批；确认后可继续同一路径执行。"
         + (f"\n结果摘要：{preview}" if preview else "")
+    )
+
+
+def _tool_args_parse_error_result(tool_name: str, parse_error: str) -> str:
+    payload = {
+        "error": f"工具参数解析失败: {parse_error}",
+        "recoverable": True,
+        "reason": "tool_arguments_json_invalid",
+        "tool_name": tool_name,
+    }
+    if tool_name in _WRITE_CONTENT_TOOLS:
+        payload.update({
+            "chunk_policy": "openhands_style_file_chunking",
+            "max_chunk_chars": _MAX_WRITE_CHUNK_CHARS,
+            "recommended_chunk_chars": "800-1200",
+            "next_action": (
+                "重新调用同一个写入工具；第一块 mode='overwrite'，"
+                "后续块 mode='append'，每块 content 控制在 800-1200 字符。"
+            ),
+        })
+    return _json.dumps(payload, ensure_ascii=False)
+
+
+def _build_write_chunking_correction(tool_name: str, parse_error: str) -> Dict[str, Any]:
+    return internal_control_message(
+        "[工具参数分片纠偏] 上一次写文件工具调用的 arguments 不是合法 JSON，"
+        f"通常是 content 过长导致模型输出被 max_tokens 截断。工具={tool_name}；"
+        f"解析错误={parse_error}。"
+        "下一轮必须重新调用同一个写入工具，采用 OpenHands 式小块写入："
+        "第一块 mode='overwrite'，后续块 mode='append'，每块 content 800-1200 字符，"
+        f"单块绝不能超过 {_MAX_WRITE_CHUNK_CHARS} 字符。"
+        "不要继续输出大段自然语言，不要 submit_final_answer；全部写入后再运行验证命令或读取文件确认。"
     )
 
 
@@ -145,6 +202,7 @@ class FCLoopState(TypedDict, total=False):
     user_input_text: str
     is_resume: bool
     forced_first_tool_name: str
+    forced_next_tool_name: str
     resume_automark_count: int
     null_response_count: int  # 连续 response=None 的拦截次数
     api_timeout_count: int  # API 连续超时次数
@@ -215,11 +273,12 @@ def _make_call_model_node(engine: "InferenceEngine"):
         vllm_model_id = state["vllm_model_id"]
         force_first_tool = state.get("force_first_tool", False)
         forced_first_tool_name = state.get("forced_first_tool_name")
+        forced_next_tool_name = state.get("forced_next_tool_name")
 
         # 构建 API 调用参数（使用注意力窗口裁剪后的消息）
         windowed_messages = (
             engine._attn_window.apply_window()
-            if engine._attn_window else messages
+            if engine._attn_window else strip_llm_message_metadata(messages)
         )
         api_kwargs: Dict[str, Any] = {
             "model": vllm_model_id,
@@ -248,7 +307,17 @@ def _make_call_model_node(engine: "InferenceEngine"):
                     cb_force_no_tools = False
                     state["cb_force_no_tools"] = False
                     api_kwargs["tools"] = tool_definitions
-                    api_kwargs["tool_choice"] = "auto"
+                    if forced_next_tool_name and _set_forced_tool_choice(
+                        api_kwargs, tool_definitions, forced_next_tool_name
+                    ):
+                        state["forced_next_tool_name"] = ""
+                        logger.warning(
+                            "[FC][Graph][CB] 任务图未完成，强制恢复工具执行: %s -> %s",
+                            getattr(_next_node, "id", ""),
+                            forced_next_tool_name,
+                        )
+                    else:
+                        api_kwargs["tool_choice"] = "auto"
                     logger.warning(
                         "[FC][Graph][CB] 任务图仍有未完成节点，恢复工具定义供模型继续执行: %s",
                         getattr(_next_node, "id", ""),
@@ -257,7 +326,12 @@ def _make_call_model_node(engine: "InferenceEngine"):
                 logger.debug("[FC][Graph][CB] 恢复工具定义检查失败: %s", cb_restore_err)
         elif tool_definitions:
             api_kwargs["tools"] = tool_definitions
-            if forced_first_tool_name and fc_turn == 1:
+            if forced_next_tool_name and _set_forced_tool_choice(
+                api_kwargs, tool_definitions, forced_next_tool_name
+            ):
+                state["forced_next_tool_name"] = ""
+                logger.info("[FC][Graph] 纠偏轮：强制调用 %s", forced_next_tool_name)
+            elif forced_first_tool_name and fc_turn == 1:
                 api_kwargs["tool_choice"] = {
                     "type": "function",
                     "function": {"name": forced_first_tool_name},
@@ -329,7 +403,7 @@ def _make_call_model_node(engine: "InferenceEngine"):
                     if engine.backup_client and LLM_MODEL_ID_BACKUP:
                         backup_resp = engine.backup_client.chat.completions.create(
                             model=LLM_MODEL_ID_BACKUP,
-                            messages=messages,
+                            messages=strip_llm_message_metadata(messages),
                             max_tokens=state.get("response_max_tokens", 1024),
                             temperature=0.3,
                             stream=False,
@@ -367,7 +441,7 @@ def _make_call_model_node(engine: "InferenceEngine"):
                     logger.info(f"🔄 [FC][Graph] 切换备用模型: {LLM_MODEL_ID_BACKUP}")
                     backup_resp = engine.backup_client.chat.completions.create(
                         model=LLM_MODEL_ID_BACKUP,
-                        messages=messages,
+                        messages=strip_llm_message_metadata(messages),
                         max_tokens=1024,
                         temperature=0.3,
                         stream=False,
@@ -403,10 +477,41 @@ def _make_call_model_node(engine: "InferenceEngine"):
         # 拆解 API 返回（避免将 OpenAI 对象存入 state）
         tool_calls_data = None
         response_content = msg.content or ""
+        raw_tool_calls = getattr(msg, "tool_calls", None) or []
+        finish_reason = getattr(choice, "finish_reason", None)
+        usage_summary = _summarize_llm_usage(getattr(api_response, "usage", None))
+        tool_call_names = [
+            str(getattr(getattr(tc, "function", None), "name", "") or "")
+            for tc in raw_tool_calls
+        ]
+        logger.info(
+            "[FC][Graph][LLMReturn] turn=%s model=%s finish_reason=%r "
+            "content_len=%s content_preview=%r tool_calls=%s tool_names=%s usage=%s",
+            fc_turn,
+            vllm_model_id,
+            finish_reason,
+            len(response_content),
+            _compact_line(response_content, 240),
+            len(raw_tool_calls),
+            tool_call_names,
+            usage_summary,
+        )
+        if not response_content and not raw_tool_calls:
+            logger.warning(
+                "[FC][Graph][EmptyLLMReturn] turn=%s model=%s finish_reason=%r "
+                "usage=%s messages=%s tools=%s tool_choice=%r",
+                fc_turn,
+                vllm_model_id,
+                finish_reason,
+                usage_summary,
+                len(windowed_messages),
+                len(tool_definitions or []),
+                api_kwargs.get("tool_choice"),
+            )
 
-        if msg.tool_calls:
+        if raw_tool_calls:
             logger.info(
-                f"[FC][Graph] Turn {fc_turn}: 模型请求 {len(msg.tool_calls)} 个工具调用"
+                f"[FC][Graph] Turn {fc_turn}: 模型请求 {len(raw_tool_calls)} 个工具调用"
             )
             tool_calls_data = [
                 {
@@ -417,7 +522,7 @@ def _make_call_model_node(engine: "InferenceEngine"):
                         "arguments": tc.function.arguments,
                     },
                 }
-                for tc in msg.tool_calls
+                for tc in raw_tool_calls
             ]
         else:
             logger.info(
@@ -456,6 +561,18 @@ def _make_exec_tools_node(engine: "InferenceEngine"):
                 assistant_msg, turn=fc_turn, group_id=grp,
             )
 
+        if response_content:
+            try:
+                engine._publish_task_graph_event(
+                    "model_progress",
+                    fc_turn,
+                    "",
+                    response_content,
+                    f"model-step-{fc_turn}",
+                )
+            except Exception:
+                logger.debug("[FC][Graph] model_progress 生命周期事件发布失败", exc_info=True)
+
         # 执行每个工具调用
         for tc_data in tool_calls_data:
             # 中断检查
@@ -467,10 +584,63 @@ def _make_exec_tools_node(engine: "InferenceEngine"):
 
             tool_name = tc_data["function"]["name"]
             tool_args = {}
+            parse_error = ""
             try:
                 tool_args = _json.loads(tc_data["function"]["arguments"] or "{}")
-            except Exception:
-                pass
+            except Exception as exc:
+                parse_error = str(exc)
+
+            if parse_error:
+                logger.error(
+                    "[FC][Graph] 工具 %s 参数解析失败: %s",
+                    tool_name,
+                    parse_error,
+                )
+                result_text = _tool_args_parse_error_result(tool_name, parse_error)
+                engine._circuit_breaker.record_call(
+                    tool_name,
+                    {"_parse_error": parse_error},
+                    result_text,
+                )
+                tool_msg = {
+                    "role": "tool",
+                    "tool_call_id": tc_data["id"],
+                    "content": result_text,
+                }
+                messages.append(tool_msg)
+                if engine._attn_window:
+                    engine._attn_window.register_message(
+                        tool_msg,
+                        turn=fc_turn,
+                        tool_name=tool_name,
+                        group_id=grp,
+                    )
+                tool_results_buffer.append({
+                    "tool_name": tool_name,
+                    "reason": _extract_tool_call_reason(response_content, tool_name),
+                    "result": result_text,
+                })
+                engine._publish_task_graph_event(
+                    "agent_tool_call",
+                    fc_turn,
+                    tool_name,
+                    result_text,
+                    tc_data.get("id", ""),
+                )
+                if tool_name in _WRITE_CONTENT_TOOLS:
+                    correction = _build_write_chunking_correction(
+                        tool_name,
+                        parse_error,
+                    )
+                    messages.append(correction)
+                    if engine._attn_window:
+                        engine._attn_window.register_message(
+                            correction,
+                            turn=fc_turn,
+                            group_id=grp,
+                        )
+                    state["forced_next_tool_name"] = tool_name
+                continue
 
             # 注意力窗口：观察工具调用
             if engine._attn_window:
@@ -555,54 +725,67 @@ def _make_exec_tools_node(engine: "InferenceEngine"):
             )
 
             if _is_protected_mutation_block(tool_name, result_text):
-                block_response = _approval_block_response(tool_name, result_text)
                 logger.warning(
-                    "[FC][Graph] 受保护变更工具被拒绝/失败，硬阻断后续工具: %s",
+                    "[FC][Graph] 受保护变更工具未获应用，禁止本地绕过但保持FC可恢复: %s",
                     tool_name,
                 )
                 setattr(engine, "_approval_block_active", True)
-                setattr(engine, "_last_fc_terminate_reason", "approval_blocked")
-                return {
-                    "response": block_response,
-                    "cb_force_no_tools": True,
-                    "tool_calls_data": None,
-                    "response_content": None,
-                    "should_terminate": "approval_blocked",
-                    "_bfs_first_run": True,
-                    "_bfs_memory_triggered": False,
-                    "_bfs_attention_triggered": False,
-                }
+                messages.append(internal_control_message(
+                    "[审批边界] 上一次受保护写入/命令未被用户应用。"
+                    "不要改用 exec_write_file 或 exec_run_command 绕过审批；"
+                    "如果用户已经开启自动审批，继续使用同一个 IDE/受保护工具重试；"
+                    "否则向用户说明需要审批后再继续。"
+                ))
 
         # Circuit Breaker: 本轮所有工具执行完毕，评估状态
         cb_state, cb_reason = engine._circuit_breaker.evaluate(fc_turn, messages)
 
         cb_force_no_tools = False
+        forced_next_tool_name = ""
         if cb_state == CircuitBreakerState.RED:
             logger.warning(f"[FC][Graph][CB] RED 触发 (turn={fc_turn}): {cb_reason}")
-            cb_force_no_tools = True
             # 记录降级阶段为 CB 触发，而非超时（避免 SmartDegradation 误报"主模型响应超时"）
             engine._last_timeout_phase = TimeoutPhase.CIRCUIT_BREAKER_TRIPPED
             engine._last_timeout_elapsed = 0.0
-            cb_convergence = {
-                "role": "user",
-                "content": (
+            _has_uncompleted, _next_node = _task_graph_uncompleted_context()
+            if _has_uncompleted and not engine_tool_budget_exhausted(engine):
+                cb_convergence, forced_next_tool_name = _build_uncompleted_task_correction(
+                    f"Circuit Breaker 触发：{cb_reason}",
+                    tag="[Circuit Breaker纠偏]",
+                    tool_definitions=state.get("tool_definitions"),
+                )
+                logger.warning(
+                    "[FC][Graph][CB] 任务图未完成，RED 转为工具纠偏: %s",
+                    getattr(_next_node, "id", ""),
+                )
+            else:
+                cb_force_no_tools = True
+                cb_convergence = internal_control_message(
                     f"[Circuit Breaker 强制收敛] {cb_reason}\n"
                     "你必须立刻基于已有信息生成最终回复，不允许再调用任何工具。"
-                ),
-            }
+                )
             messages.append(cb_convergence)
             if engine._attn_window:
                 engine._attn_window.register_message(cb_convergence, turn=fc_turn)
 
         elif cb_state == CircuitBreakerState.YELLOW:
             logger.warning(f"[FC][Graph][CB] YELLOW 警告 (turn={fc_turn}): {cb_reason}")
-            cb_hint = {
-                "role": "user",
-                "content": (
+            _has_uncompleted, _next_node = _task_graph_uncompleted_context()
+            if _has_uncompleted and not engine_tool_budget_exhausted(engine):
+                cb_hint, forced_next_tool_name = _build_uncompleted_task_correction(
+                    f"Circuit Breaker 警告：{cb_reason}",
+                    tag="[Circuit Breaker纠偏]",
+                    tool_definitions=state.get("tool_definitions"),
+                )
+                logger.warning(
+                    "[FC][Graph][CB] 任务图未完成，YELLOW 转为工具纠偏: %s",
+                    getattr(_next_node, "id", ""),
+                )
+            else:
+                cb_hint = internal_control_message(
                     f"[Circuit Breaker 警告] {cb_reason}\n"
                     "请尽快总结当前信息并回复用户，避免继续调用更多工具。"
-                ),
-            }
+                )
             messages.append(cb_hint)
             if engine._attn_window:
                 engine._attn_window.register_message(cb_hint, turn=fc_turn)
@@ -707,7 +890,7 @@ def _make_exec_tools_node(engine: "InferenceEngine"):
         else:
             logger.debug(f"[FC][Graph] BFS 扩散跳过（非触发条件）: first_run={_bfs_first_run}, memory={_bfs_memory_triggered}, attention={_bfs_attention_triggered}")
 
-        return {
+        result = {
             "cb_force_no_tools": cb_force_no_tools,
             "tool_calls_data": None,
             "response_content": None,
@@ -716,6 +899,9 @@ def _make_exec_tools_node(engine: "InferenceEngine"):
             "_bfs_memory_triggered": False,  # 重置记忆触发标记
             "_bfs_attention_triggered": False,  # 重置注意力触发标记
         }
+        if forced_next_tool_name:
+            result["forced_next_tool_name"] = forced_next_tool_name
+        return result
 
     return exec_tools_node
 
@@ -757,20 +943,16 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                     f"drift={is_drifted}, sim={similarity:.3f}, {drift_reason}"
                 )
                 if is_drifted:
-                    drift_hint = {
-                        "role": "user",
-                        "content": (
-                            f"[语义漂移拦截] 当前回复疑似偏离用户原始任务，"
-                            f"相似度 {similarity:.3f}。原因：{drift_reason}\n"
-                            f"请重新聚焦任务：「{state.get('user_input_text', '')[:300]}」"
-                        ),
-                    }
-                    messages.append({"role": "assistant", "content": response})
+                    drift_hint = internal_control_message(
+                        f"[语义漂移拦截] 当前回复疑似偏离用户原始任务，"
+                        f"相似度 {similarity:.3f}。原因：{drift_reason}\n"
+                        f"请重新聚焦任务：「{state.get('user_input_text', '')[:300]}」"
+                    )
+                    rejected_reply = internal_control_message(response, role="assistant")
+                    messages.append(rejected_reply)
                     messages.append(drift_hint)
                     if engine._attn_window:
-                        engine._attn_window.register_message(
-                            {"role": "assistant", "content": response}, turn=fc_turn,
-                        )
+                        engine._attn_window.register_message(rejected_reply, turn=fc_turn)
                         engine._attn_window.register_message(drift_hint, turn=fc_turn)
                     new_null_count = state.get("null_response_count", 0) + 1
                     result = {
@@ -928,20 +1110,18 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                 response, _get_tg()
             )
             if block:
-                correction = {
-                    "role": "user",
-                    "content": (
-                        f"[规则守护] {block_reason}\n"
-                        "请调用 task_view_overview 查看任务图，"
-                        "然后继续执行未完成的任务。不要直接回复用户。"
-                    ),
-                }
-                messages.append({"role": "assistant", "content": response})
+                correction, forced_tool = _build_uncompleted_task_correction(
+                    block_reason,
+                    previous_reply=response,
+                    tag="[规则守护]",
+                )
+                rejected_reply = internal_control_message(response, role="assistant")
+                messages.append(rejected_reply)
                 messages.append(correction)
+                if forced_tool:
+                    state["forced_next_tool_name"] = forced_tool
                 if engine._attn_window:
-                    engine._attn_window.register_message(
-                        {"role": "assistant", "content": response}, turn=fc_turn,
-                    )
+                    engine._attn_window.register_message(rejected_reply, turn=fc_turn)
                     engine._attn_window.register_message(correction, turn=fc_turn)
                 should_block = True
         except Exception as guard_err:
@@ -953,22 +1133,24 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                 "response": None,
                 "should_terminate": "",
                 "null_response_count": new_null_count,
+                "cb_force_no_tools": False,
+                "forced_next_tool_name": state.get("forced_next_tool_name", ""),
             }
-            # 拦截次数达到阈值时，注入 CB 强制收敛信号
+            # 拦截次数达到阈值时，继续做工具纠偏，而不是收敛成最终回复。
             if new_null_count >= 2:
-                convergence_msg = {
-                    "role": "user",
-                    "content": (
-                        "[强制收敛] 多次拦截检测到任务图有未完成节点，"
-                        "但模型持续尝试直接回复。请立即基于已有信息生成最终回复。"
-                    ),
-                }
-                messages.append(convergence_msg)
+                correction_msg, forced_tool = _build_uncompleted_task_correction(
+                    "多次拦截检测到任务图有未完成节点，但模型持续尝试直接回复。",
+                    previous_reply=response,
+                    tag="[强制纠偏]",
+                )
+                messages.append(correction_msg)
+                if forced_tool:
+                    state["forced_next_tool_name"] = forced_tool
+                    result["forced_next_tool_name"] = forced_tool
                 if engine._attn_window:
-                    engine._attn_window.register_message(convergence_msg, turn=fc_turn)
-                result["cb_force_no_tools"] = True
+                    engine._attn_window.register_message(correction_msg, turn=fc_turn)
                 logger.info(
-                    f"[FC][Graph] 拦截次数达 {new_null_count}，注入 CB 强制收敛"
+                    f"[FC][Graph] 拦截次数达 {new_null_count}，注入工具纠偏"
                 )
             return result
 
@@ -1043,20 +1225,16 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                     except Exception:
                         pass
                 else:
-                    gap_hint = {
-                        "role": "user",
-                        "content": (
-                            f"[信息缺口提示] 当前子任务缺少前置结果: {gap_desc}\n"
-                            "请先用 task_view_overview 查看任务图，找到并执行未完成的前置子任务，"
-                            "或用 task_mark_status 更新进度后继续。"
-                        ),
-                    }
-                    messages.append({"role": "assistant", "content": response})
+                    gap_hint = internal_control_message(
+                        f"[信息缺口提示] 当前子任务缺少前置结果: {gap_desc}\n"
+                        "请先用 task_view_overview 查看任务图，找到并执行未完成的前置子任务，"
+                        "或用 task_mark_status 更新进度后继续。"
+                    )
+                    rejected_reply = internal_control_message(response, role="assistant")
+                    messages.append(rejected_reply)
                     messages.append(gap_hint)
                     if engine._attn_window:
-                        engine._attn_window.register_message(
-                            {"role": "assistant", "content": response}, turn=fc_turn,
-                        )
+                        engine._attn_window.register_message(rejected_reply, turn=fc_turn)
                         engine._attn_window.register_message(gap_hint, turn=fc_turn)
                     should_continue = True
                     new_null_count = state.get("null_response_count", 0) + 1
@@ -1151,22 +1329,18 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                                 f"[FC][ContinueTaskGraph][AutoMark] 下一节点: {next_node.id}"
                                 f" ({next_node.label}), 标记 in_progress"
                             )
-                            continuation = {
-                                "role": "user",
-                                "content": (
-                                    f"[自动进度更新] 节点 {target.id}（{target.label}）已完成。\n"
-                                    f"请继续执行节点 {next_node.id}（{next_node.label}）"
-                                    f"：{next_node.desc or next_node.label}\n"
-                                    f"完成后请用 task_mark_status(node_id='{next_node.id}',"
-                                    f" status='completed', result='结果') 提交。"
-                                ),
-                            }
-                            messages.append({"role": "assistant", "content": response})
+                            continuation = internal_control_message(
+                                f"[自动进度更新] 节点 {target.id}（{target.label}）已完成。\n"
+                                f"请继续执行节点 {next_node.id}（{next_node.label}）"
+                                f"：{next_node.desc or next_node.label}\n"
+                                f"完成后请用 task_mark_status(node_id='{next_node.id}',"
+                                f" status='completed', result='结果') 提交。"
+                            )
+                            rejected_reply = internal_control_message(response, role="assistant")
+                            messages.append(rejected_reply)
                             messages.append(continuation)
                             if engine._attn_window:
-                                engine._attn_window.register_message(
-                                    {"role": "assistant", "content": response}, turn=fc_turn,
-                                )
+                                engine._attn_window.register_message(rejected_reply, turn=fc_turn)
                                 engine._attn_window.register_message(continuation, turn=fc_turn)
                             new_null_count = state.get("null_response_count", 0) + 1
                             result = {
@@ -1195,22 +1369,20 @@ def _make_eval_response_node(engine: "InferenceEngine"):
             tool_results_buffer,
         )
         if file_op_guard == "retry":
-            messages.append({"role": "assistant", "content": response})
-            messages.append({
-                "role": "user",
-                "content": (
+            rejected_reply = internal_control_message(response, role="assistant")
+            file_guard_hint = internal_control_message(
                     "[文件操作真实性校验] 用户要求创建、写入、修改或删除文件，"
                     "但目前没有看到任何成功的文件操作工具结果。"
                     "请立刻调用可用的写入工具完成真实落盘："
                     "如果用户给出宿主机绝对路径，优先调用 ide_write_file；"
                     "否则调用 exec_write_file。"
                     "完成前不要声称文件已创建或已写入。"
-                ),
-            })
+            )
+            messages.append(rejected_reply)
+            messages.append(file_guard_hint)
             if engine._attn_window:
-                engine._attn_window.register_message(
-                    {"role": "assistant", "content": response}, turn=fc_turn,
-                )
+                engine._attn_window.register_message(rejected_reply, turn=fc_turn)
+                engine._attn_window.register_message(file_guard_hint, turn=fc_turn)
             return {
                 "response": None,
                 "should_terminate": "",
@@ -1315,19 +1487,16 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                         _completed_count = len([
                             n for n in _leaves if n.status == "completed"
                         ])
-                        nudge = {
-                            "role": "user",
-                            "content": (
-                                f"[空回复拦截] 你的回复为空，但任务图还有 "
-                                f"{len(_uncompleted)}/{len(_leaves)} 个未完成节点。\n"
-                                f"当前进度：{_completed_count}/{len(_leaves)} 完成。\n"
-                                f"请立即开始执行节点 {_next.id}（{_next.label}）"
-                                f"：{_next.desc or _next.label}\n"
-                                f"生成该节点的详细内容，完成后调用 "
-                                f"task_mark_status(node_id='{_next.id}', "
-                                f"status='completed', result='你的结果')。"
-                            ),
-                        }
+                        nudge = internal_control_message(
+                            f"[空回复拦截] 你的回复为空，但任务图还有 "
+                            f"{len(_uncompleted)}/{len(_leaves)} 个未完成节点。\n"
+                            f"当前进度：{_completed_count}/{len(_leaves)} 完成。\n"
+                            f"请立即开始执行节点 {_next.id}（{_next.label}）"
+                            f"：{_next.desc or _next.label}\n"
+                            f"生成该节点的详细内容，完成后调用 "
+                            f"task_mark_status(node_id='{_next.id}', "
+                            f"status='completed', result='你的结果')。"
+                        )
                         messages.append(nudge)
                         if engine._attn_window:
                             engine._attn_window.register_message(nudge, turn=fc_turn)
@@ -1421,20 +1590,16 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                                 _save_active_backup()
                             except Exception:
                                 pass
-                        nudge_uc = {
-                            "role": "user",
-                            "content": (
-                                f"[任务未完成] 仍有 {len(uncompleted_uc)}/{total_uc} 个子任务未完成。"
-                                f"当前应执行: {current_uc.id}({current_uc.label})。"
-                                f"请继续调用工具执行任务，不要提前生成最终总结。"
-                            ),
-                        }
-                        messages.append({"role": "assistant", "content": response})
+                        nudge_uc = internal_control_message(
+                            f"[任务未完成] 仍有 {len(uncompleted_uc)}/{total_uc} 个子任务未完成。"
+                            f"当前应执行: {current_uc.id}({current_uc.label})。"
+                            f"请继续调用工具执行任务，不要提前生成最终总结。"
+                        )
+                        rejected_reply = internal_control_message(response, role="assistant")
+                        messages.append(rejected_reply)
                         messages.append(nudge_uc)
                         if engine._attn_window:
-                            engine._attn_window.register_message(
-                                {"role": "assistant", "content": response}, turn=fc_turn,
-                            )
+                            engine._attn_window.register_message(rejected_reply, turn=fc_turn)
                             engine._attn_window.register_message(nudge_uc, turn=fc_turn)
                         new_null_count = state.get("null_response_count", 0) + 1
                         result = {
@@ -1472,22 +1637,18 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                             (n for n in uncompleted_ri if n.status == "in_progress"),
                             uncompleted_ri[0],
                         )
-                        nudge_ri = {
-                            "role": "user",
-                            "content": (
-                                f"[响应提前中断] 回复仅 {len(response.strip())} 字符，"
-                                f"疑似工具调用未完整生成。仍有 "
-                                f"{len(uncompleted_ri)}/{len(leaves_ri)} 个子任务未完成。"
-                                f"当前应执行: {current_ri.id}({current_ri.label})。"
-                                f"请继续调用工具执行任务。"
-                            ),
-                        }
-                        messages.append({"role": "assistant", "content": response})
+                        nudge_ri = internal_control_message(
+                            f"[响应提前中断] 回复仅 {len(response.strip())} 字符，"
+                            f"疑似工具调用未完整生成。仍有 "
+                            f"{len(uncompleted_ri)}/{len(leaves_ri)} 个子任务未完成。"
+                            f"当前应执行: {current_ri.id}({current_ri.label})。"
+                            f"请继续调用工具执行任务。"
+                        )
+                        rejected_reply = internal_control_message(response, role="assistant")
+                        messages.append(rejected_reply)
                         messages.append(nudge_ri)
                         if engine._attn_window:
-                            engine._attn_window.register_message(
-                                {"role": "assistant", "content": response}, turn=fc_turn,
-                            )
+                            engine._attn_window.register_message(rejected_reply, turn=fc_turn)
                             engine._attn_window.register_message(nudge_ri, turn=fc_turn)
                         new_null_count = state.get("null_response_count", 0) + 1
                         return {
@@ -1512,20 +1673,16 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                 "what can i", "请问", "请说",
             )
             if any(p in stripped_lower for p in greeting_patterns) or len(stripped_lower) < 50:
-                first_hint = {
-                    "role": "user",
-                    "content": (
-                        f"[首轮回复无效] 你返回了问候或过短回复，但用户任务是：\n"
-                        f"「{state.get('user_input_text', '')[:300]}」\n"
-                        f"请不要打招呼或反问，直接分析任务需求并调用工具开始执行。"
-                    ),
-                }
-                messages.append({"role": "assistant", "content": response})
+                first_hint = internal_control_message(
+                    f"[首轮回复无效] 你返回了问候或过短回复，但用户任务是：\n"
+                    f"「{state.get('user_input_text', '')[:300]}」\n"
+                    f"请不要打招呼或反问，直接分析任务需求并调用工具开始执行。"
+                )
+                rejected_reply = internal_control_message(response, role="assistant")
+                messages.append(rejected_reply)
                 messages.append(first_hint)
                 if engine._attn_window:
-                    engine._attn_window.register_message(
-                        {"role": "assistant", "content": response}, turn=fc_turn,
-                    )
+                    engine._attn_window.register_message(rejected_reply, turn=fc_turn)
                     engine._attn_window.register_message(first_hint, turn=fc_turn)
                 return {
                     "response": None,
@@ -1835,6 +1992,28 @@ def _compact_line(text: str, max_len: int = 64) -> str:
     return compact[: max_len - 3].rstrip() + "..."
 
 
+def _summarize_llm_usage(usage: Any) -> Dict[str, Any]:
+    if not usage:
+        return {}
+    keys = (
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+    )
+    summary: Dict[str, Any] = {}
+    for key in keys:
+        value = None
+        if isinstance(usage, dict):
+            value = usage.get(key)
+        else:
+            value = getattr(usage, key, None)
+        if value is not None:
+            summary[key] = value
+    return summary
+
+
 def _extract_tool_call_reason(text: str, tool_name: str, max_len: int = 160) -> str:
     """Extract the model's own short explanation for a tool call when present."""
     raw = " ".join(str(text or "").split())
@@ -1888,6 +2067,135 @@ def _task_graph_uncompleted_context():
         uncompleted[0],
     )
     return True, current
+
+
+def _set_forced_tool_choice(
+    api_kwargs: Dict[str, Any],
+    tool_definitions: List[Dict],
+    tool_name: str,
+) -> bool:
+    """Force one tool call when the current API/tool bundle exposes it."""
+    if not tool_name:
+        return False
+    available = {
+        str((schema.get("function") or {}).get("name") or "")
+        for schema in (tool_definitions or [])
+        if isinstance(schema, dict)
+    }
+    if tool_name not in available:
+        return False
+    api_kwargs["tool_choice"] = {
+        "type": "function",
+        "function": {"name": tool_name},
+    }
+    return True
+
+
+def _build_uncompleted_task_correction(
+    reason: str,
+    *,
+    previous_reply: str = "",
+    tag: str = "[规则守护]",
+    tool_definitions: Optional[List[Dict]] = None,
+) -> Tuple[Dict[str, Any], str]:
+    """Build a correction turn that steers an unfinished task back to tools."""
+    has_uncompleted, current = _task_graph_uncompleted_context()
+    node_id = getattr(current, "id", "") if current else ""
+    label = getattr(current, "label", "") if current else ""
+    desc = getattr(current, "desc", "") if current else ""
+    node_text = " ".join(part for part in (label, desc) if part)
+    expected_files = _extract_expected_file_names(node_text)
+
+    available_tools = {
+        str((schema.get("function") or {}).get("name") or "")
+        for schema in (tool_definitions or [])
+        if isinstance(schema, dict)
+    }
+    forced_tool = ""
+    if expected_files:
+        if not available_tools or "exec_write_file" in available_tools:
+            forced_tool = "exec_write_file"
+        elif "ide_write_file" in available_tools:
+            forced_tool = "ide_write_file"
+    current_line = (
+        f"当前应执行节点: {node_id}({label})。" if node_id or label
+        else "当前任务图仍有未完成节点。"
+    )
+    desc_line = f"节点要求: {desc}" if desc else ""
+    files_line = (
+        "预期产物: " + ", ".join(expected_files[:3])
+        if expected_files else ""
+    )
+    previous_line = (
+        f"上一轮只输出了进度句: {previous_reply.strip()[:120]}"
+        if previous_reply else ""
+    )
+
+    if expected_files:
+        if forced_tool == "exec_write_file":
+            action_line = (
+                f"下一轮必须优先调用 exec_write_file 写入 {expected_files[0]}。"
+                "如果内容较长，先用 mode='overwrite' 写第一段，再用 mode='append' "
+                "分多轮追加，每轮 content 控制在 800-1200 字符；写入成功并验证后再调用 "
+                f"task_mark_status(node_id='{node_id}', status='completed')。"
+            )
+        elif forced_tool == "ide_write_file":
+            action_line = (
+                f"下一轮必须优先调用 ide_write_file 写入 {expected_files[0]}。"
+                "如果内容较长，先用 mode='overwrite' 写第一段，再用 mode='append' "
+                "通过同一个受保护通道分段追加；每轮 content 控制在 800-1200 字符，"
+                "不要继续输出超长工具参数。"
+                "写入成功并验证后再调用 "
+                f"task_mark_status(node_id='{node_id}', status='completed')。"
+            )
+        else:
+            action_line = (
+                f"下一轮必须调用可用写入工具真实落盘 {expected_files[0]}；"
+                "如果内容较长，采用分段或脚本化方式，避免超长工具参数被截断。"
+            )
+    else:
+        action_line = (
+            "下一轮必须调用能产生真实进展的工具，例如写文件、执行命令或更新当前节点；"
+            "不要只查看任务图、不要只输出进度句、不要提交最终回答。"
+        )
+
+    content = "\n".join(
+        line for line in (
+            f"{tag} {reason}",
+            previous_line,
+            current_line,
+            desc_line,
+            files_line,
+            action_line,
+            "在当前节点完成前，禁止自然语言回复用户，禁止 submit_final_answer。",
+        )
+        if line
+    )
+    if not has_uncompleted:
+        forced_tool = ""
+    return internal_control_message(content), forced_tool
+
+
+def _extract_expected_file_names(text: str) -> List[str]:
+    """Extract likely file outputs from a task node description."""
+    if not text:
+        return []
+    import re as _re
+
+    pattern = (
+        r"(?<![\w.-])"
+        r"([A-Za-z0-9_\-./\\]+"
+        r"\.(?:js|mjs|cjs|ts|tsx|jsx|py|html|css|json|md|txt|yaml|yml|vue|svelte))"
+    )
+    seen = set()
+    files: List[str] = []
+    for match in _re.findall(pattern, text, flags=_re.IGNORECASE):
+        name = match.strip("`'\"，。；;:：、()（）[]【】")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        files.append(name)
+    return files
 
 
 def _check_file_operation_truth(

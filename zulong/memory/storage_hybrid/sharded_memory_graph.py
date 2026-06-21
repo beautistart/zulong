@@ -103,6 +103,7 @@ class ShardedMemoryGraph:
             map_size_mb=global_index_map_size_mb
         )
         self._rag_manager = None  # RAGManager 引用
+        self._adapters: Dict[str, Any] = {}
         
         self.active_shards: OrderedDict[str, MemoryGraphHybrid] = OrderedDict()
         self.local_indexes: OrderedDict[str, LocalShardIndex] = OrderedDict()
@@ -132,6 +133,8 @@ class ShardedMemoryGraph:
             "local_index_rebuild_count": 0,
             "active_skeleton_enqueue_count": 0,
             "active_skeleton_background_refresh_count": 0,
+            "hot_semantic_search_count": 0,
+            "hot_semantic_fallback_count": 0,
         }
         self._last_size_check_node_counts: Dict[str, int] = {}
         self._compacting_shards: Set[str] = set()
@@ -1846,7 +1849,7 @@ class ShardedMemoryGraph:
 
     @property
     def stats(self) -> Dict[str, Any]:
-        """兼容 NetworkX MemoryGraph.stats 属性。"""
+        """兼容 MemoryGraph.stats 公共属性。"""
         return self.get_total_stats()
 
     def get_total_stats(self) -> Dict[str, Any]:
@@ -2302,7 +2305,7 @@ class ShardedMemoryGraph:
         hot_threshold: float,
         session_id: str = "",
     ) -> List[Dict[str, Any]]:
-        """热路径：当前分片热节点扫描 + 关键词打分。"""
+        """热路径：当前分片热节点扫描，融合关键词打分与可选 embedding 语义分。"""
         current_shard = self.get_current_shard()
         if not current_shard:
             return []
@@ -2317,16 +2320,30 @@ class ShardedMemoryGraph:
         except Exception:
             return []
 
+        semantic_scores, semantic_status = self._score_hot_nodes_semantically(query_text, hot_nodes)
+        if semantic_status == "ok":
+            self._stats["hot_semantic_search_count"] += 1
+        elif semantic_status != "skipped":
+            self._stats["hot_semantic_fallback_count"] += 1
+
         results: List[Dict[str, Any]] = []
         for node in hot_nodes:
             text_parts = [
                 getattr(node, "label", "") or "",
                 getattr(node, "content", "") or "",
+                getattr(node, "content_summary", "") or "",
             ]
             combined = " ".join(filter(None, text_parts))
             if not combined.strip():
                 continue
-            score = self._bigram_overlap_score(query_text, combined)
+            keyword_score = self._bigram_overlap_score(query_text, combined)
+            semantic_score = float(semantic_scores.get(node.node_id, 0.0))
+            retrieval_modes = []
+            if keyword_score > 0:
+                retrieval_modes.append("keyword")
+            if semantic_score > 0:
+                retrieval_modes.append("semantic")
+            score = keyword_score * 0.55 + semantic_score * 0.45
             if score <= 0:
                 continue
             if session_id and node.node_id.startswith(f"dialogue:session_{session_id}"):
@@ -2342,6 +2359,11 @@ class ShardedMemoryGraph:
             score *= importance_boost.get(importance, 1.0)
 
             metadata = getattr(node, "metadata", {}) or {}
+            result_metadata = dict(metadata)
+            result_metadata["retrieval_modes"] = retrieval_modes
+            result_metadata["keyword_score"] = round(float(keyword_score), 4)
+            result_metadata["semantic_score"] = round(float(semantic_score), 4)
+            result_metadata["semantic_status"] = semantic_status
             results.append({
                 "node_id": node.node_id,
                 "graph_memory_id": node.node_id,
@@ -2352,13 +2374,80 @@ class ShardedMemoryGraph:
                 "content": getattr(node, "content", ""),
                 "summary": getattr(node, "content_summary", "") or metadata.get("content_summary", ""),
                 "score": score,
-                "source": "hot",
+                "source": "hot_hybrid" if semantic_score > 0 else "hot_keyword",
                 "importance": importance,
-                "metadata": metadata,
-                "memory_address": self._build_memory_address(node, source="hot"),
+                "metadata": result_metadata,
+                "memory_address": self._build_memory_address(node, source="hot_hybrid" if semantic_score > 0 else "hot_keyword"),
                 "recall_hint": "需要详情时，用 graph_memory_id 调用 read_memory_node 或 discover_related。",
             })
         return results
+
+    def _score_hot_nodes_semantically(
+        self,
+        query_text: str,
+        hot_nodes: List[NodeProperties],
+        max_nodes: int = 160,
+    ) -> Tuple[Dict[str, float], str]:
+        """为热节点计算轻量语义分。
+
+        返回 (node_id -> score, status)。status:
+        - ok: 成功计算 embedding 分数
+        - skipped: 无查询或无候选
+        - unavailable: embedding 依赖/模型不可用
+        - failed: 编码或向量形状异常
+        """
+        if not query_text or not hot_nodes:
+            return {}, "skipped"
+
+        candidates = sorted(
+            hot_nodes,
+            key=lambda n: float(getattr(n, "last_accessed", 0.0) or 0.0),
+            reverse=True,
+        )[:max_nodes]
+        docs: List[str] = []
+        node_ids: List[str] = []
+        for node in candidates:
+            text = " ".join(filter(None, [
+                getattr(node, "label", "") or "",
+                getattr(node, "content_summary", "") or "",
+                getattr(node, "content", "") or "",
+            ])).strip()
+            if not text:
+                continue
+            node_ids.append(node.node_id)
+            docs.append(text[:1000])
+        if not docs:
+            return {}, "skipped"
+
+        try:
+            import numpy as np
+            from zulong.memory.embedding_manager import get_embedding_manager
+        except Exception:
+            return {}, "unavailable"
+
+        try:
+            manager = get_embedding_manager()
+            if getattr(manager, "_model", None) is None and hasattr(manager, "_mock_encode"):
+                vectors = manager._mock_encode([query_text[:1000], *docs])
+            else:
+                vectors = manager.encode([query_text[:1000], *docs])
+            matrix = np.asarray(vectors, dtype="float32")
+            if matrix.ndim != 2 or matrix.shape[0] != len(docs) + 1:
+                return {}, "failed"
+            query_vec = matrix[0]
+            doc_matrix = matrix[1:]
+            denom = (np.linalg.norm(doc_matrix, axis=1) * np.linalg.norm(query_vec)) + 1e-8
+            scores = (doc_matrix @ query_vec) / denom
+        except Exception as exc:
+            logger.debug(f"[ShardedMemoryGraph] 热路径语义检索降级: {exc}")
+            return {}, "failed"
+
+        result: Dict[str, float] = {}
+        for node_id, score in zip(node_ids, scores):
+            value = max(0.0, float(score))
+            if value >= 0.05:
+                result[node_id] = min(1.0, value)
+        return result, "ok"
 
     def _retrieve_historical_bfs_from_hot(
         self,
@@ -2472,6 +2561,51 @@ class ShardedMemoryGraph:
             logger.info(f"[ShardedMemoryGraph] 已删除节点: {node_id} (shard={shard_id})")
             return True
 
+    def remove_edge(self, source_id: str, target_id: str) -> bool:
+        """删除边（兼容 MemoryGraph 公共接口）。"""
+        with self.shard_lock:
+            shard, shard_id = self._get_indexed_shard(source_id)
+            if shard and target_id in shard.topology:
+                try:
+                    if shard.remove_edge(source_id, target_id):
+                        shard_info = self.shard_index.setdefault("shards", {}).setdefault(shard_id, {})
+                        shard_info["edge_count"] = max(0, int(shard_info.get("edge_count") or 0) - 1)
+                        self._last_topology_write_at = time.time()
+                        self._check_topology_delta_compaction(shard_id, shard)
+                        self._save_shard_index()
+                        return True
+                except Exception as exc:
+                    logger.debug(
+                        f"[ShardedMemoryGraph] 删除同分片边失败 {source_id}->{target_id}: {exc}"
+                    )
+
+            try:
+                removed = bool(self.global_index.delete_cross_edge(source_id, target_id))
+            except Exception as exc:
+                logger.debug(
+                    f"[ShardedMemoryGraph] 删除跨分片边失败 {source_id}->{target_id}: {exc}"
+                )
+                removed = False
+
+            if removed:
+                self.global_index.sync()
+                return True
+
+            for candidate_shard_id in self.list_all_shards():
+                if candidate_shard_id == shard_id:
+                    continue
+                candidate = self.get_shard(candidate_shard_id, load_if_missing=True)
+                if not candidate or source_id not in candidate.topology or target_id not in candidate.topology:
+                    continue
+                if candidate.remove_edge(source_id, target_id):
+                    shard_info = self.shard_index.setdefault("shards", {}).setdefault(candidate_shard_id, {})
+                    shard_info["edge_count"] = max(0, int(shard_info.get("edge_count") or 0) - 1)
+                    self._last_topology_write_at = time.time()
+                    self._check_topology_delta_compaction(candidate_shard_id, candidate)
+                    self._save_shard_index()
+                    return True
+        return False
+
     def get_importance(self, node_id: str):
         """读取节点重要度（兼容 MemoryGraph 接口）。"""
         node = self.get_node(node_id)
@@ -2489,17 +2623,77 @@ class ShardedMemoryGraph:
         except Exception:
             return raw_value
     
-    def set_importance(self, node_id: str, importance) -> None:
+    def set_importance(self, node_id: str, importance) -> bool:
         """设置节点重要性（兼容 MemoryGraph 接口）"""
         node = self.get_node(node_id)
         if not node:
-            return
+            return False
         importance_value = getattr(importance, "value", importance) or "normal"
         node.importance = str(importance_value)
         metadata = dict(getattr(node, "metadata", {}) or {})
         metadata["importance"] = str(importance_value)
         node.metadata = metadata
+        return self.update_node(node)
+
+    def get_temperature(self, node_id: str):
+        """动态计算节点温度（兼容 MemoryGraph 公共接口）。"""
+        node = self.get_node(node_id)
+        if not node:
+            return None
+        elapsed = time.time() - float(getattr(node, "last_accessed", 0.0) or 0.0)
+        temp_value = "hot" if elapsed < 3600 else "warm" if elapsed < 86400 else "cold"
+        try:
+            from zulong.memory.memory_graph import Temperature
+            return Temperature(temp_value)
+        except Exception:
+            return temp_value
+
+    def update_temperature(self, node_id: str):
+        """动态计算温度并写回节点 metadata（兼容 MemoryGraph 公共接口）。"""
+        temp = self.get_temperature(node_id)
+        node = self.get_node(node_id)
+        if not node or temp is None:
+            return temp
+        temp_value = str(getattr(temp, "value", temp) or "cold")
+        metadata = dict(getattr(node, "metadata", {}) or {})
+        metadata["temperature"] = temp_value
+        node.metadata = metadata
+        node.temperature = temp_value
         self.update_node(node)
+        return temp
+
+    def promote_importance(self, node_id: str, target) -> bool:
+        """只向上提升节点重要度（兼容 MemoryGraph 公共接口）。"""
+        node = self.get_node(node_id)
+        if not node:
+            return False
+
+        order = {
+            "forgettable": 0,
+            "normal": 1,
+            "important": 2,
+            "core": 3,
+            "must_remember": 4,
+        }
+        current = self.get_importance(node_id) or "normal"
+        current_value = str(getattr(current, "value", current) or "normal").lower()
+        target_value = str(getattr(target, "value", target) or "normal").lower()
+        if order.get(target_value, 1) <= order.get(current_value, 1):
+            return False
+
+        metadata = dict(getattr(node, "metadata", {}) or {})
+        history = list(metadata.get("importance_history") or [])
+        history.append({"from": current_value, "to": target_value, "timestamp": time.time()})
+        metadata["importance"] = target_value
+        metadata["importance_history"] = history
+        node.metadata = metadata
+        node.importance = target_value
+        updated = self.update_node(node)
+        if updated:
+            logger.info(
+                f"[ShardedMemoryGraph] 节点 {node_id} 重要度提升: {current_value} -> {target_value}"
+            )
+        return updated
     
     def get_children(self, node_id: str, edge_type=None) -> list:
         """获取子节点列表（兼容 MemoryGraph 接口）
@@ -3145,6 +3339,84 @@ class ShardedMemoryGraph:
         except Exception as exc:
             logger.debug(f"读取 LMDB 跨分片边列表失败: {exc}")
             return []
+
+    def discover_semantic_neighbors(
+        self,
+        node_id: str,
+        top_k: int = 5,
+        threshold: float = 0.7,
+    ) -> List[Tuple[str, float]]:
+        """发现语义邻居并写入 semantic 边（原生分片实现）。"""
+        node = self.get_node(node_id)
+        if not node:
+            return []
+
+        metadata = dict(getattr(node, "metadata", {}) or {})
+        query_parts = [
+            getattr(node, "label", ""),
+            getattr(node, "content", ""),
+            getattr(node, "content_summary", ""),
+            metadata.get("content", ""),
+            metadata.get("content_summary", ""),
+            metadata.get("summary", ""),
+        ]
+        query_text = " ".join(str(part) for part in query_parts if part).strip()
+        if not query_text:
+            return []
+        query_text = query_text[:2000]
+
+        candidates: Dict[str, float] = {}
+        try:
+            for item in self._retrieve_summary_navigation(
+                query_text,
+                top_k=max(top_k * 3, 10),
+                exclude_node_ids={node_id},
+            ):
+                neighbor_id = item.get("node_id") or item.get("graph_memory_id")
+                if not neighbor_id or neighbor_id == node_id:
+                    continue
+                try:
+                    score = float(item.get("score", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    score = 0.0
+                if score > 0:
+                    candidates[neighbor_id] = max(candidates.get(neighbor_id, 0.0), score)
+        except Exception as exc:
+            logger.debug(f"[ShardedMemoryGraph] 摘要语义邻居检索跳过 node={node_id}: {exc}")
+
+        try:
+            for item in self.search_nodes(query_text, max_results=max(top_k * 3, 10)):
+                neighbor_id = item.get("node_id") or item.get("graph_memory_id")
+                if not neighbor_id or neighbor_id == node_id:
+                    continue
+                try:
+                    score = float(item.get("score", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    score = 0.0
+                if score > 0:
+                    candidates[neighbor_id] = max(candidates.get(neighbor_id, 0.0), score)
+        except Exception as exc:
+            logger.debug(f"[ShardedMemoryGraph] 关键词语义邻居检索跳过 node={node_id}: {exc}")
+
+        results = [
+            (neighbor_id, score)
+            for neighbor_id, score in candidates.items()
+            if score >= threshold and self.has_node(neighbor_id)
+        ]
+        results.sort(key=lambda item: item[1], reverse=True)
+        results = results[:max(0, top_k)]
+
+        for neighbor_id, score in results:
+            if self.has_edge(node_id, neighbor_id):
+                continue
+            try:
+                self.add_edge(node_id, neighbor_id, "semantic", weight=score)
+            except Exception as exc:
+                logger.debug(
+                    f"[ShardedMemoryGraph] semantic 边写入跳过 {node_id}->{neighbor_id}: {exc}"
+                )
+
+        return results
     
     def index_summary(self, node_id: str, summary_text: str) -> None:
         """索引节点摘要（兼容 MemoryGraph 接口）
@@ -3182,11 +3454,9 @@ class ShardedMemoryGraph:
         self.update_node(node)
     
     def register_adapter(self, name: str, adapter) -> None:
-        """注册适配器（兼容 MemoryGraph 接口）
-        
-        分片存储暂不需要适配器。
-        """
-        pass
+        """注册适配器（兼容 MemoryGraph 公共接口）。"""
+        if name:
+            self._adapters[name] = adapter
     
     def compute_activations(
         self,
@@ -3317,6 +3587,70 @@ class ShardedMemoryGraph:
         except Exception as e:
             logger.warning(f"[ShardedMemoryGraph] compute_activations 异常: {e}")
             return {}
+
+    def compute_activations_dynamic(
+        self,
+        seed_node_ids: List[str],
+        context_window_size: int = 131072,
+        usage_ratio: float = 0.0,
+        node_type_filter: Optional[Set[str]] = None,
+    ) -> Dict[str, float]:
+        """上下文感知的 BFS 激活（兼容 MemoryGraph 公共接口）。"""
+        usage_ratio_value = float(usage_ratio or 0.0)
+        remaining_ratio = max(0.0, 1.0 - usage_ratio_value)
+
+        if context_window_size >= 200000:
+            window_tier = 2.0
+        elif context_window_size >= 128000:
+            window_tier = 1.5
+        elif context_window_size >= 64000:
+            window_tier = 1.0
+        else:
+            window_tier = 0.5
+
+        capacity_factor = remaining_ratio * (0.5 + 0.5 * min(window_tier / 2.0, 1.0))
+        max_depth = max(2, min(6, int(2 + 4 * capacity_factor)))
+        decay = 0.3 + 0.4 * (1.0 - capacity_factor)
+        min_activation = 0.01 + 0.09 * (1.0 - capacity_factor)
+
+        logger.info(
+            f"[ShardedMemoryGraph] 动态BFS参数: context_window={context_window_size}, "
+            f"usage_ratio={usage_ratio_value:.2f}, capacity_factor={capacity_factor:.2f} -> "
+            f"max_depth={max_depth}, decay={decay:.2f}, min_activation={min_activation:.3f}"
+        )
+
+        return self.compute_activations(
+            seed_node_ids,
+            max_depth=max_depth,
+            decay=decay,
+            min_activation=min_activation,
+            node_type_filter=node_type_filter,
+        )
+
+    def retrieve_context_dynamic(
+        self,
+        query_text: str,
+        context_window_size: int = 131072,
+        usage_ratio: float = 0.0,
+        session_id: str = "",
+    ):
+        """上下文感知的记忆检索（兼容 MemoryGraph 公共接口）。"""
+        usage_ratio_value = float(usage_ratio or 0.0)
+        context_window_value = float(context_window_size or 131072)
+        remaining_ratio = max(0.0, 1.0 - usage_ratio_value)
+        window_factor = min(context_window_value / 128000, 2.0)
+        top_k = max(3, min(20, int(10 * remaining_ratio * window_factor)))
+        hot_window_minutes = max(5, min(60, int(30 * remaining_ratio + 10)))
+        logger.info(
+            f"[ShardedMemoryGraph] 动态检索参数: remaining={remaining_ratio:.2f}, "
+            f"window_factor={window_factor:.2f} -> top_k={top_k}, hot_window={hot_window_minutes}min"
+        )
+        return self.retrieve_context(
+            query_text,
+            top_k=top_k,
+            hot_window_minutes=hot_window_minutes,
+            session_id=session_id,
+        )
     
     def set_rag_manager(self, rag_manager):
         """注入 RAGManager 供 backend_ref 反查使用（兼容 MemoryGraph 接口）"""
