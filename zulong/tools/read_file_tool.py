@@ -1,8 +1,10 @@
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List
 
 from .base import BaseTool, ToolCategory, ToolRequest, ToolResult
+from .workspace_access import normalize_workspace_path
 
 
 class ReadFileTool(BaseTool):
@@ -26,6 +28,17 @@ class ReadFileTool(BaseTool):
     def cleanup(self) -> None:
         pass
 
+    @staticmethod
+    def _same_path(left: Any, right: Any) -> bool:
+        if not left or not right:
+            return False
+        try:
+            return os.path.normcase(normalize_workspace_path(left)) == os.path.normcase(
+                normalize_workspace_path(right)
+            )
+        except Exception:
+            return str(left) == str(right)
+
     def _get_parameters_schema(self) -> Dict[str, Any]:
         return {
             "type": "object",
@@ -46,6 +59,18 @@ class ReadFileTool(BaseTool):
                     "type": "integer",
                     "description": "最大返回行数，默认 400。",
                     "default": 400,
+                },
+                "workspace_path": {
+                    "type": "string",
+                    "description": "可选。本轮显式指定的工作区目录；提供后安全边界以该目录为准。",
+                },
+                "workspace_dir": {
+                    "type": "string",
+                    "description": "可选。workspace_path 的兼容别名。",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "可选。当前执行目录，作为显式工作区兼容字段。",
                 },
             },
             "required": ["file_path"],
@@ -70,7 +95,26 @@ class ReadFileTool(BaseTool):
         try:
             from .task_tools import get_active_workspace_dir
 
-            workspace = Path(get_active_workspace_dir() or ".").resolve()
+            explicit_workspace = (
+                params.get("workspace_path")
+                or params.get("workspace_dir")
+                or params.get("cwd")
+                or ""
+            )
+            explicit_workspace = str(explicit_workspace or "").strip()
+            if explicit_workspace:
+                workspace = Path(
+                    os.path.expandvars(os.path.expanduser(explicit_workspace))
+                ).resolve()
+            else:
+                workspace = Path(get_active_workspace_dir() or ".").resolve()
+            if not workspace.exists() or not workspace.is_dir():
+                return self._create_result(
+                    success=False,
+                    error=f"工作区不存在或不是目录: {workspace}",
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
             candidates: List[Path] = []
 
             raw = Path(file_path)
@@ -78,7 +122,8 @@ class ReadFileTool(BaseTool):
                 candidates.append(raw.resolve())
             else:
                 candidates.append((workspace / raw).resolve())
-                candidates.append((Path(".").resolve() / raw).resolve())
+                if not explicit_workspace:
+                    candidates.append((Path(".").resolve() / raw).resolve())
 
             target = next((p for p in candidates if p.exists() and p.is_file()), None)
             if target is None:
@@ -90,14 +135,64 @@ class ReadFileTool(BaseTool):
                 )
 
             try:
-                target.relative_to(workspace)
-            except ValueError:
-                return self._create_result(
-                    success=False,
-                    error=f"安全限制：文件必须位于当前工作区内。当前工作区: {workspace}",
-                    execution_time=time.time() - start_time,
-                    request_id=request.request_id,
+                workspace_norm = os.path.normcase(str(workspace))
+                target_norm = os.path.normcase(str(target))
+                inside_workspace = (
+                    os.path.commonpath([workspace_norm, target_norm])
+                    == workspace_norm
                 )
+            except ValueError:
+                inside_workspace = False
+            target_requires_external_authorization = False
+            authorization_workspace = workspace
+            if not inside_workspace:
+                # 用户直接给出当前任务工作区外的路径时，不应让模型绕到 exec 命令。
+                # 将目标文件父目录作为本轮外部文件夹访问范围；非 full_auto
+                # 会等待授权，full_auto 会在 workspace_access 中权威短路放行。
+                authorization_workspace = target.parent.resolve()
+                target_requires_external_authorization = True
+                inside_workspace = True
+
+            active_workspace = get_active_workspace_dir() or os.getcwd()
+            needs_folder_authorization = bool(
+                explicit_workspace
+                and not self._same_path(active_workspace, workspace)
+            ) or bool(
+                target_requires_external_authorization
+                or (
+                    raw.is_absolute()
+                    and not self._same_path(active_workspace, workspace)
+                )
+            )
+            if needs_folder_authorization:
+                from .workspace_access import require_folder_access_authorization
+
+                access = require_folder_access_authorization(
+                    str(authorization_workspace),
+                    current_workspace=active_workspace,
+                    tool_name=self.name,
+                    action_summary=(
+                        f"允许祖龙访问文件夹：{authorization_workspace}\n"
+                        f"待读取文件：{target.name}"
+                    ),
+                    conversation_id=(
+                        params.get("conversation_id")
+                        or params.get("session_id")
+                        or ""
+                    ),
+                    session_id=params.get("session_id") or "",
+                    request_id=params.get("request_id") or request.request_id,
+                    timeout=float(params.get("approval_timeout") or 180.0),
+                )
+                if not access.approved:
+                    return self._create_result(
+                        success=False,
+                        data=access.to_payload(),
+                        error=access.message,
+                        status_code=403,
+                        execution_time=time.time() - start_time,
+                        request_id=request.request_id,
+                    )
 
             content = target.read_text(encoding="utf-8", errors="replace")
             lines = content.splitlines()

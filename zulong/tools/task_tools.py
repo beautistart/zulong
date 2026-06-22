@@ -15,6 +15,7 @@ import os
 import json
 import asyncio
 import threading
+import contextvars
 import re
 from pathlib import Path
 from difflib import SequenceMatcher
@@ -33,6 +34,10 @@ _active_task_graph = None
 _active_graph_id = None
 _active_workspace_dir = None  # 当前活跃任务的工作目录绝对路径
 _active_graph_lock = threading.RLock()
+_runtime_workspace_dir_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "zulong_runtime_workspace_dir",
+    default="",
+)
 
 # 任务图磁盘备份目录
 _GRAPH_BACKUP_DIR = os.path.join(".", "data", "graph_backups")
@@ -592,6 +597,18 @@ _EXPLICIT_WORKSPACE_PATH_RE = re.compile(
     r"(?P<path>[A-Za-z]:[\\/][A-Za-z0-9_.$~ (){}\[\]\-\\/]+|/(?:[^，。；;,\n\r\"'`]+))",
     re.IGNORECASE,
 )
+_TASK_OUTPUT_PATH_KEYWORDS = (
+    "独立产物目录", "产物目录", "产物路径", "输出目录", "输出路径", "结果目录", "目标目录",
+    "任务目录", "任务路径", "工作区", "工作目录", "项目目录", "项目文件夹",
+    "保存到", "生成到", "写入到", "放到", "落到", "创建到", "执行目录",
+    "artifact", "artifacts", "output", "target", "workspace", "workdir",
+    "project dir", "project directory",
+)
+_TASK_INPUT_PATH_KEYWORDS = (
+    "真实输入项目", "输入项目", "源项目", "源码项目", "待分析项目", "分析项目",
+    "参考项目", "读取项目", "扫描项目", "被分析项目", "输入目录", "源目录",
+    "source", "input", "reference", "read-only", "readonly",
+)
 _PROJECT_NAME_PATTERNS = (
     re.compile(r"(?:项目文件夹|项目目录|文件夹|目录)\s*[“\"'](?P<name>[^”\"']{1,80})[”\"']"),
     re.compile(r"以\s*[“\"'](?P<name>[^”\"']{1,80})[”\"']\s*为项目"),
@@ -615,6 +632,81 @@ def _normalize_path_for_match(path_value: str) -> str:
         return str(Path(str(path_value or "")).resolve()).lower().replace("/", "\\")
     except Exception:
         return str(path_value or "").lower().replace("/", "\\")
+
+
+def _iter_path_matches_with_context(raw: str) -> List[Tuple[str, int, int]]:
+    """Extract absolute paths from free text in stable left-to-right order."""
+    matches: List[Tuple[int, int, str]] = []
+    for regex in (_WINDOWS_ABS_PATH_RE, _POSIX_ABS_PATH_RE):
+        for match in regex.finditer(raw or ""):
+            candidate = _trim_inferred_path_candidate(match.group("path"))
+            candidate = re.sub(r"(?:文件夹|目录|下|中|里|作为|为|创建).*$", "", candidate).strip()
+            candidate = candidate.rstrip("\\/")
+            if candidate:
+                matches.append((match.start(), match.end(), candidate))
+    matches.sort(key=lambda item: (item[0], item[1]))
+
+    deduped: List[Tuple[str, int, int]] = []
+    seen: set[str] = set()
+    for start, end, candidate in matches:
+        key = _normalize_path_for_match(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((candidate, start, end))
+    return deduped
+
+
+def _score_task_workspace_path(raw: str, start: int, end: int) -> float:
+    """Score a path mention as the task/output workspace, not merely an input repo."""
+    before = (raw or "")[max(0, start - 80):start].lower()
+    after = (raw or "")[end:min(len(raw or ""), end + 80)].lower()
+    nearby = f"{before} {after}"
+    score = 0.0
+
+    if any(keyword.lower() in nearby for keyword in _TASK_OUTPUT_PATH_KEYWORDS):
+        score += 100.0
+    if any(keyword.lower() in nearby for keyword in _TASK_INPUT_PATH_KEYWORDS):
+        score -= 80.0
+    if re.search(r"(?:在|到|至|于)\s*$", before):
+        score += 8.0
+    if re.search(r"^\s*(?:下|中|里|内|执行|创建|生成|保存|输出|写入)", after):
+        score += 8.0
+    # Later explicit output paths often refine an earlier input/source path.
+    score += start / 100000.0
+    return score
+
+
+def _select_task_workspace_path_from_text(raw: str) -> str:
+    """Choose the most likely task workspace path from a user/task description.
+
+    When both an input/source project and an output/artifact directory are
+    present, the artifact/output directory must win so TaskGraph follows the
+    real task execution location.
+    """
+    candidates = _iter_path_matches_with_context(raw or "")
+    if not candidates:
+        return ""
+    scored = [
+        (_score_task_workspace_path(raw or "", start, end), index, candidate)
+        for index, (candidate, start, end) in enumerate(candidates)
+    ]
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return scored[0][2]
+
+
+def _split_exact_workspace_path(path_value: Any) -> Tuple[str, str]:
+    """Treat a granted/current workspace_path as the exact task directory."""
+    workspace = _normalize_workspace_dir(str(path_value or ""))
+    if not workspace:
+        return "", ""
+    try:
+        path = Path(workspace.rstrip("\\/"))
+        if path.name:
+            return str(path.parent), _clean_project_folder_name(path.name)
+    except Exception:
+        pass
+    return "", ""
 
 
 def _task_graph_leaf_counts(tg) -> Tuple[int, int]:
@@ -681,15 +773,27 @@ def infer_project_workspace_hint(text: str) -> Tuple[str, str]:
     if workspace_match:
         candidate = _trim_inferred_path_candidate(workspace_match.group("path"))
         candidate = re.sub(r"(?:下|中|里|作为|创建).*$", "", candidate).strip()
+        candidate = candidate.rstrip("\\/")
+        # If the first "项目目录" mention is actually an input/source repo and a
+        # later output/artifact/workspace path is present, bind the task to the
+        # execution/artifact directory instead of the read-only input project.
+        selected = _select_task_workspace_path_from_text(raw)
+        if selected and _normalize_path_for_match(selected) != _normalize_path_for_match(candidate):
+            explicit_score = _score_task_workspace_path(
+                raw,
+                workspace_match.start("path"),
+                workspace_match.end("path"),
+            )
+            selected_score = 0.0
+            for path_candidate, start, end in _iter_path_matches_with_context(raw):
+                if _normalize_path_for_match(path_candidate) == _normalize_path_for_match(selected):
+                    selected_score = _score_task_workspace_path(raw, start, end)
+                    break
+            if selected_score > explicit_score:
+                candidate = selected
         final_path = Path(candidate.rstrip("\\/"))
         if final_path.name:
             return str(final_path.parent), _clean_project_folder_name(final_path.name)
-
-    path_match = _WINDOWS_ABS_PATH_RE.search(raw) or _POSIX_ABS_PATH_RE.search(raw)
-    if path_match:
-        candidate = _trim_inferred_path_candidate(path_match.group("path"))
-        candidate = re.sub(r"(?:文件夹|目录|下|中|里|作为|为|创建).*$", "", candidate).strip()
-        target_path = candidate.rstrip("\\/")
 
     for pattern in _PROJECT_NAME_PATTERNS:
         match = pattern.search(raw)
@@ -697,6 +801,8 @@ def infer_project_workspace_hint(text: str) -> Tuple[str, str]:
             project_name = _clean_project_folder_name(match.group("name"))
             if project_name:
                 break
+
+    target_path = _select_task_workspace_path_from_text(raw)
 
     if target_path and not project_name:
         try:
@@ -1156,8 +1262,25 @@ def get_active_task_graph(workspace_dir=None):
 
 def get_active_workspace_dir():
     """获取当前活跃任务的工作目录路径，无活跃任务时返回 None"""
+    runtime_workspace = _normalize_workspace_dir(_runtime_workspace_dir_var.get("") or "")
+    if runtime_workspace:
+        return runtime_workspace
     with _active_graph_lock:
         return _active_workspace_dir
+
+
+def set_runtime_workspace_dir(workspace_dir: Optional[str]):
+    """Temporarily override workspace resolution for one tool execution."""
+    runtime_workspace = _normalize_workspace_dir(workspace_dir)
+    return _runtime_workspace_dir_var.set(runtime_workspace)
+
+
+def reset_runtime_workspace_dir(token) -> None:
+    """Restore the previous temporary workspace override."""
+    try:
+        _runtime_workspace_dir_var.reset(token)
+    except Exception:
+        pass
 
 
 def _normalize_workspace_dir(value: Optional[str]) -> str:

@@ -15,6 +15,61 @@ from typing import Dict, List, Optional, Any
 logger = logging.getLogger(__name__)
 
 
+def normalize_dsml_tool_markup(text: str) -> str:
+    """Normalize DeepSeek DSML pseudo-tags into ordinary XML-like tags.
+
+    Some models emit tags such as ``<??DSML??invoke ...>`` instead of
+    OpenAI native tool_calls.  They are still a recoverable structured tool
+    call, but the normal XML parser cannot see them until the DSML prefix is
+    removed.
+    """
+    if not text:
+        return ""
+    normalized = text
+    # Full-width vertical bars are what DeepSeek produced in the Web test; keep
+    # ASCII variants too so copied/normalized transcripts remain parseable.
+    normalized = re.sub(
+        r"<\s*(?:[\|\uff5c]\s*){0,2}DSML(?:\s*[\|\uff5c]){0,2}\s*",
+        "<",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(
+        r"</\s*(?:[\|\uff5c]\s*){0,2}DSML(?:\s*[\|\uff5c]){0,2}\s*",
+        "</",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    return normalized
+
+
+def strip_xml_tool_call_markup(text: str) -> str:
+    """Remove XML/DSML tool-call markup while preserving leading prose."""
+    if not text:
+        return ""
+    cleaned = normalize_dsml_tool_markup(text)
+    cleaned = re.sub(r"<thinking>.*?</thinking>", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL)
+    # Remove wrapped tool-call blocks first.
+    cleaned = re.sub(
+        r"<(?:tool_calls|tool_call|function_call)>(.*?)</(?:tool_calls|tool_call|function_call)>",
+        "",
+        cleaned,
+        flags=re.DOTALL,
+    )
+    # Remove top-level invoke/function/tool wrappers and residual parameter tags.
+    cleaned = re.sub(r"<invoke(?:\s[^>]*)?>.*?</invoke>", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"<function(?:\s[^>]*)?>.*?</function>", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"<tool(?:\s[^>]*)?>.*?</tool>", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"<parameter(?:\s[^>]*)?>.*?</parameter>", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(
+        r"</?(?:parameter|function|tool_call|function_call|tool_calls|tool_use|invoke|tool|name|arguments)(?:\s[^>]*)?>",
+        "",
+        cleaned,
+    )
+    return " ".join(cleaned.split()).strip()
+
+
 def _unescape_closing_tag(value: str, *tag_names: str) -> str:
     """反向还原闭合标签转义。"""
     for tag in tag_names:
@@ -110,73 +165,41 @@ class IDEFormatTranslator:
 
     @staticmethod
     def parse_xml_tool_calls(text: str) -> List[Dict]:
-        """从 LLM 文本输出中解析 XML 格式的工具调用
+        """Parse XML/DSML text tool calls into OpenAI tool_calls format.
 
-        当 LLM 输出包含 IDE XML 工具标签时（偶尔发生），
-        解析为 OpenAI tool_calls 格式供 FC 循环处理。
-
-        支持三类格式：
-        1. IDE 标准: <list_files><path>...</path></list_files>
-        2. 通用包装: <tool_call><function name="list_files">
-                      <parameter name="path">...</parameter></function></tool_call>
-        3. JSON 包装: <tool_call>{"name":"list_files","arguments":{...}}</tool_call>
-
-        Args:
-            text: LLM 输出的文本
-
-        Returns:
-            解析出的 tool_calls 列表（OpenAI 格式）
+        Full L2 normally expects native OpenAI tool_calls.  Some providers or
+        models instead emit XML-like text, including DeepSeek DSML pseudo-tags
+        such as ``<??DSML??invoke name="task_create_plan">``.  Treat these as
+        recoverable tool calls rather than user-visible final text.
         """
         from zulong.ide.ide_tool_registry import IDE_REMOTE_TOOLS
         import uuid
 
-        # 预处理: 移除 <thinking>/<think> 块（模型思考过程，不属于工具调用）
+        text = normalize_dsml_tool_markup(text or "")
         text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
 
-        # 扩展工具名单：远程工具 + 内部代码智能工具（模型可能以 XML 形式调用）
         _INTERNAL_XML_PARSEABLE = {
             "index_project", "index_code_file", "search_code_symbols",
             "get_symbol_context", "get_impact_analysis", "analyze_module",
             "task_create_plan", "task_add_node", "task_mark_status",
-            "task_view_overview", "recall_memory", "save_memory_note",
-            "navigate_attention", "search_experience", "search_tools",
-            "zulong_code_query", "zulong_task_link_code",
+            "task_view_overview", "task_get_detail", "task_update_node",
+            "task_add_dependency", "task_remove_node", "task_list_suspended",
+            "task_suspend", "submit_final_answer", "read_file",
+            "exec_write_file", "exec_run_command", "ide_write_file",
+            "recall_memory", "save_memory_note", "read_memory_node",
+            "discover_related", "navigate_attention", "adjust_attention_mode",
+            "search_experience", "search_tools", "zulong_code_query",
+            "zulong_task_link_code",
         }
         ALL_PARSEABLE_TOOLS = IDE_REMOTE_TOOLS | _INTERNAL_XML_PARSEABLE
 
-        tool_calls = []
+        tool_calls: List[Dict] = []
 
-        # ── 格式 1a: IDE 标准 <tool_name>...</tool_name> (有闭合标签) ──
+        # Format A: <tool_name><arg>value</arg></tool_name>
         for tool_name in ALL_PARSEABLE_TOOLS:
             pattern = rf"<{re.escape(tool_name)}>(.*?)</{re.escape(tool_name)}>"
-            matches = re.findall(pattern, text, re.DOTALL)
-            for match in matches:
-                args = IDEFormatTranslator._parse_xml_args(match)
-                if args:  # 仅在成功解析出参数时才添加
-                    tool_calls.append({
-                        "id": f"call_{uuid.uuid4().hex[:12]}",
-                        "type": "function",
-                        "function": {
-                            "name": tool_name,
-                            "arguments": json.dumps(args, ensure_ascii=False),
-                        },
-                    })
-
-        if tool_calls:
-            return tool_calls
-
-        # ── 格式 1b: 无闭合标签回退 <tool_name>...(到下一个工具标签或文本末尾) ──
-        # 部分模型不输出 </tool_name> 闭合标签
-        _tool_open_re = "|".join(re.escape(t) for t in ALL_PARSEABLE_TOOLS)
-        for tool_name in ALL_PARSEABLE_TOOLS:
-            unclosed_pat = (
-                rf"<{re.escape(tool_name)}>"
-                rf"(.*?)"
-                rf"(?=<(?:{_tool_open_re})>|\Z)"
-            )
-            matches = re.findall(unclosed_pat, text, re.DOTALL)
-            for match in matches:
+            for match in re.findall(pattern, text, re.DOTALL):
                 args = IDEFormatTranslator._parse_xml_args(match)
                 if args:
                     tool_calls.append({
@@ -187,26 +210,88 @@ class IDEFormatTranslator:
                             "arguments": json.dumps(args, ensure_ascii=False),
                         },
                     })
-
         if tool_calls:
             return tool_calls
 
-        # ── 格式 2: <tool_call> 包装格式 ──
-        # 匹配 <tool_call>...</tool_call> 或 <function_call>...</function_call>
+        # Format B: unclosed <tool_name>... fallback
+        _tool_open_re = "|".join(re.escape(t) for t in ALL_PARSEABLE_TOOLS)
+        for tool_name in ALL_PARSEABLE_TOOLS:
+            unclosed_pat = (
+                rf"<{re.escape(tool_name)}>"
+                rf"(.*?)"
+                rf"(?=<(?:{_tool_open_re})>|\Z)"
+            )
+            for match in re.findall(unclosed_pat, text, re.DOTALL):
+                args = IDEFormatTranslator._parse_xml_args(match)
+                if args:
+                    tool_calls.append({
+                        "id": f"call_{uuid.uuid4().hex[:12]}",
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(args, ensure_ascii=False),
+                        },
+                    })
+        if tool_calls:
+            return tool_calls
+
+        # Format C: <tool_call>, <function_call>, or <tool_calls> wrappers.
         tc_blocks = re.findall(
-            r"<(?:tool_call|function_call)>(.*?)</(?:tool_call|function_call)>",
-            text, re.DOTALL)
+            r"<(?:tool_call|function_call|tool_calls)>(.*?)</(?:tool_call|function_call|tool_calls)>",
+            text,
+            re.DOTALL,
+        )
         for block in tc_blocks:
+            invoke_calls = IDEFormatTranslator._parse_invoke_tool_call_blocks(
+                block, ALL_PARSEABLE_TOOLS
+            )
+            if invoke_calls:
+                tool_calls.extend(invoke_calls)
+                continue
             parsed = IDEFormatTranslator._parse_tool_call_block(
-                block, IDE_REMOTE_TOOLS)
+                block, ALL_PARSEABLE_TOOLS
+            )
             if parsed:
                 tool_calls.append({
                     "id": f"call_{uuid.uuid4().hex[:12]}",
                     "type": "function",
                     "function": parsed,
                 })
+        if tool_calls:
+            return tool_calls
 
-        return tool_calls
+        # Format D: top-level <invoke name="tool">...</invoke>.
+        return IDEFormatTranslator._parse_invoke_tool_call_blocks(
+            text, ALL_PARSEABLE_TOOLS
+        )
+
+
+    @staticmethod
+    def _parse_invoke_tool_call_blocks(
+        text: str, known_tools: set
+    ) -> List[Dict]:
+        """Parse <invoke name="tool"><parameter name="x">v</parameter></invoke>."""
+        import uuid
+
+        calls: List[Dict] = []
+        for match in re.finditer(
+            r'<invoke\s+name=["\']([\w.-]+)["\'][^>]*>(.*?)</invoke>',
+            text or "",
+            re.DOTALL,
+        ):
+            name = match.group(1).strip()
+            if name not in known_tools:
+                continue
+            args = IDEFormatTranslator._parse_parameter_tags(match.group(2))
+            calls.append({
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args, ensure_ascii=False),
+                },
+            })
+        return calls
 
     @staticmethod
     def _parse_tool_call_block(
@@ -237,7 +322,7 @@ class IDEFormatTranslator:
 
         # ── 变体 B: <function name="..."> 属性格式 ──
         fn_attr = re.search(
-            r'<function\s+name=["\'](\w+)["\']>(.*?)</function>',
+            r'<function\s+name=["\'](\w+)["\'][^>]*>(.*?)</function>',
             block, re.DOTALL)
         if fn_attr:
             name = fn_attr.group(1)
@@ -269,7 +354,7 @@ class IDEFormatTranslator:
         args = {}
         # 格式 1: <parameter name="key">value</parameter>
         for m in re.finditer(
-                r'<parameter\s+name=["\'](\w+)["\']>(.*?)</parameter>',
+                r'<parameter\s+name=["\'](\w+)["\'][^>]*>(.*?)</parameter>',
                 block, re.DOTALL):
             args[m.group(1)] = m.group(2).strip()
         if args:

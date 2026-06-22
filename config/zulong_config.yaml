@@ -6,8 +6,8 @@ attention_selection:
   max_switch_history: 50
   min_confidence_threshold: 0.3
   oscillation_detection_window: 10
-  pressure_threshold_high: '0.6'
-  pressure_threshold_medium: '0.5'
+  pressure_threshold_high: '0.1'
+  pressure_threshold_medium: '0.1'
 audio:
   asr:
     backend: sensevoice
@@ -130,9 +130,9 @@ l2_inference:
   backup_model: deepseek-v4-pro
   circuit_breaker:
     bfs_min_interval: 3
-    context_red_ratio: '0.6'
+    context_red_ratio: '0.1'
     context_window_size: 131072
-    context_yellow_ratio: '0.5'
+    context_yellow_ratio: '0.1'
     enabled: true
     max_yellow_before_red: 4
     no_progress_red: 8
@@ -229,7 +229,7 @@ llm:
     base_url: http://localhost:11434/v1
     model_id: qwen3.5:4b
   deepseek:
-    api_key: sk-61976bdc19c94dd3be8a1373cc0355ee
+    api_key: sk-f5fbf20095de478fb711cfd0d573739e
     backend: deepseek
     base_url: https://api.deepseek.com
     model_id: deepseek-v4-pro
@@ -401,11 +401,11 @@ security:
     requests_per_minute: 60
 system:
   cache_dir: ./cache
-  data_dir: D:/AI/project/zulong_beta5/data
+  data_dir: ./data
   debug_mode: false
   environment: production
   log_level: INFO
-  models_dir: D:/AI/project/zulong_beta5/models
+  models_dir: ./models
   name: ZULONG
   version: 2.0.0
 tools:

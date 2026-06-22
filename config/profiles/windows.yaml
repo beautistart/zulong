@@ -32,6 +32,7 @@ llm:
     model_id: ${ZULONG_ONEAPI_MODEL_ID:gpt-4o-mini}
   custom:
     base_url: ${ZULONG_CUSTOM_LLM_BASE_URL:http://localhost:11434/v1}
+    api_key: ${ZULONG_CUSTOM_LLM_API_KEY:EMPTY}
     model_id: ${ZULONG_CUSTOM_LLM_MODEL_ID:qwen3.5:4b}
   transformer:
     device: auto

@@ -52,6 +52,7 @@ from zulong.l2.info_gap_detector import InformationGapDetector, InfoGapType
 from zulong.l2.attention_window import (
     AttentionWindowManager, AttentionMode, MAX_TOOL_RESULT_CHARS,
 )
+from zulong.l2.attention_config import AttentionConfig
 from zulong.l2.circuit_breaker import ToolCallCircuitBreaker, CircuitBreakerState
 from zulong.l2.rule_guardian import RuleGuardian
 from zulong.l2.fc_runner import run_fc_loop
@@ -287,6 +288,7 @@ class InferenceEngine:
             # 超时上下文（供降级处理器使用）
             self._last_timeout_phase: Optional[TimeoutPhase] = None
             self._last_timeout_elapsed: float = 0.0
+            self._last_model_error_reason: Optional[str] = None
             self._response_is_fallback: bool = False  # 标记当前 response 是否来自降级路径
             
             # FC 循环请求间隔（防止 API 被打满）
@@ -1334,6 +1336,29 @@ class InferenceEngine:
             pass
         return 0.0
 
+    def _attention_pressure_thresholds_for_feedback(self) -> Dict[str, float]:
+        """Return configured pressure thresholds used by attention telemetry."""
+        try:
+            attn_window = getattr(self, "_attn_window", None)
+            cfg = getattr(attn_window, "_llm_config", None) if attn_window is not None else None
+            if cfg is None:
+                cfg = AttentionConfig.load_from_yaml()
+            high = float(getattr(cfg, "pressure_threshold_high", 0.60))
+            medium = float(getattr(cfg, "pressure_threshold_medium", high))
+            if medium > high:
+                medium = high
+            return {"medium": medium, "high": high}
+        except Exception:
+            return {"medium": 0.50, "high": 0.60}
+
+    def _attention_pressure_tier_for_feedback(self, ratio: float) -> str:
+        thresholds = self._attention_pressure_thresholds_for_feedback()
+        if ratio >= thresholds["high"]:
+            return "red"
+        if ratio >= thresholds["medium"]:
+            return "yellow"
+        return "green"
+
     def _send_task_graph_update(self, event_data: Dict[str, Any]) -> None:
         """Publish a direct task graph update for Web clients that do not inspect pipeline data."""
         graph_data = event_data.get("graph") if isinstance(event_data, dict) else None
@@ -1365,12 +1390,8 @@ class InferenceEngine:
             attn_window = getattr(self, "_attn_window", None)
             if attn_window is not None and getattr(attn_window, "mode", None):
                 mode = str(getattr(attn_window.mode, "value", "") or mode)
-            if ratio >= 0.60:
-                tier = "red"
-            elif ratio >= 0.50:
-                tier = "yellow"
-            else:
-                tier = "green"
+            thresholds = self._attention_pressure_thresholds_for_feedback()
+            tier = self._attention_pressure_tier_for_feedback(ratio)
             self._send_thinking_step("attention.update", {
                 "mode": mode,
                 "turn": fc_turn,
@@ -1379,6 +1400,8 @@ class InferenceEngine:
                 "budget_usage": round(ratio * 100, 1),
                 "context_pressure": round(ratio, 3),
                 "pressure_tier": tier,
+                "pressure_threshold_medium": thresholds["medium"],
+                "pressure_threshold_high": thresholds["high"],
                 "progress": progress,
             })
         except Exception as exc:
@@ -2286,9 +2309,10 @@ class InferenceEngine:
         """
         timeout_phase = self._last_timeout_phase or TimeoutPhase.ORCHESTRATOR_NO_OUTPUT
         elapsed = self._last_timeout_elapsed
-        # 非超时阶段 (ORCHESTRATOR_NO_OUTPUT / CIRCUIT_BREAKER_TRIPPED) 的 model_id 应为 CORE
-        if timeout_phase in (TimeoutPhase.CORE_TIMEOUT, TimeoutPhase.ORCHESTRATOR_NO_OUTPUT,
-                             TimeoutPhase.CIRCUIT_BREAKER_TRIPPED):
+        # CORE_* / 非超时阶段 (ORCHESTRATOR_NO_OUTPUT / CIRCUIT_BREAKER_TRIPPED) 的 model_id 应为 CORE
+        if (timeout_phase.name.startswith("CORE_") or
+                timeout_phase in (TimeoutPhase.ORCHESTRATOR_NO_OUTPUT,
+                                  TimeoutPhase.CIRCUIT_BREAKER_TRIPPED)):
             model_id = "CORE"
         else:
             model_id = "BACKUP"
@@ -2300,12 +2324,46 @@ class InferenceEngine:
             model_id=model_id,
             user_input=user_input or "",
             request_id=request_id,
+            error_reason=self._last_model_error_reason,
         )
         
         response = self._degradation_handler.generate_response(context)
         self._degradation_handler.generate_diagnostic_log(context)
         
         return response
+
+    @staticmethod
+    def _classify_model_api_error(err: Exception) -> tuple[TimeoutPhase, str]:
+        """Classify non-timeout model API errors for user-facing diagnostics."""
+        text = str(err or "")
+        safe_text = re.sub(r"sk-[A-Za-z0-9_\-]{12,}", "sk-***", text)
+        lower = safe_text.lower()
+        status = getattr(err, "status_code", None)
+        if status is None:
+            response = getattr(err, "response", None)
+            status = getattr(response, "status_code", None)
+
+        if status == 402 or "402" in safe_text or "payment required" in lower or "insufficient balance" in lower:
+            return (
+                TimeoutPhase.CORE_QUOTA_EXHAUSTED,
+                "主模型额度或余额不足（402/Insufficient Balance）",
+            )
+        if status == 429 or "429" in safe_text or "rate limit" in lower or "too many requests" in lower:
+            return (
+                TimeoutPhase.CORE_RATE_LIMIT,
+                "主模型触发频率限制（429/rate limit）",
+            )
+        if status == 503 or "503" in safe_text or "service temporarily unavailable" in lower:
+            return (
+                TimeoutPhase.CORE_API_ERROR,
+                "主模型服务暂不可用（503/service unavailable）",
+            )
+
+        compact = _compact_log_line(safe_text, 200)
+        return (
+            TimeoutPhase.CORE_API_ERROR,
+            f"主模型 API 调用失败：{compact}" if compact else "主模型 API 调用失败",
+        )
 
     def _call_l2_once(
         self,
@@ -2386,6 +2444,7 @@ class InferenceEngine:
         except concurrent.futures.TimeoutError:
             self._last_timeout_phase = TimeoutPhase.CORE_TIMEOUT
             self._last_timeout_elapsed = self._core_timeout
+            self._last_model_error_reason = None
             self._health_tracker.record_timeout("CORE")
             logger.error(
                 "🚨 [L2] CORE 单次推理超时 (>%s秒)，尝试备用模型",
@@ -2400,6 +2459,10 @@ class InferenceEngine:
                 "fallback_used": True,
             }
         except Exception as api_err:
+            phase, reason = self._classify_model_api_error(api_err)
+            self._last_timeout_phase = phase
+            self._last_timeout_elapsed = 0.0
+            self._last_model_error_reason = reason
             logger.error("🚨 [L2] CORE 单次推理失败: %s", api_err)
             backup_text = asyncio.run(
                 self._generate_with_backup(messages, user_input)
@@ -2464,12 +2527,34 @@ class InferenceEngine:
                 [tc["function"]["name"] for tc in tool_calls_data],
             )
         else:
-            logger.info(
-                "[L2] 单次决策直接回复，长度 %d",
-                len(response_content),
-            )
+            try:
+                from zulong.ide.ide_format_translator import (
+                    IDEFormatTranslator,
+                    strip_xml_tool_call_markup,
+                )
+
+                xml_tool_calls = IDEFormatTranslator.parse_xml_tool_calls(response_content)
+            except Exception as xml_err:
+                xml_tool_calls = []
+                logger.debug("[L2] XML/DSML 工具调用回退解析失败: %s", xml_err)
+            if xml_tool_calls:
+                tool_calls_data = xml_tool_calls
+                response_content = strip_xml_tool_call_markup(response_content)
+                logger.warning(
+                    "[L2] 单次决策从模型文本中恢复 %s 个 XML/DSML 工具调用: %s",
+                    len(xml_tool_calls),
+                    [tc.get("function", {}).get("name", "") for tc in xml_tool_calls],
+                )
+            else:
+                logger.info(
+                    "[L2] 单次决策直接回复，长度 %d",
+                    len(response_content),
+                )
 
         self._health_tracker.record_success("CORE")
+        self._last_timeout_phase = None
+        self._last_timeout_elapsed = 0.0
+        self._last_model_error_reason = None
         return {
             "response_content": response_content,
             "tool_calls_data": tool_calls_data,
@@ -2564,6 +2649,7 @@ class InferenceEngine:
             
             response_text = response.choices[0].message.content
             self._health_tracker.record_success("BACKUP")
+            self._last_model_error_reason = None
             logger.info(f"✅ [BACKUP] 备用模型生成完成，长度：{len(response_text)}")
             response_text = self._degradation_handler.append_backup_hint(response_text)
             return response_text

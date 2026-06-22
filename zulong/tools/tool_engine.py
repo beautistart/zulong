@@ -283,6 +283,76 @@ class ToolEngine:
         # 执行
         call.status = "running"
         logger.debug(f"[ToolEngine] Calling {tool_name}.{action}")
+        runtime_workspace_token = None
+        runtime_workspace_reset = None
+        try:
+            runtime_workspace = (
+                parameters.get("workspace_path")
+                or parameters.get("workspace_dir")
+                or parameters.get("cwd")
+                or ""
+            )
+            if runtime_workspace:
+                from zulong.tools.task_tools import (
+                    get_active_workspace_dir,
+                    reset_runtime_workspace_dir,
+                    set_runtime_workspace_dir,
+                )
+                from zulong.tools.workspace_access import (
+                    normalize_workspace_path,
+                    require_folder_access_authorization,
+                )
+
+                import os
+
+                normalized_workspace = normalize_workspace_path(runtime_workspace)
+                current_workspace = get_active_workspace_dir() or os.getcwd()
+                same_workspace = False
+                try:
+                    same_workspace = bool(
+                        current_workspace
+                        and os.path.normcase(normalize_workspace_path(current_workspace))
+                        == os.path.normcase(normalized_workspace)
+                    )
+                except Exception:
+                    same_workspace = bool(current_workspace and current_workspace == normalized_workspace)
+                if not same_workspace:
+                    access = require_folder_access_authorization(
+                        normalized_workspace,
+                        current_workspace=current_workspace,
+                        tool_name=tool_name,
+                        action_summary=f"允许祖龙访问文件夹：{normalized_workspace}",
+                        conversation_id=(
+                            parameters.get("conversation_id")
+                            or parameters.get("session_id")
+                            or self.get_context("conversation_id")
+                            or self.get_context("session_id")
+                            or ""
+                        ),
+                        session_id=parameters.get("session_id") or self.get_context("session_id") or "",
+                        request_id=parameters.get("request_id") or self.get_context("request_id") or call_id,
+                        timeout=float(parameters.get("approval_timeout") or 180.0),
+                    )
+                    if not access.approved:
+                        call.status = "failed"
+                        call.error = access.message
+                        call.end_time = time.time()
+                        result = ToolResult(
+                            success=False,
+                            data=access.to_payload(),
+                            error=access.message,
+                            status_code=403,
+                            execution_time=call.end_time - call.start_time,
+                            request_id=call_id,
+                        )
+                        self.total_calls += 1
+                        self.failed_calls += 1
+                        self._record_call(call)
+                        return result
+                runtime_workspace_token = set_runtime_workspace_dir(normalized_workspace)
+                runtime_workspace_reset = reset_runtime_workspace_dir
+        except Exception as exc:
+            logger.debug("[ToolEngine] Runtime workspace context skipped: %s", exc)
         
         try:
             result = tool.execute(request)
@@ -335,6 +405,9 @@ class ToolEngine:
                 execution_time=time.time() - call.start_time,
                 request_id=call_id
             )
+        finally:
+            if runtime_workspace_token is not None and runtime_workspace_reset:
+                runtime_workspace_reset(runtime_workspace_token)
         
         # 记录
         self._record_call(call)

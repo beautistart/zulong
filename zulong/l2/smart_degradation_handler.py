@@ -13,6 +13,9 @@ class TimeoutPhase(Enum):
     BACKUP_TIMEOUT = "BACKUP_TIMEOUT"
     BACKUP_UNAVAILABLE = "BACKUP_UNAVAILABLE"
     CORE_BACKUP_SAME_MODEL = "CORE_BACKUP_SAME_MODEL"
+    CORE_RATE_LIMIT = "CORE_RATE_LIMIT"
+    CORE_QUOTA_EXHAUSTED = "CORE_QUOTA_EXHAUSTED"
+    CORE_API_ERROR = "CORE_API_ERROR"
     CIRCUIT_BREAKER_TRIPPED = "CIRCUIT_BREAKER_TRIPPED"  # 非超时: CircuitBreaker 触发 RED 提前终止
     ORCHESTRATOR_NO_OUTPUT = "ORCHESTRATOR_NO_OUTPUT"  # 非超时: 编排器/FC 完成但未生成有效回复
 
@@ -32,6 +35,7 @@ class DegradationContext:
     model_id: str
     user_input: str
     request_id: Optional[str] = None
+    error_reason: Optional[str] = None
 
 
 DELETE_MARKERS = ["删除", "移除", "清除", "忘记", "去掉", "不要记住", "删掉", "抹除"]
@@ -43,7 +47,10 @@ DEGRADATION_REASONS: Dict[TimeoutPhase, str] = {
     TimeoutPhase.CORE_TIMEOUT: "主模型响应超时",
     TimeoutPhase.BACKUP_TIMEOUT: "主模型和备用模型都响应超时",
     TimeoutPhase.BACKUP_UNAVAILABLE: "主模型不可用，备用模型也未配置或不可用",
-    TimeoutPhase.CORE_BACKUP_SAME_MODEL: "主模型响应超时，备用模型与主模型相同，无法继续降级",
+    TimeoutPhase.CORE_BACKUP_SAME_MODEL: "主模型不可用，备用模型与主模型相同，无法继续降级",
+    TimeoutPhase.CORE_RATE_LIMIT: "主模型触发频率限制（429/rate limit）",
+    TimeoutPhase.CORE_QUOTA_EXHAUSTED: "主模型额度或余额不足（402/Insufficient Balance）",
+    TimeoutPhase.CORE_API_ERROR: "主模型 API 调用失败",
     TimeoutPhase.CIRCUIT_BREAKER_TRIPPED: "安全防护触发：检测到重复调用或无效循环，已提前终止",
     TimeoutPhase.ORCHESTRATOR_NO_OUTPUT: "推理流程已完成，但模型未生成有效回复（可能因 API 返回空或编排器提前终止）",
 }
@@ -74,10 +81,12 @@ class SmartDegradationHandler:
         except Exception:
             degradation_id = str(int(time.time()))
         intent = self.classify_intent(context.user_input)
-        reason = DEGRADATION_REASONS.get(
+        reason = context.error_reason or DEGRADATION_REASONS.get(
             context.timeout_phase,
             DEGRADATION_REASONS[TimeoutPhase.CORE_TIMEOUT],
         )
+        if context.timeout_phase == TimeoutPhase.CORE_BACKUP_SAME_MODEL and context.error_reason:
+            reason = f"{context.error_reason}，备用模型与主模型相同，无法继续降级"
         base_msg = f"系统当前出问题了，{reason}，因此无法正常回复。"
         if context.elapsed_seconds > 0:
             base_msg = base_msg.rstrip("。") + f"（已等待{int(context.elapsed_seconds)}秒）。"
@@ -96,6 +105,8 @@ class SmartDegradationHandler:
             "input_type": intent.value,
             "fallback_template_used": True,
         }
+        if context.error_reason:
+            log_data["error_reason"] = context.error_reason
         logger.info(f"[SmartDegradation] {log_data}")
         return log_data
 

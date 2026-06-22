@@ -110,9 +110,13 @@ class ModelPreloader:
                 f"✅ [ModelPreloader] 预热完成，耗时 {elapsed:.1f}s"
             )
         else:
+            reason = self._preload_error or "unknown"
+            if "timeout" in reason.lower() or "timed out" in reason.lower():
+                summary = f"预热超时 ({self.timeout}s)"
+            else:
+                summary = "预热失败"
             logger.warning(
-                f"⚠️ [ModelPreloader] 预热超时 ({self.timeout}s)，"
-                f"错误: {self._preload_error}"
+                f"⚠️ [ModelPreloader] {summary}，错误: {reason}"
             )
 
     def _preload_ollama(self) -> None:

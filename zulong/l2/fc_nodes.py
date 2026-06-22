@@ -531,9 +531,29 @@ def _make_call_model_node(engine: "InferenceEngine"):
                 for tc in raw_tool_calls
             ]
         else:
-            logger.info(
-                f"[FC][Graph] Turn {fc_turn}: 模型直接回复，长度 {len(response_content)}"
-            )
+            try:
+                from zulong.ide.ide_format_translator import (
+                    IDEFormatTranslator,
+                    strip_xml_tool_call_markup,
+                )
+
+                xml_tool_calls = IDEFormatTranslator.parse_xml_tool_calls(response_content)
+            except Exception as xml_err:
+                xml_tool_calls = []
+                logger.debug("[FC][Graph] XML/DSML 工具调用回退解析失败: %s", xml_err)
+            if xml_tool_calls:
+                tool_calls_data = xml_tool_calls
+                response_content = strip_xml_tool_call_markup(response_content)
+                logger.warning(
+                    "[FC][Graph] Turn %s: 从模型文本中恢复 %s 个 XML/DSML 工具调用: %s",
+                    fc_turn,
+                    len(xml_tool_calls),
+                    [tc.get("function", {}).get("name", "") for tc in xml_tool_calls],
+                )
+            else:
+                logger.info(
+                    f"[FC][Graph] Turn {fc_turn}: 模型直接回复，长度 {len(response_content)}"
+                )
 
         return {
             "tool_calls_data": tool_calls_data,

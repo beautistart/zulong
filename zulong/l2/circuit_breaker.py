@@ -81,7 +81,8 @@ class ToolCallRecord:
 
     def __init__(self, function_name: str, params_hash: str, result_hash: str,
                  result_len: int, timestamp: float, query: str = "",
-                 result_preview: str = "", normalized_result_hash: str = ""):
+                 result_preview: str = "", normalized_result_hash: str = "",
+                 is_error: Optional[bool] = None):
         self.function_name = function_name
         self.params_hash = params_hash
         self.result_hash = result_hash
@@ -90,6 +91,7 @@ class ToolCallRecord:
         self.query = query
         self.result_preview = result_preview
         self.normalized_result_hash = normalized_result_hash or result_hash
+        self.is_error = is_error
 
 
 class ToolCallCircuitBreaker:
@@ -223,6 +225,7 @@ class ToolCallCircuitBreaker:
         params_hash = self._hash_dict(params_dict)
         result_hash = self._hash_text(result_content)
         result_preview = str(result_content or "")[:200]
+        is_error = self._classify_error_result(result_content)
         normalized_result_hash = self._hash_text(
             self._normalize_result_text(result_content)
         )
@@ -241,6 +244,7 @@ class ToolCallCircuitBreaker:
             query=query,
             result_preview=result_preview,
             normalized_result_hash=normalized_result_hash,
+            is_error=is_error,
         )
         self._call_history.append(record)
 
@@ -496,7 +500,12 @@ class ToolCallCircuitBreaker:
         count = 0
         last_tool = ""
         for record in reversed(self._call_history[-6:]):
-            if not self._is_error_result(record.result_preview):
+            is_error = (
+                bool(record.is_error)
+                if record.is_error is not None
+                else self._is_error_result(record.result_preview)
+            )
+            if not is_error:
                 break
             count += 1
             last_tool = record.function_name
@@ -552,6 +561,7 @@ class ToolCallCircuitBreaker:
                     "query": r.query,
                     "result_preview": r.result_preview,
                     "normalized_result_hash": r.normalized_result_hash,
+                    "is_error": r.is_error,
                 }
                 for r in self._call_history
             ],
@@ -621,6 +631,58 @@ class ToolCallCircuitBreaker:
         if len(scrubbed) < 30:
             return "short:" + scrubbed
         return "content:" + scrubbed[:500]
+
+    @classmethod
+    def _classify_error_result(cls, text: str) -> bool:
+        """Classify tool result failure using structured fields before text.
+
+        Some successful results legitimately contain words like "error" in file
+        names or source code (for example Rust `error.rs` or `error_code.rs`).
+        The consecutive-error signal must not treat those successful reads or
+        commands as failures just because the preview contains those tokens.
+        """
+        raw = str(text or "").strip()
+        if not raw:
+            return False
+
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = None
+
+        if isinstance(data, dict):
+            success = data.get("success", data.get("ok", None))
+            status = str(data.get("status") or data.get("state") or "").lower()
+            if success is True or status in {
+                "ok",
+                "success",
+                "succeeded",
+                "completed",
+                "complete",
+                "done",
+            }:
+                return False
+            if success is False or status in {"error", "failed", "failure"}:
+                return True
+
+            if "returncode" in data:
+                try:
+                    if int(data.get("returncode")) == 0:
+                        return False
+                    return True
+                except (TypeError, ValueError):
+                    pass
+
+            if data.get("content") is not None and not data.get("error"):
+                return False
+            if data.get("file_path") and data.get("content") is not None:
+                return False
+            if data.get("stdout") and not data.get("stderr") and not data.get("error"):
+                return False
+            if data.get("error") or data.get("exception") or data.get("traceback"):
+                return True
+
+        return cls._contains_error_terms(raw.lower())
 
     @staticmethod
     def _scrub_result_noise(text: str) -> str:
