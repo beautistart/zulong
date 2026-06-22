@@ -292,11 +292,12 @@ class InferenceEngine:
             # FC 循环请求间隔（防止 API 被打满）
             self._fc_request_interval = float(_l2_config.get('request_interval', 1.0))
             
-            # 🔥 新增：加载步数限制配置（替代时间超时机制）
+            # 🔥 加载步数限制配置。enabled=false 时只记录进度，不因步数触发终止。
             _step_config = _l2_config.get('step_limits', {})
-            self._max_fc_turns = _step_config.get('max_fc_turns', 100)  # FC 循环最大步数
-            self._soft_limit = _step_config.get('soft_limit', 50)  # 软限制
-            self._hard_limit = _step_config.get('hard_limit', 100)  # 硬限制
+            self._step_limits_enabled = bool(_step_config.get('enabled', True))
+            self._max_fc_turns = _step_config.get('max_fc_turns', 100)  # FC 循环展示用步数
+            self._soft_limit = _step_config.get('soft_limit', 50)  # 软限制（启用时生效）
+            self._hard_limit = _step_config.get('hard_limit', 100)  # 硬限制（启用时生效）
             self._warning_interval = _step_config.get('warning_interval', 10)  # 警告间隔
             
             self._remote_tool_timeout = _timeout_config.get('remote_tool', 600)  # IDE模式远程工具等待超时
@@ -310,7 +311,10 @@ class InferenceEngine:
             self._rule_guardian = RuleGuardian(enabled=True)
             
             logger.info(f"⏱️ [L2] 超时配置: core={self._core_timeout}s, backup={self._backup_timeout}s, fc_loop={self._fc_loop_timeout}s, request_interval={self._fc_request_interval}s")
-            logger.info(f"🔢 [L2] 步数配置: max={self._max_fc_turns}, soft={self._soft_limit}, hard={self._hard_limit}")
+            logger.info(
+                f"🔢 [L2] 步数配置: enabled={self._step_limits_enabled}, "
+                f"max={self._max_fc_turns}, soft={self._soft_limit}, hard={self._hard_limit}"
+            )
             
             # 注入 RAGManager 到 search_experience 工具（ExperienceRAG 被动检索）
             _exp_tool = self.tool_engine.registry.get("search_experience")
@@ -3609,7 +3613,7 @@ class InferenceEngine:
                     # 🔥 标记：后续 response 来自降级路径，非模型原始输出
                     self._response_is_fallback = True
                     # 🔥 优化：根据达到限制的原因选择不同处理方式
-                    if fc_turn >= self._hard_limit:
+                    if getattr(self, "_step_limits_enabled", True) and fc_turn >= self._hard_limit:
                         logger.warning(f"[FC] 达到硬限制 {self._hard_limit} 步，使用降级回复")
                     else:
                         logger.warning(f"[FC] FC 循环异常终止 (已执行 {fc_turn} 步)")

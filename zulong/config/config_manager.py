@@ -430,6 +430,8 @@ def get_l2_inference_config() -> Dict[str, Any]:
         ),
         'orchestrator': config_manager.get_dict('l2_inference.orchestrator'),
         'fc_loop': config_manager.get_dict('l2_inference.fc_loop'),
+        'circuit_breaker': config_manager.get_dict('l2_inference.circuit_breaker'),
+        'step_limits': config_manager.get_dict('l2_inference.step_limits'),
     }
 
 

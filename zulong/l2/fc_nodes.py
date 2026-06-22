@@ -220,19 +220,25 @@ def _make_check_node(engine: "InferenceEngine"):
         fc_turn = state["fc_turn"] + 1
         state["fc_turn"] = fc_turn
 
+        step_limits_enabled = bool(getattr(engine, "_step_limits_enabled", True))
+        max_turns = getattr(engine, "_max_fc_turns", 0)
+        soft_limit = getattr(engine, "_soft_limit", 0)
+        hard_limit = getattr(engine, "_hard_limit", 0)
+
         # 进度监控
         if fc_turn % engine._warning_interval == 0:
+            limit_text = f"/{max_turns}" if step_limits_enabled and max_turns else ""
             logger.info(
-                f"[FC][Graph] 进度: {fc_turn}/{engine._max_fc_turns} 步，"
+                f"[FC][Graph] 进度: {fc_turn}{limit_text} 步，"
                 f"已执行 {len(state['tool_results_buffer'])} 次工具调用"
             )
 
-        if fc_turn > engine._soft_limit:
-            logger.warning(f"[FC][Graph] ⚠️ 已超过软限制 ({engine._soft_limit} 步)，继续执行...")
+        if step_limits_enabled and soft_limit and fc_turn > soft_limit:
+            logger.warning(f"[FC][Graph] ⚠️ 已超过软限制 ({soft_limit} 步)，继续执行...")
 
         # 硬限制检查
-        if fc_turn >= engine._hard_limit:
-            logger.error(f"[FC][Graph] 🚨 达到硬限制 ({engine._hard_limit} 步)，强制终止")
+        if step_limits_enabled and hard_limit and fc_turn >= hard_limit:
+            logger.error(f"[FC][Graph] 🚨 达到硬限制 ({hard_limit} 步)，强制终止")
             return {"fc_turn": fc_turn, "should_terminate": "hard_limit"}
 
         # 中断信号检查
@@ -385,7 +391,7 @@ def _make_call_model_node(engine: "InferenceEngine"):
             api_timeout_count = state.get("api_timeout_count", 0) + 1
             _MAX_API_TIMEOUTS = 1  # 超时 1 次即切换备用模型，避免用户长时间等待
 
-            if fc_turn >= engine._hard_limit:
+            if bool(getattr(engine, "_step_limits_enabled", True)) and fc_turn >= engine._hard_limit:
                 logger.error("[FC][Graph] 🚨 超时且达到硬限制，使用降级回复")
                 return {
                     "response": engine._get_fallback_response(state.get("user_input_text", "")),

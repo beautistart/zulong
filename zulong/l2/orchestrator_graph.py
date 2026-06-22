@@ -519,10 +519,11 @@ def schedule_node(state: OrchestratorState, engine) -> OrchestratorState:
         state["phase"] = PHASE_SYNTHESIZE
         return state
 
-    # 检查全局 FC 步数限制 — 软着陆：存检查点+进度报告+自动继续
+    # 检查全局 FC 步数限制 — step_limits.enabled=false 时完全跳过。
+    step_limits_enabled = bool(getattr(engine, "_step_limits_enabled", True))
     max_turns = state.get("max_total_fc_turns", 100)
     total_used = state.get("total_fc_turns", 0)
-    if total_used >= max_turns:
+    if step_limits_enabled and max_turns and total_used >= max_turns:
         _save_checkpoint(state, f"budget_pause_{total_used}")
         report = _generate_progress_report(state, tg)
         # 将进度报告存入 state 供前端/日志消费
@@ -742,10 +743,13 @@ def execute_node(state: OrchestratorState, engine) -> OrchestratorState:
         ),
     })
 
-    # 计算子任务 FC 预算
-    subtask_budget = state.get("subtask_fc_budget", 30)
-    remaining_global = state.get("max_total_fc_turns", 100) - state.get("total_fc_turns", 0)
-    effective_budget = min(subtask_budget, remaining_global)
+    # step_limits.enabled=false 时不计算/裁剪子任务 FC 步数预算。
+    if bool(getattr(engine, "_step_limits_enabled", True)):
+        subtask_budget = state.get("subtask_fc_budget", 30)
+        remaining_global = state.get("max_total_fc_turns", 100) - state.get("total_fc_turns", 0)
+        effective_budget = min(subtask_budget, remaining_global)
+    else:
+        effective_budget = None
 
     response, fc_turn = _run_tool_cycle_after_decision(
         engine,
@@ -1064,9 +1068,14 @@ def _generate_progress_report(state, tg) -> str:
     total_turns = state.get("total_fc_turns", 0)
     max_turns = state.get("max_total_fc_turns", 100)
     completed_results = state.get("completed_results", {})
+    step_limits_enabled = bool(state.get("step_limits_enabled", True))
 
     lines = [
-        f"## 进度报告 (FC 步数: {total_turns}/{max_turns})",
+        (
+            f"## 进度报告 (FC 步数: {total_turns}/{max_turns})"
+            if step_limits_enabled and max_turns
+            else f"## 进度报告 (FC 步数: {total_turns}，无步数上限)"
+        ),
         "",
     ]
 
@@ -1295,6 +1304,7 @@ class OrchestratorWithLangGraph:
             "tool_definitions": tool_definitions,
             "user_input_text": user_input,
             "total_fc_turns": 0,
+            "step_limits_enabled": bool(getattr(self.engine, "_step_limits_enabled", True)),
             "max_total_fc_turns": orch_config.get("max_total_fc_turns", 100),
             "subtask_reflection_count": {},
             "should_terminate": "",
@@ -1387,6 +1397,7 @@ class OrchestratorWithLangGraph:
             "tool_definitions": tool_definitions,
             "user_input_text": user_input,
             "total_fc_turns": 0,
+            "step_limits_enabled": bool(getattr(self.engine, "_step_limits_enabled", True)),
             "max_total_fc_turns": orch_config.get("max_total_fc_turns", 100),
             "subtask_reflection_count": {},
             "should_terminate": "",
@@ -1598,6 +1609,7 @@ def run_orchestrator(
         "tool_definitions": tool_definitions,
         "user_input_text": user_input,
         "total_fc_turns": 0,
+        "step_limits_enabled": bool(getattr(engine, "_step_limits_enabled", True)),
         "max_total_fc_turns": orch_config.get("max_total_fc_turns", 100),
         "subtask_reflection_count": {},
         "should_terminate": "",
@@ -1618,11 +1630,12 @@ def run_orchestrator(
         f"is_resume={is_resume}, max_fc_turns={state['max_total_fc_turns']}"
     )
 
-    # 状态机循环（安全上限防止无限循环）
-    max_iterations = 200
+    # 状态机循环。全局步数限制关闭时，不再用固定迭代次数强制终止。
+    step_limits_enabled = bool(getattr(engine, "_step_limits_enabled", True))
+    max_iterations = 200 if step_limits_enabled else None
     iteration = 0
 
-    while iteration < max_iterations:
+    while max_iterations is None or iteration < max_iterations:
         iteration += 1
         phase = state["phase"]
 
@@ -1652,7 +1665,7 @@ def run_orchestrator(
                 f"进入 synthesize 汇总"
             )
 
-    if iteration >= max_iterations:
+    if max_iterations is not None and iteration >= max_iterations:
         logger.error("[Orchestrator] 达到最大迭代次数，强制终止")
 
     # 🔥 经验提取：成功完成的任务存入 ExperienceRAG，供后续任务复用

@@ -129,6 +129,8 @@ def _same_path(left: Optional[str], right: Optional[str]) -> bool:
 def _resolve_active_task_workspace(
     preferred: Optional[str] = None,
     task_graph_id: Optional[str] = None,
+    *,
+    prefer_explicit: bool = False,
 ) -> str:
     """Resolve the current task workspace without falling back to repo cwd."""
     candidates: List[str] = []
@@ -136,6 +138,14 @@ def _resolve_active_task_workspace(
     def add_candidate(value: Optional[str]) -> None:
         if value:
             candidates.append(value)
+
+    # Explicit workspace switching is different from resolving an ordinary
+    # tool-call workspace. When the user/model asks to open a concrete
+    # workspace, that destination must win over the active TaskGraph's current
+    # workspace; otherwise recovery flows can never switch away from a stale
+    # graph binding.
+    if prefer_explicit:
+        add_candidate(preferred)
 
     if task_graph_id:
         try:
@@ -160,9 +170,10 @@ def _resolve_active_task_workspace(
     except Exception:
         pass
 
-    # Web payloads can carry stale IDE context. Prefer authoritative task
-    # binding first, and only use the requested path as a final fallback.
-    add_candidate(preferred)
+    if not prefer_explicit:
+        # Web payloads can carry stale IDE context. Prefer authoritative task
+        # binding first, and only use the requested path as a final fallback.
+        add_candidate(preferred)
 
     for candidate in candidates:
         try:
@@ -2715,11 +2726,25 @@ async def _handle_conversation_switch(data: dict) -> None:
                 claim_unowned=claim_unowned,
             )
             if loaded:
+                actual_workspace = workspace_path or ""
+                try:
+                    from zulong.tools.task_tools import get_active_task_graph, get_active_workspace_dir
+                    active_tg = get_active_task_graph()
+                    if active_tg is not None and normalize_task_graph_id(getattr(active_tg, "id", "")) == graph_id:
+                        actual_workspace = (
+                            getattr(active_tg, "metadata", {}).get("workspace_dir")
+                            or get_active_workspace_dir()
+                            or actual_workspace
+                        )
+                except Exception:
+                    pass
                 logger.info(
-                    "[WebChatRouter] 会话切换激活任务图: session=%s graph=%s workspace=%s",
+                    "[WebChatRouter] Conversation switch activated TaskGraph: "
+                    "session=%s graph=%s requested_workspace=%s actual_workspace=%s",
                     conversation_id,
                     graph_id,
                     workspace_path or "-",
+                    actual_workspace or "-",
                 )
             else:
                 set_active_task_graph(None, None)
@@ -2847,9 +2872,15 @@ async def _handle_ide_action(ws: WebSocket, action: str, data: dict) -> None:
     payload.setdefault("conversation_id", data.get("conversation_id") or data.get("session_id"))
     payload.setdefault("turn_id", data.get("turn_id") or data.get("request_id"))
     requested_workspace = payload.get("workspace_path") or payload.get("cwd")
+    is_explicit_workspace_switch = action in (
+        MessageType.IDE_OPEN_WORKSPACE,
+        "ide_open_workspace",
+        "ide:open_workspace",
+    )
     workspace_path = _resolve_active_task_workspace(
         requested_workspace,
         payload.get("task_graph_id") or payload.get("graph_id"),
+        prefer_explicit=is_explicit_workspace_switch,
     )
     if workspace_path:
         payload["workspace_path"] = workspace_path

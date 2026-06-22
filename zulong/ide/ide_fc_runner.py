@@ -726,6 +726,7 @@ class IDEFCRunner(FCRunner):
         self._max_fc_turns = getattr(engine, "_max_fc_turns", 100)
         self._soft_limit = getattr(engine, "_soft_limit", 50)
         self._hard_limit = getattr(engine, "_hard_limit", 100)
+        self._step_limits_enabled = bool(getattr(engine, "_step_limits_enabled", True))
         self._warning_interval = getattr(engine, "_warning_interval", 10)
         self._fc_loop_timeout = getattr(engine, "_fc_loop_timeout", 600)
         self._fc_request_interval = getattr(engine, "_fc_request_interval", 1.0)
@@ -5134,9 +5135,9 @@ class IDEFCRunner(FCRunner):
         if (fc > 1
                 and self._progress_report_interval > 0
                 and fc % self._progress_report_interval == 0
-                and fc < self._hard_limit):
+                and (not self._step_limits_enabled or fc < self._hard_limit)):
             self._broadcast_periodic_progress(state)
-        if fc > self._soft_limit and fc % self._warning_interval == 1:
+        if self._step_limits_enabled and fc > self._soft_limit and fc % self._warning_interval == 1:
             # 软限制：注入进度提醒到消息列表，引导 LLM 收敛
             report = self._build_progress_hint(state)
             logger.warning(f"[IDEFCRunner] 超软限制 ({self._soft_limit}), 注入进度提示")
@@ -5146,7 +5147,7 @@ class IDEFCRunner(FCRunner):
                 # 独立 group_id：避免被 None 组膨胀后整体淘汰
                 gid = self._attn_window.new_tool_group()
                 self._attn_window.register_message(hint_msg, turn=fc, group_id=gid)
-        if fc >= self._hard_limit:
+        if self._step_limits_enabled and fc >= self._hard_limit:
             # 生成结构化进度报告
             progress = self._generate_progress_report(state)
             state.progress_reports.append(progress)

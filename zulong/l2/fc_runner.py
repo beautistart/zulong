@@ -36,6 +36,15 @@ from zulong.l2.tool_budget import (
 logger = logging.getLogger(__name__)
 
 
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 class FCRunner:
     """核心 FC 循环执行器
 
@@ -64,10 +73,11 @@ class FCRunner:
 
     def __init__(self, engine: "InferenceEngine"):
         self.engine = engine
-        self._hard_limit = getattr(engine, "_hard_limit", 100)
-        self._soft_limit = getattr(engine, "_soft_limit", 50)
-        self._max_fc_turns = getattr(engine, "_max_fc_turns", 100)
-        self._warning_interval = getattr(engine, "_warning_interval", 10)
+        self._hard_limit = _safe_int(getattr(engine, "_hard_limit", 100), 100)
+        self._soft_limit = _safe_int(getattr(engine, "_soft_limit", 50), 50)
+        self._max_fc_turns = _safe_int(getattr(engine, "_max_fc_turns", 100), 100)
+        self._step_limits_enabled = bool(getattr(engine, "_step_limits_enabled", True))
+        self._warning_interval = max(1, _safe_int(getattr(engine, "_warning_interval", 10), 10))
         self._fc_request_interval = getattr(engine, "_fc_request_interval", 1.0)
         self._setup_nodes()
 
@@ -193,13 +203,14 @@ class FCRunner:
             self._on_loop_done(state, None, 0)
             return None, 0
 
-        max_iterations = self._hard_limit + 15  # 绝对安全上限
+        max_iterations = None if not self._step_limits_enabled else self._hard_limit + 15
 
         logger.info(
             f"[FCRunner] 开始工具循环: "
             f"tools={len(tool_definitions)}, model={vllm_model_id}, "
             f"initial_tool_calls={len(initial_tool_calls_data or [])}, "
-            f"hard_limit={self._hard_limit}"
+            f"step_limits_enabled={self._step_limits_enabled}, "
+            f"hard_limit={self._hard_limit if self._step_limits_enabled else 'disabled'}"
         )
 
         try:
@@ -222,7 +233,9 @@ class FCRunner:
                     self._on_loop_done(state, response, fc_turn)
                     return response, fc_turn
 
-            for _ in range(max_iterations):
+            loop_iter = 0
+            while max_iterations is None or loop_iter < max_iterations:
+                loop_iter += 1
                 # ── Phase 1: Check ──
                 result = self.check_state(state)
                 state.update(result)
@@ -300,8 +313,9 @@ class FCRunner:
 
         except Exception as e:
             err_name = type(e).__name__
-            logger.error(f"[FCRunner] 循环异常 ({err_name}): {e}")
+            logger.exception(f"[FCRunner] 循环异常 ({err_name}): {e}")
             self.engine._last_fc_terminate_reason = "exception"
+            fallback_turn = state.get("fc_turn", 0)
             # 从 messages 中恢复最后一条 assistant 回复
             for msg in reversed(messages):
                 if isinstance(msg, dict) and msg.get("role") == "assistant":
@@ -311,11 +325,11 @@ class FCRunner:
                             f"[FCRunner] 从 messages 恢复最后回复，"
                             f"长度={len(content)}"
                         )
-                        self._on_loop_done(state, content, self._hard_limit)
-                        return content, self._hard_limit
+                        self._on_loop_done(state, content, fallback_turn)
+                        return content, fallback_turn
             fallback = self.engine._get_fallback_response(user_input)
-            self._on_loop_done(state, fallback, self._hard_limit)
-            return fallback, self._hard_limit
+            self._on_loop_done(state, fallback, fallback_turn)
+            return fallback, fallback_turn
 
         response = state.get("response")
         fc_turn = state.get("fc_turn", 0)

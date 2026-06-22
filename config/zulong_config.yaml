@@ -92,9 +92,10 @@ event_bus:
 ide:
   enabled: true
   fc_limits:
-    hard_limit: 100
-    max_fc_turns: 100
-    soft_limit: 50
+    enabled: false
+    hard_limit: 0
+    max_fc_turns: 0
+    soft_limit: 0
   host: 127.0.0.1
   port: 8090
   session:
@@ -140,7 +141,7 @@ l2_inference:
     pattern_window: 10
     pattern_yellow_count: 8
     query_similarity_threshold: 0.85
-    safety_hard_cap: 100
+    safety_hard_cap: null
     time_red_seconds: 120
     time_yellow_seconds: 60
   core_model: qwen3.5:cloud
@@ -148,7 +149,7 @@ l2_inference:
     api_timeout_seconds: 30
     checkpointer_db_path: ./data/fc_loop_checkpoints.db
     circuit_breaker_enabled: true
-    max_fc_turns: 50
+    max_fc_turns: 0
     use_langgraph_checkpointer: false
   generation:
     frequency_penalty: 0.0
@@ -166,7 +167,7 @@ l2_inference:
     max_redo_per_subtask: 5
     max_replan_count: 3
     reflection_max_tokens: 512
-    subtask_fc_budget: 50
+    subtask_fc_budget: 0
     use_langgraph: true
     use_langgraph_checkpointer: false
   request_interval: 2.0
@@ -175,10 +176,10 @@ l2_inference:
     delay: 1.0
     max_attempts: 3
   step_limits:
-    enabled: true
-    hard_limit: 200
-    max_fc_turns: 200
-    soft_limit: 80
+    enabled: false
+    hard_limit: 0
+    max_fc_turns: 0
+    soft_limit: 0
     warning_interval: 10
   task_suspension:
     auto_suspend_on_time_limit: true

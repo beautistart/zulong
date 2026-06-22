@@ -300,6 +300,163 @@ def ensure_task_graph_owner_for_request(
     )
 
 
+
+def _task_graph_title(tg) -> str:
+    try:
+        title = str(getattr(tg, "title", "") or "").strip()
+        if title:
+            return title
+        root = tg.get_node("req") if hasattr(tg, "get_node") else None
+        if root is not None:
+            return str(getattr(root, "label", "") or getattr(root, "desc", "") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _sync_conversation_workspace_binding(
+    tg,
+    graph_id: Any,
+    workspace_dir: str,
+    conversation_id: Any = "",
+    session_node_id: Any = "",
+    source: str = "task_tools",
+) -> None:
+    """Keep the Web conversation ledger aligned with the active TaskGraph workspace."""
+    graph_id = normalize_task_graph_id(graph_id)
+    workspace = _normalize_workspace_dir(workspace_dir)
+    if not graph_id or not workspace:
+        return
+    try:
+        if not os.path.isdir(workspace):
+            return
+    except Exception:
+        return
+
+    try:
+        meta = getattr(tg, "metadata", {}) or {}
+        if not isinstance(meta, dict):
+            meta = {}
+    except Exception:
+        meta = {}
+
+    conv_id = str(
+        conversation_id
+        or meta.get("owner_conversation_id")
+        or meta.get("conversation_id")
+        or ""
+    ).strip()
+    if not conv_id:
+        return
+
+    owner_session_node_id = infer_task_graph_owner_session_node_id(
+        conv_id,
+        session_node_id
+        or meta.get("owner_session_node_id")
+        or meta.get("session_node_id")
+        or meta.get("dialogue_session_id")
+        or "",
+    )
+
+    try:
+        from zulong.launcher.interaction_store import get_interaction_store
+
+        store = get_interaction_store()
+        existing = store.get_conversation(conv_id) or {}
+        existing_graph_id = normalize_task_graph_id(existing.get("task_graph_id"))
+        if existing_graph_id and existing_graph_id != graph_id:
+            logger.warning(
+                "[TaskGraphOwner] Conversation workspace sync skipped for different graph: "
+                "conversation=%s existing=%s incoming=%s",
+                conv_id, existing_graph_id, graph_id,
+            )
+            return
+
+        merged_meta = dict(meta)
+        merged_meta.update({
+            "owner_conversation_id": conv_id,
+            "owner_session_node_id": owner_session_node_id,
+            "workspace_dir": workspace,
+            "workspace_path": workspace,
+            "project_id": workspace,
+        })
+        store.upsert_conversation(
+            conv_id,
+            title=_task_graph_title(tg) or str(existing.get("title") or ""),
+            source=str(existing.get("source") or source or "task_tools"),
+            workspace_path=workspace,
+            project_id=workspace,
+            task_graph_id=graph_id,
+            session_node_id=owner_session_node_id or None,
+            metadata=merged_meta,
+            active=True,
+        )
+        if tg is not None:
+            try:
+                tg.metadata["owner_conversation_id"] = conv_id
+                tg.metadata["conversation_id"] = conv_id
+                tg.metadata["owner_session_node_id"] = owner_session_node_id
+                tg.metadata["session_node_id"] = owner_session_node_id
+                tg.metadata["dialogue_session_id"] = owner_session_node_id
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.debug("[TaskGraphOwner] Conversation workspace sync skipped: %s", exc)
+
+
+def _first_existing_metadata_workspace(tg) -> str:
+    try:
+        meta = getattr(tg, "metadata", {}) or {}
+        if not isinstance(meta, dict):
+            return ""
+    except Exception:
+        return ""
+    for candidate in _metadata_workspace_candidates(meta):
+        workspace = _normalize_workspace_dir(candidate)
+        if workspace and os.path.isdir(workspace):
+            return workspace
+    return ""
+
+
+def _merge_backup_workspace_metadata(current_tg, backup_tg, graph_id: str) -> bool:
+    """Merge explicit workspace metadata from disk backup into a stale in-memory graph."""
+    if current_tg is None or backup_tg is None:
+        return False
+    backup_workspace = _first_existing_metadata_workspace(backup_tg)
+    if not backup_workspace:
+        return False
+    current_workspace = _first_existing_metadata_workspace(current_tg)
+    if current_workspace == backup_workspace:
+        return False
+
+    try:
+        current_meta = getattr(current_tg, "metadata", {}) or {}
+        backup_meta = getattr(backup_tg, "metadata", {}) or {}
+        if not isinstance(current_meta, dict) or not isinstance(backup_meta, dict):
+            return False
+        for key in (
+            "workspace_dir",
+            "workspace_path",
+            "target_path",
+            "project_name",
+            "workspace_fix_note",
+            "workspace_fixed_at",
+        ):
+            if backup_meta.get(key):
+                current_meta[key] = backup_meta.get(key)
+        current_meta["workspace_dir"] = backup_workspace
+        current_meta.setdefault("workspace_path", backup_workspace)
+        logger.warning(
+            "[TaskTools] In-memory TaskGraph workspace refreshed from disk backup: "
+            "graph=%s previous=%s resolved=%s",
+            graph_id, current_workspace or "-", backup_workspace,
+        )
+        return True
+    except Exception as exc:
+        logger.debug("[TaskTools] Backup workspace metadata merge skipped: %s", exc)
+        return False
+
+
 def _bind_conversation_task_graph_once(
     *,
     conversation_id: Any,
@@ -343,6 +500,7 @@ def _bind_conversation_task_graph_once(
             title=title or "",
             source=source,
             workspace_path=workspace_dir or None,
+            project_id=workspace_dir or None,
             task_graph_id=graph_id,
             session_node_id=owner_session_node_id or None,
             metadata=merged_meta,
@@ -1064,30 +1222,182 @@ def _infer_workspace_from_project_registry(graph_id: str) -> str:
     return ""
 
 
+def _task_graph_workspace_texts(tg) -> List[str]:
+    """Return active-node text snippets that may contain explicit workspace paths."""
+    if tg is None:
+        return []
+
+    try:
+        nodes = getattr(tg, "_nodes", None) or getattr(tg, "nodes", None) or {}
+        if callable(nodes):
+            nodes = nodes()
+        if isinstance(nodes, dict):
+            node_values = list(nodes.values())
+        else:
+            node_values = list(nodes or [])
+    except Exception:
+        node_values = []
+
+    def node_status(node) -> str:
+        if isinstance(node, dict):
+            return str(node.get("status") or "")
+        return str(getattr(node, "status", "") or "")
+
+    def node_text(node) -> str:
+        if isinstance(node, dict):
+            parts = [
+                node.get("label") or "",
+                node.get("desc") or "",
+                node.get("title") or "",
+                node.get("description") or "",
+            ]
+        else:
+            parts = [
+                getattr(node, "label", "") or "",
+                getattr(node, "desc", "") or "",
+                getattr(node, "title", "") or "",
+                getattr(node, "description", "") or "",
+            ]
+        return "\n".join(str(part) for part in parts if part)
+
+    texts: List[str] = []
+    # Active nodes are the strongest signal when a recovered graph mentions
+    # several historical workspaces in its root requirement.
+    for wanted_status in ("in_progress", "pending"):
+        for node in node_values:
+            if node_status(node) == wanted_status:
+                text = node_text(node)
+                if text:
+                    texts.append(text)
+        if texts:
+            return texts
+
+    title = str(getattr(tg, "title", "") or "")
+    if title:
+        texts.append(title)
+    try:
+        meta = getattr(tg, "metadata", {}) or {}
+        if isinstance(meta, dict):
+            for key in ("user_requirement", "description", "title"):
+                value = str(meta.get(key) or "")
+                if value:
+                    texts.append(value)
+    except Exception:
+        pass
+    return texts
+
+
+def _infer_workspace_from_graph_text(tg) -> str:
+    """Infer the current workspace from active TaskGraph node text."""
+    for text in _task_graph_workspace_texts(tg):
+        for match in list(_WINDOWS_ABS_PATH_RE.finditer(text)) + list(_POSIX_ABS_PATH_RE.finditer(text)):
+            candidate = _trim_inferred_path_candidate(match.group("path"))
+            if not candidate:
+                continue
+            workspace = _normalize_workspace_dir(candidate)
+            if os.path.isdir(workspace):
+                return workspace
+            try:
+                parent = str(Path(workspace).parent)
+                if parent and os.path.isdir(parent):
+                    return _normalize_workspace_dir(parent)
+            except Exception:
+                continue
+    return ""
+
+
+def _metadata_workspace_candidates(meta: Dict[str, Any]) -> List[str]:
+    """Prefer explicit graph-owned workspace fields over transient session cwd."""
+    if not isinstance(meta, dict):
+        return []
+
+    candidates: List[str] = []
+
+    def add(value: Any):
+        workspace = _normalize_workspace_dir(str(value or ""))
+        if workspace and workspace not in candidates:
+            candidates.append(workspace)
+
+    workspace_path = meta.get("workspace_path")
+    target_path = meta.get("target_path")
+    project_name = str(meta.get("project_name") or "").strip()
+    workspace_dir = meta.get("workspace_dir")
+
+    add(workspace_path)
+
+    target_workspace = _normalize_workspace_dir(str(target_path or ""))
+    if target_workspace and project_name:
+        # In normal project creation target_path is the parent directory and
+        # project_name is the actual workspace folder.  During manual recovery
+        # target_path may already be the exact workspace; keep both cases.
+        try:
+            joined = str(Path(target_workspace) / project_name)
+            if os.path.isdir(joined):
+                add(joined)
+        except Exception:
+            pass
+        try:
+            if Path(target_workspace).name.lower() == project_name.lower():
+                add(target_workspace)
+        except Exception:
+            pass
+    elif target_workspace:
+        add(target_workspace)
+
+    add(workspace_dir)
+    return candidates
+
+
 def _resolve_task_workspace_dir(tg, graph_id: str = "", workspace_dir: Optional[str] = None) -> str:
-    """Resolve and persist the workspace bound to a TaskGraph."""
+    """Resolve and persist the workspace bound to a TaskGraph.
+
+    The TaskGraph's own explicit workspace metadata is the source of truth.
+    Transient callers may pass the current Web/IDE session cwd, which can be
+    unrelated after task recovery; use that only after graph-owned signals fail.
+    """
     graph_id = normalize_task_graph_id(graph_id or getattr(tg, "id", "") or getattr(tg, "graph_id", ""))
-    candidates = [
+    meta: Dict[str, Any] = {}
+    if tg is not None:
+        try:
+            meta = getattr(tg, "metadata", {}) or {}
+            if not isinstance(meta, dict):
+                meta = {}
+        except Exception:
+            meta = {}
+
+    candidates: List[str] = []
+    candidates.extend(_metadata_workspace_candidates(meta))
+    candidates.append(_infer_workspace_from_graph_text(tg) if tg is not None else "")
+    candidates.extend([
         workspace_dir,
-        getattr(tg, "metadata", {}).get("workspace_dir", "") if tg is not None else "",
         _infer_workspace_from_project_registry(graph_id),
         _infer_workspace_from_file_refs(tg) if tg is not None else "",
-    ]
+    ])
 
-    # Preserve the current binding only for the same graph.
+    # Preserve the current binding only for the same graph, and only as a
+    # fallback.  This avoids cross-session workspace pollution during resume.
     try:
         if graph_id and graph_id == _active_graph_id:
             candidates.append(_active_workspace_dir)
     except Exception:
         pass
 
+    seen: set[str] = set()
     for candidate in candidates:
         workspace = _normalize_workspace_dir(candidate)
-        if not workspace:
+        if not workspace or workspace in seen:
             continue
+        seen.add(workspace)
         if os.path.isdir(workspace):
             if tg is not None:
                 try:
+                    previous = _normalize_workspace_dir(meta.get("workspace_dir") or "")
+                    if previous and previous != workspace:
+                        logger.warning(
+                            "[TaskTools] Workspace binding conflict corrected from graph metadata: "
+                            "graph=%s previous=%s resolved=%s arg=%s",
+                            graph_id, previous, workspace, _normalize_workspace_dir(workspace_dir),
+                        )
                     tg.metadata["workspace_dir"] = workspace
                 except Exception:
                     pass
@@ -1247,6 +1557,14 @@ def set_active_task_graph(
         ):
             return False
     resolved_workspace = _resolve_task_workspace_dir(tg, graph_id, workspace_dir)
+    if tg is not None and graph_id and resolved_workspace:
+        _sync_conversation_workspace_binding(
+            tg,
+            graph_id,
+            resolved_workspace,
+            conversation_id=conversation_id,
+            session_node_id=session_node_id,
+        )
     with _active_graph_lock:
         if tg is None:
             clear_workspace = _normalize_workspace_dir(workspace_dir) or _active_workspace_dir
@@ -1492,7 +1810,9 @@ def load_task_graph_deterministic(
         return False
 
     current = get_active_task_graph(workspace_dir=workspace_dir) or get_active_task_graph()
+    backup_tg = load_graph_from_backup(graph_id)
     if current and normalize_task_graph_id(getattr(current, "id", "")) == graph_id:
+        _merge_backup_workspace_metadata(current, backup_tg, graph_id)
         if not set_active_task_graph(
             current,
             graph_id,
@@ -1502,10 +1822,10 @@ def load_task_graph_deterministic(
             claim_unowned=claim_unowned,
         ):
             return False
-        logger.info("[TaskTools] 确定性恢复 Level 1 (内存): %s", graph_id)
+        logger.info("[TaskTools] Deterministic recovery Level 1 (memory): %s", graph_id)
         return True
 
-    tg = load_graph_from_backup(graph_id)
+    tg = backup_tg
     if tg:
         if not set_active_task_graph(
             tg,
@@ -1516,7 +1836,7 @@ def load_task_graph_deterministic(
             claim_unowned=claim_unowned,
         ):
             return False
-        logger.info("[TaskTools] 确定性恢复 Level 2 (磁盘): %s", graph_id)
+        logger.info("[TaskTools] Deterministic recovery Level 2 (disk): %s", graph_id)
         return True
 
     try:

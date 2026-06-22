@@ -236,6 +236,8 @@ _monitor_connections: Set[WebSocket] = set()
 def _resolve_active_task_workspace(
     preferred: Optional[str] = None,
     task_graph_id: Optional[str] = None,
+    *,
+    prefer_explicit: bool = False,
 ) -> str:
     """Resolve the current task workspace; never use repo cwd as an implicit task dir."""
     candidates = []
@@ -243,6 +245,14 @@ def _resolve_active_task_workspace(
     def add_candidate(value: Optional[str]) -> None:
         if value:
             candidates.append(value)
+
+    # For explicit workspace-switch actions (for example ide_open_workspace),
+    # the user/model supplied path is the requested destination and must not be
+    # shadowed by the currently active TaskGraph workspace. The normal resolver
+    # still keeps TaskGraph/registry data first to protect ordinary tool calls
+    # from stale Web/IDE payloads.
+    if prefer_explicit:
+        add_candidate(preferred)
 
     if task_graph_id:
         try:
@@ -267,9 +277,10 @@ def _resolve_active_task_workspace(
     except Exception:
         pass
 
-    # The request payload may contain stale IDE context (for example a parent
-    # folder). It is only a final fallback after TaskGraph/ProjectRegistry data.
-    add_candidate(preferred)
+    if not prefer_explicit:
+        # The request payload may contain stale IDE context (for example a parent
+        # folder). It is only a final fallback after TaskGraph/ProjectRegistry data.
+        add_candidate(preferred)
 
     for candidate in candidates:
         try:
@@ -815,9 +826,15 @@ async def request_ide_action(action: str, payload: Dict[str, Any]) -> Dict[str, 
     """Forward a non-chat IDE command to the active VS Code backend bridge."""
     task_graph_id = payload.get("task_graph_id") or payload.get("graph_id")
     requested_workspace = payload.get("workspace_path") or payload.get("cwd")
+    is_explicit_workspace_switch = action in (
+        MessageType.IDE_OPEN_WORKSPACE,
+        "ide_open_workspace",
+        "ide:open_workspace",
+    )
     workspace_path = _resolve_active_task_workspace(
         requested_workspace,
         task_graph_id,
+        prefer_explicit=is_explicit_workspace_switch,
     )
     if workspace_path:
         payload["workspace_path"] = workspace_path

@@ -4359,6 +4359,9 @@
                 placeholder.textContent = '\u7b49\u5f85\u65b0\u4efb\u52a1\u5f00\u59cb\u3002';
                 ledger.appendChild(placeholder);
             }
+            if (sourceEntries.length > 0 && targetLedger && targetLedger.classList.contains('task-feedback-history-ledger')) {
+                placeholder.textContent = '';
+            }
             sourceEntries.forEach(function(entry, idx) {
                 var el = ledger.querySelector('[data-feedback-entry-id="' + entry.id + '"]');
                 if (!el) {
@@ -4623,9 +4626,20 @@
 
         function renderTaskFeedbackHistoryCard(entries, summaryText, historyId, beforeNode) {
             if (!chatMessages) return false;
+            // 完成汇报卡只承载最终汇报本身；中间过程/工具返回不再装入此卡。
+            // 过程 entries 如需回放，由 renderTaskFeedbackProcessLedger 单独呈现。
+            entries = [];
             var safeId = String(historyId || ('task-feedback-history-' + Date.now())).replace(/[^a-zA-Z0-9_.:-]/g, '_');
             var existing = document.getElementById(safeId);
             if (existing) {
+                var existingLedger = existing.querySelector('.task-feedback-ledger');
+                if (existingLedger) {
+                    syncFixedFeedbackLedger(existingLedger, []);
+                }
+                var existingSummary = existing.querySelector('.task-feedback-history-summary');
+                if (existingSummary && summaryText) {
+                    renderCardMarkdown(existingSummary, summaryText);
+                }
                 if (beforeNode && beforeNode.parentElement === chatMessages && beforeNode !== existing && existing.nextSibling !== beforeNode) {
                     chatMessages.insertBefore(existing, beforeNode);
                     return true;

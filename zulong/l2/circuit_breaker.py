@@ -27,6 +27,49 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
+def _cfg_float(value: Any, default: float) -> float:
+    """Return a numeric config value even when YAML/env provided a string."""
+    try:
+        if value is None:
+            return float(default)
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[CircuitBreaker] Invalid float config %r, fallback=%s",
+            value,
+            default,
+        )
+        return float(default)
+
+
+def _cfg_int(value: Any, default: int) -> int:
+    """Return an integer config value even when YAML/env provided a string."""
+    try:
+        if value is None:
+            return int(default)
+        return int(float(value))
+    except (TypeError, ValueError):
+        logger.warning(
+            "[CircuitBreaker] Invalid int config %r, fallback=%s",
+            value,
+            default,
+        )
+        return int(default)
+
+
+def _cfg_optional_int(value: Any, default: Optional[int]) -> Optional[int]:
+    """Parse optional integer limits; common disabled sentinels become None."""
+    disabled = {None, 0, -1, "0", "-1", "none", "disabled", "off", "unlimited"}
+    if isinstance(value, str):
+        value = value.strip().lower()
+    if value in disabled:
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 class CircuitBreakerState(Enum):
     GREEN = "green"
     YELLOW = "yellow"
@@ -91,28 +134,28 @@ class ToolCallCircuitBreaker:
         cfg = config or {}
         self._config = cfg
         self.enabled = cfg.get("enabled", True)
-        self._safety_hard_cap = cfg.get("safety_hard_cap", 100)
+        self._safety_hard_cap = _cfg_optional_int(cfg.get("safety_hard_cap", 100), 100)
 
         # --- 信号 2: 模式循环 ---
-        self._pattern_window = cfg.get("pattern_window", 10)
-        self._pattern_yellow_count = cfg.get("pattern_yellow_count", 8)
-        self._pattern_red_count = cfg.get("pattern_red_count", 10)
-        self._query_similarity_threshold = cfg.get("query_similarity_threshold", 0.85)
+        self._pattern_window = _cfg_int(cfg.get("pattern_window", 10), 10)
+        self._pattern_yellow_count = _cfg_int(cfg.get("pattern_yellow_count", 8), 8)
+        self._pattern_red_count = _cfg_int(cfg.get("pattern_red_count", 10), 10)
+        self._query_similarity_threshold = _cfg_float(cfg.get("query_similarity_threshold", 0.85), 0.85)
 
         # --- 信号 4: 上下文窗口压力 ---
-        self._context_window_size = cfg.get("context_window_size", 131072)
-        self._context_yellow_ratio = cfg.get("context_yellow_ratio", 0.50)
-        self._context_red_ratio = cfg.get("context_red_ratio", 0.60)
+        self._context_window_size = _cfg_int(cfg.get("context_window_size", 131072), 131072)
+        self._context_yellow_ratio = _cfg_float(cfg.get("context_yellow_ratio", 0.50), 0.50)
+        self._context_red_ratio = _cfg_float(cfg.get("context_red_ratio", 0.60), 0.60)
 
         # --- 信号 5: 经过时间（已禁用） ---
-        self._time_yellow_seconds = cfg.get("time_yellow_seconds", 60)
-        self._time_red_seconds = cfg.get("time_red_seconds", 120)
+        self._time_yellow_seconds = _cfg_float(cfg.get("time_yellow_seconds", 60), 60)
+        self._time_red_seconds = _cfg_float(cfg.get("time_red_seconds", 120), 120)
 
         # --- 信号 6: 无进度空转 ---
-        self._no_progress_yellow = cfg.get("no_progress_yellow", 5)
-        self._no_progress_red = cfg.get("no_progress_red", 8)
+        self._no_progress_yellow = _cfg_int(cfg.get("no_progress_yellow", 5), 5)
+        self._no_progress_red = _cfg_int(cfg.get("no_progress_red", 8), 8)
 
-        self._max_yellow_before_red = cfg.get("max_yellow_before_red", 5)
+        self._max_yellow_before_red = _cfg_int(cfg.get("max_yellow_before_red", 5), 5)
 
         self._call_history: List[ToolCallRecord] = []
         self._start_time: float = 0.0
@@ -123,7 +166,7 @@ class ToolCallCircuitBreaker:
             self._safety_hard_cap = 10
 
     @property
-    def safety_hard_cap(self) -> int:
+    def safety_hard_cap(self) -> Optional[int]:
         return self._safety_hard_cap
 
     def reset(self):
@@ -161,11 +204,19 @@ class ToolCallCircuitBreaker:
             cfg = ConfigManager().get("l2_inference.circuit_breaker", {})
         except Exception:
             pass
-        self._safety_hard_cap = cfg.get("safety_hard_cap", 100)
-        self._pattern_window = cfg.get("pattern_window", 10)
-        self._pattern_yellow_count = cfg.get("pattern_yellow_count", 8)
-        self._pattern_red_count = cfg.get("pattern_red_count", 10)
-        self._max_yellow_before_red = cfg.get("max_yellow_before_red", 5)
+        self._safety_hard_cap = _cfg_optional_int(cfg.get("safety_hard_cap", 100), 100)
+        self._pattern_window = _cfg_int(cfg.get("pattern_window", 10), 10)
+        self._pattern_yellow_count = _cfg_int(cfg.get("pattern_yellow_count", 8), 8)
+        self._pattern_red_count = _cfg_int(cfg.get("pattern_red_count", 10), 10)
+        self._query_similarity_threshold = _cfg_float(cfg.get("query_similarity_threshold", 0.85), 0.85)
+        self._context_window_size = _cfg_int(cfg.get("context_window_size", 131072), 131072)
+        self._context_yellow_ratio = _cfg_float(cfg.get("context_yellow_ratio", 0.50), 0.50)
+        self._context_red_ratio = _cfg_float(cfg.get("context_red_ratio", 0.60), 0.60)
+        self._time_yellow_seconds = _cfg_float(cfg.get("time_yellow_seconds", 60), 60)
+        self._time_red_seconds = _cfg_float(cfg.get("time_red_seconds", 120), 120)
+        self._no_progress_yellow = _cfg_int(cfg.get("no_progress_yellow", 5), 5)
+        self._no_progress_red = _cfg_int(cfg.get("no_progress_red", 8), 8)
+        self._max_yellow_before_red = _cfg_int(cfg.get("max_yellow_before_red", 5), 5)
         logger.info(f"[CircuitBreaker] 已重置: hard_cap={self._safety_hard_cap}")
 
     def record_call(self, function_name: str, params_dict: Dict, result_content: str):
