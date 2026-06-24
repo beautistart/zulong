@@ -1669,10 +1669,24 @@ class IDEFCRunner(FCRunner):
                         red_ratio,
                         tier=pressure_tier,
                     ).to_dict()
+                    attention_telemetry = dict(getattr(state, "attention_context_telemetry", {}) or {})
+                    attention_plan = dict(getattr(state, "attention_context_plan", {}) or {})
                     _attn_state = {
                         "mode": self._attn_window.mode.value if self._attn_window.mode else "global",
                         "turn": fc,
                         "focus_node_id": self._attn_window._current_node_id,
+                        "focus_address": attention_telemetry.get("focus_address") or attention_plan.get("focus_node_address"),
+                        "focus_path": attention_telemetry.get("focus_path") or attention_plan.get("focus_path"),
+                        "navigation_map_injected": attention_telemetry.get("navigation_map_injected"),
+                        "navigation_map_reason": attention_telemetry.get("navigation_map_reason"),
+                        "retrieved_memory_count": attention_telemetry.get("retrieved_memory_count"),
+                        "bfs_seed_count": attention_telemetry.get("bfs_seed_count"),
+                        "bfs_activated_count": attention_telemetry.get("bfs_activated_count"),
+                        "active_context_token_estimate": attention_telemetry.get("active_context_token_estimate"),
+                        "active_context_item_count": attention_telemetry.get("active_context_item_count"),
+                        "provider_prompt_tokens": attention_telemetry.get("provider_prompt_tokens"),
+                        "provider_context_pressure_percent": attention_telemetry.get("provider_context_pressure_percent"),
+                        "pressure_stage": getattr(state, "pressure_stage", ""),
                         "budget_usage": round(pressure_view.get("context_pressure_percent", ratio * 100), 1),
                         "context_pressure": round(pressure_view.get("context_pressure_ratio", ratio), 3),
                         "threshold_budget_pressure": round(pressure_view.get("context_pressure_ratio", ratio), 3),
@@ -3099,6 +3113,16 @@ class IDEFCRunner(FCRunner):
         }
         try:
             state.last_model_raw_summary = summary
+            usage_summary = summary.get("usage") or {}
+            prompt_tokens = int(usage_summary.get("prompt_tokens") or 0)
+            if prompt_tokens and self._attn_window:
+                self._attn_window._last_provider_prompt_tokens = prompt_tokens
+                threshold_budget = max(1, int(getattr(self._attn_window, "threshold_budget_tokens", 1) or 1))
+                telemetry = dict(getattr(state, "attention_context_telemetry", {}) or {})
+                telemetry["provider_prompt_tokens"] = prompt_tokens
+                telemetry["provider_context_pressure_ratio"] = round(prompt_tokens / threshold_budget, 4)
+                telemetry["provider_context_pressure_percent"] = round(prompt_tokens / threshold_budget * 100.0, 1)
+                state.attention_context_telemetry = telemetry
         except Exception:
             pass
         logger.info(
@@ -8884,6 +8908,8 @@ class IDEFCRunner(FCRunner):
                 "decision_owner": "llm",
                 "allowed_modes": ["GLOBAL", "FOCUS", "SINGLE_CHAIN"],
                 "first_threshold_response": "guidance_only",
+                "attention_context_plan": getattr(state, "attention_context_plan", {}) or {},
+                "attention_context_telemetry": getattr(state, "attention_context_telemetry", {}) or {},
             }
             logger.info(
                 "[IDEFCRunner][Pressure] YELLOW %.0f%% of threshold budget: 第一次阈值响应，仅注入动态注意力引导",
@@ -8956,6 +8982,8 @@ class IDEFCRunner(FCRunner):
             "second_threshold_response": "restricted_recovery" if recovery_tools else "guidance_only",
             "requires_note": requires_note,
             "requires_attention": requires_attention,
+            "attention_context_plan": getattr(state, "attention_context_plan", {}) or {},
+            "attention_context_telemetry": getattr(state, "attention_context_telemetry", {}) or {},
         }
         hint = {"role": "system", "content": "\n".join(parts)}
         msgs.append(hint)
