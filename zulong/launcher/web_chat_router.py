@@ -835,12 +835,20 @@ def _resolve_conversation_binding(message: dict) -> Dict[str, Optional[str]]:
         except Exception:
             binding["conversation_id"] = None
 
-    if binding.get("conversation_id") and not binding.get("session_node_id"):
+    if binding.get("conversation_id"):
         conv_id = str(binding.get("conversation_id") or "")
-        binding["session_node_id"] = (
+        canonical_session_node_id = (
             conv_id if _is_dialogue_session_node_id(conv_id)
             else f"dialogue:session_{_compact_dialogue_id(conv_id)}"
         )
+        if binding.get("session_node_id") and binding.get("session_node_id") != canonical_session_node_id:
+            logger.debug(
+                "[WebChatRouter] 纠正消息会话根绑定: conversation=%s requested=%s canonical=%s",
+                conv_id,
+                binding.get("session_node_id"),
+                canonical_session_node_id,
+            )
+        binding["session_node_id"] = canonical_session_node_id
 
     status_request_id = str(_task_execution_status.get("request_id") or "")
     status_conversation_id = str(
@@ -1098,6 +1106,11 @@ def _safe_dialogue_title(value: Any, fallback: str = "对话记录") -> str:
     if not text or _looks_corrupt_dialogue_title(text):
         return "对话记录"
     return text
+
+
+def _is_placeholder_dialogue_title(value: Any) -> bool:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text in {"", "新会话", "对话记录"}
 
 
 def _session_candidate_text(session: Dict[str, Any]) -> str:
@@ -1520,8 +1533,23 @@ def _collect_dialogue_sessions(limit: int = 200) -> Dict[str, Any]:
     try:
         for conv in store.list_conversations(limit=limit):
             conv_id = conv.get("conversation_id") or ""
-            session_node_id = conv.get("session_node_id")
-            inferred_session_node_id = session_node_id
+            stored_session_node_id = conv.get("session_node_id")
+            canonical_session_node_id = (
+                conv_id if _is_dialogue_session_node_id(conv_id)
+                else f"dialogue:session_{_compact_dialogue_id(conv_id)}"
+            ) if conv_id else ""
+            if (
+                stored_session_node_id
+                and canonical_session_node_id
+                and stored_session_node_id != canonical_session_node_id
+            ):
+                logger.debug(
+                    "[WebChatRouter] 会话列表纠正根节点展示: conversation=%s stored=%s canonical=%s",
+                    conv_id,
+                    stored_session_node_id,
+                    canonical_session_node_id,
+                )
+            inferred_session_node_id = canonical_session_node_id or stored_session_node_id
             if mg and not inferred_session_node_id and conv_id:
                 try:
                     if hasattr(mg, "get_session_node_id_for_conversation"):
@@ -1538,15 +1566,45 @@ def _collect_dialogue_sessions(limit: int = 200) -> Dict[str, Any]:
                     conv_id if _is_dialogue_session_node_id(conv_id)
                     else f"dialogue:session_{_compact_dialogue_id(conv_id)}"
                 )
+            message_count = 0
+            user_message_count = 0
+            first_user_text = ""
+            preview = ""
+            try:
+                recent_messages = store.get_messages(conv_id, limit=20) if conv_id else []
+            except Exception:
+                recent_messages = []
+            for msg in recent_messages or []:
+                text = str(msg.get("text") or "").strip()
+                if not text:
+                    continue
+                role = str(msg.get("role") or "").strip()
+                if role == "user":
+                    user_message_count += 1
+                    if not first_user_text:
+                        first_user_text = text
+                if role in {"user", "assistant"}:
+                    message_count += 1
+                    preview = text
+            if not preview:
+                try:
+                    meta = json.loads(conv.get("metadata_json") or "{}")
+                    preview = str(meta.get("preview") or "").strip()
+                    message_count = int(meta.get("message_count") or message_count or 0)
+                except Exception:
+                    pass
+            title = conv.get("title")
+            if _is_placeholder_dialogue_title(title):
+                title = first_user_text or preview or title
             # InteractionStore 是 Web 窗口身份账本。MemoryGraph 节点可能异步创建、
             # 延迟加载或被修复流程重建；列表阶段不能因为图节点暂缺删除窗口记录。
             store_sessions.append({
                 "id": conv_id,
-                "title": _safe_dialogue_title(conv.get("title"), "对话记录"),
+                "title": _safe_dialogue_title(title, preview or "对话记录"),
                 "created_at": conv.get("created_at") or 0,
                 "last_active_at": conv.get("last_active_at") or conv.get("created_at") or 0,
-                "preview": "",
-                "round_count": 0,
+                "preview": preview,
+                "round_count": user_message_count or message_count,
                 "source": conv.get("source") or "interaction_store",
                 "workspace_path": conv.get("workspace_path"),
                 "cwd": conv.get("workspace_path"),
@@ -1554,6 +1612,7 @@ def _collect_dialogue_sessions(limit: int = 200) -> Dict[str, Any]:
                 "task_graph_id": conv.get("task_graph_id"),
                 "dialogue_session_id": inferred_session_node_id,
                 "session_node_id": inferred_session_node_id,
+                "_stored_session_node_id": stored_session_node_id,
             })
     except Exception as store_err:
         logger.debug(f"[WebChatRouter] interaction store session list skipped: {store_err}")
@@ -1561,7 +1620,7 @@ def _collect_dialogue_sessions(limit: int = 200) -> Dict[str, Any]:
     # 会话窗口列表以 InteractionStore 的窗口账本为准。
     # MemoryGraph session 是记忆地址，不能反向升级成聊天窗口，否则 Web 窗口 ID
     # 和图谱 session ID 会分裂，产生空的 [记忆] 会话。
-    sessions = store_sessions
+    sessions = _dedupe_dialogue_session_records(store_sessions)
 
     active = None
     try:
@@ -1577,6 +1636,102 @@ def _collect_dialogue_sessions(limit: int = 200) -> Dict[str, Any]:
         ),
         "sessions": sessions,
     }
+
+
+def _dialogue_session_score(session: Dict[str, Any]) -> float:
+    """Prefer the canonical, user-visible owner when legacy rows conflict."""
+    score = 0.0
+    if session.get("task_graph_id"):
+        score += 1000.0
+    if session.get("_stored_session_node_id"):
+        score += 500.0
+    title = str(session.get("title") or "").strip()
+    if title and title not in {"新会话", "对话记录"}:
+        score += 300.0
+    if session.get("workspace_path") or session.get("cwd"):
+        score += 150.0
+    if session.get("source") and session.get("source") != "local":
+        score += 50.0
+    try:
+        score += min(float(session.get("last_active_at") or 0) / 1_000_000_000, 30.0)
+    except Exception:
+        pass
+    return score
+
+
+def _merge_dialogue_session_records(
+    current: Dict[str, Any],
+    incoming: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Merge duplicate window candidates without creating a new window id."""
+    if not current:
+        return dict(incoming)
+    if _dialogue_session_score(incoming) > _dialogue_session_score(current):
+        primary, secondary = dict(incoming), dict(current)
+    else:
+        primary, secondary = dict(current), dict(incoming)
+
+    for key in (
+        "preview",
+        "workspace_path",
+        "cwd",
+        "project_id",
+        "task_graph_id",
+        "dialogue_session_id",
+        "session_node_id",
+        "_stored_session_node_id",
+    ):
+        if not primary.get(key) and secondary.get(key):
+            primary[key] = secondary.get(key)
+
+    primary["created_at"] = min(
+        float(primary.get("created_at") or secondary.get("created_at") or 0),
+        float(secondary.get("created_at") or primary.get("created_at") or 0),
+    ) or primary.get("created_at") or secondary.get("created_at") or 0
+    primary["last_active_at"] = max(
+        float(primary.get("last_active_at") or 0),
+        float(secondary.get("last_active_at") or 0),
+    )
+    primary["round_count"] = max(
+        int(primary.get("round_count") or 0),
+        int(secondary.get("round_count") or 0),
+    )
+    if not primary.get("preview") and secondary.get("preview"):
+        primary["preview"] = secondary.get("preview")
+    return primary
+
+
+def _dedupe_dialogue_session_records(
+    sessions: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """TSD 23.11: one Web window per canonical session root / task graph owner."""
+    by_root: Dict[str, Dict[str, Any]] = {}
+    for raw in sessions or []:
+        session = dict(raw or {})
+        root = str(session.get("session_node_id") or session.get("dialogue_session_id") or "").strip()
+        key = root or f"id:{session.get('id') or ''}"
+        by_root[key] = _merge_dialogue_session_records(by_root.get(key) or {}, session)
+
+    by_graph: Dict[str, Dict[str, Any]] = {}
+    without_graph: List[Dict[str, Any]] = []
+    for session in by_root.values():
+        graph_id = str(session.get("task_graph_id") or "").strip()
+        if not graph_id:
+            without_graph.append(session)
+            continue
+        by_graph[graph_id] = _merge_dialogue_session_records(
+            by_graph.get(graph_id) or {},
+            session,
+        )
+
+    deduped = list(by_graph.values()) + without_graph
+    for session in deduped:
+        session.pop("_stored_session_node_id", None)
+    deduped.sort(
+        key=lambda item: float(item.get("last_active_at") or item.get("created_at") or 0),
+        reverse=True,
+    )
+    return deduped
 
 
 def _get_active_memory_graph(*, allow_fallback: bool = False):
@@ -2096,6 +2251,10 @@ def _on_l2_thinking_step(event) -> None:
                 "focus_node_id": data.get("focus_node_id"),
                 "budget_usage": data.get("budget_usage"),
                 "context_pressure": data.get("context_pressure"),
+                "trigger_context_pressure": data.get("trigger_context_pressure"),
+                "trigger_budget_usage": data.get("trigger_budget_usage"),
+                "visible_context_pressure": data.get("visible_context_pressure"),
+                "backing_context_pressure": data.get("backing_context_pressure"),
                 "pressure_tier": data.get("pressure_tier"),
                 "payload": {
                     "request_id": payload.get("request_id"),
@@ -2110,6 +2269,10 @@ def _on_l2_thinking_step(event) -> None:
                     "focus_node_id": data.get("focus_node_id"),
                     "budget_usage": data.get("budget_usage"),
                     "context_pressure": data.get("context_pressure"),
+                    "trigger_context_pressure": data.get("trigger_context_pressure"),
+                    "trigger_budget_usage": data.get("trigger_budget_usage"),
+                    "visible_context_pressure": data.get("visible_context_pressure"),
+                    "backing_context_pressure": data.get("backing_context_pressure"),
                     "pressure_tier": data.get("pressure_tier"),
                     "progress": data.get("progress"),
                 },
@@ -2690,15 +2853,62 @@ async def _handle_conversation_switch(data: dict) -> None:
     conversation_id = payload.get("conversation_id") or payload.get("session_id") or data.get("session_id")
     if not conversation_id:
         return
-    try:
-        get_conversation_orchestrator().store.set_active_conversation(conversation_id)
-    except Exception as e:
-        logger.debug(f"[WebChatRouter] conversation switch skipped: {e}")
-
     raw_graph_id = payload.get("task_graph_id") or payload.get("graph_id") or ""
     workspace_path = payload.get("workspace_path") or payload.get("cwd") or ""
     session_node_id = payload.get("session_node_id") or payload.get("dialogue_session_id") or ""
     clear_requested = bool(payload.get("clear_active_graph") or payload.get("is_new_session"))
+    has_messages = bool(payload.get("has_messages"))
+    try:
+        has_messages = has_messages or int(payload.get("message_count") or 0) > 0
+    except Exception:
+        pass
+    try:
+        store = get_conversation_orchestrator().store
+        existing = store.get_conversation(conversation_id)
+        has_structured_binding = bool(
+            raw_graph_id
+            or workspace_path
+            or payload.get("project_id")
+            or (existing and existing.get("session_node_id"))
+        )
+        if existing or has_messages or has_structured_binding:
+            # TSD §23.11: keep windows that already have a backend session root
+            # or visible chat content.  Do not promote an empty, newly-created
+            # local shell into a durable session row merely because the frontend
+            # can infer its prospective root id.
+            incoming_title = str(payload.get("title") or "").strip()
+            if (
+                existing
+                and _is_placeholder_dialogue_title(incoming_title)
+                and not _is_placeholder_dialogue_title(existing.get("title"))
+            ):
+                incoming_title = ""
+            if existing and _is_placeholder_dialogue_title(incoming_title):
+                incoming_title = ""
+            store.upsert_conversation(
+                conversation_id,
+                title=incoming_title or ("新会话" if (clear_requested and not existing) else ""),
+                source=payload.get("source") or "web_ui",
+                workspace_path=workspace_path or None,
+                project_id=payload.get("project_id"),
+                task_graph_id=raw_graph_id or None,
+                session_node_id=session_node_id or None,
+                metadata={
+                    "is_new_session": bool(payload.get("is_new_session")),
+                    "clear_active_graph": bool(payload.get("clear_active_graph")),
+                    "message_count": payload.get("message_count") or 0,
+                },
+                active=True,
+            )
+        else:
+            store.set_active_conversation(conversation_id)
+            logger.debug(
+                "[WebChatRouter] 空新会话切换不写入持久会话账本: session=%s",
+                conversation_id,
+            )
+    except Exception as e:
+        logger.debug(f"[WebChatRouter] conversation switch skipped: {e}")
+
     try:
         from zulong.tools.task_tools import (
             _interaction_store_claims_graph,
@@ -2766,16 +2976,14 @@ async def _handle_conversation_switch(data: dict) -> None:
 async def _handle_chat_visible_message(data: dict) -> None:
     payload = data.get("payload") if isinstance(data.get("payload"), dict) else data
     conversation_id = payload.get("conversation_id") or payload.get("session_id")
-    session_node_id = payload.get("session_node_id") or payload.get("dialogue_session_id") or ""
     text = (payload.get("text") or "").strip()
     role = payload.get("role") or "assistant"
     if not conversation_id or not text or role not in ("user", "assistant", "tool"):
         return
-    if not session_node_id:
-        session_node_id = (
-            conversation_id if _is_dialogue_session_node_id(conversation_id)
-            else f"dialogue:session_{_compact_dialogue_id(conversation_id)}"
-        )
+    session_node_id = (
+        conversation_id if _is_dialogue_session_node_id(conversation_id)
+        else f"dialogue:session_{_compact_dialogue_id(conversation_id)}"
+    )
     payload["session_node_id"] = session_node_id
     payload["dialogue_session_id"] = session_node_id
     try:
@@ -2871,6 +3079,42 @@ async def _handle_ide_action(ws: WebSocket, action: str, data: dict) -> None:
     payload = data.get("payload") if isinstance(data.get("payload"), dict) else dict(data)
     payload.setdefault("conversation_id", data.get("conversation_id") or data.get("session_id"))
     payload.setdefault("turn_id", data.get("turn_id") or data.get("request_id"))
+
+    if action in (
+        MessageType.IDE_APPROVAL_RESULT,
+        "ide_approval_result",
+        "ide:approval_result",
+    ):
+        try:
+            from zulong.tools.workspace_access import (
+                handle_folder_access_approval_result,
+                should_treat_as_folder_access_approval,
+            )
+
+            if should_treat_as_folder_access_approval(payload):
+                handled = handle_folder_access_approval_result(payload)
+                if handled:
+                    await _send_to_ws(ws, make_unified_message(
+                        MessageType.IDE_ACTION_RESULT,
+                        {
+                            "action": action,
+                            "payload": {
+                                "ok": True,
+                                "action": action,
+                                "approval_id": payload.get("approval_id") or payload.get("approvalId"),
+                                "approval_type": "folder_access",
+                                "handled_by": "folder_access",
+                            },
+                            "conversation_id": payload.get("conversation_id"),
+                            "turn_id": payload.get("turn_id"),
+                        },
+                        session_id=payload.get("conversation_id") or payload.get("session_id") or "",
+                        msg_id=payload.get("turn_id") or None,
+                    ))
+                    return
+        except Exception as exc:
+            logger.warning("[WebChatRouter] 文件夹访问审批结果处理失败: %s", exc)
+
     requested_workspace = payload.get("workspace_path") or payload.get("cwd")
     is_explicit_workspace_switch = action in (
         MessageType.IDE_OPEN_WORKSPACE,

@@ -1,13 +1,14 @@
 attention_selection:
   cooldown_base_seconds: 30.0
-  decision_timeout_ms: 500
+  decision_timeout_ms: null
   enabled: true
   fallback_mode: FOCUS
   max_switch_history: 50
   min_confidence_threshold: 0.3
   oscillation_detection_window: 10
-  pressure_threshold_high: '0.1'
-  pressure_threshold_medium: '0.1'
+  threshold_budget_ratio: '0.15'
+  pressure_threshold_high: '1.0'
+  pressure_threshold_medium: '0.9'
 audio:
   asr:
     backend: sensevoice
@@ -130,9 +131,10 @@ l2_inference:
   backup_model: deepseek-v4-pro
   circuit_breaker:
     bfs_min_interval: 3
-    context_red_ratio: '0.1'
+    threshold_budget_ratio: '0.15'
+    context_red_ratio: '1.0'
     context_window_size: 131072
-    context_yellow_ratio: '0.1'
+    context_yellow_ratio: '0.9'
     enabled: true
     max_yellow_before_red: 4
     no_progress_red: 8
@@ -229,7 +231,7 @@ llm:
     base_url: http://localhost:11434/v1
     model_id: qwen3.5:4b
   deepseek:
-    api_key: sk-f5fbf20095de478fb711cfd0d573739e
+    api_key: ${DEEPSEEK_API_KEY}
     backend: deepseek
     base_url: https://api.deepseek.com
     model_id: deepseek-v4-pro
@@ -296,7 +298,7 @@ llm:
     schedule_policy: lpm
     tp_size: 1
   siliconflow:
-    api_key: sk-fmylzckwftjrirdovmqygassifruqckzjsqzpbmyjrbqivcy
+    api_key: ${SILICONFLOW_API_KEY}
     backend: siliconflow
     base_url: https://api.siliconflow.cn/v1
     model_id: deepseek-ai/DeepSeek-V4-Flash

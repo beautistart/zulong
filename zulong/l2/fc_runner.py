@@ -25,6 +25,11 @@ if TYPE_CHECKING:
     from zulong.l2.inference_engine import InferenceEngine
 
 from zulong.l2.circuit_breaker import CircuitBreakerState
+from zulong.l2.attention_pressure_view import build_threshold_pressure_view
+from zulong.l2.tool_capabilities import (
+    filter_tools_by_capabilities,
+    tool_capabilities,
+)
 from zulong.l2.tool_budget import (
     engine_tool_budget_exhausted,
     get_engine_tool_budget,
@@ -156,6 +161,7 @@ class FCRunner:
         # 组装初始状态
         state: Dict = {
             "messages": messages,
+            "_all_tool_definitions": list(tool_definitions or []),
             "fc_turn": 0,
             "response": None,
             "tool_results_buffer": [],
@@ -177,6 +183,15 @@ class FCRunner:
             "null_response_count": 0,
             "api_timeout_count": 0,
             "response_max_tokens": response_max_tokens,
+            "pressure_force_attention": False,
+            "pressure_stage": "",
+            "pressure_attention_context": {},
+            "pressure_recovery_note_saved": False,
+            "pressure_recovery_attention_switched": False,
+            "pressure_recovery_requires_note": True,
+            "pressure_recovery_requires_attention": True,
+            "pressure_recovery_start_result_count": 0,
+            "_last_pressure_tier": "green",
             # 进度停滞检测跟踪
             "_progress_snapshots": [],
             "_stalled_reports": 0,
@@ -478,11 +493,16 @@ class FCRunner:
                     f"连续{len(last_tool_calls)}轮调用 {tool_names[0]} 且参数相同"
                 )
                 state["cb_force_no_tools"] = True
+                state["cb_recovery_stage"] = "restricted_recovery"
+                state.setdefault("cb_recovery_note_saved", False)
+                state.setdefault("cb_recovery_attention_switched", False)
+                state["cb_recovery_start_result_count"] = len(state.get("tool_results_buffer") or [])
                 cm = {
                     "role": "user",
                     "content": (
                         f"[系统警告] 检测到重复工具调用循环（{tool_names[0]}），"
-                        f"请立即基于已有信息生成最终回复，不允许再调用工具。"
+                        f"请先把当前证据、未完成项、失败原因写入便签并切换注意力；"
+                        f"如果仍无法继续，只能输出 partial/blocked summary，不得伪完成。"
                     ),
                 }
                 state["messages"].append(cm)
@@ -536,6 +556,17 @@ class FCRunner:
 
         return False
 
+    _CB_RESTRICTED_RECOVERY_CAPABILITIES = {
+        "attention_switch",
+        "note_anchor",
+        "memory_persist",
+        "tag_anchor",
+    }
+    _CB_RESTRICTED_EXCLUDED_CAPABILITIES = {
+        "file_write",
+        "verification",
+    }
+
     def evaluate_circuit_breaker(
         self,
         state: Dict,
@@ -557,11 +588,17 @@ class FCRunner:
         )
         if cb_state == CircuitBreakerState.RED:
             state["cb_force_no_tools"] = True
+            state["cb_recovery_stage"] = "restricted_recovery"
+            state["cb_recovery_note_saved"] = False
+            state["cb_recovery_attention_switched"] = False
+            state["cb_recovery_start_result_count"] = len(state.get("tool_results_buffer") or [])
             convergence = {
                 "role": "user",
                 "content": (
-                    f"[Circuit Breaker 强制收敛] {cb_reason}\n"
-                    "你必须立刻基于已有信息生成最终回复，不允许再调用任何工具。"
+                    f"[Circuit Breaker RED 受限恢复] {cb_reason}\n"
+                    "请先把当前证据、未完成项、失败原因、下一步建议写入便签/标签/记忆并关联当前任务节点，"
+                    "再进行一次 GLOBAL / FOCUS / SINGLE_CHAIN 注意力重选；"
+                    "本轮只允许使用便签/标签/记忆落盘和注意力切换能力。"
                 ),
             }
             state.setdefault("messages", []).append(convergence)
@@ -616,7 +653,34 @@ class FCRunner:
 
         通用安全网: CB RED 时保留收敛工具
         """
-        pass
+        self._apply_pressure_guidance(state)
+        if self._is_pressure_restricted_recovery(state):
+            self._enforce_pressure_restricted_recovery(state)
+        if self._is_cb_restricted_recovery(state):
+            recovery_tools = self._get_cb_recovery_tools(state.get("tool_definitions") or [])
+            if recovery_tools:
+                state["tool_definitions"] = recovery_tools
+                state["cb_force_no_tools"] = False
+                state["_pressure_limited_tools"] = True
+                forced = self._next_restricted_recovery_tool(state, recovery_tools)
+                state["forced_next_tool_name"] = forced
+                state.setdefault("messages", []).append({
+                    "role": "user",
+                    "content": (
+                        "[Circuit Breaker RED 受限恢复工具集]\n"
+                        "普通执行/搜索/写文件/命令/验证工具已临时收走；当前仅保留具备"
+                        "“便签/标签/记忆落盘”或“注意力切换”能力的工具。请先保存现场"
+                        "并锚定当前节点，再完成一次"
+                        " GLOBAL / FOCUS / SINGLE_CHAIN 注意力重选。"
+                    ),
+                })
+                logger.warning(
+                    "[FCRunner][CB] RED 使用受限恢复工具集: %s",
+                    [
+                        td.get("function", {}).get("name", "")
+                        for td in recovery_tools
+                    ],
+                )
 
     def _on_after_model_call(
         self,
@@ -635,7 +699,9 @@ class FCRunner:
 
     def _on_after_exec_tools(self, state: Dict) -> None:
         """钩子: 执行工具后"""
-        pass
+        self._update_cb_restricted_recovery_progress(state)
+        self._update_pressure_restricted_recovery_progress(state)
+        self._restore_full_tool_definitions_if_limited(state)
 
     def _on_before_eval(self, state: Dict, response_content: str) -> None:
         """钩子: 评估前"""
@@ -650,6 +716,408 @@ class FCRunner:
     ) -> None:
         """钩子: 循环完成"""
         pass
+
+    def _apply_pressure_guidance(self, state: Dict) -> None:
+        """Web/Core FC pressure policy aligned with the IDE runner.
+
+        Pressure does not compress context. It injects LLM-owned guidance to
+        choose GLOBAL / FOCUS / SINGLE_CHAIN.  The first threshold hit always
+        injects guidance only; if pressure is still RED on a later pass, the
+        runner enters restricted recovery and temporarily narrows available
+        tools to note/tag/memory landing plus attention-switch capabilities.
+        """
+        attn_window = getattr(self.engine, "_attn_window", None)
+        if not attn_window or state.get("cb_force_no_tools"):
+            return
+        if self._is_cb_restricted_recovery(state):
+            return
+        if self._is_pressure_restricted_recovery(state):
+            self._enforce_pressure_restricted_recovery(state)
+            return
+        if not state.get("_all_tool_definitions"):
+            state["_all_tool_definitions"] = list(state.get("tool_definitions") or [])
+
+        try:
+            ratio = float(
+                getattr(
+                    attn_window,
+                    "trigger_context_pressure_ratio",
+                    getattr(
+                        attn_window,
+                        "context_pressure_ratio",
+                        getattr(attn_window, "usage_ratio", 0.0),
+                    ),
+                )
+                or 0.0
+            )
+        except Exception:
+            ratio = 0.0
+        yellow_ratio = 0.90
+        red_ratio = 1.0
+        threshold_budget_ratio = 0.5
+        try:
+            attn_cfg = getattr(attn_window, "_llm_config", None)
+            if attn_cfg:
+                yellow_ratio = float(getattr(attn_cfg, "pressure_threshold_medium", yellow_ratio))
+                red_ratio = float(getattr(attn_cfg, "pressure_threshold_high", red_ratio))
+                threshold_budget_ratio = float(getattr(attn_cfg, "threshold_budget_ratio", threshold_budget_ratio))
+            else:
+                cb = getattr(self.engine, "_circuit_breaker", None)
+                cb_cfg = getattr(cb, "_config", {}) or {}
+                yellow_ratio = float(cb_cfg.get("context_yellow_ratio", yellow_ratio))
+                red_ratio = float(cb_cfg.get("context_red_ratio", red_ratio))
+                threshold_budget_ratio = float(cb_cfg.get("threshold_budget_ratio", threshold_budget_ratio))
+        except Exception:
+            pass
+
+        if ratio > red_ratio:
+            tier = "red"
+        elif ratio > yellow_ratio:
+            tier = "yellow"
+        else:
+            tier = "green"
+        pressure_view = build_threshold_pressure_view(
+            ratio,
+            yellow_ratio,
+            red_ratio,
+            tier=tier,
+        )
+
+        state["_last_pressure_tier"] = tier
+        if tier == "green":
+            if state.get("pressure_stage") not in {"restricted_recovery"}:
+                state["pressure_stage"] = ""
+                state["pressure_force_attention"] = False
+            return
+
+        fc = int(state.get("fc_turn", 0) or 0)
+        # TSD v2.9.22 两段式：即使 yellow/red 阈值配置相同，第一次
+        # 达阈值也只能提醒 LLM 自主选择注意力，不得立刻收走普通工具。
+        if state.get("pressure_stage") not in {"yellow_guidance", "restricted_recovery"}:
+            hint = {
+                "role": "system",
+                "content": (
+                    "[上下文压力 - 注意力引导] "
+                    f"当前上下文压力已达 {pressure_view.threshold_relative_percent:.0f}%。"
+                    "请由 LLM 自主判断是否需要切换 GLOBAL / FOCUS / SINGLE_CHAIN；"
+                    "动态注意力不是压缩上下文，而是重新选择当前必要上下文，暂排/降权无关上下文；"
+                    "若需要收窄关注范围，可调用注意力切换能力，例如聚焦当前子任务"
+                    "或深入关键节点。普通读写/命令工具结果只作为证据，不直接决定模式。"
+                ),
+            }
+            state.setdefault("messages", []).append(hint)
+            try:
+                attn_window.register_message(hint, turn=fc)
+            except Exception:
+                pass
+            logger.info(
+                "[FCRunner][Pressure] YELLOW %.0f%% of threshold budget: 第一次阈值响应，仅注入动态注意力引导",
+                pressure_view.threshold_relative_percent,
+            )
+            state["pressure_stage"] = "yellow_guidance"
+            state["pressure_attention_context"] = {
+                "tier": tier,
+                "ratio": round(ratio, 4),
+                "yellow_ratio": round(float(yellow_ratio), 4),
+                "red_ratio": round(float(red_ratio), 4),
+                "context_pressure_ratio": round(pressure_view.context_pressure_ratio, 4),
+                "context_pressure_percent": round(pressure_view.context_pressure_percent, 1),
+                "threshold_budget_ratio": round(float(threshold_budget_ratio), 4),
+                "threshold_budget_percent": round(pressure_view.threshold_relative_percent, 1),
+                "active_threshold_ratio": round(pressure_view.active_threshold_ratio, 4),
+                "budget_reference": "threshold_budget_is_100_percent",
+                "fc_turn": fc,
+                "decision_owner": "llm",
+                "allowed_modes": ["GLOBAL", "FOCUS", "SINGLE_CHAIN"],
+                "first_threshold_response": "guidance_only",
+            }
+            return
+
+        if tier != "red":
+            return
+
+        self._enter_pressure_restricted_recovery(
+            state,
+            ratio=ratio,
+            yellow_ratio=yellow_ratio,
+            red_ratio=red_ratio,
+            threshold_budget_ratio=threshold_budget_ratio,
+            pressure_view=pressure_view,
+            fc=fc,
+            attn_window=attn_window,
+        )
+
+    def _enter_pressure_restricted_recovery(
+        self,
+        state: Dict,
+        *,
+        ratio: float,
+        yellow_ratio: float,
+        red_ratio: float,
+        threshold_budget_ratio: float,
+        pressure_view,
+        fc: int,
+        attn_window,
+    ) -> None:
+        """Enter the second pressure response stage.
+
+        This is deliberately capability based.  It never binds policy to one
+        concrete tool name; the selected tool names are only the runtime
+        providers of the required capabilities.
+        """
+        recovery_tools = self._get_cb_recovery_tools(
+            state.get("_all_tool_definitions") or state.get("tool_definitions") or []
+        )
+        requires_note = bool(
+            self._first_recovery_landing_tool(recovery_tools)
+        )
+        requires_attention = bool(
+            self._first_tool_with_capability(recovery_tools, "attention_switch")
+        )
+        state["pressure_stage"] = "restricted_recovery" if recovery_tools else "guidance_only"
+        state["pressure_force_attention"] = bool(recovery_tools)
+        state["pressure_recovery_note_saved"] = False
+        state["pressure_recovery_attention_switched"] = False
+        state["pressure_recovery_requires_note"] = requires_note
+        state["pressure_recovery_requires_attention"] = requires_attention
+        state["pressure_recovery_start_result_count"] = len(state.get("tool_results_buffer") or [])
+        state["pressure_attention_context"] = {
+            "tier": "red",
+            "ratio": round(ratio, 4),
+            "yellow_ratio": round(float(yellow_ratio), 4),
+            "red_ratio": round(float(red_ratio), 4),
+            "context_pressure_ratio": round(pressure_view.context_pressure_ratio, 4),
+            "context_pressure_percent": round(pressure_view.context_pressure_percent, 1),
+            "threshold_budget_ratio": round(float(threshold_budget_ratio), 4),
+            "threshold_budget_percent": round(pressure_view.threshold_relative_percent, 1),
+            "active_threshold_ratio": round(pressure_view.active_threshold_ratio, 4),
+            "budget_reference": "threshold_budget_is_100_percent",
+            "fc_turn": fc,
+            "decision_owner": "llm",
+            "allowed_modes": ["GLOBAL", "FOCUS", "SINGLE_CHAIN"],
+            "second_threshold_response": "restricted_recovery" if recovery_tools else "guidance_only",
+            "requires_note": requires_note,
+            "requires_attention": requires_attention,
+        }
+        hint = {
+            "role": "system",
+            "content": (
+                f"[动态注意力重选] 当前上下文压力达到 {pressure_view.threshold_relative_percent:.0f}%。\n"
+                "你必须基于当前任务、未覆盖节点、证据状态和必要上下文，"
+                "自主选择一次注意力动作：\n"
+                "- GLOBAL：需要重新注入全局任务/证据上下文时选择；\n"
+                "- FOCUS：需要聚焦当前局部节点或局部失败时选择；\n"
+                "- SINGLE_CHAIN：需要沿当前执行链连续推进时选择。\n"
+                "请说明本次要注入哪些必要上下文、暂排哪些无关上下文、"
+                "以及何时回到全局。"
+            ),
+        }
+        state.setdefault("messages", []).append(hint)
+        try:
+            attn_window.register_message(hint, turn=fc)
+        except Exception:
+            pass
+
+        if recovery_tools:
+            self._enforce_pressure_restricted_recovery(state)
+            logger.info(
+                "[FCRunner][Pressure] RED %.0f%% of threshold budget: 第二次阈值响应，进入受限恢复，仅保留便签/标签/记忆落盘+注意力切换能力工具 %s",
+                pressure_view.threshold_relative_percent,
+                [
+                    td.get("function", {}).get("name", "")
+                    for td in recovery_tools
+                ],
+            )
+        else:
+            logger.info(
+                "[FCRunner][Pressure] RED %.0f%%: 未找到受限恢复能力工具，仅注入动态注意力重选提醒",
+                ratio * 100,
+            )
+
+    def _enforce_pressure_restricted_recovery(self, state: Dict) -> None:
+        recovery_tools = self._get_cb_recovery_tools(
+            state.get("_all_tool_definitions") or state.get("tool_definitions") or []
+        )
+        if not recovery_tools:
+            state["pressure_force_attention"] = False
+            state["pressure_stage"] = "guidance_only"
+            return
+        state["tool_definitions"] = recovery_tools
+        state["_pressure_limited_tools"] = True
+        state["pressure_force_attention"] = True
+        forced_recovery = self._next_pressure_recovery_tool(state, recovery_tools)
+        if forced_recovery:
+            state["forced_next_tool_name"] = forced_recovery
+
+    @staticmethod
+    def _get_attention_only_tools(tool_definitions: List[Dict]) -> List[Dict]:
+        return filter_tools_by_capabilities(tool_definitions, {"attention_switch"})
+
+    @classmethod
+    def _get_cb_recovery_tools(cls, tool_definitions: List[Dict]) -> List[Dict]:
+        retained: List[Dict] = []
+        for td in tool_definitions or []:
+            caps = tool_capabilities(td)
+            if caps & cls._CB_RESTRICTED_RECOVERY_CAPABILITIES:
+                if not (caps & cls._CB_RESTRICTED_EXCLUDED_CAPABILITIES):
+                    retained.append(td)
+        return retained
+
+    @staticmethod
+    def _first_tool_with_capability(
+        tool_definitions: List[Dict],
+        capability: str,
+    ) -> str:
+        for td in tool_definitions or []:
+            if capability in tool_capabilities(td):
+                name = str(td.get("function", {}).get("name", "") or "").strip()
+                if name:
+                    return name
+        return ""
+
+    @staticmethod
+    def _first_tool_with_any_capability(
+        tool_definitions: List[Dict],
+        capabilities: set,
+    ) -> str:
+        wanted = {str(cap or "").strip() for cap in capabilities if str(cap or "").strip()}
+        for td in tool_definitions or []:
+            if tool_capabilities(td) & wanted:
+                name = str(td.get("function", {}).get("name", "") or "").strip()
+                if name:
+                    return name
+        return ""
+
+    @classmethod
+    def _first_recovery_landing_tool(cls, tool_definitions: List[Dict]) -> str:
+        for capability in ("note_anchor", "memory_persist", "tag_anchor"):
+            name = cls._first_tool_with_capability(tool_definitions, capability)
+            if name:
+                return name
+        return ""
+
+    @classmethod
+    def _next_restricted_recovery_tool(
+        cls,
+        state: Dict,
+        tool_definitions: List[Dict],
+    ) -> str:
+        if not state.get("cb_recovery_note_saved"):
+            return cls._first_recovery_landing_tool(tool_definitions)
+        if not state.get("cb_recovery_attention_switched"):
+            return cls._first_tool_with_capability(tool_definitions, "attention_switch")
+        return ""
+
+    @classmethod
+    def _next_pressure_recovery_tool(
+        cls,
+        state: Dict,
+        tool_definitions: List[Dict],
+    ) -> str:
+        if (
+            state.get("pressure_recovery_requires_note", True)
+            and not state.get("pressure_recovery_note_saved")
+        ):
+            return cls._first_recovery_landing_tool(tool_definitions)
+        if (
+            state.get("pressure_recovery_requires_attention", True)
+            and not state.get("pressure_recovery_attention_switched")
+        ):
+            return cls._first_tool_with_capability(tool_definitions, "attention_switch")
+        return ""
+
+    @staticmethod
+    def _is_cb_restricted_recovery(state: Dict) -> bool:
+        return state.get("cb_recovery_stage") in {
+            "restricted_recovery",
+            "note_attention",  # 兼容旧会话状态
+        }
+
+    @staticmethod
+    def _is_pressure_restricted_recovery(state: Dict) -> bool:
+        return state.get("pressure_stage") == "restricted_recovery"
+
+    def _update_cb_restricted_recovery_progress(self, state: Dict) -> None:
+        if not self._is_cb_restricted_recovery(state):
+            return
+        start_index = int(state.get("cb_recovery_start_result_count", 0) or 0)
+        tool_names = [
+            str(item.get("tool_name") or "").strip()
+            for item in (state.get("tool_results_buffer", []) or [])[start_index:]
+            if str(item.get("tool_name") or "").strip()
+        ]
+        if not tool_names:
+            return
+        caps_by_name = {
+            str(td.get("function", {}).get("name", "") or "").strip(): tool_capabilities(td)
+            for td in state.get("_all_tool_definitions") or state.get("tool_definitions") or []
+        }
+        if any(
+            caps_by_name.get(name, set()) & {"note_anchor", "memory_persist", "tag_anchor"}
+            for name in tool_names
+        ):
+            state["cb_recovery_note_saved"] = True
+        if any(
+            "attention_switch" in caps_by_name.get(name, set())
+            for name in tool_names
+        ):
+            state["cb_recovery_attention_switched"] = True
+        if state.get("cb_recovery_note_saved") and state.get("cb_recovery_attention_switched"):
+            state["cb_recovery_stage"] = ""
+            state["cb_force_no_tools"] = False
+
+    def _update_pressure_restricted_recovery_progress(self, state: Dict) -> None:
+        if not self._is_pressure_restricted_recovery(state):
+            return
+        start_index = int(state.get("pressure_recovery_start_result_count", 0) or 0)
+        tool_names = [
+            str(item.get("tool_name") or "").strip()
+            for item in (state.get("tool_results_buffer", []) or [])[start_index:]
+            if str(item.get("tool_name") or "").strip()
+        ]
+        if not tool_names:
+            return
+        caps_by_name = {
+            str(td.get("function", {}).get("name", "") or "").strip(): tool_capabilities(td)
+            for td in state.get("_all_tool_definitions") or state.get("tool_definitions") or []
+        }
+        if any(
+            caps_by_name.get(name, set()) & {"note_anchor", "memory_persist", "tag_anchor"}
+            for name in tool_names
+        ):
+            state["pressure_recovery_note_saved"] = True
+        if any(
+            "attention_switch" in caps_by_name.get(name, set())
+            for name in tool_names
+        ):
+            state["pressure_recovery_attention_switched"] = True
+
+        requires_note = bool(state.get("pressure_recovery_requires_note", True))
+        requires_attention = bool(state.get("pressure_recovery_requires_attention", True))
+        note_done = state.get("pressure_recovery_note_saved") or not requires_note
+        attention_done = state.get("pressure_recovery_attention_switched") or not requires_attention
+        if note_done and attention_done:
+            state["pressure_stage"] = ""
+            state["pressure_force_attention"] = False
+            ctx = dict(state.get("pressure_attention_context") or {})
+            ctx.update({
+                "completed": True,
+                "resolved_at_result_count": len(state.get("tool_results_buffer") or []),
+            })
+            state["pressure_attention_context"] = ctx
+
+    @staticmethod
+    def _restore_full_tool_definitions_if_limited(state: Dict) -> None:
+        if state.get("cb_recovery_stage") in {"restricted_recovery", "note_attention"}:
+            return
+        if state.get("pressure_stage") == "restricted_recovery":
+            return
+        if not state.get("_pressure_limited_tools"):
+            return
+        full_tools = state.get("_all_tool_definitions") or []
+        if full_tools:
+            state["tool_definitions"] = full_tools
+        state["_pressure_limited_tools"] = False
 
     @staticmethod
     def _inject_continue_uncompleted_task(state: Dict) -> None:

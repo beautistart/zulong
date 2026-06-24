@@ -8,7 +8,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 from .base import BaseTool, ToolCategory, ToolRequest, ToolResult
 
@@ -85,45 +85,116 @@ def _nearest_existing_parent(path: Path) -> Path | None:
 
 
 def _normalize_workspace_for_target(file_path: str, workspace_path: str) -> str:
-    """Keep explicit paths inside the nearest existing parent workspace.
+    """Preserve the explicit task workspace selected by L2/TaskGraph.
 
-    Models sometimes pass the not-yet-created target directory as
-    workspace_path. For file creation, the bridge should use the nearest
-    existing parent, while still rejecting unrelated implicit fallbacks.
+    Previous logic replaced a not-yet-created workspace with its nearest
+    existing parent. That made writes appear under a parent directory and broke
+    TSD v2.9.6/v2.9.8's "current TaskGraph workspace is the sole task
+    directory" invariant. Creation paths may create the explicit workspace; the
+    framework must not silently reinterpret it as a parent.
     """
-    try:
-        target = Path(file_path)
-        workspace = Path(workspace_path) if workspace_path else None
-        if not target.is_absolute() or not workspace or workspace.exists():
-            return workspace_path
-        parent = _nearest_existing_parent(workspace)
-        if not parent:
-            return workspace_path
-        try:
-            target.resolve().relative_to(parent.resolve())
-            return str(parent)
-        except Exception:
-            return workspace_path
-    except Exception:
-        return workspace_path
+    return workspace_path
 
 
-def _active_or_explicit_workspace(workspace_path: str) -> str:
-    candidates = []
+def _active_workspace() -> str:
     try:
         from zulong.tools.task_tools import get_active_workspace_dir
 
-        candidates.append(get_active_workspace_dir())
+        active = get_active_workspace_dir()
     except Exception:
-        pass
-    candidates.append(workspace_path)
-    for candidate in candidates:
-        if candidate:
-            try:
-                return str(Path(str(candidate)).resolve())
-            except Exception:
-                return str(candidate)
+        active = ""
+    if active:
+        try:
+            return str(Path(str(active)).resolve())
+        except Exception:
+            return str(active)
     return ""
+
+
+def _normalize_optional_path(value: str) -> str:
+    if not value:
+        return ""
+    try:
+        return str(Path(str(value)).resolve())
+    except Exception:
+        return str(value)
+
+
+def _workspace_binding_state(workspace_path: str) -> Dict[str, str | bool]:
+    """Resolve active/explicit workspace without silently choosing on conflict."""
+    explicit = _normalize_optional_path(workspace_path)
+    active = _active_workspace()
+    conflict = False
+    if active and explicit:
+        try:
+            conflict = Path(active).resolve() != Path(explicit).resolve()
+        except Exception:
+            conflict = active != explicit
+    return {
+        "active": active,
+        "explicit": explicit,
+        "workspace": explicit or active,
+        "conflict": conflict,
+    }
+
+
+def _active_or_explicit_workspace(workspace_path: str) -> str:
+    state = _workspace_binding_state(workspace_path)
+    return str(state.get("workspace") or "")
+
+
+def _target_workspace_policy_violation(
+    file_path: str,
+    workspace_path: str,
+    *,
+    create_directory: bool,
+) -> Dict[str, Any] | None:
+    state = _workspace_binding_state(workspace_path)
+    if state.get("conflict"):
+        return {
+            "ok": False,
+            "status": "workspace_conflict",
+            "error": (
+                "工具请求的 workspace_path 与当前 TaskGraph 工作区不一致，"
+                "已拒绝执行以避免写入错误目录。请先由 L2 修正 TaskGraph 绑定或调整工具参数。"
+            ),
+            "active_workspace": state.get("active") or "",
+            "requested_workspace": state.get("explicit") or "",
+            "workspace_path": state.get("workspace") or "",
+            "file_path": file_path,
+            "applied": False,
+            "verified": False,
+        }
+    workspace = str(state.get("workspace") or "")
+    if not workspace:
+        return None
+    try:
+        workspace_resolved = Path(workspace).resolve()
+        target = Path(file_path)
+        if not target.is_absolute():
+            return None
+        target_resolved = target.resolve()
+        try:
+            target_resolved.relative_to(workspace_resolved)
+            return None
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "status": "path_outside_workspace",
+            "error": (
+                "目标路径不在当前任务工作区内，已拒绝静默改写或压扁路径。"
+                "请由 L2 重新确认任务工作区，或把 file_path 改为工作区内相对路径。"
+            ),
+            "workspace_path": str(workspace_resolved),
+            "resolved_path": str(target_resolved),
+            "file_path": str(target_resolved),
+            "applied": False,
+            "verified": False,
+        }
+    except Exception:
+        return None
+    return None
 
 
 def _coerce_target_into_workspace(
@@ -131,7 +202,14 @@ def _coerce_target_into_workspace(
     workspace_path: str,
     *,
     create_directory: bool,
-) -> tuple[str, str, bool, str]:
+) -> Tuple[str, str, bool, str]:
+    """Normalize only safe in-workspace targets; never basename-redirect.
+
+    Older behavior silently rewrote an absolute path outside the active task
+    workspace to its basename inside the workspace. That violated the TSD
+    workspace binding contract and flattened nested project files.  The
+    separate policy validator now returns a structured error for such cases.
+    """
     workspace = _active_or_explicit_workspace(workspace_path)
     if not workspace:
         return file_path, workspace_path, False, ""
@@ -141,22 +219,10 @@ def _coerce_target_into_workspace(
         if not target.is_absolute():
             return file_path, str(workspace_resolved), False, ""
         target_resolved = target.resolve()
-        try:
-            target_resolved.relative_to(workspace_resolved)
-            return str(target_resolved), str(workspace_resolved), False, ""
-        except Exception:
-            pass
-        if create_directory and target_resolved.name.lower() == workspace_resolved.name.lower():
-            return str(workspace_resolved), str(workspace_resolved), True, (
-                "absolute directory target was redirected to the active task workspace"
-            )
-        if target_resolved.name:
-            return target_resolved.name, str(workspace_resolved), True, (
-                "absolute target outside the active task workspace was redirected inside the workspace"
-            )
+        target_resolved.relative_to(workspace_resolved)
+        return str(target_resolved), str(workspace_resolved), False, ""
     except Exception:
-        pass
-    return file_path, workspace_path, False, ""
+        return file_path, str(workspace) if workspace else workspace_path, False, ""
 
 
 def _ide_bridge_available(workspace_path: str) -> bool:
@@ -410,6 +476,26 @@ class IdeWriteFileTool(BaseTool):
             workspace_path = _infer_workspace_from_path(file_path, create_directory=create_directory)
         else:
             workspace_path = _normalize_workspace_for_target(file_path, workspace_path)
+        policy_violation = _target_workspace_policy_violation(
+            file_path,
+            workspace_path,
+            create_directory=create_directory,
+        )
+        if policy_violation:
+            logger.warning(
+                "[ide_write_file][P10] workspace policy rejected path=%s workspace=%s status=%s error=%s",
+                file_path,
+                workspace_path or "<empty>",
+                policy_violation.get("status"),
+                _safe_log_summary(policy_violation.get("error") or ""),
+            )
+            return self._create_result(
+                success=False,
+                data=policy_violation,
+                error=str(policy_violation.get("error") or "workspace path policy violation"),
+                execution_time=time.time() - start,
+                request_id=request.request_id,
+            )
         file_path, workspace_path, redirected_path, redirect_reason = _coerce_target_into_workspace(
             file_path,
             workspace_path,

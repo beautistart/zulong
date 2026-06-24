@@ -12,6 +12,7 @@ from .attention_types import (
     ThresholdCheckResult,
 )
 from .attention_config import AttentionConfig
+from .attention_pressure_view import build_context_pressure_view
 
 if TYPE_CHECKING:
     from .attention_window import AttentionWindowManager
@@ -47,19 +48,32 @@ class PressureDetector:
         start_time = time.time()
         
         try:
-            total_tokens = sum(env.tokens for env in self._awm.envelopes)
-            current_budget = self._awm.budget
-            
-            if current_budget <= 0:
-                pressure_value = 999.0
+            backing_tokens = sum(env.tokens for env in self._awm.envelopes)
+            llm_context_budget = getattr(self._awm, "context_window_size", None)
+            current_budget = llm_context_budget or self._awm.budget
+            has_visible_window = bool(getattr(self._awm, "_last_window_message_count", 0))
+            if has_visible_window:
+                total_tokens = int(getattr(self._awm, "active_context_tokens", 0) or 0)
             else:
-                pressure_value = total_tokens / current_budget
-            
+                # Bootstrap: no Web-visible/LLM-visible window has been recorded
+                # yet, so use the backing pool once to allow the first attention
+                # choice.  After that, trigger pressure must match the page.
+                total_tokens = backing_tokens
+
+            pressure_view = build_context_pressure_view(
+                total_tokens,
+                current_budget,
+                self._config.threshold_budget_ratio,
+                self._config.pressure_threshold_medium,
+                self._config.pressure_threshold_high,
+            )
+            pressure_value = pressure_view.context_pressure_ratio
+
             velocity = self._calculate_velocity()
             predicted = self._predict_pressure(pressure_value, velocity)
             trend = self._determine_trend(pressure_value)
-            
-            budget_usage = total_tokens / current_budget if current_budget > 0 else 1.0
+
+            budget_usage = pressure_value
             message_count = len(self._awm.envelopes)
             token_density = total_tokens / max(message_count, 1)
             
@@ -71,6 +85,8 @@ class PressureDetector:
                 budget_usage=budget_usage,
                 message_count=message_count,
                 token_density=token_density,
+                threshold_relative_pressure=pressure_view.threshold_relative_ratio,
+                threshold_reference=pressure_view.active_threshold_ratio,
             )
             
             self._pressure_history.append(metrics)
@@ -170,7 +186,7 @@ class PressureDetector:
         high_threshold = self._config.pressure_threshold_high
         medium_threshold = self._config.pressure_threshold_medium
         
-        if metrics.current_pressure >= high_threshold:
+        if metrics.current_pressure > high_threshold:
             return ThresholdCheckResult(
                 should_trigger=True,
                 trigger_type="high_pressure",
@@ -178,20 +194,16 @@ class PressureDetector:
                 pressure_value=metrics.current_pressure,
             )
         
-        if metrics.current_pressure >= medium_threshold:
-            if metrics.pressure_trend == PressureTrend.RISING:
-                return ThresholdCheckResult(
-                    should_trigger=True,
-                    trigger_type="medium_pressure_rising",
-                    message=f"压力值{metrics.current_pressure:.3f}超过中压阈值且趋势上升",
-                    pressure_value=metrics.current_pressure,
-                )
-        
-        if metrics.predicted_pressure_5s >= high_threshold:
+        if metrics.current_pressure > medium_threshold:
+            trigger_type = (
+                "medium_pressure_rising"
+                if metrics.pressure_trend == PressureTrend.RISING
+                else "medium_pressure"
+            )
             return ThresholdCheckResult(
                 should_trigger=True,
-                trigger_type="predicted_high",
-                message=f"预测压力{metrics.predicted_pressure_5s:.3f}将超过高压阈值",
+                trigger_type=trigger_type,
+                message=f"压力值{metrics.current_pressure:.3f}超过中压阈值{medium_threshold}",
                 pressure_value=metrics.current_pressure,
             )
         

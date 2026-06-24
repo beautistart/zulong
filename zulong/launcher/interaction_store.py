@@ -35,6 +35,59 @@ def _json_dumps(value: Optional[Dict[str, Any]]) -> str:
     return json.dumps(value or {}, ensure_ascii=False, default=str)
 
 
+def _compact_dialogue_id(value: Any) -> str:
+    """Return the stable compact id used by Web and MemoryGraph session roots."""
+    text = str(value or "").strip()
+    return "".join(ch if (ch.isalnum() or ch in "_-") else "_" for ch in text)
+
+
+def _canonical_session_node_id(conversation_id: Any) -> Optional[str]:
+    conv_id = str(conversation_id or "").strip()
+    if not conv_id:
+        return None
+    if conv_id.startswith("dialogue:session_") and "/" not in conv_id:
+        return conv_id
+    return f"dialogue:session_{_compact_dialogue_id(conv_id)}"
+
+
+def _normalize_session_node_id(
+    conversation_id: Any,
+    session_node_id: Optional[Any] = None,
+) -> Optional[str]:
+    """Normalize the one-to-one Web window -> MemoryGraph session root binding.
+
+    TSD 23.11 requires every Web conversation window to have one deterministic
+    root dialogue/session node, and all turns/rounds must stay below that root.
+    Therefore an incoming child address (``.../round_x``) or a foreign root is
+    never accepted as the window binding; the root is always derived from the
+    conversation id.
+    """
+    canonical = _canonical_session_node_id(conversation_id)
+    if not canonical:
+        return None
+    raw_node = str(session_node_id or "").strip()
+    if raw_node and raw_node != canonical:
+        logger.warning(
+            "[InteractionStore] 纠正会话根节点绑定: conversation=%s requested=%s canonical=%s",
+            conversation_id,
+            raw_node,
+            canonical,
+        )
+    return canonical
+
+
+def _coerce_existing_session_node_id(
+    conversation_id: Any,
+    session_node_id: Optional[Any] = None,
+) -> Optional[str]:
+    """Return a safe root for legacy lookup without creating child roots."""
+    raw_node = str(session_node_id or "").strip()
+    if raw_node.startswith("dialogue:session_"):
+        return raw_node.split("/", 1)[0]
+    conv_id = str(conversation_id or "").strip()
+    return _canonical_session_node_id(conv_id)
+
+
 class InteractionStore:
     """SQLite-backed ledger for conversations, voice records, and links."""
 
@@ -115,6 +168,21 @@ class InteractionStore:
                 conn.execute("SELECT session_node_id FROM conversation LIMIT 0")
             except Exception:
                 conn.execute("ALTER TABLE conversation ADD COLUMN session_node_id TEXT")
+            # 历史库可能已有重复根节点；不让索引迁移阻塞启动，运行时
+            # upsert_conversation 仍会强制一个窗口只绑定自己的规范根节点。
+            try:
+                conn.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_session_node_unique
+                    ON conversation(session_node_id)
+                    WHERE session_node_id IS NOT NULL AND session_node_id != ''
+                    """
+                )
+            except sqlite3.IntegrityError:
+                logger.warning(
+                    "[InteractionStore] 历史会话根节点存在重复，跳过唯一索引创建；"
+                    "运行时将按 conversation_id 规范根节点归并。"
+                )
 
     def upsert_conversation(
         self,
@@ -130,15 +198,73 @@ class InteractionStore:
         active: bool = True,
     ) -> Dict[str, Any]:
         now = time.time()
+        conversation_id = str(conversation_id or "").strip()
+        if not conversation_id:
+            raise ValueError("conversation_id required")
         if task_graph_id is not None and not str(task_graph_id).strip():
             task_graph_id = None
-        if session_node_id is not None and not str(session_node_id).strip():
-            session_node_id = None
+        session_node_id = _normalize_session_node_id(conversation_id, session_node_id)
         with self._lock, self._connect() as conn:
             existing = conn.execute(
                 "SELECT * FROM conversation WHERE conversation_id = ?",
                 (conversation_id,),
             ).fetchone()
+            if session_node_id:
+                owner = conn.execute(
+                    """
+                    SELECT conversation_id FROM conversation
+                    WHERE session_node_id = ? AND conversation_id != ?
+                    ORDER BY last_active_at DESC
+                    LIMIT 1
+                    """,
+                    (session_node_id, conversation_id),
+                ).fetchone()
+                if owner:
+                    owner_conversation_id = owner["conversation_id"]
+                    owner_canonical = _canonical_session_node_id(owner_conversation_id)
+                    try:
+                        if owner_canonical and owner_canonical != session_node_id:
+                            taken = conn.execute(
+                                """
+                                SELECT conversation_id FROM conversation
+                                WHERE session_node_id = ? AND conversation_id != ?
+                                LIMIT 1
+                                """,
+                                (owner_canonical, owner_conversation_id),
+                            ).fetchone()
+                            conn.execute(
+                                """
+                                UPDATE conversation
+                                SET session_node_id = ?, updated_at = ?
+                                WHERE conversation_id = ?
+                                """,
+                                (None if taken else owner_canonical, now, owner_conversation_id),
+                            )
+                            logger.warning(
+                                "[InteractionStore] 修复历史会话根节点串绑: owner=%s old=%s new=%s",
+                                owner_conversation_id,
+                                session_node_id,
+                                owner_canonical if not taken else "NULL",
+                            )
+                    except Exception as exc:
+                        logger.debug("[InteractionStore] 历史根节点串绑修复跳过: %s", exc)
+                    owner = conn.execute(
+                        """
+                        SELECT conversation_id FROM conversation
+                        WHERE session_node_id = ? AND conversation_id != ?
+                        ORDER BY last_active_at DESC
+                        LIMIT 1
+                        """,
+                        (session_node_id, conversation_id),
+                    ).fetchone()
+                    if owner:
+                        logger.warning(
+                            "[InteractionStore] 会话根节点仍被占用，保持当前窗口规范根节点: "
+                            "conversation=%s root=%s owner=%s",
+                            conversation_id,
+                            session_node_id,
+                            owner["conversation_id"],
+                        )
             if active:
                 conn.execute("UPDATE conversation SET active = 0 WHERE active = 1")
             if existing:
@@ -238,7 +364,7 @@ class InteractionStore:
         return dict(row) if row else None
 
     def find_conversation_by_session_node(self, session_node_id: str) -> Optional[Dict[str, Any]]:
-        session_node_id = (session_node_id or "").strip()
+        session_node_id = _coerce_existing_session_node_id("", session_node_id) or ""
         if not session_node_id:
             return None
         with self._lock, self._connect() as conn:
@@ -368,7 +494,7 @@ class InteractionStore:
                 f"""
                 SELECT * FROM conversation
                 WHERE {' OR '.join(clauses)}
-                ORDER BY last_active_at DESC
+                ORDER BY (task_graph_id IS NOT NULL) DESC, last_active_at DESC
                 LIMIT 1
                 """,
                 tuple(params),

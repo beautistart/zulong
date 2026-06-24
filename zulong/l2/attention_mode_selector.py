@@ -16,17 +16,19 @@ from .attention_types import (
     PressureTrend,
 )
 from .attention_config import AttentionConfig
+from .attention_pressure_view import build_threshold_pressure_view
 
 logger = logging.getLogger(__name__)
 
 
-DECISION_PROMPT_TEMPLATE = """你是一个注意力模式选择助手。当前系统上下文压力较高，需要选择最合适的注意力模式来优化推理效率。
+DECISION_PROMPT_TEMPLATE = """你是一个注意力模式选择助手。当前系统上下文压力已接近或超过触发阈值，需要选择最合适的注意力模式来优化推理效率。
 
 ## 当前压力指标
-- **压力值**: {pressure_value:.3f}
+- **当前上下文压力**: {threshold_relative_percent:.1f}%
 - **压力趋势**: {pressure_trend}
-- **预算使用率**: {budget_usage:.1%}
 - **消息数量**: {message_count}
+
+说明：请直接基于当前上下文压力百分比与任务上下文选择注意力模式。动态注意力不是压缩上下文，而是重新选择当前必要上下文，暂排/降权无关上下文，并在需要时回到 GLOBAL。
 
 ## 当前状态
 - **当前注意力模式**: {current_mode}
@@ -130,10 +132,15 @@ class AttentionModeSelector:
         
         history_str = self._format_switch_history(switch_history or [])
         
+        pressure_view = build_threshold_pressure_view(
+            pressure_metrics.current_pressure,
+            self._config.pressure_threshold_medium,
+            self._config.pressure_threshold_high,
+        )
+
         prompt = DECISION_PROMPT_TEMPLATE.format(
-            pressure_value=pressure_metrics.current_pressure,
+            threshold_relative_percent=pressure_view.threshold_relative_percent,
             pressure_trend=trend_map.get(pressure_metrics.pressure_trend, "未知"),
-            budget_usage=pressure_metrics.budget_usage,
             message_count=pressure_metrics.message_count,
             current_mode=current_mode,
             task_context=task_context[:500] if task_context else "无任务上下文",
@@ -184,7 +191,7 @@ class AttentionModeSelector:
         
         Args:
             request: 决策请求
-            timeout_ms: 超时时间(毫秒)，默认使用配置值
+            timeout_ms: 超时时间(毫秒)，默认使用配置值；None/0/负数表示无限等待
             
         Returns:
             DecisionResponse决策响应
@@ -202,12 +209,15 @@ class AttentionModeSelector:
             )
         
         try:
-            timeout_sec = timeout_ms / 1000.0
-            
-            response = await asyncio.wait_for(
-                self._call_llm_internal(request.prompt),
-                timeout=timeout_sec,
-            )
+            if timeout_ms is None or timeout_ms <= 0:
+                logger.info("[AttentionModeSelector] LLM决策使用无限等待模式")
+                response = await self._call_llm_internal(request.prompt)
+            else:
+                timeout_sec = timeout_ms / 1000.0
+                response = await asyncio.wait_for(
+                    self._call_llm_internal(request.prompt),
+                    timeout=timeout_sec,
+                )
             
             parsed = self.parse_decision_response(response)
             

@@ -84,11 +84,11 @@ _PLAN_TOOLS = {
 # 🔥 做事模板：给 LLM 的 few-shot 操作示例
 # 当模型不了解如何调用工具时，此示例教它正确的工具调用格式
 _PLAN_FEW_SHOT_EXAMPLE = """\
-【任务规划操作示例 — 你必须调用工具函数，禁止用文字代替！】
+【任务规划操作示例 — 仅当模型判断本轮确属需要任务分解的复杂任务时使用】
 
 示例场景：用户说"帮我写一个坦克大战网页游戏"
 
-你应该依次调用以下工具（直接调函数，不要回复"我将创建..."之类的文字！）：
+如果你判断本轮需要创建/扩展任务图谱，可依次调用以下工具：
 
 ① task_create_plan(title="坦克大战游戏", user_requirement="帮我写一个坦克大战网页游戏")
 
@@ -105,11 +105,11 @@ _PLAN_FEW_SHOT_EXAMPLE = """\
 ⑦ task_view_overview()
 
 ⚠️ 核心规则：
-- 第一步永远是 task_create_plan，不能跳过
-- 所有子任务用 task_add_node 挂到 parent_id="req" 下
-- 有依赖关系的用 task_add_dependency 连接
-- 最后用 task_view_overview 确认结构
-- 禁止回复文字描述，必须实际调用工具函数
+- 创建任务图谱是 L2/LLM 的语义决策，不由会话启动、新会话按钮或空图模板强制触发。
+- 只有复杂编程、长流程执行、多步骤计划、明确“开始/继续/编辑任务”等需求才应创建或扩展 TaskGraph。
+- 普通问答、解释、排查原因、确认规则、无明确执行目标的对话，应直接回答，不要调用 task_create_plan。
+- 需要建图时，先用 task_create_plan 建立根任务，再用 task_add_node 挂到 parent_id="req" 下。
+- 有依赖关系的用 task_add_dependency 连接，最后可用 task_view_overview 确认结构。
 """
 
 # Execute 阶段工具集：执行+读写节点
@@ -404,13 +404,12 @@ def plan_node(state: OrchestratorState, engine) -> OrchestratorState:
             "先用 task_view_overview 查看当前状态。\n"
         )
     elif not has_active_graph:
-        # 🔥 [Fix-8] 没有活跃图谱时，必须先创建新图谱
         plan_hint = (
-            "\n【重要】当前没有活跃任务图谱，请首先调用 task_create_plan 创建新图谱：\n"
-            "1. 调用 task_create_plan(title='任务标题') 创建新图谱和根节点\n"
-            "2. 然后用 task_add_node 添加子任务节点（parent_id='req'）\n"
-            "3. 用 task_add_dependency 建立依赖关系\n"
-            "4. 完成后不要执行，只需要完成规划即可\n"
+            "\n【任务图谱创建边界】当前没有活跃任务图谱。\n"
+            "1. 先判断用户语义是否确属复杂任务、长流程执行、明确开始/继续/编辑任务。\n"
+            "2. 若只是普通问答、规则解释、原因分析或闲聊，直接回答，不要创建 TaskGraph。\n"
+            "3. 若确需任务图谱，再调用 task_create_plan 创建根节点，并用 task_add_node 添加子任务。\n"
+            "4. 用 task_add_dependency 建立必要依赖；规划完成后不要越权执行。\n"
         )
     else:
         plan_hint = (
@@ -445,16 +444,13 @@ def plan_node(state: OrchestratorState, engine) -> OrchestratorState:
         "content": f"[编排器-规划阶段] {plan_hint}",
     })
 
-    # 🔥 无活跃图谱时，强制首轮调用 task_create_plan（禁止模型回复文字）
-    _force_tool = "task_create_plan" if not has_active_graph else ""
-
     response, fc_turn = _run_tool_cycle_after_decision(
         engine,
         messages=messages,
         tool_definitions=plan_tools,
         vllm_model_id=state["vllm_model_id"],
         force_first_tool=False,
-        forced_first_tool_name=_force_tool,
+        forced_first_tool_name="",
         user_input=state["user_input_text"],
         response_max_tokens=2048,
     )
@@ -463,10 +459,19 @@ def plan_node(state: OrchestratorState, engine) -> OrchestratorState:
     # 防止模型"不听话"（回复文字而非调用工具）导致后续阶段空转
     tg_after = get_active_task_graph()
     if tg_after is None:
+        response_text = str(response or "").strip()
+        if response_text:
+            logger.info(
+                "[Orchestrator] PLAN 阶段模型选择不创建 TaskGraph，按直接回复结束"
+            )
+            state["response"] = response_text
+            state["should_terminate"] = "direct_answer_no_graph"
+            state["phase"] = PHASE_SYNTHESIZE
+            return state
         plan_retry = state.get("_plan_retry_count", 0)
         if plan_retry < 2:
             logger.warning(
-                f"[Orchestrator] PLAN 未生成 TaskGraph，"
+                f"[Orchestrator] PLAN 未生成 TaskGraph 且无直接回复，"
                 f"重试 {plan_retry + 1}/2"
             )
             state["_plan_retry_count"] = plan_retry + 1
@@ -906,7 +911,10 @@ def synthesize_node(state: OrchestratorState, engine) -> OrchestratorState:
 
     tg = get_active_task_graph()
     if tg is None:
-        state["response"] = "任务已完成，但无法获取任务图数据。"
+        if state.get("response"):
+            state["should_terminate"] = "done"
+            return state
+        state["response"] = "已完成本轮回复；本轮没有创建任务图谱。"
         state["should_terminate"] = "done"
         return state
 

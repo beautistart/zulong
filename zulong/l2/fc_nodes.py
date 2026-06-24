@@ -60,8 +60,6 @@ _WRITE_CONTENT_TOOLS = {
     "write_to_file",
 }
 
-_MAX_WRITE_CHUNK_CHARS = 1800
-
 _APPROVAL_DENIAL_MARKERS = (
     "用户未",
     "用户拒绝",
@@ -153,12 +151,11 @@ def _tool_args_parse_error_result(tool_name: str, parse_error: str) -> str:
     }
     if tool_name in _WRITE_CONTENT_TOOLS:
         payload.update({
-            "chunk_policy": "openhands_style_file_chunking",
-            "max_chunk_chars": _MAX_WRITE_CHUNK_CHARS,
+            "chunk_policy": "adaptive_file_chunking",
             "recommended_chunk_chars": "800-1200",
             "next_action": (
-                "重新调用同一个写入工具；第一块 mode='overwrite'，"
-                "后续块 mode='append'，每块 content 控制在 800-1200 字符。"
+                "重新调用同一个写入工具；优先完整写入。若模型输出容易被截断，"
+                "可第一块 mode='overwrite'，后续块 mode='append'，并按当前模型输出能力自适应分片。"
             ),
         })
     return _json.dumps(payload, ensure_ascii=False)
@@ -169,9 +166,9 @@ def _build_write_chunking_correction(tool_name: str, parse_error: str) -> Dict[s
         "[工具参数分片纠偏] 上一次写文件工具调用的 arguments 不是合法 JSON，"
         f"通常是 content 过长导致模型输出被 max_tokens 截断。工具={tool_name}；"
         f"解析错误={parse_error}。"
-        "下一轮必须重新调用同一个写入工具，采用 OpenHands 式小块写入："
-        "第一块 mode='overwrite'，后续块 mode='append'，每块 content 800-1200 字符，"
-        f"单块绝不能超过 {_MAX_WRITE_CHUNK_CHARS} 字符。"
+        "下一轮必须重新调用同一个写入工具；优先完整写入。"
+        "若模型输出容易被截断，再采用自适应分片："
+        "第一块 mode='overwrite'，后续块 mode='append'，分片大小按当前模型输出能力决定。"
         "不要继续输出大段自然语言，不要 submit_final_answer；全部写入后再运行验证命令或读取文件确认。"
     )
 
@@ -309,7 +306,11 @@ def _make_call_model_node(engine: "InferenceEngine"):
             logger.info("[FC][Graph][CB] Circuit Breaker RED: 强制文本回复，移除所有工具定义")
             try:
                 _has_uncompleted, _next_node = _task_graph_uncompleted_context()
-                if _has_uncompleted and not engine_tool_budget_exhausted(engine):
+                if (
+                    _has_uncompleted
+                    and not engine_tool_budget_exhausted(engine)
+                    and state.get("cb_recovery_stage") not in {"restricted_recovery", "note_attention"}
+                ):
                     cb_force_no_tools = False
                     state["cb_force_no_tools"] = False
                     api_kwargs["tools"] = tool_definitions
@@ -787,8 +788,9 @@ def _make_exec_tools_node(engine: "InferenceEngine"):
             else:
                 cb_force_no_tools = True
                 cb_convergence = internal_control_message(
-                    f"[Circuit Breaker 强制收敛] {cb_reason}\n"
-                    "你必须立刻基于已有信息生成最终回复，不允许再调用任何工具。"
+                    f"[Circuit Breaker RED 受限恢复] {cb_reason}\n"
+                    "不要把未完成任务伪装成完成。请先把当前证据、未完成项、失败原因写成便签并关联当前任务节点，"
+                    "再进行一次注意力重选；若仍无法继续，只能输出 partial/blocked summary。"
                 )
             messages.append(cb_convergence)
             if engine._attn_window:
@@ -1002,6 +1004,65 @@ def _make_eval_response_node(engine: "InferenceEngine"):
             except Exception as drift_err:
                 logger.warning(f"[FC][Graph][DriftDetector] 检测异常，跳过: {drift_err}")
 
+        # CB RED 受限恢复：在完成“便签/标签/记忆落盘 + 注意力切换”之前，
+        # 不允许模型用纯文本提前结束。
+        if state.get("cb_recovery_stage") in {"restricted_recovery", "note_attention"} and not (
+            state.get("cb_recovery_note_saved")
+            and state.get("cb_recovery_attention_switched")
+        ):
+            recovery_hint = internal_control_message(
+                "[Circuit Breaker RED 受限恢复未完成]\n"
+                "请不要直接输出最终总结。当前只允许完成："
+                "1) 写入并锚定便签/标签/记忆；2) 执行一次 GLOBAL / FOCUS / SINGLE_CHAIN 注意力切换。"
+            )
+            if response:
+                messages.append(internal_control_message(response, role="assistant"))
+            messages.append(recovery_hint)
+            if engine._attn_window:
+                if response:
+                    engine._attn_window.register_message(
+                        internal_control_message(response, role="assistant"),
+                        turn=fc_turn,
+                    )
+                engine._attn_window.register_message(recovery_hint, turn=fc_turn)
+            return {
+                "response": None,
+                "should_terminate": "",
+                "cb_force_no_tools": True,
+                "null_response_count": state.get("null_response_count", 0) + 1,
+            }
+
+        # 上下文压力 RED 受限恢复：与 CB RED 使用同一完成口径。
+        # 未完成“便签/标签/记忆落盘 + 注意力切换”前，不允许 LLM
+        # 通过纯文本绕开第二阶段工具拦截。
+        if state.get("pressure_stage") == "restricted_recovery":
+            requires_note = bool(state.get("pressure_recovery_requires_note", True))
+            requires_attention = bool(state.get("pressure_recovery_requires_attention", True))
+            note_done = bool(state.get("pressure_recovery_note_saved")) or not requires_note
+            attention_done = bool(state.get("pressure_recovery_attention_switched")) or not requires_attention
+            if not (note_done and attention_done):
+                recovery_hint = internal_control_message(
+                    "[上下文压力 RED 受限恢复未完成]\n"
+                    "请不要直接输出最终总结。当前只允许完成："
+                    "1) 写入并锚定便签/标签/记忆；2) 执行一次 GLOBAL / FOCUS / SINGLE_CHAIN 注意力切换。"
+                )
+                if response:
+                    messages.append(internal_control_message(response, role="assistant"))
+                messages.append(recovery_hint)
+                if engine._attn_window:
+                    if response:
+                        engine._attn_window.register_message(
+                            internal_control_message(response, role="assistant"),
+                            turn=fc_turn,
+                        )
+                    engine._attn_window.register_message(recovery_hint, turn=fc_turn)
+                return {
+                    "response": None,
+                    "should_terminate": "",
+                    "cb_force_no_tools": False,
+                    "null_response_count": state.get("null_response_count", 0) + 1,
+                }
+
         # CB 强制收敛：接受回复，跳过 Rule A 和 InfoGap
         if cb_force_no_tools:
             synthesized = _synthesize_cleanup_report_from_tool_results(
@@ -1065,7 +1126,8 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                             state.get("user_input_text", "")
                         )
                     response = fallback
-            # CB 路径下也执行 Backfill：回填任务图节点内容
+            # CB 路径下也记录 Backfill 候选：只写入 metadata，不自动完成节点。
+            # 节点完成只能来自显式 task_mark_status 与统一完成质量门证据。
             # 质量检查：如果回复主要是 JSON/结构化工具输出，跳过 Backfill 防止数据污染
             _json_chars = sum(1 for c in response if c in '{}[]":,')
             _is_structured = (_json_chars / max(len(response), 1)) > 0.12
@@ -1098,9 +1160,10 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                                             f"{_cb_node.id}({_cb_node.label})"
                                         )
                                         continue
-                                    _cb_tg.update_node_status(
-                                        _cb_node.id, "completed", result=_cb_content,
-                                    )
+                                    if hasattr(_cb_node, "metadata"):
+                                        _cb_node.metadata["backfill_candidate_result"] = _cb_content
+                                        _cb_node.metadata["backfill_candidate_at_turn"] = fc_turn
+                                        _cb_node.metadata["backfill_candidate_cb_path"] = True
                                     _cb_filled += 1
                             if _cb_filled > 0:
                                 try:
@@ -1108,12 +1171,17 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                                 except Exception:
                                     pass
                                 logger.info(
-                                    f"[FC][Graph][CB][Backfill] CB 路径回填: "
-                                    f"{_cb_filled}/{len(_cb_uncompleted)} 节点已完成"
+                                    f"[FC][Graph][CB][Backfill] CB 路径记录候选: "
+                                    f"{_cb_filled}/{len(_cb_uncompleted)}，不自动改 completed"
                                 )
                                 engine._publish_task_graph_event(
                                     "agent_tool_call", fc_turn, "task_backfill",
-                                    f'{{"backfilled":{_cb_filled},"total_leaf":{len(_cb_leaves)}}}',
+                                    _json.dumps({
+                                        "candidate_backfill": _cb_filled,
+                                        "total_leaf": len(_cb_leaves),
+                                        "auto_completed": 0,
+                                        "cb_path": True,
+                                    }, ensure_ascii=False),
                                 )
                 except Exception as cb_bf_err:
                     logger.warning(f"[FC][Graph][CB][Backfill] 异常: {cb_bf_err}")
@@ -1290,8 +1358,10 @@ def _make_eval_response_node(engine: "InferenceEngine"):
             }
 
         # ── 继续任务图 Auto-Mark 安全网 ──────────────────────────────
-        # 小模型在继续任务图流程中常常生成实质内容但忘记调用 task_mark_status，
-        # 这里在接受回复前自动补标节点，避免任务图永远不更新。
+        # 小模型在继续任务图流程中常常生成实质内容但忘记调用 task_mark_status。
+        # 这里不再自动把节点标记为 completed，只记录“进度候选”，再要求
+        # LLM 结合真实工具/验证证据显式调用 task_mark_status，避免绕过
+        # TaskSpec Coverage Gate。
         _MAX_CONTINUE_AUTOMARKS = 5
         is_resume = state.get("is_resume", False)
         resume_automark_count = state.get("resume_automark_count", 0)
@@ -1321,32 +1391,46 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                         if not target:
                             target = uncompleted[0]
 
-                        # 自动标记完成
+                        # 只记录候选进度，不自动标记完成。
                         result_text = response[:500]
                         if _looks_like_incomplete_result(result_text):
                             return {
                                 "response": response,
                                 "should_terminate": "done",
                             }
-                        tg.update_node_status(target.id, "completed", result=result_text)
+                        if hasattr(target, "metadata"):
+                            target.metadata["auto_progress_candidate"] = result_text
+                            target.metadata["auto_progress_candidate_at_turn"] = fc_turn
+                            target.metadata["auto_progress_candidate_source"] = "resume_text_review"
                         try:
                             _save_active_backup()
                         except Exception:
                             pass
                         logger.info(
-                            f"[FC][ContinueTaskGraph][AutoMark] 自动完成节点 {target.id}"
+                            f"[FC][ContinueTaskGraph][AutoMark] 记录候选进度 {target.id}"
                             f" ({target.label}), result_len={len(result_text)}"
                         )
                         engine._publish_task_graph_event(
                             "agent_tool_call", fc_turn, "task_mark_status",
-                            f'{{"node_id":"{target.id}","status":"completed","auto_mark":true}}',
+                            _json.dumps({
+                                "node_id": target.id,
+                                "auto_progress_candidate": True,
+                                "auto_completed": False,
+                            }, ensure_ascii=False),
                         )
 
                         # 检查剩余未完成节点
-                        remaining = [n for n in tg.get_leaf_nodes() if n.status != "completed"]
+                        remaining = [
+                            n for n in tg.get_leaf_nodes()
+                            if n.status not in ("completed", "skipped")
+                        ]
                         if remaining:
-                            next_node = remaining[0]
-                            tg.update_node_status(next_node.id, "in_progress")
+                            next_node = next(
+                                (n for n in remaining if n.status == "in_progress"),
+                                remaining[0],
+                            )
+                            if next_node.status in ("pending", "needs_adjust", "waiting_input"):
+                                tg.update_node_status(next_node.id, "in_progress")
                             try:
                                 _save_active_backup()
                             except Exception:
@@ -1356,11 +1440,11 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                                 f" ({next_node.label}), 标记 in_progress"
                             )
                             continuation = internal_control_message(
-                                f"[自动进度更新] 节点 {target.id}（{target.label}）已完成。\n"
-                                f"请继续执行节点 {next_node.id}（{next_node.label}）"
-                                f"：{next_node.desc or next_node.label}\n"
-                                f"完成后请用 task_mark_status(node_id='{next_node.id}',"
-                                f" status='completed', result='结果') 提交。"
+                                f"[自动进度候选] 检测到节点 {target.id}（{target.label}）"
+                                "可能已有文本产出，但系统不会自动标记完成。\n"
+                                "请基于真实工具/验证证据显式调用 task_mark_status；"
+                                f"当前继续处理节点 {next_node.id}（{next_node.label}）"
+                                f"：{next_node.desc or next_node.label}。"
                             )
                             rejected_reply = internal_control_message(response, role="assistant")
                             messages.append(rejected_reply)
@@ -1379,7 +1463,7 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                             return result
                         else:
                             logger.info(
-                                "[FC][ContinueTaskGraph][AutoMark] 所有节点已完成，接受回复"
+                                "[FC][ContinueTaskGraph][AutoMark] 仅记录候选进度，等待显式完成确认"
                             )
             except Exception as am_err:
                 logger.warning(f"[FC][ContinueTaskGraph][AutoMark] 异常: {am_err}")
@@ -1423,12 +1507,13 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                 "should_terminate": "done",
             }
 
-        # ── 工具增强首次执行：任务图节点内容回填 ──────────────────
+        # ── 工具增强首次执行：任务图节点候选内容记录 ──────────────────
         # 小模型在任务图首次执行时常见行为：
         #   1. 调用 task_create_plan + task_add_node 创建任务图骨架
         #   2. 直接生成完整回复内容，跳过逐节点 task_mark_status
         # 导致任务图节点全部为空但回复内容完整。
-        # 此安全网在接受回复前自动回填节点内容，确保前端任务图可视化正确。
+        # 此安全网只把候选内容写入节点 metadata，供质量门和后续 LLM 复核；
+        # 不自动把节点改成 completed，避免“文本相似”绕过显式执行和验证证据。
         if (
             not is_resume
             and len(response) > 100
@@ -1454,14 +1539,15 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                             node_content = _extract_node_content(
                                 response, node.label, max_len=500,
                             )
-                            # 只有在回复中确实找到匹配内容时才标记完成
+                            # 只有在回复中确实找到匹配内容时才记录候选。
                             if (
                                 _has_content_match(response, node.label)
                                 and not _looks_like_incomplete_result(node_content)
                             ):
-                                tg.update_node_status(
-                                    node.id, "completed", result=node_content,
-                                )
+                                if hasattr(node, "metadata"):
+                                    node.metadata["backfill_candidate_result"] = node_content
+                                    node.metadata["backfill_candidate_at_turn"] = fc_turn
+                                    node.metadata["backfill_candidate_cb_path"] = False
                                 backfill_count += 1
                             else:
                                 skipped_count += 1
@@ -1473,12 +1559,17 @@ def _make_eval_response_node(engine: "InferenceEngine"):
                         except Exception:
                             pass
                         logger.info(
-                            f"[FC][Backfill] 工具增强首次执行回填: "
-                            f"已填充 {backfill_count} 个节点，跳过 {skipped_count} 个无匹配节点"
+                            f"[FC][Backfill] 工具增强首次执行记录候选: "
+                            f"候选 {backfill_count} 个节点，跳过 {skipped_count} 个无匹配节点；不自动改 completed"
                         )
                         engine._publish_task_graph_event(
                             "agent_tool_call", fc_turn, "task_backfill",
-                            f'{{"backfilled":{backfill_count},"skipped":{skipped_count},"total_leaf":{len(leaf_nodes)}}}',
+                            _json.dumps({
+                                "candidate_backfill": backfill_count,
+                                "skipped": skipped_count,
+                                "total_leaf": len(leaf_nodes),
+                                "auto_completed": 0,
+                            }, ensure_ascii=False),
                         )
             except Exception as bf_err:
                 logger.warning(f"[FC][Backfill] 异常: {bf_err}")

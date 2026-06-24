@@ -19,6 +19,7 @@ import atexit
 import hashlib
 import json as _json
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -26,6 +27,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from zulong.l2.fc_runner import FCRunner
+from zulong.l2.attention_pressure_view import build_threshold_pressure_view
+from zulong.l2.attention_context_retrieval import (
+    build_attention_context_bundle,
+    render_attention_context_message,
+)
 from zulong.ide.ide_session import IDEFCState, AgentSession
 from zulong.ide.ide_tool_registry import (
     ANNOUNCE_STEP_TOOL_NAME,
@@ -57,6 +63,7 @@ from zulong.l2.tool_budget import (
     record_engine_tool_calls_used,
     sync_engine_tool_budget,
 )
+from zulong.l2.tool_capabilities import tool_capabilities
 
 if TYPE_CHECKING:
     from zulong.l2.inference_engine import InferenceEngine
@@ -717,6 +724,17 @@ class IDEFCRunner(FCRunner):
     避免并发 Session 状态冲突。
     """
 
+    _CB_RESTRICTED_RECOVERY_CAPABILITIES = {
+        "attention_switch",
+        "note_anchor",
+        "memory_persist",
+        "tag_anchor",
+    }
+    _CB_RESTRICTED_EXCLUDED_CAPABILITIES = {
+        "file_write",
+        "verification",
+    }
+
     def __init__(self, engine: "InferenceEngine", session: AgentSession,
                  tool_registry: IDEToolRegistry):
         super().__init__(engine)
@@ -1103,6 +1121,11 @@ class IDEFCRunner(FCRunner):
                     should_continue = await self._exec_tools_async(
                         state, tc_data, resp_content or "",
                         send_callback, tool_result_queue, cancel_event, loop)
+                    self._update_cb_recovery_progress(
+                        state,
+                        tool_names,
+                        state.tool_definitions,
+                    )
                     if should_continue == "cancelled":
                         return await loop.run_in_executor(
                             None, self._finalize, state, "cancelled")
@@ -1296,27 +1319,27 @@ class IDEFCRunner(FCRunner):
                     await self._emit_execution_event(
                         send_callback,
                         "completed",
-                        "FC 循环完成。",
+                        "FC 循环进入完成收束，等待统一质量门写回。",
                         turn=state.fc_turn,
                         event_type="FC_DONE",
                         payload={
                             "total_turns": state.fc_turn,
                             "reason": "done",
                             "summary": {
-                                "completed": ["FC 循环已完成"],
+                                "completed": ["FC 循环已收束"],
                                 "verified": [],
                                 "remaining": [],
-                                "risk": "",
-                                "next_step": "等待下一轮用户输入。",
+                                "risk": "最终完成状态以统一完成质量门为准。",
+                                "next_step": "等待完成质量门写回或转为 partial/blocked。",
                             },
                             "interaction": {
                                 "kind": "summary",
-                                "status": "succeeded",
-                                "title": "执行结束",
-                                "detail": "祖龙已完成本轮执行。",
-                                "progress": 100,
+                                "status": "running",
+                                "title": "质量门收束中",
+                                "detail": "祖龙已生成候选结果，正在交由统一完成质量门确认。",
+                                "progress": 95,
                                 "progress_items": [
-                                    self._progress_item("FC 循环已完成", "completed", source="summary")
+                                    self._progress_item("候选结果已生成，等待质量门确认", "running", source="summary")
                                 ],
                             },
                         },
@@ -1333,44 +1356,20 @@ class IDEFCRunner(FCRunner):
                     else:
                         state.final_answer = None
 
-                    # 将 FC 统计和最终答案写入 TaskGraph，供 TaskArchive/MemoryGraph 使用
+                    # 仅记录 FC 统计。最终答案写入/归档必须由统一 _finalize()
+                    # 在完成质量门通过后执行，避免 submit_final_answer 绕过证据门。
                     try:
-                        from zulong.tools.task_tools import get_active_task_graph, _write_final_answer_to_task_graph
+                        from zulong.tools.task_tools import get_active_task_graph
                         _tg = get_active_task_graph(workspace_dir=getattr(self, 'cwd', None))
                         if _tg and hasattr(_tg, "metadata"):
                             _tg.metadata["total_turns"] = state.fc_turn
                             _tg.metadata["duration"] = time.time() - getattr(_tg, "created_at", time.time())
-                            _answer_for_graph = state.final_answer or state.last_response_content
-                            if _answer_for_graph:
-                                _write_final_answer_to_task_graph(
-                                    _tg,
-                                    _answer_for_graph,
-                                    source="ide_fc_runner",
-                                )
                     except Exception:
                         pass
 
-                    # 后处理（耗时操作，客户端已收到完成通知）
-                    await loop.run_in_executor(
-                        None, self._auto_complete_task, state)
-                    self._finalize_dialogue_round(state, status="completed")
-                    await loop.run_in_executor(
-                        None, self._auto_save_session_memory, state)
-                    self._save_runner_state()
-                    self.session.fc_state = state
-
-                    # 🔥 修复：FC 完成后重新归档，补全 final_answer/duration/turns
-                    try:
-                        from zulong.tools.task_tools import get_active_task_graph, _auto_archive_completed
-                        _tg = get_active_task_graph(workspace_dir=getattr(self, 'cwd', None))
-                        if _tg:
-                            _auto_archive_completed(_tg)
-                    except Exception:
-                        pass
-
-                    return IDEFCResult(
-                        phase="done",
-                        text_response=state.final_answer or state.last_response_content)
+                    # 所有最终写回/归档统一走 _finalize，避免局部 done 路径绕过质量门。
+                    return await loop.run_in_executor(
+                        None, self._finalize, state, "done")
                 elif verdict == "cb_force":
                     state.cb_force_no_tools = True
                 # "continue" → 继续循环
@@ -1574,17 +1573,20 @@ class IDEFCRunner(FCRunner):
             # CircuitBreaker 评估
             try:
                 if self._circuit_breaker:
-                    _aw_ratio = self._attn_window.usage_ratio if self._attn_window else -1.0
+                    _aw_ratio = (
+                        getattr(
+                            self._attn_window,
+                            "trigger_context_pressure_ratio",
+                            getattr(self._attn_window, "context_pressure_ratio", self._attn_window.usage_ratio),
+                        )
+                        if self._attn_window else -1.0
+                    )
                     cb_s, cb_r = self._circuit_breaker.evaluate(fc, msgs, attn_usage_ratio=_aw_ratio)
                     if cb_s == CircuitBreakerState.RED:
                         logger.warning(f"[IDEFCRunner][CB] RED: {cb_r}")
                         state.cb_force_no_tools = True
                         state.cb_trigger_reason = cb_r  # 保存CB原因供_finalize使用
-                        cm = internal_control_message(
-                            f"[Circuit Breaker 强制收敛] {cb_r}\n"
-                            "你必须立刻基于已有信息生成最终回复，"
-                            "不允许再调用任何工具。"
-                        )
+                        cm = self._build_cb_red_control_message(state, cb_r)
                         msgs.append(cm)
                         if self._attn_window:
                             self._attn_window.register_message(cm, turn=fc)
@@ -1630,11 +1632,67 @@ class IDEFCRunner(FCRunner):
             # ── TSD v2.7: 发射 attention:update ──
             if self._attn_window:
                 try:
+                    ratio = float(
+                        getattr(
+                            self._attn_window,
+                            "trigger_context_pressure_ratio",
+                            getattr(
+                                self._attn_window,
+                                "context_pressure_ratio",
+                                getattr(self._attn_window, "usage_ratio", 0.0),
+                            ),
+                        )
+                        or 0.0
+                    )
+                    yellow_ratio = 0.90
+                    red_ratio = 1.0
+                    try:
+                        attn_cfg = getattr(self._attn_window, "_llm_config", None)
+                        if attn_cfg:
+                            yellow_ratio = float(getattr(attn_cfg, "pressure_threshold_medium", yellow_ratio))
+                            red_ratio = float(getattr(attn_cfg, "pressure_threshold_high", red_ratio))
+                        elif self._circuit_breaker:
+                            cb_cfg = getattr(self._circuit_breaker, "_config", {}) or {}
+                            yellow_ratio = float(cb_cfg.get("context_yellow_ratio", yellow_ratio))
+                            red_ratio = float(cb_cfg.get("context_red_ratio", red_ratio))
+                    except Exception:
+                        pass
+                    if ratio > red_ratio:
+                        pressure_tier = "red"
+                    elif ratio > yellow_ratio:
+                        pressure_tier = "yellow"
+                    else:
+                        pressure_tier = "green"
+                    pressure_view = build_threshold_pressure_view(
+                        ratio,
+                        yellow_ratio,
+                        red_ratio,
+                        tier=pressure_tier,
+                    ).to_dict()
                     _attn_state = {
                         "mode": self._attn_window.mode.value if self._attn_window.mode else "global",
                         "turn": fc,
                         "focus_node_id": self._attn_window._current_node_id,
-                        "budget_usage": round(self._attn_window.usage_ratio * 100, 1) if hasattr(self._attn_window, "usage_ratio") else 0,
+                        "budget_usage": round(pressure_view.get("context_pressure_percent", ratio * 100), 1),
+                        "context_pressure": round(pressure_view.get("context_pressure_ratio", ratio), 3),
+                        "threshold_budget_pressure": round(pressure_view.get("context_pressure_ratio", ratio), 3),
+                        "threshold_budget_percent": pressure_view.get("context_pressure_percent"),
+                        "active_threshold_ratio": pressure_view.get("active_threshold_ratio"),
+                        "budget_reference": pressure_view.get("budget_reference"),
+                        "raw_context_pressure": round(ratio, 3),
+                        "trigger_context_pressure": round(ratio, 3),
+                        "trigger_budget_usage": round(pressure_view.get("context_pressure_percent", ratio * 100), 1),
+                        "visible_context_pressure": round(
+                            float(getattr(self._attn_window, "active_context_pressure_ratio", ratio) or ratio),
+                            3,
+                        ),
+                        "backing_context_pressure": round(
+                            float(getattr(self._attn_window, "context_pressure_ratio", ratio) or ratio),
+                            3,
+                        ),
+                        "pressure_tier": pressure_tier,
+                        "pressure_threshold_medium": yellow_ratio,
+                        "pressure_threshold_high": red_ratio,
                     }
                     await send_callback(MessageType.ATTENTION_UPDATE, _attn_state)
                 except Exception as _e:
@@ -3091,7 +3149,17 @@ class IDEFCRunner(FCRunner):
         cb_reason = str(getattr(state, "cb_trigger_reason", "") or "")
         attn_ratio = -1.0
         try:
-            attn_ratio = float(getattr(self._attn_window, "usage_ratio", -1.0))
+            attn_ratio = float(
+                getattr(
+                    self._attn_window,
+                    "trigger_context_pressure_ratio",
+                    getattr(
+                        self._attn_window,
+                        "context_pressure_ratio",
+                        getattr(self._attn_window, "usage_ratio", -1.0),
+                    ),
+                )
+            )
         except Exception:
             attn_ratio = -1.0
         if (
@@ -3224,6 +3292,46 @@ class IDEFCRunner(FCRunner):
             or "失败" in head
             or "异常" in head
         )
+
+    @classmethod
+    def _tool_result_success(cls, item: Dict[str, Any]) -> bool:
+        """Return success using structured tool result fields before text heuristics.
+
+        The completion gate must not treat a command with ``returncode != 0`` as
+        successful only because the command output also contains words such as
+        "passed" or "成功".  Prefer objective result fields emitted by tools,
+        then fall back to the legacy text detector.
+        """
+        if not isinstance(item, dict):
+            return False
+        result = item.get("result", "")
+        parsed = cls._structured_tool_result(result)
+        if parsed:
+            for key in ("returncode", "exit_code", "status_code"):
+                if key in parsed:
+                    try:
+                        return int(parsed.get(key)) == 0
+                    except Exception:
+                        pass
+            for key in ("success", "ok"):
+                if key in parsed:
+                    return bool(parsed.get(key))
+            for key in ("is_error", "failed", "error"):
+                if key in parsed:
+                    value = parsed.get(key)
+                    if isinstance(value, bool):
+                        return not value
+                    if value not in (None, "", 0, "0", False):
+                        return False
+            status_text = str(parsed.get("status") or "").strip().lower()
+            if status_text:
+                if status_text in {"success", "succeeded", "ok", "passed", "pass", "completed"}:
+                    return True
+                if status_text in {"failed", "failure", "error", "blocked", "timeout", "timed_out"}:
+                    return False
+        if "success" in item:
+            return bool(item.get("success"))
+        return not cls._tool_result_failed_text(result)
 
     @staticmethod
     def _structured_tool_result(result: str) -> Dict[str, Any]:
@@ -5020,6 +5128,16 @@ class IDEFCRunner(FCRunner):
                     )
                     self._publish_fc_progress(state, "exec_tools", f"{len(tc_data)} tool calls")
                     remote = self._exec_tools(state, tc_data, resp_content)
+                    self._update_cb_recovery_progress(
+                        state,
+                        [tc["function"]["name"] for tc in tc_data],
+                        state.tool_definitions,
+                    )
+                    self._update_pressure_recovery_progress(
+                        state,
+                        [tc["function"]["name"] for tc in tc_data],
+                        state.tool_definitions,
+                    )
                     if remote:
                         self._publish_fc_progress(state, "pause_for_remote", f"{len(remote)} remote tools")
                         # 注意：暂停不清除状态，恢复后会继续运行
@@ -5059,39 +5177,19 @@ class IDEFCRunner(FCRunner):
                     if _final_answer:
                         state.final_answer = _final_answer
 
-                    # 将 FC 统计和最终答案写入 TaskGraph
+                    # 仅记录 FC 统计。最终答案写入/归档必须由统一 _finalize()
+                    # 在完成质量门通过后执行。
                     try:
-                        from zulong.tools.task_tools import get_active_task_graph, _write_final_answer_to_task_graph
+                        from zulong.tools.task_tools import get_active_task_graph
                         _tg = get_active_task_graph(workspace_dir=getattr(self, 'cwd', None))
                         if _tg and hasattr(_tg, "metadata"):
                             _tg.metadata["total_turns"] = state.fc_turn
                             _tg.metadata["duration"] = time.time() - getattr(_tg, "created_at", time.time())
-                            _answer_for_graph = state.final_answer or state.last_response_content
-                            if _answer_for_graph:
-                                _write_final_answer_to_task_graph(
-                                    _tg,
-                                    _answer_for_graph,
-                                    source="ide_fc_runner",
-                                )
                     except Exception:
                         pass
 
-                    self._auto_complete_task(state)
-                    self._finalize_dialogue_round(state, status="completed")
-                    self._auto_save_session_memory(state)
-                    self._save_runner_state()
-                    self.session.fc_state = state
-
-                    # 🔥 修复：FC 完成后重新归档，补全 final_answer/duration/turns
-                    try:
-                        from zulong.tools.task_tools import get_active_task_graph, _auto_archive_completed
-                        _tg = get_active_task_graph(workspace_dir=getattr(self, 'cwd', None))
-                        if _tg:
-                            _auto_archive_completed(_tg)
-                    except Exception:
-                        pass
-
-                    return IDEFCResult(phase="done", text_response=state.final_answer or state.last_response_content)
+                    # 所有最终写回/归档统一走 _finalize，避免局部 done 路径绕过质量门。
+                    return self._finalize(state, "done")
                 elif verdict == "cb_force":
                     state.cb_force_no_tools = True
                 # verdict == "continue" → 继续循环
@@ -5228,11 +5326,15 @@ class IDEFCRunner(FCRunner):
                     f"连续{len(last_tool_calls)}轮调用 {tool_names[0]} 且参数相同"
                 )
                 state.cb_force_no_tools = True
+                state.cb_recovery_stage = "restricted_recovery"
+                state.cb_recovery_note_saved = False
+                state.cb_recovery_attention_switched = False
                 cm = {
                     "role": "user",
                     "content": (
                         f"[系统警告] 检测到重复工具调用循环（{tool_names[0]}），"
-                        f"请立即基于已有信息生成最终回复，不允许再调用工具。"
+                        f"请先把当前证据、未完成项、失败原因写入便签并切换注意力；"
+                        f"如果仍无法继续，只能输出 partial/blocked summary，不得伪完成。"
                     ),
                 }
                 state.messages.append(cm)
@@ -5419,11 +5521,123 @@ class IDEFCRunner(FCRunner):
         # 所有指标都无变化 → 停滞
         return True
 
+    def _build_dynamic_attention_context_message(
+        self,
+        state: IDEFCState,
+        base_messages: List[Dict],
+        *,
+        fc: int,
+    ) -> Tuple[List[Dict], Optional[Dict]]:
+        """Build and inject the per-call active context defined by TSD v2.9.24.
+
+        This is not a backing_pool and is not pinned into the conversation.  It
+        reconstructs the current necessary context from TaskGraph / MemoryGraph /
+        BFS for this one model call, then lets AttentionWindow remain only the
+        low-level safety fallback.
+        """
+        if not self._attn_window:
+            return base_messages, None
+        try:
+            task_graph = self._get_current_task_graph()
+            try:
+                from zulong.memory.memory_graph import get_memory_graph
+                memory_graph = get_memory_graph()
+            except Exception:
+                memory_graph = getattr(self._attn_window, "memory_graph", None)
+
+            ratio = float(
+                getattr(
+                    self._attn_window,
+                    "trigger_context_pressure_ratio",
+                    getattr(self._attn_window, "context_pressure_ratio", 0.0),
+                )
+                or 0.0
+            )
+            mode_value = getattr(getattr(self._attn_window, "mode", None), "value", "global")
+            pressure_stage = str(getattr(state, "pressure_stage", "") or "")
+            pressure_context = getattr(state, "pressure_attention_context", {}) or {}
+            include_navigation = pressure_stage in {"yellow_guidance", "restricted_recovery"}
+            if not include_navigation and str(mode_value).lower() != "global":
+                include_navigation = True
+            trigger_reason = pressure_stage or "model_call"
+            if pressure_context.get("tier"):
+                trigger_reason = f"pressure_{pressure_context.get('tier')}_{pressure_stage or 'active'}"
+            query_text = str(getattr(state, "user_input_text", "") or "")
+            if not query_text:
+                for msg in reversed(list(getattr(state, "messages", []) or [])):
+                    if isinstance(msg, dict) and msg.get("role") == "user" and msg.get("content"):
+                        query_text = str(msg.get("content") or "")
+                        break
+
+            uncovered_node_ids: List[str] = []
+            try:
+                if task_graph:
+                    coverage = self._compute_node_coverage(state, task_graph)
+                    uncovered_node_ids = list(coverage.get("uncovered_in_progress") or [])
+            except Exception:
+                uncovered_node_ids = []
+
+            bundle = build_attention_context_bundle(
+                mode=mode_value,
+                query_text=query_text,
+                attention_window=self._attn_window,
+                task_graph=task_graph,
+                memory_graph=memory_graph,
+                pressure_percent=ratio * 100.0,
+                trigger_reason=trigger_reason,
+                include_navigation_map=include_navigation,
+                navigation_reason=trigger_reason if include_navigation else "",
+                uncovered_node_ids=uncovered_node_ids,
+            )
+            rendered_msg = render_attention_context_message(bundle)
+            rendered_text = rendered_msg.get("content", "")
+            if not rendered_text:
+                return base_messages, None
+
+            telemetry = dict(bundle.telemetry or {})
+            telemetry.update({
+                "pressure_percent": round(ratio * 100.0, 1),
+                "pressure_stage": pressure_stage,
+                "threshold_budget_tokens": getattr(self._attn_window, "threshold_budget_tokens", None),
+                "active_context_rendered_chars": len(rendered_text),
+            })
+            plan_dict = bundle.plan.to_dict()
+            state.attention_context_plan = plan_dict
+            state.attention_context_telemetry = telemetry
+            state.last_attention_context_rendered = rendered_text[:4000]
+            state.last_attention_context_key = "%s|%s|%s|%s" % (
+                plan_dict.get("mode"),
+                plan_dict.get("focus_node_id"),
+                trigger_reason,
+                fc,
+            )
+            try:
+                self._attn_window._last_active_context_extra_tokens = int(
+                    telemetry.get("active_context_token_estimate") or 0
+                )
+            except Exception:
+                pass
+            logger.info(
+                "[IDEFCRunner][AttentionContext] turn=%s mode=%s focus=%s memory=%s bfs=%s tokens=%s nav=%s",
+                fc,
+                plan_dict.get("mode"),
+                plan_dict.get("focus_node_address") or plan_dict.get("focus_node_id"),
+                telemetry.get("retrieved_memory_count"),
+                telemetry.get("bfs_activated_count"),
+                telemetry.get("active_context_token_estimate"),
+                telemetry.get("navigation_map_injected"),
+            )
+            return [rendered_msg] + list(base_messages or []), telemetry
+        except Exception as exc:
+            logger.debug("[IDEFCRunner] ????????????: %s", exc)
+            return base_messages, None
+
     def _call_model(self, state: IDEFCState) -> Tuple[Optional[List[Dict]], Optional[str]]:
         """LLM API 调用。返回 (tool_calls, content)。都为 None 表示超时。"""
         call_start = time.perf_counter()
         fc = state.fc_turn
         msgs = self._attn_window.apply_window() if self._attn_window else state.messages
+        msgs, _attention_context_telemetry = self._build_dynamic_attention_context_message(state, msgs, fc=fc)
         extra_kw = self.engine._get_llm_extra_kwargs()
         # Qwen3 系列默认开启思维链（<think>），FC 模式下禁用以避免空 content
         eb = extra_kw.get("extra_body", {})
@@ -5444,32 +5658,44 @@ class IDEFCRunner(FCRunner):
                 state.tool_call_budget,
             )
         elif state.cb_force_no_tools:
-            # CB RED: 保留记忆恢复和最终提交工具，移除其余工具
-            # 防止 CB 模式下模型持续调用保留工具导致死循环：
-            # 连续调用保留工具超过 3 次后，完全移除所有工具强制纯文本回复
-            if state.cb_tool_streak >= 3:
-                # 已连续 3 次在 CB 模式下调用工具，强制纯文本
+            # CB RED 只有两轮口径：YELLOW 纠偏；RED 立即进入受限恢复。
+            # RED 不再先保留普通收敛工具，立即进入受限恢复。
+            state.cb_recovery_stage = "restricted_recovery"
+            cb_retained = self._get_cb_recovery_tools(state.tool_definitions)
+            if cb_retained:
+                kw["tools"] = cb_retained
+                next_tool = self._next_cb_recovery_tool(state, cb_retained)
+                if next_tool:
+                    kw["tool_choice"] = {
+                        "type": "function",
+                        "function": {"name": next_tool},
+                    }
+                else:
+                    kw["tool_choice"] = "required"
                 logger.warning(
-                    f"[IDEFCRunner][CB] cb_tool_streak={state.cb_tool_streak}，"
-                    f"移除所有工具强制纯文本回复"
+                    f"[IDEFCRunner][CB] RED 进入受限恢复，"
+                    f"仅保留便签/标签/记忆落盘+注意力切换能力工具 {len(cb_retained)} 个"
                 )
             else:
-                cb_retained = self._get_cb_retained_tools(state.tool_definitions)
-                if cb_retained:
-                    kw["tools"] = cb_retained
-                    kw["tool_choice"] = "auto"
-                    logger.info(f"[IDEFCRunner][CB] 保留 {len(cb_retained)} 个收敛工具 (streak={state.cb_tool_streak})")
-                else:
-                    logger.info("[IDEFCRunner][CB] 强制文本，移除工具")
+                logger.warning("[IDEFCRunner][CB] RED 未找到受限恢复工具，回退纯文本")
         elif state.pressure_force_attention:
-            # 压力 RED: 工具列表仅保留注意力工具，强制 LLM 调用
-            attn_tools = self._get_attention_only_tools(state.tool_definitions)
-            if attn_tools:
-                kw["tools"] = attn_tools
-                kw["tool_choice"] = "required"
-                logger.info(f"[IDEFCRunner][Pressure] 工具列表约束为注意力工具 ({len(attn_tools)}个)")
+            # 压力 RED: 只保留注意力切换 + 便签/标签/记忆落盘能力，
+            # 由 LLM 自主选择 GLOBAL/FOCUS/SINGLE_CHAIN 并按需保存现场。
+            recovery_tools = self._get_cb_recovery_tools(state.tool_definitions)
+            if recovery_tools:
+                kw["tools"] = recovery_tools
+                next_tool = self._next_pressure_recovery_tool(state, recovery_tools)
+                kw["tool_choice"] = (
+                    {"type": "function", "function": {"name": next_tool}}
+                    if next_tool else "required"
+                )
+                logger.info(
+                    "[IDEFCRunner][Pressure] 工具列表约束为注意力/便签/标签/记忆落盘能力工具 (%s个)，selection_context=%s",
+                    len(recovery_tools),
+                    getattr(state, "pressure_attention_context", {}) or {},
+                )
             else:
-                logger.warning("[IDEFCRunner][Pressure] 注意力工具不在 tool_definitions 中，回退正常模式")
+                logger.warning("[IDEFCRunner][Pressure] 受限恢复工具不在 tool_definitions 中，回退正常模式")
                 state.pressure_force_attention = False
                 if state.tool_definitions:
                     kw["tools"] = state.tool_definitions
@@ -5884,6 +6110,209 @@ class IDEFCRunner(FCRunner):
         return retained
 
     @staticmethod
+    def _tool_capabilities(tool_definition: Dict[str, Any]) -> set[str]:
+        """Infer coarse tool capabilities without binding policies to one name."""
+        return set(tool_capabilities(tool_definition))
+
+    @classmethod
+    def _tool_capability_map(cls, tool_definitions: Optional[List[Dict[str, Any]]]) -> Dict[str, set[str]]:
+        capability_by_name: Dict[str, set[str]] = {}
+        for td in tool_definitions or []:
+            fn = str(td.get("function", {}).get("name", "") or "").strip()
+            if fn:
+                capability_by_name[fn] = cls._tool_capabilities(td)
+        return capability_by_name
+
+    @classmethod
+    def _tool_result_has_capability(
+        cls,
+        item: Dict[str, Any],
+        capability: str,
+        capability_by_name: Optional[Dict[str, set[str]]] = None,
+    ) -> bool:
+        name = str(item.get("tool_name", "") or "").strip()
+        if not name:
+            return False
+        caps = (capability_by_name or {}).get(name, set())
+        if capability in caps:
+            return True
+        arguments = item.get("arguments", {}) or {}
+        if isinstance(arguments, dict):
+            arg_names = {str(k).lower() for k in arguments.keys()}
+            if (
+                capability == "file_write"
+                and bool({"path", "file_path", "target_path"} & arg_names)
+                and bool({"content", "diff", "replacement"} & arg_names)
+            ):
+                return True
+            if capability == "verification" and bool({"command", "regex", "query", "url"} & arg_names):
+                return True
+            if capability == "attention_switch" and bool({"mode", "direction", "target_node_id"} & arg_names):
+                result_text = cls._tool_result_text(item).lower()
+                return "attention" in result_text or "注意力" in result_text
+            if capability == "note_anchor" and bool({"content", "label", "entries"} & arg_names):
+                result_text = cls._tool_result_text(item).lower()
+                return any(token in result_text for token in ("note", "memory", "便签", "笔记", "记忆"))
+        return False
+
+    @classmethod
+    def _tool_has_capability(cls, tool_definition: Dict[str, Any], capability: str) -> bool:
+        return capability in cls._tool_capabilities(tool_definition)
+
+    @classmethod
+    def _get_cb_recovery_tools(cls, tool_definitions: List[Dict]) -> List[Dict]:
+        """CB RED 受限恢复工具。
+
+        TSD 对齐口径：
+        - 不再直接硬中断任务；
+        - 仅保留“便签/标签/记忆落盘能力”和“注意力切换能力”；
+        - 按工具能力类别筛选；具体工具名仅作为当前工具描述不足时的兼容映射。
+        """
+        retained = []
+        for td in tool_definitions:
+            caps = cls._tool_capabilities(td)
+            if caps & cls._CB_RESTRICTED_RECOVERY_CAPABILITIES:
+                if caps & cls._CB_RESTRICTED_EXCLUDED_CAPABILITIES:
+                    continue
+                retained.append(td)
+        return retained
+
+    @classmethod
+    def _first_tool_with_capability(cls, tool_definitions: List[Dict], capability: str) -> str:
+        for td in tool_definitions or []:
+            if capability in cls._tool_capabilities(td):
+                name = str(td.get("function", {}).get("name", "") or "").strip()
+                if name:
+                    return name
+        return ""
+
+    @classmethod
+    def _first_recovery_landing_tool(cls, tool_definitions: List[Dict]) -> str:
+        for capability in ("note_anchor", "memory_persist", "tag_anchor"):
+            name = cls._first_tool_with_capability(tool_definitions, capability)
+            if name:
+                return name
+        return ""
+
+    @classmethod
+    def _next_cb_recovery_tool(cls, state: IDEFCState, tool_definitions: List[Dict]) -> str:
+        if not getattr(state, "cb_recovery_note_saved", False):
+            return cls._first_recovery_landing_tool(tool_definitions)
+        if not getattr(state, "cb_recovery_attention_switched", False):
+            return cls._first_tool_with_capability(tool_definitions, "attention_switch")
+        return ""
+
+    @classmethod
+    def _next_pressure_recovery_tool(cls, state: IDEFCState, tool_definitions: List[Dict]) -> str:
+        if (
+            getattr(state, "pressure_recovery_requires_note", True)
+            and not getattr(state, "pressure_recovery_note_saved", False)
+        ):
+            return cls._first_recovery_landing_tool(tool_definitions)
+        if (
+            getattr(state, "pressure_recovery_requires_attention", True)
+            and not getattr(state, "pressure_recovery_attention_switched", False)
+        ):
+            return cls._first_tool_with_capability(tool_definitions, "attention_switch")
+        return ""
+
+    def _build_cb_red_control_message(self, state: IDEFCState, reason: str) -> Dict:
+        """Build TSD-aligned CircuitBreaker RED control guidance.
+
+        RED 触发后立即进入
+        “便签/标签/记忆锚定 + 注意力重选”的受限恢复回路。
+        """
+        state.cb_recovery_stage = "restricted_recovery"
+        state.cb_recovery_note_saved = False
+        state.cb_recovery_attention_switched = False
+        focus_node = ""
+        try:
+            focus_node = str(getattr(self._attn_window, "_current_node_id", "") or "")
+        except Exception:
+            focus_node = ""
+        content = (
+            f"[Circuit Breaker RED 受限恢复] {reason}\n"
+            "不要直接最终收束，也不要继续普通执行/搜索/写文件/命令/验证工具。\n"
+            "请按顺序完成两步：\n"
+            "1) 调用便签/标签/记忆落盘能力，把当前可用证据、未完成项、失败原因、下一步建议保存下来；"
+            f"内容必须关联当前焦点节点 {focus_node or '当前任务节点'}。\n"
+            "2) 调用注意力切换能力，基于便签和当前任务状态选择 GLOBAL / FOCUS / SINGLE_CHAIN 之一，"
+            "并说明需要注入哪些上下文、暂排哪些上下文。\n"
+            "本轮普通执行工具已被收走，只保留便签/标签/记忆落盘和注意力切换能力。"
+        )
+        return internal_control_message(content)
+
+    @classmethod
+    def _update_cb_recovery_progress(
+        cls,
+        state: IDEFCState,
+        tool_names: List[str],
+        tool_definitions: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Track RED restricted recovery progress and release the hard tool gate once complete."""
+        if getattr(state, "cb_recovery_stage", "") not in {"restricted_recovery", "note_attention"}:
+            return
+        names = {str(name or "").strip() for name in tool_names if name}
+        capability_by_name = cls._tool_capability_map(tool_definitions)
+        if any(
+            capability_by_name.get(name, set()) & {"note_anchor", "memory_persist", "tag_anchor"}
+            for name in names
+        ):
+            state.cb_recovery_note_saved = True
+        if any(
+            "attention_switch" in capability_by_name.get(name, set())
+            for name in names
+        ):
+            state.cb_recovery_attention_switched = True
+        if state.cb_recovery_note_saved and state.cb_recovery_attention_switched:
+            state.cb_force_no_tools = False
+            state.cb_tool_streak = 0
+            state.cb_recovery_stage = ""
+
+    @classmethod
+    def _update_pressure_recovery_progress(
+        cls,
+        state: IDEFCState,
+        tool_names: List[str],
+        tool_definitions: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Track context-pressure restricted recovery progress."""
+        if getattr(state, "pressure_stage", "") != "restricted_recovery":
+            return
+        names = {str(name or "").strip() for name in tool_names if name}
+        if not names:
+            return
+        capability_by_name = cls._tool_capability_map(tool_definitions)
+        if any(
+            capability_by_name.get(name, set()) & {"note_anchor", "memory_persist", "tag_anchor"}
+            for name in names
+        ):
+            state.pressure_recovery_note_saved = True
+        if any(
+            "attention_switch" in capability_by_name.get(name, set())
+            for name in names
+        ):
+            state.pressure_recovery_attention_switched = True
+
+        note_done = (
+            getattr(state, "pressure_recovery_note_saved", False)
+            or not getattr(state, "pressure_recovery_requires_note", True)
+        )
+        attention_done = (
+            getattr(state, "pressure_recovery_attention_switched", False)
+            or not getattr(state, "pressure_recovery_requires_attention", True)
+        )
+        if note_done and attention_done:
+            ctx = dict(getattr(state, "pressure_attention_context", {}) or {})
+            ctx.update({
+                "completed": True,
+                "resolved_at_turn": getattr(state, "fc_turn", 0),
+            })
+            state.pressure_attention_context = ctx
+            state.pressure_stage = ""
+            state.pressure_force_attention = False
+
+    @staticmethod
     def _strip_xml_tool_tags(text: str) -> str:
         """从文本中移除 XML 工具调用标签，保留前置文本"""
         import re as _re
@@ -5984,15 +6413,20 @@ class IDEFCRunner(FCRunner):
                 self._exec_internal(state, td, fc, grp)
             try:
                 if self._circuit_breaker:
-                    _aw_ratio = self._attn_window.usage_ratio if self._attn_window else -1.0
+                    _aw_ratio = (
+                        getattr(
+                            self._attn_window,
+                            "trigger_context_pressure_ratio",
+                            getattr(self._attn_window, "context_pressure_ratio", self._attn_window.usage_ratio),
+                        )
+                        if self._attn_window else -1.0
+                    )
                     cb_s, cb_r = self._circuit_breaker.evaluate(fc, msgs, attn_usage_ratio=_aw_ratio)
                     if cb_s == CircuitBreakerState.RED:
                         logger.warning(f"[IDEFCRunner][CB] RED: {cb_r}")
                         state.cb_force_no_tools = True
                         state.cb_trigger_reason = cb_r  # 保存CB原因供_finalize使用
-                        cm = internal_control_message(
-                            f"[Circuit Breaker 强制收敛] {cb_r}\n你必须立刻基于已有信息生成最终回复，不允许再调用任何工具。"
-                        )
+                        cm = self._build_cb_red_control_message(state, cb_r)
                         msgs.append(cm)
                         if self._attn_window:
                             self._attn_window.register_message(cm, turn=fc)
@@ -6140,25 +6574,24 @@ class IDEFCRunner(FCRunner):
                             is_code_gen = any(kw in label_lower or kw in desc_lower
                                               for kw in _code_gen_kw)
                             if is_code_gen:
-                                # 检查最近的工具调用中是否有 write_to_file/replace_in_file
-                                recent_tools = [r.get("tool_name", "") for r in state.tool_results_buffer[-10:]]
-                                has_write = any(t in ("write_to_file", "replace_in_file")
-                                                for t in recent_tools)
+                                capability_by_name = self._tool_capability_map(
+                                    getattr(state, "tool_definitions", []) or []
+                                )
+                                recent_results = list(state.tool_results_buffer[-10:] or [])
+                                has_write = any(
+                                    self._tool_result_has_capability(r, "file_write", capability_by_name)
+                                    and r.get("success", not self._tool_result_failed_text(r.get("result", "")))
+                                    for r in recent_results
+                                )
                                 if not has_write:
                                     warn = (
                                         f"\n\n⚠️ [任务完成验证] 该节点({node.label})属于代码生成任务，"
-                                        f"但未检测到 write_to_file/replace_in_file 工具调用。"
-                                        f"请确认文件已正确创建。如需创建文件，请调用: "
-                                        f"write_to_file(path='文件路径', content='文件内容')"
+                                        f"但最近未检测到成功的文件写入能力工具结果。"
+                                        f"请确认文件已真实落盘；如尚未落盘，请调用当前可用的文件写入工具。"
                                     )
                                     rt = rt + warn
                 except Exception as val_err:
                     logger.debug(f"[IDEFCRunner] 任务完成验证异常: {val_err}")
-        # 注意力工具执行完毕后，恢复正常工具列表
-        if tn in ("navigate_attention", "adjust_attention_mode"):
-            if state.pressure_force_attention:
-                state.pressure_force_attention = False
-                logger.info(f"[IDEFCRunner][Pressure] 注意力工具 {tn} 已执行，恢复正常工具列表")
         attn_after = self._attention_state()
         if self._circuit_breaker:
             self._circuit_breaker.record_call(tn, ta, rt)
@@ -6428,6 +6861,41 @@ class IDEFCRunner(FCRunner):
         )
 
         if state.cb_force_no_tools:
+            if getattr(state, "cb_recovery_stage", "") in {"restricted_recovery", "note_attention"} and not (
+                getattr(state, "cb_recovery_note_saved", False)
+                and getattr(state, "cb_recovery_attention_switched", False)
+            ):
+                recovery_hint = internal_control_message(
+                    "[Circuit Breaker RED 受限恢复未完成]\n"
+                    "请不要直接输出最终总结。必须先完成："
+                    "1) 写入并锚定便签/标签/记忆；2) 执行一次注意力切换。"
+                )
+                msgs.append(recovery_hint)
+                if self._attn_window:
+                    self._attn_window.register_message(recovery_hint, turn=fc)
+                return "continue"
+
+        if getattr(state, "pressure_stage", "") == "restricted_recovery":
+            note_done = (
+                getattr(state, "pressure_recovery_note_saved", False)
+                or not getattr(state, "pressure_recovery_requires_note", True)
+            )
+            attention_done = (
+                getattr(state, "pressure_recovery_attention_switched", False)
+                or not getattr(state, "pressure_recovery_requires_attention", True)
+            )
+            if not (note_done and attention_done):
+                recovery_hint = internal_control_message(
+                    "[上下文压力 RED 受限恢复未完成]\n"
+                    "请不要直接输出最终总结。必须先完成："
+                    "1) 写入并锚定便签/标签/记忆；2) 执行一次注意力切换。"
+                )
+                msgs.append(recovery_hint)
+                if self._attn_window:
+                    self._attn_window.register_message(recovery_hint, turn=fc)
+                return "continue"
+
+        if state.cb_force_no_tools:
             if not resp or len(resp.strip()) < 10:
                 resp = self._get_cb_fallback(state)
             self._run_backfill(state, resp, is_cb_path=True)
@@ -6549,23 +7017,20 @@ class IDEFCRunner(FCRunner):
                             (n for n in uncompleted_mono if n.status == "in_progress"),
                             uncompleted_mono[0],
                         )
-                        # 🔥 强纠正提示：明确告诉模型用哪个工具、什么参数
-                        # 优先级：1. write_to_file（代码生成节点） 2. read_file（分析节点） 3. execute_command（命令节点）
+                        # 强纠正提示按工具能力表达，不绑定单个工具名。
                         label_lower = (current_mono.label or "").lower()
                         tool_hint = ""
                         if any(kw in label_lower for kw in ("写", "编写", "创建", "生成", "代码", "code", "write", "create", "文件", "file", "html", "css", "js", "实现", "开发")):
                             tool_hint = (
-                                f'请立即调用 write_to_file 创建文件。\n'
-                                f'示例: write_to_file(path="文件路径", content="文件内容")'
+                                "请立即调用当前可用的文件写入能力工具完成真实落盘。"
                             )
                         elif any(kw in label_lower for kw in ("分析", "分析", "检查", "review", "查看", "阅读", "读", "read")):
-                            tool_hint = "请调用 read_file 或 index_code_file 分析代码。"
+                            tool_hint = "请调用当前可用的读取/检索/分析能力工具获取证据。"
                         elif any(kw in label_lower for kw in ("运行", "执行", "测试", "运行", "test", "run", "命令", "command")):
-                            tool_hint = "请调用 execute_command 运行命令。"
+                            tool_hint = "请调用当前可用的命令执行/验证能力工具运行检查。"
                         else:
                             tool_hint = (
-                                "请调用合适的工具（write_to_file/read_file/execute_command）"
-                                "来执行任务。不要只口头叙述！"
+                                "请调用与当前节点匹配的执行能力工具推进任务。不要只口头叙述！"
                             )
                         nudge_mono = {
                             "role": "user",
@@ -6653,19 +7118,24 @@ class IDEFCRunner(FCRunner):
                         result_text = resp[:500]
                         if _looks_like_incomplete_result(result_text):
                             return "done"
-                        tg.update_node_status(tgt.id, "completed", result=result_text)
+                        if hasattr(tgt, "metadata"):
+                            tgt.metadata["auto_progress_candidate"] = result_text
+                            tgt.metadata["auto_progress_candidate_at_turn"] = state.fc_turn
+                            tgt.metadata["auto_progress_candidate_source"] = "resume_text_review"
                         try: _save_active_backup()
                         except Exception as e:
                             ErrorHandler.handle_exception(e, ErrorCode.CFG_SAVE_FAILED, context={"operation": "save_active_backup"}, log_level=logging.WARNING)
-                        rem = [n for n in tg.get_leaf_nodes() if n.status != "completed"]
+                        rem = [n for n in tg.get_leaf_nodes() if n.status not in ("completed", "skipped")]
                         if rem:
                             nn = rem[0]
-                            tg.update_node_status(nn.id, "in_progress")
+                            if nn.status in ("pending", "needs_adjust", "waiting_input"):
+                                tg.update_node_status(nn.id, "in_progress")
                             try: _save_active_backup()
                             except Exception as e:
                                 ErrorHandler.handle_exception(e, ErrorCode.CFG_SAVE_FAILED, context={"operation": "save_active_backup"}, log_level=logging.WARNING)
                             cont = {"role": "user", "content":
-                                    f"[自动进度] {tgt.id}({tgt.label})完成。继续 {nn.id}({nn.label})。"}
+                                    f"[自动进度候选] 检测到 {tgt.id}({tgt.label}) 可能已有文本产出，但不会自动标记完成。"
+                                    f"请基于真实工具/验证证据显式调用 task_mark_status；当前继续 {nn.id}({nn.label})。"}
                             msgs.append({"role": "assistant", "content": resp})
                             msgs.append(cont)
                             if self._attn_window:
@@ -6796,15 +7266,15 @@ class IDEFCRunner(FCRunner):
                             (n for n in uncompleted_ri if n.status == "in_progress"),
                             uncompleted_ri[0],
                         )
-                        # 🔥 根据当前节点类型提供具体工具引导
+                        # 根据当前节点类型提供能力类别引导，不绑定单个工具名。
                         label_ri = (current_ri.label or "").lower()
                         tool_ri_hint = ""
                         if any(kw in label_ri for kw in ("写", "编写", "创建", "生成", "代码", "code", "write", "create", "文件", "file", "html", "css", "js", "实现", "开发", "页面")):
-                            tool_ri_hint = "\n请调用: write_to_file(path='文件路径', content='文件完整内容')"
+                            tool_ri_hint = "\n请调用当前可用的文件写入能力工具完成真实落盘。"
                         elif any(kw in label_ri for kw in ("运行", "执行", "测试", "test", "run", "命令")):
-                            tool_ri_hint = "\n请调用: execute_command(command='命令')"
+                            tool_ri_hint = "\n请调用当前可用的命令执行/验证能力工具运行检查。"
                         elif any(kw in label_ri for kw in ("查看", "分析", "阅读", "检查", "read", "review")):
-                            tool_ri_hint = "\n请调用: read_file(path='文件路径')"
+                            tool_ri_hint = "\n请调用当前可用的读取/检索/分析能力工具获取证据。"
                         nudge_ri = {
                             "role": "user",
                             "content": (
@@ -6928,6 +7398,31 @@ class IDEFCRunner(FCRunner):
                         break
         if not resp:
             resp = self.engine._get_fallback_response(state.user_input_text)
+        try:
+            from zulong.tools.task_tools import (
+                get_active_task_graph,
+                _write_final_answer_to_task_graph,
+                _auto_archive_completed,
+            )
+            _tg = get_active_task_graph(workspace_dir=getattr(self, 'cwd', None))
+            if _tg and hasattr(_tg, "metadata"):
+                _tg.metadata["total_turns"] = state.fc_turn
+                _tg.metadata["duration"] = time.time() - getattr(_tg, "created_at", time.time())
+                if reason == "done" and resp:
+                    _write_final_answer_to_task_graph(
+                        _tg,
+                        resp,
+                        source="fc_finalize_quality_pass",
+                    )
+                    _auto_archive_completed(_tg)
+                elif resp:
+                    root = _tg.get_node("req") if hasattr(_tg, "get_node") else None
+                    if root is not None:
+                        root.metadata["non_completion_summary"] = str(resp)
+                        root.metadata["non_completion_reason"] = reason
+                        root.metadata["non_completion_updated_at"] = time.time()
+        except Exception as exc:
+            logger.debug("[IDEFCRunner] finalize TaskGraph 写回跳过: %s", exc)
         logger.info(f"[IDEFCRunner] 终止: {reason}, turns={state.fc_turn}, len={len(resp or '')}")
         # 清理共享线程池
         try:
@@ -7204,7 +7699,7 @@ class IDEFCRunner(FCRunner):
         ))
         failed_recent = [
             item for item in recent
-            if not item.get("success", not self._tool_result_failed_text(item.get("result", "")))
+            if not self._tool_result_success(item)
         ]
         if failed_recent and not mentions_risk:
             names = "、".join(
@@ -7289,29 +7784,25 @@ class IDEFCRunner(FCRunner):
             }
             coverage = self._compute_node_coverage(state, tg)
 
-        recent = list(getattr(state, "tool_results_buffer", []) or [])[-10:]
+        all_results = list(getattr(state, "tool_results_buffer", []) or [])
+        recent = all_results[-10:]
         failed_tools = [
-            item for item in recent
-            if not item.get("success", not self._tool_result_failed_text(item.get("result", "")))
+            item for item in all_results
+            if not self._tool_result_success(item)
         ]
         empty_tools = [
-            item for item in recent
+            item for item in all_results
             if not str(item.get("result", "") or "").strip()
             or str(item.get("result", "") or "").strip() in {"{}", "[]", "null", "None"}
         ]
+        capability_by_name = self._tool_capability_map(getattr(state, "tool_definitions", []) or [])
         write_ops = [
-            item for item in recent
-            if str(item.get("tool_name", "")) in {
-                "write_to_file", "replace_in_file", "ide_write_file",
-                "ide_replace_text", "create_file", "insert_code_block",
-            }
+            item for item in all_results
+            if self._tool_result_has_capability(item, "file_write", capability_by_name)
         ]
         verify_ops = [
-            item for item in recent
-            if str(item.get("tool_name", "")) in {
-                "exec_run_command", "execute_command", "browser_action",
-                "read_file", "ide_read_file", "search_code_symbols",
-            }
+            item for item in all_results
+            if self._tool_result_has_capability(item, "verification", capability_by_name)
         ]
         tests_run = []
         for item in verify_ops:
@@ -7321,6 +7812,13 @@ class IDEFCRunner(FCRunner):
 
         hard_constraints = self._extract_lightweight_constraints(state.user_input_text)
         target_constraints = self._extract_target_constraints(state.user_input_text)
+        if tg:
+            meta = getattr(tg, "metadata", {}) or {}
+            target_constraints["selected_workspace_dir"] = str(
+                meta.get("workspace_dir") or meta.get("workspace_path") or ""
+            )
+            target_constraints["path_roles"] = meta.get("path_roles") or []
+            target_constraints["path_candidates"] = meta.get("path_candidates") or []
         written_paths = self._collect_written_paths(write_ops)
         command_evidence = self._collect_command_evidence(verify_ops)
         violated_constraints = self._target_constraint_violations(
@@ -7337,6 +7835,16 @@ class IDEFCRunner(FCRunner):
             for cmd in latest_commands.values()
             if cmd.get("status") == "failed"
         ][:5]
+        taskspec_coverage = self._collect_taskspec_coverage(
+            tg,
+            state.user_input_text,
+            all_results,
+            getattr(state, "tool_definitions", []) or [],
+        )
+        if taskspec_coverage.get("missing_required_evidence"):
+            for missing in taskspec_coverage.get("missing_required_evidence", [])[:5]:
+                if missing not in violated_constraints:
+                    violated_constraints.append(missing)
         mentioned_constraints = [
             c for c in hard_constraints
             if c.lower() in str(resp or "").lower()
@@ -7365,15 +7873,16 @@ class IDEFCRunner(FCRunner):
                 "mentioned_constraints": mentioned_constraints,
                 "violated_constraints": violated_constraints,
                 "target_paths": target_constraints.get("target_paths", []),
-                "project_name": target_constraints.get("project_name", ""),
-                "requires_root_command": target_constraints.get("requires_root_command", False),
+                "selected_workspace_dir": target_constraints.get("selected_workspace_dir", ""),
             },
+            "taskspec_coverage": taskspec_coverage,
             "completion_evidence": {
-                "project_name": target_constraints.get("project_name", ""),
                 "target_paths": target_constraints.get("target_paths", []),
+                "selected_workspace_dir": target_constraints.get("selected_workspace_dir", ""),
                 "written_paths": written_paths,
                 "commands": command_evidence,
                 "failed_commands_uncovered": failed_commands_uncovered,
+                "taskspec_coverage": taskspec_coverage,
             },
             "risks": {
                 "response_mentions_risk": any(term in str(resp or "").lower() for term in (
@@ -7390,7 +7899,6 @@ class IDEFCRunner(FCRunner):
 
     @staticmethod
     def _extract_target_constraints(user_text: str) -> Dict[str, Any]:
-        import os as _os
         import re as _re
 
         text = str(user_text or "")
@@ -7401,24 +7909,38 @@ class IDEFCRunner(FCRunner):
             clean = path.strip().rstrip("。；;,，")
             if clean and clean not in target_paths:
                 target_paths.append(clean)
-        project_name = ""
-        project_match = _re.search(r"(?:项目名|项目|目录名|文件夹名)[:：\s]+([\w\-.]+)", text)
-        if project_match:
-            project_name = project_match.group(1).strip("。；;,，")
-        elif target_paths:
-            project_name = _os.path.basename(target_paths[-1].replace("\\", "/").rstrip("/"))
-        requires_root_command = any(
-            term in text for term in ("根目录", "仓库根目录", "项目根目录", "repo root", "repository root")
-        )
         return {
             "target_paths": target_paths[:6],
-            "project_name": project_name,
-            "requires_root_command": requires_root_command,
+            "selected_workspace_dir": "",
         }
 
     @staticmethod
     def _normalize_path_text(value: Any) -> str:
         return str(value or "").replace("\\", "/").rstrip("/").lower()
+
+    @staticmethod
+    def _path_is_absolute_text(value: Any) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        try:
+            return Path(text).is_absolute()
+        except Exception:
+            return bool(re.match(r"^[A-Za-z]:[\\/]", text) or text.startswith("/"))
+
+    @classmethod
+    def _path_inside_text(cls, path_value: Any, workspace_value: Any) -> bool:
+        path_text = str(path_value or "").strip()
+        workspace_text = str(workspace_value or "").strip()
+        if not path_text or not workspace_text:
+            return False
+        try:
+            Path(path_text).resolve().relative_to(Path(workspace_text).resolve())
+            return True
+        except Exception:
+            path_norm = cls._normalize_path_text(path_text)
+            workspace_norm = cls._normalize_path_text(workspace_text)
+            return bool(path_norm and workspace_norm and path_norm.startswith(workspace_norm + "/"))
 
     @classmethod
     def _collect_written_paths(cls, write_ops: List[Dict[str, Any]]) -> List[str]:
@@ -7431,7 +7953,152 @@ class IDEFCRunner(FCRunner):
                 value = str(args.get(key) or "").strip()
                 if value and value not in paths:
                     paths.append(value)
+            result = item.get("result")
+            parsed: Any = None
+            if isinstance(result, dict):
+                parsed = result
+            elif isinstance(result, str) and result.strip().startswith(("{", "[")):
+                try:
+                    parsed = _json.loads(result)
+                except Exception:
+                    parsed = None
+            if isinstance(parsed, dict):
+                data = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
+                for key in ("resolved_path", "file_path", "workspace_path", "cwd"):
+                    value = str(data.get(key) or "").strip()
+                    if value and value not in paths:
+                        paths.append(value)
         return paths[:20]
+
+    @staticmethod
+    def _tool_result_text(item: Dict[str, Any]) -> str:
+        try:
+            result = item.get("result", "")
+            if isinstance(result, (dict, list)):
+                return _json.dumps(result, ensure_ascii=False)
+            return str(result or "")
+        except Exception:
+            return ""
+
+    @classmethod
+    def _collect_taskspec_coverage(
+        cls,
+        tg: Any,
+        user_text: str,
+        tool_results: List[Dict[str, Any]],
+        tool_definitions: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Generic TaskSpec coverage gate built on existing TaskGraph/evidence.
+
+        This intentionally avoids project-specific terms.  It asks only whether
+        the original task shape represented in TaskGraph has corresponding
+        execution evidence: completed leaf nodes have non-trivial results,
+        write-oriented nodes have write evidence, validation-oriented nodes have
+        command/read evidence, and failed commands are not left uncovered.
+        """
+        coverage: Dict[str, Any] = {
+            "source": "task_graph_and_tool_evidence",
+            "checked": False,
+            "node_count": 0,
+            "missing_required_evidence": [],
+            "covered_nodes": [],
+            "uncovered_nodes": [],
+        }
+        if tg is None:
+            return coverage
+        leaves = [
+            n for n in getattr(tg, "get_leaf_nodes", lambda: [])()
+            if not str(getattr(n, "id", "")).startswith("crg_")
+        ]
+        coverage["checked"] = True
+        coverage["node_count"] = len(leaves)
+        if not leaves:
+            return coverage
+
+        capability_by_name = cls._tool_capability_map(tool_definitions)
+        write_evidence = [
+            item for item in tool_results
+            if cls._tool_result_has_capability(item, "file_write", capability_by_name)
+            and cls._tool_result_success(item)
+        ]
+        verify_evidence = [
+            item for item in tool_results
+            if cls._tool_result_has_capability(item, "verification", capability_by_name)
+            and cls._tool_result_success(item)
+        ]
+        failed_evidence = [
+            item for item in tool_results
+            if not cls._tool_result_success(item)
+        ]
+        all_text = "\n".join(
+            [str(user_text or "")]
+            + [
+                str(item.get("tool_name", ""))
+                + " "
+                + _json.dumps(item.get("arguments", {}), ensure_ascii=False, default=str)
+                + " "
+                + cls._tool_result_text(item)[:1200]
+                for item in tool_results
+            ]
+        ).lower()
+
+        missing: List[str] = []
+        for node in leaves:
+            node_id = str(getattr(node, "id", "") or "")
+            label = str(getattr(node, "label", "") or "")
+            desc = str(getattr(node, "desc", "") or "")
+            result = str(getattr(node, "result", "") or "").strip()
+            status = str(getattr(node, "status", "") or "")
+            node_text = f"{label} {desc}".lower()
+            node_report = {
+                "node_id": node_id,
+                "label": label,
+                "status": status,
+                "has_result": bool(result),
+            }
+            if status not in {"completed", "skipped"}:
+                missing.append(f"TaskSpec 节点未完成: {node_id} {label}")
+                coverage["uncovered_nodes"].append(node_report)
+                continue
+            if status == "completed" and len(result) < 20:
+                missing.append(f"TaskSpec 节点完成结果证据不足: {node_id} {label}")
+                coverage["uncovered_nodes"].append(node_report)
+                continue
+
+            # Generic stage signals, not tied to a project or fixed task number.
+            needs_write = bool(
+                re.search(r"\b(write|create|generate|implement|edit|modify|file|code)\b", node_text)
+                or any(token in node_text for token in ("写", "创建", "生成", "实现", "修改", "文件", "代码"))
+            )
+            needs_verify = bool(
+                re.search(r"\b(test|verify|validate|check|build|lint|run)\b", node_text)
+                or any(token in node_text for token in ("测试", "验证", "检查", "构建", "运行", "端到端", "集成"))
+            )
+            node_tokens = [
+                token.lower()
+                for token in re.findall(r"[A-Za-z0-9_\-.]{3,}", f"{label} {desc} {result}")
+            ][:12]
+            text_mentions_node = any(token in all_text for token in node_tokens)
+            if needs_write and not (write_evidence or text_mentions_node):
+                missing.append(f"TaskSpec 写入类节点缺少工具落盘证据: {node_id} {label}")
+                coverage["uncovered_nodes"].append(node_report)
+                continue
+            if needs_verify and not (verify_evidence or text_mentions_node):
+                missing.append(f"TaskSpec 验证类节点缺少验证证据: {node_id} {label}")
+                coverage["uncovered_nodes"].append(node_report)
+                continue
+            coverage["covered_nodes"].append(node_report)
+
+        if failed_evidence:
+            missing.append(
+                "TaskSpec 存在未覆盖失败工具结果: "
+                + "、".join(str(item.get("tool_name") or "工具") for item in failed_evidence[:3])
+            )
+        coverage["missing_required_evidence"] = missing[:12]
+        coverage["write_evidence_count"] = len(write_evidence)
+        coverage["verify_evidence_count"] = len(verify_evidence)
+        coverage["failed_evidence_count"] = len(failed_evidence)
+        return coverage
 
     def _collect_command_evidence(self, verify_ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         commands: List[Dict[str, Any]] = []
@@ -7445,8 +8112,8 @@ class IDEFCRunner(FCRunner):
                 args = {}
             command = str(args.get("command") or args.get("cmd") or "").strip()
             cwd = str(args.get("cwd") or args.get("workspace_path") or default_cwd).strip()
-            success = bool(item.get("success", not self._tool_result_failed_text(item.get("result", ""))))
             result_text = str(item.get("result", "") or "")
+            success = self._tool_result_success(item)
             exit_code = 0 if success else 1
             try:
                 parsed = _json.loads(result_text)
@@ -7454,6 +8121,10 @@ class IDEFCRunner(FCRunner):
                     data = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
                     if isinstance(data.get("returncode"), int):
                         exit_code = data["returncode"]
+                        success = exit_code == 0
+                    elif isinstance(data.get("exit_code"), int):
+                        exit_code = data["exit_code"]
+                        success = exit_code == 0
             except Exception:
                 pass
             commands.append({
@@ -7474,20 +8145,29 @@ class IDEFCRunner(FCRunner):
         command_evidence: List[Dict[str, Any]],
     ) -> List[str]:
         violations: List[str] = []
-        targets = list(target_constraints.get("target_paths") or [])
-        normalized_written = [cls._normalize_path_text(path) for path in written_paths]
-        for target in targets:
-            normalized_target = cls._normalize_path_text(target)
-            if normalized_target and not any(path.startswith(normalized_target) or normalized_target in path for path in normalized_written):
-                violations.append(f"用户指定目标目录缺少写入证据: {target}")
-        project_name = str(target_constraints.get("project_name") or "").strip()
-        if project_name and written_paths:
-            pn = project_name.lower()
-            if not any(pn in cls._normalize_path_text(path).split("/") for path in written_paths):
-                violations.append(f"用户指定项目名缺少写入证据: {project_name}")
-        if target_constraints.get("requires_root_command"):
-            if not any(cmd.get("covers_root") and cmd.get("status") == "succeeded" for cmd in command_evidence):
-                violations.append("用户要求根目录验证，但缺少根目录成功命令证据")
+        selected_workspace = str(target_constraints.get("selected_workspace_dir") or "").strip()
+        if selected_workspace:
+            outside_writes = [
+                path for path in written_paths
+                if cls._path_is_absolute_text(path)
+                and not cls._path_inside_text(path, selected_workspace)
+            ]
+            if outside_writes:
+                violations.append(
+                    "写入路径与当前 TaskGraph 工作区不一致: "
+                    + "、".join(str(path)[:120] for path in outside_writes[:3])
+                )
+            outside_commands = [
+                cmd for cmd in command_evidence
+                if str(cmd.get("cwd") or "").strip()
+                and cls._path_is_absolute_text(cmd.get("cwd"))
+                and not cls._path_inside_text(cmd.get("cwd"), selected_workspace)
+            ]
+            if outside_commands:
+                violations.append(
+                    "命令执行目录与当前 TaskGraph 工作区不一致: "
+                    + "、".join(str(cmd.get("cwd") or "")[:120] for cmd in outside_commands[:3])
+                )
         latest_by_command: Dict[str, Dict[str, Any]] = {}
         for cmd in command_evidence:
             key = " ".join(str(cmd.get("command") or "").lower().split()) or str(cmd.get("cwd") or "")
@@ -7515,6 +8195,7 @@ class IDEFCRunner(FCRunner):
         constraints = evidence.get("constraints", {}) or {}
         risks = evidence.get("risks", {}) or {}
         attention = evidence.get("attention", {}) or {}
+        taskspec = evidence.get("taskspec_coverage", {}) or {}
 
         reasons: List[str] = []
         risk_reasons: List[str] = []
@@ -7563,6 +8244,23 @@ class IDEFCRunner(FCRunner):
         for item in violated[:3]:
             reasons.append(f"用户硬约束可能未满足: {item}")
 
+        taskspec_missing = list(taskspec.get("missing_required_evidence", []) or [])
+        if taskspec_missing:
+            taskspec_score = 0.35
+            for item in taskspec_missing[:3]:
+                reasons.append(f"原始任务要求覆盖不足: {item}")
+        else:
+            taskspec_score = 1.0 if taskspec.get("checked") else 0.85
+
+        failed_commands_uncovered = list(
+            (evidence.get("completion_evidence", {}) or {}).get("failed_commands_uncovered", []) or []
+        )
+        if failed_commands_uncovered:
+            verify_score = min(verify_score, 0.2)
+            handling_score = min(handling_score, 0.25)
+            for command in failed_commands_uncovered[:3]:
+                reasons.append(f"存在失败验证命令未被后续成功覆盖: {command}")
+
         has_known_risk = bool(reasons or risk_reasons or failed or unfinished)
         if has_known_risk and not risks.get("response_mentions_risk"):
             risk_score = 0.45
@@ -7573,17 +8271,19 @@ class IDEFCRunner(FCRunner):
 
         dimensions = {
             "task_coverage": task_score,
+            "taskspec_coverage": taskspec_score,
             "verification_evidence": verify_score,
             "tool_result_handling": handling_score,
             "constraint_alignment": constraint_score,
             "risk_transparency": risk_score,
         }
         score = (
-            task_score * 0.30
-            + verify_score * 0.25
-            + handling_score * 0.20
-            + constraint_score * 0.15
-            + risk_score * 0.10
+            task_score * 0.24
+            + taskspec_score * 0.18
+            + verify_score * 0.22
+            + handling_score * 0.17
+            + constraint_score * 0.11
+            + risk_score * 0.08
         )
         if score >= 0.80:
             level = "pass"
@@ -7591,6 +8291,9 @@ class IDEFCRunner(FCRunner):
             level = "warn"
         else:
             level = "iterate"
+        if failed_commands_uncovered:
+            level = "blocked"
+            score = min(score, 0.49)
         return {
             "score": round(score, 3),
             "level": level,
@@ -7983,6 +8686,23 @@ class IDEFCRunner(FCRunner):
             )
             return ("cb_force" if state.null_response_count >= 4 else "continue"), resp
 
+        if quality.get("level") == "blocked":
+            state.cb_trigger_reason = state.cb_trigger_reason or "quality_blocked"
+            logger.info(
+                "[IDEFCRunner][CompletionGate] blocked summary score=%.3f",
+                state.quality_last_score,
+            )
+            self._log_fc_decision_path(
+                state,
+                path="completion_gate_blocked_summary",
+                tool_calls=[],
+                response_content=resp,
+                root_cause="quality_blocked",
+                score=state.quality_last_score,
+                quality_level=quality.get("level"),
+            )
+            return None, resp
+
         if quality.get("level") == "warn":
             appendix = self._quality_risk_appendix(quality)
             if appendix and appendix not in resp:
@@ -8020,7 +8740,7 @@ class IDEFCRunner(FCRunner):
             unc = [n for n in leaves if n.status not in ("completed", "skipped")]
             if not unc or _looks_like_incomplete_result(response):
                 return
-            cnt = 0
+            candidates = []
             for nd in unc:
                 if _has_content_match(response, nd.label):
                     node_content = _extract_node_content(response, nd.label, 500)
@@ -8030,77 +8750,112 @@ class IDEFCRunner(FCRunner):
                             f"{nd.id}({nd.label})"
                         )
                         continue
-                    tg.update_node_status(nd.id, "completed", result=node_content)
-                    cnt += 1
-            if cnt > 0:
+                    if hasattr(nd, "metadata"):
+                        nd.metadata["backfill_candidate_result"] = node_content
+                        nd.metadata["backfill_candidate_at_turn"] = state.fc_turn
+                        nd.metadata["backfill_candidate_cb_path"] = bool(is_cb_path)
+                    candidates.append(nd.id)
+            if candidates:
                 try: _save_active_backup()
                 except Exception as e:
                     ErrorHandler.handle_exception(e, ErrorCode.CFG_SAVE_FAILED, context={"operation": "save_active_backup"}, log_level=logging.WARNING)
-                logger.info(f"[IDEFCRunner][Backfill] {'CB ' if is_cb_path else ''}回填: {cnt}/{len(unc)}")
+                logger.info(
+                    "[IDEFCRunner][Backfill] %s记录候选结果: %s/%s，不自动改 completed",
+                    "CB " if is_cb_path else "",
+                    len(candidates),
+                    len(unc),
+                )
                 self.engine._publish_task_graph_event(
                     "agent_tool_call", state.fc_turn, "task_backfill",
-                    f'{{"backfilled":{cnt},"total_leaf":{len(leaves)}}}')
+                    _json.dumps({
+                        "candidate_backfill": len(candidates),
+                        "total_leaf": len(leaves),
+                        "auto_completed": 0,
+                    }, ensure_ascii=False))
         except Exception as e:
             logger.warning(f"[IDEFCRunner][Backfill] {e}")
 
     def _apply_pressure_guidance(self, state: IDEFCState, fc: int) -> None:
-        """上下文压力感知 → 注意力引导（两级：yellow 引导 / red 强制选择注意力工具）"""
-        if not self._attn_window or state.cb_force_no_tools:
-            return  # CB RED 已接管，不重复干预
+        """Apply TSD-aligned context-pressure attention guidance.
 
-        ratio = self._attn_window.usage_ratio
-        yellow_ratio = 0.50
-        red_ratio = 0.60
+        Internal tier detection uses raw context-window usage.  Guidance shown
+        to the LLM uses a threshold-normalized pressure view: the active
+        threshold budget is 100%.
+        """
+        if not self._attn_window or state.cb_force_no_tools:
+            return  # CB RED ?????????
+        if getattr(state, "cb_recovery_stage", "") in {"restricted_recovery", "note_attention"}:
+            return
+        if getattr(state, "pressure_stage", "") == "restricted_recovery":
+            return
+
+        ratio = float(
+            getattr(
+                self._attn_window,
+                "trigger_context_pressure_ratio",
+                getattr(
+                    self._attn_window,
+                    "context_pressure_ratio",
+                    getattr(self._attn_window, "usage_ratio", 0.0),
+                ),
+            )
+            or 0.0
+        )
+        yellow_ratio = 0.90
+        red_ratio = 1.0
+        threshold_budget_ratio = 0.5
         try:
             attn_cfg = getattr(self._attn_window, "_llm_config", None)
             if attn_cfg:
                 yellow_ratio = float(getattr(attn_cfg, "pressure_threshold_medium", yellow_ratio))
                 red_ratio = float(getattr(attn_cfg, "pressure_threshold_high", red_ratio))
+                threshold_budget_ratio = float(getattr(attn_cfg, "threshold_budget_ratio", threshold_budget_ratio))
             elif self._circuit_breaker:
                 cb_cfg = getattr(self._circuit_breaker, "_config", {}) or {}
                 yellow_ratio = float(cb_cfg.get("context_yellow_ratio", yellow_ratio))
                 red_ratio = float(cb_cfg.get("context_red_ratio", red_ratio))
+                threshold_budget_ratio = float(cb_cfg.get("threshold_budget_ratio", threshold_budget_ratio))
         except Exception:
             pass
 
-        # 分级（仅两级）
-        if ratio >= red_ratio:
+        if ratio > red_ratio:
             tier = "red"
-        elif ratio >= yellow_ratio:
+        elif ratio > yellow_ratio:
             tier = "yellow"
         else:
             tier = "green"
-
-        # 仅在跨越阈值时触发（避免每轮重复注入）
-        if tier == self._last_pressure_tier:
-            return
-
+        pressure_view = build_threshold_pressure_view(
+            ratio,
+            yellow_ratio,
+            red_ratio,
+            tier=tier,
+        )
         self._last_pressure_tier = tier
 
         if tier == "green":
+            if getattr(state, "pressure_stage", "") != "restricted_recovery":
+                state.pressure_stage = ""
+                state.pressure_force_attention = False
             return
 
         msgs = state.messages
         task_graph = self._get_current_task_graph()
 
-        if tier == "yellow":
-            # ── Yellow: 注入引导提示 + BFS 推荐焦点 ──
-            acts = self._maybe_run_bfs(fc, trigger="pressure_crossing")
-
+        # 两段式：即使 high==medium，第一次达阈值也只注入注意力引导。
+        if getattr(state, "pressure_stage", "") not in {"yellow_guidance", "restricted_recovery"}:
+            acts = self._maybe_run_bfs(fc, trigger="pressure_threshold_guidance")
             parts = [
-                f"[上下文压力 - 注意力引导] 当前上下文使用率已达 {ratio:.0%}。",
-                "建议调用注意力工具收窄关注范围：",
-                "  - adjust_attention_mode(mode='focus') 聚焦当前子任务",
-                "  - navigate_attention(direction='deeper') 深入关键节点",
+                (
+                    "[上下文压力 - 注意力引导] "
+                    f"当前上下文压力已达 {pressure_view.threshold_relative_percent:.0f}%。"
+                ),
+                "请由 LLM 自主判断是否需要切换 GLOBAL / FOCUS / SINGLE_CHAIN。",
+                "动态注意力不是压缩上下文，而是重新选择当前必要上下文，暂排/降权无关上下文。",
+                "普通读写/命令/检索工具结果只作为证据，不直接决定模式。",
             ]
-
-            # BFS 推荐节点
             if acts:
                 seeds_set = set(self._compute_bfs_seeds())
-                candidates = [
-                    (nid, score) for nid, score in acts.items()
-                    if score > 0.6 and nid not in seeds_set
-                ]
+                candidates = [(nid, score) for nid, score in acts.items() if score > 0.6 and nid not in seeds_set]
                 if candidates:
                     top_nid, top_score = max(candidates, key=lambda x: x[1])
                     top_task_node_id = self._task_node_id_from_memory_id(top_nid, task_graph)
@@ -8109,61 +8864,115 @@ class IDEFCRunner(FCRunner):
                         if task_graph and top_task_node_id
                         else top_nid
                     )
-                    parts.append(
-                        f"  - navigate_attention(direction='jump', target_node_id='{top_task_node_id or top_nid}') "
-                        f"[BFS推荐 {top_display}，激活分={top_score:.2f}]"
-                    )
-
+                    parts.append(f"可参考高激活节点：{top_display}（激活={top_score:.2f}），但最终由 LLM 自主选择。")
             hint = {"role": "system", "content": "\n".join(parts)}
             msgs.append(hint)
             self._attn_window.register_message(hint, turn=fc)
-            logger.info(f"[IDEFCRunner][Pressure] YELLOW ({ratio:.0%}): 注入注意力工具引导")
+            state.pressure_stage = "yellow_guidance"
+            state.pressure_attention_context = {
+                "tier": tier,
+                "ratio": round(float(ratio), 4),
+                "yellow_ratio": round(float(yellow_ratio), 4),
+                "red_ratio": round(float(red_ratio), 4),
+                "context_pressure_ratio": round(pressure_view.context_pressure_ratio, 4),
+                "context_pressure_percent": round(pressure_view.context_pressure_percent, 1),
+                "threshold_budget_ratio": round(float(threshold_budget_ratio), 4),
+                "threshold_budget_percent": round(pressure_view.threshold_relative_percent, 1),
+                "active_threshold_ratio": round(pressure_view.active_threshold_ratio, 4),
+                "budget_reference": "threshold_budget_is_100_percent",
+                "fc_turn": fc,
+                "decision_owner": "llm",
+                "allowed_modes": ["GLOBAL", "FOCUS", "SINGLE_CHAIN"],
+                "first_threshold_response": "guidance_only",
+            }
+            logger.info(
+                "[IDEFCRunner][Pressure] YELLOW %.0f%% of threshold budget: 第一次阈值响应，仅注入动态注意力引导",
+                pressure_view.threshold_relative_percent,
+            )
+            return
 
-        elif tier == "red":
-            # ── Red: 约束 LLM 只能调用注意力工具 ──
-            state.pressure_force_attention = True
+        if tier != "red":
+            return
 
-            # BFS 推荐焦点
-            acts = self._maybe_run_bfs(fc, trigger="pressure_crossing")
+        recovery_tools = self._get_cb_recovery_tools(state.tool_definitions)
+        requires_note = bool(self._first_recovery_landing_tool(recovery_tools))
+        requires_attention = bool(self._first_tool_with_capability(recovery_tools, "attention_switch"))
+        state.pressure_stage = "restricted_recovery" if recovery_tools else "guidance_only"
+        state.pressure_force_attention = bool(recovery_tools)
+        state.pressure_recovery_note_saved = False
+        state.pressure_recovery_attention_switched = False
+        state.pressure_recovery_requires_note = requires_note
+        state.pressure_recovery_requires_attention = requires_attention
+        state.pressure_recovery_start_result_count = len(state.tool_results_buffer or [])
 
-            parts = [
-                f"[注意力强制切换] 上下文使用率达到 {ratio:.0%}（红色警戒）。",
-                "你必须立即调用注意力工具进行焦点切换：",
-                "  - adjust_attention_mode(mode='single_chain') 切换为单链推理模式",
-                "  - navigate_attention(direction='deeper') 深入当前节点",
-            ]
+        # BFS only provides candidate focus evidence; LLM still owns the choice.
+        acts = self._maybe_run_bfs(fc, trigger="pressure_restricted_recovery")
+        recommended_focus = ""
+        recommended_display = ""
+        recommended_score = 0.0
 
-            if acts:
-                seeds_set = set(self._compute_bfs_seeds())
-                candidates = [
-                    (nid, score) for nid, score in acts.items()
-                    if score > 0.4 and nid not in seeds_set
-                ]
-                if candidates:
-                    top_nid, top_score = max(candidates, key=lambda x: x[1])
-                    top_task_node_id = self._task_node_id_from_memory_id(top_nid, task_graph)
-                    top_display = (
-                        task_graph.get_node_address(top_task_node_id)
-                        if task_graph and top_task_node_id
-                        else top_nid
-                    )
-                    parts.append(
-                        f"  - navigate_attention(direction='jump', target_node_id='{top_task_node_id or top_nid}') "
-                        f"[推荐焦点 {top_display}，激活分={top_score:.2f}]"
-                    )
+        parts = [
+            (
+                "[动态注意力 RED 受限恢复] "
+                f"当前上下文压力已达 {pressure_view.threshold_relative_percent:.0f}%。"
+            ),
+            "请先保存当前证据/未完成项/失败原因/下一步建议，再完成一次注意力重选。",
+            "1) 调用便签/标签/记忆落盘能力，并关联当前焦点节点。",
+            "2) 调用注意力切换能力，由 LLM 选择 GLOBAL / FOCUS / SINGLE_CHAIN，并说明注入/暂排上下文。",
+        ]
+        if acts:
+            seeds_set = set(self._compute_bfs_seeds())
+            candidates = [(nid, score) for nid, score in acts.items() if score > 0.4 and nid not in seeds_set]
+            if candidates:
+                top_nid, top_score = max(candidates, key=lambda x: x[1])
+                top_task_node_id = self._task_node_id_from_memory_id(top_nid, task_graph)
+                recommended_focus = top_task_node_id or top_nid
+                recommended_score = float(top_score)
+                top_display = (
+                    task_graph.get_node_address(top_task_node_id)
+                    if task_graph and top_task_node_id
+                    else top_nid
+                )
+                recommended_display = str(top_display)
+                parts.append(f"可参考高激活节点：{top_display}（激活={top_score:.2f}），但最终由 LLM 自主选择。")
 
-            hint = {"role": "system", "content": "\n".join(parts)}
-            msgs.append(hint)
-            self._attn_window.register_message(hint, turn=fc)
-            logger.info(f"[IDEFCRunner][Pressure] RED ({ratio:.0%}): 强制注意力工具选择")
+        state.pressure_attention_context = {
+            "tier": "red",
+            "ratio": round(float(ratio), 4),
+            "yellow_ratio": round(float(yellow_ratio), 4),
+            "red_ratio": round(float(red_ratio), 4),
+            "context_pressure_ratio": round(pressure_view.context_pressure_ratio, 4),
+            "context_pressure_percent": round(pressure_view.context_pressure_percent, 1),
+            "threshold_budget_ratio": round(float(threshold_budget_ratio), 4),
+            "threshold_budget_percent": round(pressure_view.threshold_relative_percent, 1),
+            "active_threshold_ratio": round(pressure_view.active_threshold_ratio, 4),
+            "budget_reference": "threshold_budget_is_100_percent",
+            "fc_turn": fc,
+            "recommended_focus": recommended_focus,
+            "recommended_display": recommended_display,
+            "recommended_score": round(recommended_score, 4),
+            "decision_owner": "llm",
+            "allowed_modes": ["GLOBAL", "FOCUS", "SINGLE_CHAIN"],
+            "second_threshold_response": "restricted_recovery" if recovery_tools else "guidance_only",
+            "requires_note": requires_note,
+            "requires_attention": requires_attention,
+        }
+        hint = {"role": "system", "content": "\n".join(parts)}
+        msgs.append(hint)
+        self._attn_window.register_message(hint, turn=fc)
+        logger.info(
+            "[IDEFCRunner][Pressure] RED %.0f%% of threshold budget: 第二次阈值响应，进入受限恢复 context=%s tools=%s",
+            pressure_view.threshold_relative_percent,
+            state.pressure_attention_context,
+            [td.get("function", {}).get("name", "") for td in recovery_tools],
+        )
 
-    @staticmethod
-    def _get_attention_only_tools(tool_definitions: List[Dict]) -> List[Dict]:
-        """压力 RED 时仅保留注意力工具，强制 LLM 从中选择"""
-        _ATTENTION_TOOL_NAMES = {"navigate_attention", "adjust_attention_mode"}
+    @classmethod
+    def _get_attention_only_tools(cls, tool_definitions: List[Dict]) -> List[Dict]:
+        """兼容旧调用：压力 RED 时仅取注意力切换能力工具。"""
         return [
             td for td in tool_definitions
-            if td.get("function", {}).get("name", "") in _ATTENTION_TOOL_NAMES
+            if cls._tool_has_capability(td, "attention_switch")
         ]
 
     def _run_bfs_activation(self, fc_turn: int) -> None:
@@ -8532,49 +9341,46 @@ class IDEFCRunner(FCRunner):
             logger.warning(f"[IDEFCRunner] 自动创建任务计划失败（不影响FC循环）: {e}")
 
     def _auto_complete_task(self, state: IDEFCState) -> None:
-        """FC 正常完成时自动标记任务节点
+        """FC 正常完成时不再自动伪完成任务节点。
 
-        in_progress → completed（当前正在做的确实结束了）
-        pending → skipped（从未执行，标记为跳过而非虚假完成）
-        排除 CRG 自动注入的 crg_ 节点，它们已由后台线程标记为 completed
+        任务节点完成必须来自显式 task_mark_status 和完成质量门证据。
+        这里仅记录未完成统计，避免旧逻辑把 in_progress 批量改成
+        completed、把 pending 批量改成 skipped，从而绕过 TaskSpec Coverage Gate。
         """
         try:
             from zulong.tools.task_tools import get_active_task_graph, _save_active_backup
             tg = get_active_task_graph(workspace_dir=getattr(self, 'cwd', None))
             if not tg:
                 return
-            response = state.last_response_content or ""
             leaves = tg.get_leaf_nodes()
-            completed_count = 0
-            skipped_count = 0
+            in_progress_count = 0
+            pending_count = 0
             for leaf in leaves:
                 if leaf.id.startswith("crg_"):
                     continue
                 if leaf.status == "in_progress":
-                    tg.update_node_status(
-                        leaf.id, "completed",
-                        result=response[:500] if response else "(IDE 会话已完成)",
-                    )
-                    completed_count += 1
+                    in_progress_count += 1
                 elif leaf.status == "pending":
-                    tg.update_node_status(
-                        leaf.id, "skipped",
-                        result="(FC循环终止，任务未执行)",
-                    )
-                    skipped_count += 1
-            total = completed_count + skipped_count
-            if total > 0:
+                    pending_count += 1
+            if hasattr(tg, "metadata"):
+                tg.metadata["last_fc_unfinished_snapshot"] = {
+                    "in_progress": in_progress_count,
+                    "pending": pending_count,
+                    "fc_turn": state.fc_turn,
+                    "updated_at": time.time(),
+                }
                 try:
                     _save_active_backup()
                 except Exception:
                     pass
                 logger.info(
-                    f"[IDEFCRunner] 自动标记任务完成: "
-                    f"{completed_count} 个in_progress→completed, "
-                    f"{skipped_count} 个pending→skipped"
+                    "[IDEFCRunner] 完成阶段未自动改写节点状态: "
+                    "in_progress=%s pending=%s",
+                    in_progress_count,
+                    pending_count,
                 )
         except Exception as e:
-            logger.debug(f"[IDEFCRunner] 自动标记任务完成失败: {e}")
+            logger.debug(f"[IDEFCRunner] 未完成统计记录失败: {e}")
 
     def _publish_fc_progress(self, state: IDEFCState, stage: str, detail: str = ""):
         """发布 FC 循环进度事件到 EventBus → IDEWebBridge → 仪表盘"""

@@ -93,7 +93,7 @@ APPLY_WINDOW_EXTENSION = """
 # 步骤4: 实现LLM选择相关的辅助方法
 # ============================================================================
 
-HELPER_METHODS = """
+HELPER_METHODS = r'''
     def set_llm_client(self, llm_client):
         """设置LLM客户端实例
         
@@ -144,7 +144,7 @@ HELPER_METHODS = """
             
             logger.info(
                 f"[AttentionWindow] 触发LLM注意力选择: {threshold_result.trigger_type} "
-                f"(压力={metrics.current_pressure:.3f})"
+                f"(当前上下文压力={metrics.threshold_relative_pressure * 100:.1f}%)"
             )
             
             task_context = self._get_task_context_summary()
@@ -244,7 +244,7 @@ HELPER_METHODS = """
             "cooldown_seconds": self._cooldown_manager.get_current_cooldown_seconds(),
             "switch_history": [r.to_dict() for r in history[-5:]],
         }
-"""
+'''
 
 # ============================================================================
 # 配置文件示例 (config/zulong_config.yaml)
@@ -258,8 +258,9 @@ attention_selection:
   enabled: true
   
   # 压力阈值配置
-  pressure_threshold_high: 0.6      # 高压阈值
-  pressure_threshold_medium: 0.5    # 中压阈值
+  threshold_budget_ratio: 0.5       # 阈值预算=LLM原始上下文窗口的50%
+  pressure_threshold_high: 1.0      # RED触发线：上下文压力 >100%
+  pressure_threshold_medium: 0.9    # YELLOW触发线：上下文压力 >90%
   
   # 冷却时间配置
   cooldown_base_seconds: 30.0       # 基础冷却时间(秒)
@@ -268,7 +269,7 @@ attention_selection:
   fallback_mode: "FOCUS"            # Fallback默认模式
   
   # 性能配置
-  decision_timeout_ms: 500          # LLM决策超时(毫秒)
+  decision_timeout_ms: null         # null表示等待LLM完成注意力选择
   
   # 震荡检测配置
   oscillation_detection_window: 10  # 震荡检测窗口大小

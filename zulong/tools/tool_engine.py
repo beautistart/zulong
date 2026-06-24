@@ -290,8 +290,21 @@ class ToolEngine:
                 parameters.get("workspace_path")
                 or parameters.get("workspace_dir")
                 or parameters.get("cwd")
+                or (
+                    self.get_context("workspace_path")
+                    if tool_name == "task_create_plan"
+                    else ""
+                )
+                or (
+                    self.get_context("workspace_dir")
+                    if tool_name == "task_create_plan"
+                    else ""
+                )
                 or ""
             )
+            if tool_name == "task_create_plan" and runtime_workspace:
+                parameters.setdefault("workspace_path", runtime_workspace)
+                parameters.setdefault("workspace_dir", runtime_workspace)
             if runtime_workspace:
                 from zulong.tools.task_tools import (
                     get_active_workspace_dir,

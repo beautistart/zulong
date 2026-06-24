@@ -14,11 +14,12 @@ logger = logging.getLogger(__name__)
 class AttentionConfig:
     """注意力选择配置类"""
     enabled: bool = True                          # 功能开关
-    pressure_threshold_high: float = 0.6          # 高压阈值
-    pressure_threshold_medium: float = 0.5        # 中压阈值
+    threshold_budget_ratio: float = 0.5           # 阈值预算=LLM原始上下文窗口的比例
+    pressure_threshold_high: float = 1.0          # 高压阈值（上下文压力 > 100%）
+    pressure_threshold_medium: float = 0.9        # 中压阈值（上下文压力 > 90%）
     cooldown_base_seconds: float = 30.0           # 基础冷却时间(秒)
     fallback_mode: str = "FOCUS"                  # Fallback模式
-    decision_timeout_ms: int = 500                # 决策超时(毫秒)
+    decision_timeout_ms: Optional[int] = None     # 决策超时(毫秒)；None/0/负数表示无限等待
     oscillation_detection_window: int = 10        # 震荡检测窗口大小
     
     max_switch_history: int = 50                  # 最大切换历史记录数
@@ -79,6 +80,35 @@ class AttentionConfig:
                     )
                     return default
 
+            def _get_optional_timeout_ms(key: str, default: Optional[int]) -> Optional[int]:
+                value = attention_config.get(key, default)
+                if value is None:
+                    return None
+                if isinstance(value, str):
+                    normalized = value.strip().lower()
+                    if normalized in {
+                        "",
+                        "none",
+                        "null",
+                        "false",
+                        "off",
+                        "disabled",
+                        "infinite",
+                        "infinity",
+                        "unlimited",
+                        "no_timeout",
+                    }:
+                        return None
+                    value = normalized
+                try:
+                    parsed = int(value)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        f"[AttentionConfig] {key}={value!r} 无法解析为整数或无限等待标记，使用默认值 {default}"
+                    )
+                    return default
+                return parsed if parsed > 0 else None
+
             def _get_bool(key: str, default: bool) -> bool:
                 value = attention_config.get(key, default)
                 if isinstance(value, bool):
@@ -89,11 +119,12 @@ class AttentionConfig:
             
             config = cls(
                 enabled=_get_bool("enabled", default_config.enabled),
+                threshold_budget_ratio=_get_float("threshold_budget_ratio", default_config.threshold_budget_ratio),
                 pressure_threshold_high=_get_float("pressure_threshold_high", default_config.pressure_threshold_high),
                 pressure_threshold_medium=_get_float("pressure_threshold_medium", default_config.pressure_threshold_medium),
                 cooldown_base_seconds=_get_float("cooldown_base_seconds", default_config.cooldown_base_seconds),
                 fallback_mode=attention_config.get("fallback_mode", default_config.fallback_mode),
-                decision_timeout_ms=_get_int("decision_timeout_ms", default_config.decision_timeout_ms),
+                decision_timeout_ms=_get_optional_timeout_ms("decision_timeout_ms", default_config.decision_timeout_ms),
                 oscillation_detection_window=_get_int("oscillation_detection_window", default_config.oscillation_detection_window),
                 max_switch_history=_get_int("max_switch_history", default_config.max_switch_history),
                 min_confidence_threshold=_get_float("min_confidence_threshold", default_config.min_confidence_threshold),
@@ -116,17 +147,24 @@ class AttentionConfig:
         """
         is_valid = True
         
-        if not (0.01 <= self.pressure_threshold_high <= 1.5):
+        if not (0.01 <= self.threshold_budget_ratio <= 1.0):
+            old_value = self.threshold_budget_ratio
+            self.threshold_budget_ratio = max(0.01, min(1.0, self.threshold_budget_ratio))
+            logger.warning(f"[AttentionConfig] threshold_budget_ratio超出范围[0.01, 1.0]，"
+                          f"从{old_value}修正为{self.threshold_budget_ratio}")
+            is_valid = False
+
+        if not (0.01 <= self.pressure_threshold_high <= 2.0):
             old_value = self.pressure_threshold_high
-            self.pressure_threshold_high = max(0.01, min(1.5, self.pressure_threshold_high))
-            logger.warning(f"[AttentionConfig] pressure_threshold_high超出范围[0.01, 1.5]，"
+            self.pressure_threshold_high = max(0.01, min(2.0, self.pressure_threshold_high))
+            logger.warning(f"[AttentionConfig] pressure_threshold_high超出范围[0.01, 2.0]，"
                           f"从{old_value}修正为{self.pressure_threshold_high}")
             is_valid = False
         
-        if not (0.01 <= self.pressure_threshold_medium <= 1.0):
+        if not (0.01 <= self.pressure_threshold_medium <= 2.0):
             old_value = self.pressure_threshold_medium
-            self.pressure_threshold_medium = max(0.01, min(1.0, self.pressure_threshold_medium))
-            logger.warning(f"[AttentionConfig] pressure_threshold_medium超出范围[0.01, 1.0]，"
+            self.pressure_threshold_medium = max(0.01, min(2.0, self.pressure_threshold_medium))
+            logger.warning(f"[AttentionConfig] pressure_threshold_medium超出范围[0.01, 2.0]，"
                           f"从{old_value}修正为{self.pressure_threshold_medium}")
             is_valid = False
 
@@ -146,12 +184,15 @@ class AttentionConfig:
                           f"从{old_value}修正为{self.cooldown_base_seconds}")
             is_valid = False
         
-        if not (100 <= self.decision_timeout_ms <= 2000):
-            old_value = self.decision_timeout_ms
-            self.decision_timeout_ms = max(100, min(2000, self.decision_timeout_ms))
-            logger.warning(f"[AttentionConfig] decision_timeout_ms超出范围[100, 2000]，"
-                          f"从{old_value}修正为{self.decision_timeout_ms}")
-            is_valid = False
+        if self.decision_timeout_ms is not None:
+            if self.decision_timeout_ms <= 0:
+                self.decision_timeout_ms = None
+            elif not (100 <= self.decision_timeout_ms <= 300_000):
+                old_value = self.decision_timeout_ms
+                self.decision_timeout_ms = max(100, min(300_000, self.decision_timeout_ms))
+                logger.warning(f"[AttentionConfig] decision_timeout_ms超出范围[100, 300000]，"
+                              f"从{old_value}修正为{self.decision_timeout_ms}")
+                is_valid = False
         
         valid_modes = ["GLOBAL", "FOCUS", "SINGLE_CHAIN"]
         if self.fallback_mode not in valid_modes:
@@ -169,6 +210,7 @@ class AttentionConfig:
         """导出为字典格式"""
         return {
             "enabled": self.enabled,
+            "threshold_budget_ratio": self.threshold_budget_ratio,
             "pressure_threshold_high": self.pressure_threshold_high,
             "pressure_threshold_medium": self.pressure_threshold_medium,
             "cooldown_base_seconds": self.cooldown_base_seconds,

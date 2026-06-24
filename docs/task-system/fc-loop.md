@@ -70,10 +70,10 @@ fc_graph.py 路径完全缺失以下能力：
 ### 3.3 AttentionWindow (attention_window.py, 948 行, 生产级 4/5)
 
 - **三种模式**:
-  - GLOBAL: 大纲权重高, 深度递减 (depth0→×1.2, depth4+→×0.3)
-  - FOCUS: 当前节点×3.0, 祖先/依赖×2.0, 兄弟×1.5, 无关×0.5
-  - SINGLE_CHAIN: 当前链×5.0, 祖先×3.0, 依赖×2.5, 无关×0.2
-- **自动状态机**: recall_memory→FOCUS, exec_write_file→SINGLE_CHAIN, task_view_overview→GLOBAL
+  - GLOBAL: 保持全局任务/记忆上下文视角，用于规划、复核、汇总与跨分支判断
+  - FOCUS: 由 LLM 在上下文压力或任务阶段需要时选择焦点节点，按需注入当前节点、祖先、依赖与关键证据，暂排无关上下文
+  - SINGLE_CHAIN: 由 LLM 在单链深度执行/调试时选择当前推理链，优先注入当前链路必要上下文；需要跨分支判断时应能重新注入其他上下文或回到 GLOBAL
+- **触发原则**: 上下文压力阈值监控是触发 L2 动态注意力切换的主信号；LLM 根据当前任务、压力、覆盖缺口和证据状态自主选择 GLOBAL / FOCUS / SINGLE_CHAIN。普通工具调用只能进入工具账本、压力观测和质量证据，不得作为主规则绑定或直接触发模式切换。
 - **权重公式**: `base × time_decay(0.95^age) × mode_mult × memory_boost(1.0~1.5)`
 - **消息分组**: tool_group 确保 assistant+tool 消息原子性淘汰
 - **淘汰处理**: 淘汰摘要持久化到 MemoryGraph + TaskGraph, 提示LLM用recall_memory恢复
@@ -229,7 +229,7 @@ Cline v3.82.0 fork → zulong-ide 插件 → 全面重写通信协议 (XML → W
 |------|------|---------|---------|
 | `circuit_breaker.py` | L61 | `CB_RETAINED_NAMES` 白名单 | CB RED 状态下仍允许调用 |
 | `circuit_breaker.py` | L74 | 终结类工具白名单 | 分类为"终结工具" |
-| `attention_window.py` | L89 | GLOBAL_TRIGGER_TOOLS 集合 | 调用后自动切换到 GLOBAL 模式 |
+| `attention_window.py` | 历史旧实现 | GLOBAL_TRIGGER_TOOLS 集合 | 已废弃：普通工具名不得直接触发 GLOBAL 模式 |
 | `attention_window.py` | L519 | 特殊处理分支 | 调用时清除焦点状态 |
 | `task_graph.py` | L129 | 注释文档 | 模型通过它完成任务 |
 

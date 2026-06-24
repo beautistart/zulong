@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 
 # 工作区根目录（安全边界）
 WORKSPACE_DIR = os.environ.get("ZULONG_WORKSPACE", "./agent_workspace")
-MAX_WRITE_CHUNK_CHARS = 1800
 # 命令白名单
 COMMON_COMMAND_WHITELIST = {
     "python", "python3", "node", "npm", "npx", "pip", "pip3",
@@ -354,7 +353,7 @@ class ExecWriteFileTool(BaseTool):
             "创建、覆写或追加写入工作区中的文件。"
             "用于生成代码、配置文件、文档等。"
             "文件路径会被限制在工作区目录内。"
-            "长文件请按 800-1200 字符分片写入：第一片 mode=overwrite，后续 mode=append。"
+            "支持一次写入完整文件；写入后会读取校验，失败时返回结构化错误。"
         )
 
 
@@ -453,32 +452,6 @@ class ExecWriteFileTool(BaseTool):
                         request_id=request.request_id,
                     )
             effective_content = existing + content if mode == "append" else content
-            content_chars = len(content)
-            if content_chars > MAX_WRITE_CHUNK_CHARS:
-                logger.warning(
-                    "[exec_write_file][P10] oversized chunk path=%s mode=%s content_chars=%s",
-                    target,
-                    mode,
-                    content_chars,
-                )
-                return self._create_result(
-                    success=False,
-                    data={
-                        "file_path": str(target),
-                        "mode": mode,
-                        "content_chars": content_chars,
-                        "max_chunk_chars": MAX_WRITE_CHUNK_CHARS,
-                        "recoverable": True,
-                        "chunk_policy": "openhands_style_file_chunking",
-                        "next_action": (
-                            "请把文件内容拆成 800-1200 字符的小块；"
-                            "第一块 mode='overwrite'，后续块 mode='append'。"
-                        ),
-                    },
-                    error=f"单次写入内容过长: {content_chars} 字符，需分片写入",
-                    execution_time=time.time() - start_time,
-                    request_id=request.request_id,
-                )
             target.write_text(effective_content, encoding="utf-8")
             expected_bytes = len(effective_content.encode("utf-8"))
             verified = target.is_file()
@@ -597,7 +570,7 @@ class ExecWriteFileTool(BaseTool):
                 },
                 "content": {
                     "type": "string",
-                    "description": "要写入的文件内容。单块建议 800-1200 字符，最大 1800 字符。",
+                    "description": "要写入的完整文件内容；append 模式会追加到现有内容后并整体校验。",
                 },
                 "mode": {
                     "type": "string",

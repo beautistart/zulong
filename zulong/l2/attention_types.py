@@ -34,7 +34,7 @@ class OscillationLevel(Enum):
 @dataclass
 class PressureMetrics:
     """压力指标数据类"""
-    current_pressure: float              # 当前压力值 (tokens/budget)
+    current_pressure: float              # 当前上下文压力 (tokens/阈值预算)
     pressure_trend: PressureTrend        # 压力趋势
     pressure_velocity: float             # 压力变化速率
     predicted_pressure_5s: float         # 预测5秒后压力值
@@ -43,6 +43,8 @@ class PressureMetrics:
     budget_usage: float = 0.0            # 预算使用率
     message_count: int = 0               # 消息数量
     token_density: float = 0.0           # token密度
+    threshold_relative_pressure: float = 0.0  # 兼容字段：同 current_pressure/context_pressure
+    threshold_reference: float = 0.0      # 本次触发线（yellow/red）参考值
     
     def __post_init__(self):
         if self.current_pressure < 0:
@@ -60,6 +62,8 @@ class PressureMetrics:
             "budget_usage": self.budget_usage,
             "message_count": self.message_count,
             "token_density": self.token_density,
+            "threshold_relative_pressure": self.threshold_relative_pressure,
+            "threshold_reference": self.threshold_reference,
         }
 
 

@@ -58,14 +58,32 @@ class IDEFCState:
     # CB 模式工具调用连续计数（防止 CB 模式下模型持续调用保留工具导致死循环）
     cb_tool_streak: int = 0
 
+    # CB RED 受限恢复：仅保留便签/标签/记忆落盘与注意力切换能力
+    cb_recovery_stage: str = ""
+    cb_recovery_note_saved: bool = False
+    cb_recovery_attention_switched: bool = False
+
     # CB 触发原因（用于_finalize判断是否blocked而非error，对齐TSD §23.3.6）
     cb_trigger_reason: str = ""
 
     # 独白计数器：连续纯文本回复（无工具调用）次数，检测模型"叙述而不执行"的退化模式
     consecutive_text_only_count: int = 0
 
-    # 压力 RED: 约束工具列表为仅注意力工具
+    # 压力响应：第一次阈值只引导，第二次 RED 才约束为注意力 + 便签/标签/记忆落盘工具
     pressure_force_attention: bool = False
+    pressure_stage: str = ""
+    pressure_attention_context: Dict[str, Any] = field(default_factory=dict)
+    pressure_recovery_note_saved: bool = False
+    pressure_recovery_attention_switched: bool = False
+    pressure_recovery_requires_note: bool = True
+    pressure_recovery_requires_attention: bool = True
+    pressure_recovery_start_result_count: int = 0
+
+    # 动态注意力上下文检索与重组：本轮 active context 计划/遥测
+    attention_context_plan: Dict[str, Any] = field(default_factory=dict)
+    attention_context_telemetry: Dict[str, Any] = field(default_factory=dict)
+    last_attention_context_key: str = ""
+    last_attention_context_rendered: str = ""
 
     # FC 执行纪律增强：导航地图与观察提示去重
     last_navigation_map_key: str = ""

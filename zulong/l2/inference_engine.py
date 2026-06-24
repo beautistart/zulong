@@ -77,6 +77,40 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+class _AttentionDecisionClient:
+    """Async adapter used only by AttentionWindow LLM mode selection."""
+
+    def __init__(self, engine: "InferenceEngine"):
+        self._engine = engine
+
+    async def chat(self, messages: List[Dict[str, str]]) -> str:
+        prompt = "\n\n".join(
+            str(msg.get("content", ""))
+            for msg in messages or []
+            if isinstance(msg, dict)
+        )
+        if not prompt:
+            return '{"mode":"GLOBAL","reason":"无注意力决策输入","confidence":0.5}'
+
+        def _call() -> str:
+            response = self._engine.vllm_client.chat.completions.create(
+                model=LLM_MODEL_ID,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=256,
+                temperature=0.1,
+                top_p=0.8,
+                stream=False,
+                **self._engine._get_llm_extra_kwargs(),
+            )
+            return response.choices[0].message.content or ""
+
+        try:
+            return await asyncio.to_thread(_call)
+        except Exception as exc:
+            logger.warning("[AttentionDecisionClient] 注意力决策调用失败: %s", exc)
+            raise
+
+
 def _compact_log_line(text: str, max_len: int = 240) -> str:
     compact = " ".join(str(text or "").split())
     if len(compact) <= max_len:
@@ -1007,20 +1041,27 @@ class InferenceEngine:
                     arguments["user_requirement"] = current_user_input
                 if current_user_input:
                     try:
-                        from zulong.tools.task_tools import infer_project_workspace_hint
+                        from zulong.tools.task_tools import extract_path_candidates_from_text
 
-                        inferred_target, inferred_project = infer_project_workspace_hint(
-                            current_user_input
+                        arguments.setdefault(
+                            "path_candidates",
+                            extract_path_candidates_from_text(current_user_input),
                         )
-                        if inferred_target and inferred_project:
-                            arguments["target_path"] = inferred_target
-                            arguments["project_name"] = inferred_project
-                        elif inferred_target and not arguments.get("target_path"):
-                            arguments["target_path"] = inferred_target
-                        elif inferred_project and not arguments.get("project_name"):
-                            arguments["project_name"] = inferred_project
                     except Exception as exc:
-                        logger.debug("[FC] task_create_plan 路径补全跳过: %s", exc)
+                        logger.debug("[FC] task_create_plan 路径候选提取跳过: %s", exc)
+                current_workspace_path = str(
+                    getattr(self, "_current_workspace_path", "") or ""
+                ).strip()
+                has_path_candidates = bool(arguments.get("path_candidates"))
+                if current_workspace_path and not (
+                    arguments.get("workspace_path")
+                    or arguments.get("workspace_dir")
+                    or arguments.get("cwd")
+                    or arguments.get("target_path")
+                    or arguments.get("path_roles")
+                    or has_path_candidates
+                ):
+                    arguments["workspace_path"] = current_workspace_path
 
             if func_name == "search_tools":
                 self._ensure_search_tools_tool_rag_bound()
@@ -1331,7 +1372,20 @@ class InferenceEngine:
         try:
             attn_window = getattr(self, "_attn_window", None)
             if attn_window is not None and hasattr(attn_window, "usage_ratio"):
-                return max(0.0, float(attn_window.usage_ratio or 0.0))
+                trigger_ratio = getattr(attn_window, "trigger_context_pressure_ratio", None)
+                if trigger_ratio is not None:
+                    return max(0.0, float(trigger_ratio or 0.0))
+                return max(
+                    0.0,
+                    float(
+                        getattr(
+                            attn_window,
+                            "context_pressure_ratio",
+                            getattr(attn_window, "usage_ratio", 0.0),
+                        )
+                        or 0.0
+                    ),
+                )
         except Exception:
             pass
         return 0.0
@@ -1343,21 +1397,42 @@ class InferenceEngine:
             cfg = getattr(attn_window, "_llm_config", None) if attn_window is not None else None
             if cfg is None:
                 cfg = AttentionConfig.load_from_yaml()
-            high = float(getattr(cfg, "pressure_threshold_high", 0.60))
+            high = float(getattr(cfg, "pressure_threshold_high", 1.0))
             medium = float(getattr(cfg, "pressure_threshold_medium", high))
             if medium > high:
                 medium = high
             return {"medium": medium, "high": high}
         except Exception:
-            return {"medium": 0.50, "high": 0.60}
+            return {"medium": 0.90, "high": 1.0}
 
     def _attention_pressure_tier_for_feedback(self, ratio: float) -> str:
         thresholds = self._attention_pressure_thresholds_for_feedback()
-        if ratio >= thresholds["high"]:
+        if ratio > thresholds["high"]:
             return "red"
-        if ratio >= thresholds["medium"]:
+        if ratio > thresholds["medium"]:
             return "yellow"
         return "green"
+
+    def _attention_pressure_view_for_feedback(self, ratio: float) -> Dict[str, Any]:
+        """Return both raw and threshold-normalized pressure telemetry."""
+        try:
+            from zulong.l2.attention_pressure_view import build_threshold_pressure_view
+
+            thresholds = self._attention_pressure_thresholds_for_feedback()
+            tier = self._attention_pressure_tier_for_feedback(ratio)
+            return build_threshold_pressure_view(
+                ratio,
+                thresholds["medium"],
+                thresholds["high"],
+                tier=tier,
+            ).to_dict()
+        except Exception:
+            return {
+                "raw_ratio": round(max(0.0, float(ratio or 0.0)), 4),
+                "threshold_relative_ratio": 0.0,
+                "threshold_relative_percent": 0.0,
+                "budget_reference": "threshold_budget_is_100_percent",
+            }
 
     def _send_task_graph_update(self, event_data: Dict[str, Any]) -> None:
         """Publish a direct task graph update for Web clients that do not inspect pipeline data."""
@@ -1392,16 +1467,54 @@ class InferenceEngine:
                 mode = str(getattr(attn_window.mode, "value", "") or mode)
             thresholds = self._attention_pressure_thresholds_for_feedback()
             tier = self._attention_pressure_tier_for_feedback(ratio)
+            pressure_view = self._attention_pressure_view_for_feedback(ratio)
+            selection_stats: Dict[str, Any] = {}
+            if attn_window is not None and hasattr(attn_window, "get_llm_selection_stats"):
+                try:
+                    selection_stats = attn_window.get_llm_selection_stats() or {}
+                except Exception:
+                    selection_stats = {}
+            last_selection = selection_stats.get("last_selection_event") or {}
+            last_decision = selection_stats.get("last_llm_decision") or {}
+            last_pressure = selection_stats.get("last_pressure_metrics") or {}
+            last_threshold = selection_stats.get("last_threshold_result") or {}
             self._send_thinking_step("attention.update", {
                 "mode": mode,
                 "turn": fc_turn,
                 "focus_node_id": active_node_id,
                 "task_graph_id": task_graph_id,
-                "budget_usage": round(ratio * 100, 1),
-                "context_pressure": round(ratio, 3),
+                "budget_usage": round(pressure_view.get("context_pressure_percent", ratio * 100), 1),
+                "context_pressure": round(pressure_view.get("context_pressure_ratio", ratio), 3),
+                "threshold_budget_pressure": round(pressure_view.get("context_pressure_ratio", ratio), 3),
+                "threshold_budget_percent": pressure_view.get("context_pressure_percent"),
+                "active_threshold_ratio": pressure_view.get("active_threshold_ratio"),
+                "budget_reference": pressure_view.get("budget_reference"),
+                "raw_context_pressure": round(ratio, 3),
+                "trigger_context_pressure": round(ratio, 3),
+                "trigger_budget_usage": round(pressure_view.get("context_pressure_percent", ratio * 100), 1),
+                "visible_context_pressure": round(
+                    float(getattr(attn_window, "active_context_pressure_ratio", ratio) or ratio),
+                    3,
+                ) if attn_window is not None else round(ratio, 3),
+                "backing_context_pressure": round(
+                    float(getattr(attn_window, "context_pressure_ratio", ratio) or ratio),
+                    3,
+                ) if attn_window is not None else round(ratio, 3),
                 "pressure_tier": tier,
                 "pressure_threshold_medium": thresholds["medium"],
                 "pressure_threshold_high": thresholds["high"],
+                "llm_selection_enabled": bool(selection_stats.get("enabled", False)),
+                "selection_attempt_count": selection_stats.get("selection_attempt_count", 0),
+                "last_pressure_value": last_pressure.get("current_pressure"),
+                "last_pressure_trigger": last_threshold.get("trigger_type"),
+                "last_pressure_should_trigger": last_threshold.get("should_trigger"),
+                "last_selection_attempted": last_selection.get("attempted"),
+                "last_selection_triggered": last_selection.get("triggered"),
+                "last_selection_mode": last_decision.get("mode"),
+                "last_selection_reason": last_decision.get("reason"),
+                "last_selection_confidence": last_decision.get("confidence"),
+                "last_selection_fallback": last_decision.get("is_fallback"),
+                "last_selection_switched": last_selection.get("switched"),
                 "progress": progress,
             })
         except Exception as exc:
@@ -3477,6 +3590,8 @@ class InferenceEngine:
                 task_graph_policy=task_graph_policy or "",
                 task_graph_id=getattr(self, "_locked_task_graph_id", "") or self._active_task_graph_id or "",
                 locked_task_graph_id=getattr(self, "_locked_task_graph_id", "") or "",
+                workspace_path=getattr(self, "_current_workspace_path", "") or "",
+                workspace_dir=getattr(self, "_current_workspace_path", "") or "",
                 workspace_root=runtime_context.get("workspace_root"),
                 os_name=runtime_context.get("os_name"),
                 shell=runtime_context.get("shell"),
@@ -3585,6 +3700,10 @@ class InferenceEngine:
                     task_graph=_task_graph,
                     memory_graph=self._get_memory_graph_safe(),
                 )
+                try:
+                    self._attn_window.set_llm_client(_AttentionDecisionClient(self))
+                except Exception as _attn_client_err:
+                    logger.debug("[AttentionWindow] LLM 决策客户端接入跳过: %s", _attn_client_err)
                 # 注册初始 messages（system + user）为 pinned
                 for _init_msg in messages:
                     self._attn_window.register_message(
@@ -3779,22 +3898,15 @@ class InferenceEngine:
                 if _task_graph_events_enabled:
                     self._publish_task_graph_event("agent_done", fc_turn, "", response or "")
                 
-                # ── 归档后补丁：回填 final_answer / duration / total_turns ──
-                # _auto_archive_completed 在 task_mark_status 级联中触发，此时
-                # FC 循环尚未结束，final_answer 等字段无法获取。在此补丁回填。
+                # ── 完成归档补丁：仅在任务图已经由统一质量门/显式完成路径归档后补字段 ──
+                # 这里不能主动调用 _write_final_answer_to_task_graph，因为它会把根节点
+                # 标记为 completed；通用 L2 结束并不等于 TaskSpec Coverage Gate 通过。
                 if _task_graph_events_enabled:
                     try:
                         from zulong.tools.task_tools import get_active_task_graph as _get_tg_patch
-                        from zulong.tools.task_tools import _write_final_answer_to_task_graph as _write_final_graph
                         from zulong.tools.task_tools import _active_graph_id as _patch_gid
                         _patch_tg = _get_tg_patch()
                         if _patch_tg and _patch_gid:
-                            if response:
-                                _write_final_graph(
-                                    _patch_tg,
-                                    response,
-                                    source="inference_engine",
-                                )
                             _patch_root = _patch_tg.get_node("req")
                             if _patch_root and _patch_root.status == "completed":
                                 from zulong.l2.task_archive import CompletedTaskArchiveManager
@@ -3806,6 +3918,12 @@ class InferenceEngine:
                                     duration=round(time.time() - generate_start, 1),
                                     task_graph_snapshot=_patch_tg.serialize(),
                                 )
+                            elif response:
+                                _patch_root = _patch_tg.get_node("req") if hasattr(_patch_tg, "get_node") else None
+                                if _patch_root is not None and hasattr(_patch_root, "metadata"):
+                                    _patch_root.metadata["candidate_final_answer"] = str(response)
+                                    _patch_root.metadata["candidate_final_answer_source"] = "inference_engine_non_quality_path"
+                                    _patch_root.metadata["candidate_final_answer_updated_at"] = time.time()
                     except Exception as _patch_err:
                         logger.warning(f"[L2] 归档补丁失败（非致命）: {_patch_err}")
             else:
@@ -4330,9 +4448,9 @@ class InferenceEngine:
             "用自然、友好的口语和用户对话，就像朋友聊天一样。",
             "\n【任务管理规则】",
             "当用户要求你完成复杂的多步骤任务时（如：开发项目、编写代码、设计方案、写报告、做游戏等），",
-            "必须按以下步骤操作：",
+            "? L2/LLM ???????????? TaskGraph???????????????????????",
             "",
-            "步骤1. 【创建总节点】调用 task_create_plan，传入：",
+            "??????????1. ?????????? task_create_plan????",
             "  - title: 简短标题（如\"Python爬虫项目方案\"）",
             "  - user_requirement: 必须原样复制用户的完整原始需求文本，不得概括或缩写",
             "",
@@ -5043,9 +5161,9 @@ class InferenceEngine:
             "用自然、友好的口语和用户对话，就像朋友聊天一样。",
             "\n【任务管理规则】",
             "当用户要求你完成复杂的多步骤任务时（如：开发项目、编写代码、设计方案、写报告、做游戏等），",
-            "必须按以下步骤操作：",
+            "? L2/LLM ???????????? TaskGraph???????????????????????",
             "",
-            "步骤1. 【创建总节点】调用 task_create_plan，传入：",
+            "??????????1. ?????????? task_create_plan????",
             "  - title: 简短标题（如\"Python爬虫项目方案\"）",
             "  - user_requirement: 必须原样复制用户的完整原始需求文本，不得概括或缩写",
             "",

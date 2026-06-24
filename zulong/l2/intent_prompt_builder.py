@@ -63,7 +63,8 @@ def _build_environment_header(runtime_context: Optional[Dict[str, Any]] = None) 
         f"- 工作区根目录: {workspace_root}\n"
         f"- 推荐命令: {', '.join(preferred_commands)}\n"
         f"- 命令风格: {command_guidance}\n"
-        "- 代码阅读/架构分析如需创建代码图谱，必须先调用 task_create_plan 创建/绑定任务图根节点；必要时用 task_add_node 添加代码分析子节点，再调用 index_project(root_dir=...)。\n"
+        "- 代码阅读/架构分析默认可直接使用只读文件/代码工具；只有 LLM 判断本轮确属复杂、持续、多步骤任务时，才调用 task_create_plan 创建/绑定任务图根节点。\n"
+        "- 若已经决定创建代码/任务图谱，可用 task_add_node 添加代码分析子节点，再调用 index_project(root_dir=...)。\n"
         "- 已有活跃任务图时，在该图下调用 index_project；之后用 search_code_symbols(query=...)、zulong_code_query(file_path=...) 继续分析。\n"
         "- 如果结构化代码工具因解析器/索引限制失败，优先改用 read_file(file_path=...) 只读读取源码，再继续分析。\n"
         "- 若需要运行命令，再调用 exec_run_command，且命令必须符合当前 shell。\n"
@@ -161,7 +162,8 @@ def _append_active_task_context(system_parts: list, task_graph_policy: str) -> N
     if not task_graph:
         system_parts.append(
             "\n当前未加载活跃任务图。若用户请求确实需要持续执行，"
-            "请用 task_create_plan 创建任务图，再用 task_add_node 分解工作。\n"
+            "可由 LLM 自主选择 task_create_plan 创建任务图，再用 task_add_node 分解工作；"
+            "普通问答/原因分析/规则解释不要创建任务图。\n"
         )
         return
 

@@ -146,8 +146,9 @@ class ToolCallCircuitBreaker:
 
         # --- 信号 4: 上下文窗口压力 ---
         self._context_window_size = _cfg_int(cfg.get("context_window_size", 131072), 131072)
-        self._context_yellow_ratio = _cfg_float(cfg.get("context_yellow_ratio", 0.50), 0.50)
-        self._context_red_ratio = _cfg_float(cfg.get("context_red_ratio", 0.60), 0.60)
+        self._threshold_budget_ratio = _cfg_float(cfg.get("threshold_budget_ratio", 0.50), 0.50)
+        self._context_yellow_ratio = _cfg_float(cfg.get("context_yellow_ratio", 0.90), 0.90)
+        self._context_red_ratio = _cfg_float(cfg.get("context_red_ratio", 1.0), 1.0)
 
         # --- 信号 5: 经过时间（已禁用） ---
         self._time_yellow_seconds = _cfg_float(cfg.get("time_yellow_seconds", 60), 60)
@@ -212,8 +213,9 @@ class ToolCallCircuitBreaker:
         self._pattern_red_count = _cfg_int(cfg.get("pattern_red_count", 10), 10)
         self._query_similarity_threshold = _cfg_float(cfg.get("query_similarity_threshold", 0.85), 0.85)
         self._context_window_size = _cfg_int(cfg.get("context_window_size", 131072), 131072)
-        self._context_yellow_ratio = _cfg_float(cfg.get("context_yellow_ratio", 0.50), 0.50)
-        self._context_red_ratio = _cfg_float(cfg.get("context_red_ratio", 0.60), 0.60)
+        self._threshold_budget_ratio = _cfg_float(cfg.get("threshold_budget_ratio", 0.50), 0.50)
+        self._context_yellow_ratio = _cfg_float(cfg.get("context_yellow_ratio", 0.90), 0.90)
+        self._context_red_ratio = _cfg_float(cfg.get("context_red_ratio", 1.0), 1.0)
         self._time_yellow_seconds = _cfg_float(cfg.get("time_yellow_seconds", 60), 60)
         self._time_red_seconds = _cfg_float(cfg.get("time_red_seconds", 120), 120)
         self._no_progress_yellow = _cfg_int(cfg.get("no_progress_yellow", 5), 5)
@@ -402,18 +404,19 @@ class ToolCallCircuitBreaker:
                                   attn_usage_ratio: float = -1.0) -> Tuple[CircuitBreakerState, str]:
         if attn_usage_ratio >= 0:
             ratio = attn_usage_ratio
-            source = "AW.usage_ratio"
+            source = "AW.trigger_context_pressure_ratio"
         else:
             total_tokens = self._estimate_messages_tokens(messages)
-            ratio = total_tokens / self._context_window_size if self._context_window_size > 0 else 0
-            source = f"独立估算({total_tokens}t/{self._context_window_size})"
-        if ratio >= self._context_red_ratio:
+            threshold_budget = max(1, int(self._context_window_size * max(0.01, min(1.0, self._threshold_budget_ratio))))
+            ratio = total_tokens / threshold_budget if threshold_budget > 0 else 0
+            source = f"独立估算({total_tokens}t/{threshold_budget}; 原始窗口={self._context_window_size})"
+        if ratio > self._context_red_ratio:
             return CircuitBreakerState.RED, (
-                f"上下文压力过高: {ratio:.0%} (≥{self._context_red_ratio:.0%}) [{source}]"
+                f"上下文压力过高: {ratio:.0%} (>{self._context_red_ratio:.0%}) [{source}]"
             )
-        if ratio >= self._context_yellow_ratio:
+        if ratio > self._context_yellow_ratio:
             return CircuitBreakerState.YELLOW, (
-                f"上下文压力警告: {ratio:.0%} (≥{self._context_yellow_ratio:.0%}) [{source}]"
+                f"上下文压力警告: {ratio:.0%} (>{self._context_yellow_ratio:.0%}) [{source}]"
             )
         return CircuitBreakerState.GREEN, ""
 

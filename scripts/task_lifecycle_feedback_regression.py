@@ -764,8 +764,8 @@ def test_pipeline_summary_hides_internal_task_ledger():
     print("[PASS] 完成总结隐藏后台任务图工具，仅保留执行层摘要")
 
 
-def test_exec_write_file_append_and_chunk_guard():
-    """exec_write_file 支持可验证 append，并拒绝超长单块写入。"""
+def test_exec_write_file_append_and_full_write_guard():
+    """exec_write_file 支持可验证 append，并允许完整文件写入。"""
     from zulong.tools import exec_tools
     from zulong.tools.base import ToolRequest
 
@@ -791,22 +791,21 @@ def test_exec_write_file_append_and_chunk_guard():
             assert second.data["mode"] == "append"
             assert second.data["verified"] is True
 
-            oversized = tool.execute(ToolRequest(
+            full_write = tool.execute(ToolRequest(
                 tool_name="exec_write_file",
                 action="execute",
                 parameters={
-                    "file_path": "too_big.txt",
-                    "content": "x" * (exec_tools.MAX_WRITE_CHUNK_CHARS + 1),
+                    "file_path": "full_write.txt",
+                    "content": "x" * 4096,
                     "mode": "overwrite",
                 },
             ))
-            assert not oversized.success
-            assert oversized.data["recoverable"] is True
-            assert oversized.data["chunk_policy"] == "openhands_style_file_chunking"
-            assert not (Path(tmp) / "too_big.txt").exists()
+            assert full_write.success, full_write.to_dict()
+            assert full_write.data["verified"] is True
+            assert (Path(tmp) / "full_write.txt").read_text(encoding="utf-8") == "x" * 4096
         finally:
             exec_tools.WORKSPACE_DIR = old_workspace
-    print("[PASS] exec_write_file append 与超长分片保护生效")
+    print("[PASS] exec_write_file append 与完整文件写入验证生效")
     print("[PASS] Pipeline feedback: 计划清单有语义，当前步骤无兜底噪声")
 
 
@@ -1027,6 +1026,6 @@ if __name__ == "__main__":
     test_full_web_pipeline_interaction_bridge_contract()
     test_pipeline_feedback_plan_and_step_contract()
     test_pipeline_summary_hides_internal_task_ledger()
-    test_exec_write_file_append_and_chunk_guard()
+    test_exec_write_file_append_and_full_write_guard()
     
     print("\n[OK] 所有 P0 验证通过")

@@ -95,15 +95,18 @@ def infer_task_graph_owner_session_node_id(
     conversation_id: Any = "",
     session_node_id: Any = "",
 ) -> str:
-    """Infer the dialogue session node address that owns a task graph."""
+    """Infer the canonical dialogue root address that owns a task graph."""
+    conv_id = str(conversation_id or "").strip()
+    if conv_id:
+        if conv_id.startswith("dialogue:session_") and "/" not in conv_id:
+            return conv_id
+        return f"dialogue:session_{_compact_dialogue_id(conv_id)}"
     node_id = str(session_node_id or "").strip()
-    if node_id:
-        return node_id
+    if node_id.startswith("dialogue:session_"):
+        return node_id.split("/", 1)[0]
     conv_id = str(conversation_id or "").strip()
     if not conv_id:
         return ""
-    if conv_id.startswith("dialogue:session_") and "/" not in conv_id:
-        return conv_id
     return f"dialogue:session_{_compact_dialogue_id(conv_id)}"
 
 
@@ -591,30 +594,6 @@ def _label_similarity(a: str, b: str) -> float:
 
 _WINDOWS_ABS_PATH_RE = re.compile(r"(?P<path>[A-Za-z]:[\\/][A-Za-z0-9_.$~ (){}\[\]\-\\/]+)")
 _POSIX_ABS_PATH_RE = re.compile(r"(?P<path>/(?:[^，。；;,\n\r\"'`]+))")
-_EXPLICIT_WORKSPACE_PATH_RE = re.compile(
-    r"(?:工作区|工作目录|项目目录|项目文件夹|workspace|project\s+dir|project\s+directory)"
-    r"\s*(?:为|是|:|：)?\s*"
-    r"(?P<path>[A-Za-z]:[\\/][A-Za-z0-9_.$~ (){}\[\]\-\\/]+|/(?:[^，。；;,\n\r\"'`]+))",
-    re.IGNORECASE,
-)
-_TASK_OUTPUT_PATH_KEYWORDS = (
-    "独立产物目录", "产物目录", "产物路径", "输出目录", "输出路径", "结果目录", "目标目录",
-    "任务目录", "任务路径", "工作区", "工作目录", "项目目录", "项目文件夹",
-    "保存到", "生成到", "写入到", "放到", "落到", "创建到", "执行目录",
-    "artifact", "artifacts", "output", "target", "workspace", "workdir",
-    "project dir", "project directory",
-)
-_TASK_INPUT_PATH_KEYWORDS = (
-    "真实输入项目", "输入项目", "源项目", "源码项目", "待分析项目", "分析项目",
-    "参考项目", "读取项目", "扫描项目", "被分析项目", "输入目录", "源目录",
-    "source", "input", "reference", "read-only", "readonly",
-)
-_PROJECT_NAME_PATTERNS = (
-    re.compile(r"(?:项目文件夹|项目目录|文件夹|目录)\s*[“\"'](?P<name>[^”\"']{1,80})[”\"']"),
-    re.compile(r"以\s*[“\"'](?P<name>[^”\"']{1,80})[”\"']\s*为项目"),
-    re.compile(r"创建(?:一个)?(?:项目文件夹|项目目录|文件夹|目录)\s*(?P<name>[\w\-\u4e00-\u9fff]{1,80})"),
-    re.compile(r"(?:项目文件夹|项目目录|文件夹|目录)\s*(?P<name>[A-Za-z][A-Za-z0-9_-]{0,79})"),
-)
 _PATH_TRAILING_ACTION_RE = re.compile(
     r"(?i)(?:\.\s+|\s+)(?=(?:write|create|make|implement|add|run|final|then|please|package|pkg|module|file|files|test|tests)\b)"
 )
@@ -657,42 +636,21 @@ def _iter_path_matches_with_context(raw: str) -> List[Tuple[str, int, int]]:
     return deduped
 
 
-def _score_task_workspace_path(raw: str, start: int, end: int) -> float:
-    """Score a path mention as the task/output workspace, not merely an input repo."""
-    before = (raw or "")[max(0, start - 80):start].lower()
-    after = (raw or "")[end:min(len(raw or ""), end + 80)].lower()
-    nearby = f"{before} {after}"
-    score = 0.0
+def extract_path_candidates_from_text(raw: str) -> List[Dict[str, Any]]:
+    """Return factual absolute-path candidates without assigning semantic roles.
 
-    if any(keyword.lower() in nearby for keyword in _TASK_OUTPUT_PATH_KEYWORDS):
-        score += 100.0
-    if any(keyword.lower() in nearby for keyword in _TASK_INPUT_PATH_KEYWORDS):
-        score -= 80.0
-    if re.search(r"(?:在|到|至|于)\s*$", before):
-        score += 8.0
-    if re.search(r"^\s*(?:下|中|里|内|执行|创建|生成|保存|输出|写入)", after):
-        score += 8.0
-    # Later explicit output paths often refine an earlier input/source path.
-    score += start / 100000.0
-    return score
-
-
-def _select_task_workspace_path_from_text(raw: str) -> str:
-    """Choose the most likely task workspace path from a user/task description.
-
-    When both an input/source project and an output/artifact directory are
-    present, the artifact/output directory must win so TaskGraph follows the
-    real task execution location.
+    The L2/LLM owns decisions such as "task workspace" vs "reference input".
+    Framework code may surface path facts, but must not use phrase lists to
+    decide the user's intended workspace.
     """
-    candidates = _iter_path_matches_with_context(raw or "")
-    if not candidates:
-        return ""
-    scored = [
-        (_score_task_workspace_path(raw or "", start, end), index, candidate)
-        for index, (candidate, start, end) in enumerate(candidates)
-    ]
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    return scored[0][2]
+    candidates: List[Dict[str, Any]] = []
+    for index, (candidate, start, end) in enumerate(_iter_path_matches_with_context(raw or "")):
+        candidates.append({
+            "path": candidate,
+            "index": index,
+            "span": [start, end],
+        })
+    return candidates
 
 
 def _split_exact_workspace_path(path_value: Any) -> Tuple[str, str]:
@@ -759,68 +717,66 @@ def _clean_project_folder_name(name: str) -> str:
     return cleaned.rstrip(".。")
 
 
+_LLM_TASK_WORKSPACE_ROLES = {
+    "task_workspace",
+    "workspace",
+    "execution_workspace",
+    "project_root",
+    "project_workspace",
+}
+
+
+def _normalize_path_roles(value: Any) -> List[Dict[str, Any]]:
+    """Normalize LLM-supplied path roles without inferring roles from prose."""
+    if not isinstance(value, list):
+        return []
+    roles: List[Dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        path = _normalize_workspace_dir(str(item.get("path") or ""))
+        role = str(item.get("role") or "").strip().lower()
+        if not path or not role:
+            continue
+        roles.append({
+            "path": path,
+            "role": role,
+            "reason": str(item.get("reason") or "").strip(),
+            "confidence": item.get("confidence"),
+        })
+    return roles
+
+
+def _workspace_from_llm_path_roles(path_roles: List[Dict[str, Any]]) -> str:
+    for item in path_roles:
+        role = str(item.get("role") or "").strip().lower()
+        if role in _LLM_TASK_WORKSPACE_ROLES:
+            return _normalize_workspace_dir(str(item.get("path") or ""))
+    return ""
+
+
+def _path_matches_any_candidate(path_value: str, path_candidates: List[Dict[str, Any]]) -> bool:
+    normalized = _normalize_path_for_match(path_value)
+    if not normalized:
+        return False
+    for item in path_candidates:
+        candidate = _normalize_path_for_match(str(item.get("path") or ""))
+        if candidate and candidate == normalized:
+            return True
+    return False
+
+
 def infer_project_workspace_hint(text: str) -> Tuple[str, str]:
-    """Infer explicit parent path and project folder name from a user request.
+    """Deprecated compatibility shim.
 
-    The parser only preserves concrete placement constraints such as
-    "在 D:/AI/project 下创建项目文件夹 mao"; L2 still owns planning.
+    Path roles are semantic task intent.  Per the TSD repair decision, framework
+    code may expose factual path candidates, but it must not infer "task
+    workspace" / "reference input" / "export target" from fixed phrase lists.
+    Callers must use LLM-supplied ``workspace_path`` or structured
+    ``path_roles`` instead.  Returning an empty hint prevents accidental
+    fallback to legacy keyword heuristics.
     """
-    raw = str(text or "")
-    target_path = ""
-    project_name = ""
-
-    workspace_match = _EXPLICIT_WORKSPACE_PATH_RE.search(raw)
-    if workspace_match:
-        candidate = _trim_inferred_path_candidate(workspace_match.group("path"))
-        candidate = re.sub(r"(?:下|中|里|作为|创建).*$", "", candidate).strip()
-        candidate = candidate.rstrip("\\/")
-        # If the first "项目目录" mention is actually an input/source repo and a
-        # later output/artifact/workspace path is present, bind the task to the
-        # execution/artifact directory instead of the read-only input project.
-        selected = _select_task_workspace_path_from_text(raw)
-        if selected and _normalize_path_for_match(selected) != _normalize_path_for_match(candidate):
-            explicit_score = _score_task_workspace_path(
-                raw,
-                workspace_match.start("path"),
-                workspace_match.end("path"),
-            )
-            selected_score = 0.0
-            for path_candidate, start, end in _iter_path_matches_with_context(raw):
-                if _normalize_path_for_match(path_candidate) == _normalize_path_for_match(selected):
-                    selected_score = _score_task_workspace_path(raw, start, end)
-                    break
-            if selected_score > explicit_score:
-                candidate = selected
-        final_path = Path(candidate.rstrip("\\/"))
-        if final_path.name:
-            return str(final_path.parent), _clean_project_folder_name(final_path.name)
-
-    for pattern in _PROJECT_NAME_PATTERNS:
-        match = pattern.search(raw)
-        if match:
-            project_name = _clean_project_folder_name(match.group("name"))
-            if project_name:
-                break
-
-    target_path = _select_task_workspace_path_from_text(raw)
-
-    if target_path and not project_name:
-        try:
-            final_path = Path(target_path)
-            if final_path.name:
-                return str(final_path.parent), _clean_project_folder_name(final_path.name)
-        except Exception:
-            pass
-
-    if target_path and project_name:
-        try:
-            final_path = Path(target_path) / project_name
-            if final_path.exists():
-                target_path = str(final_path.parent)
-        except Exception:
-            pass
-
-    return target_path, project_name
+    return "", ""
 
 
 def _explicit_recreate_requested(text: str) -> bool:
@@ -916,6 +872,8 @@ def _graph_workspace_health(tg, workspace_dir: Optional[str]) -> Dict[str, Any]:
         "workspace_dir": workspace_dir or "",
         "missing": [],
         "reason": "",
+        "warnings": [],
+        "needs_review": False,
     }
     if not workspace_dir:
         return health
@@ -939,12 +897,10 @@ def _graph_workspace_health(tg, workspace_dir: Optional[str]) -> Dict[str, Any]:
             if p.is_file() and ".zulong" not in p.parts and ".zlong" not in p.parts
         ]
         if completed_nodes and not user_files:
-            health.update({
-                "ok": False,
-                "reason": "任务图已有完成节点，但工作目录里没有可见项目文件",
-                "missing": ["project_files"],
-            })
-            return health
+            health["needs_review"] = True
+            health.setdefault("warnings", []).append(
+                "任务图已有完成节点，但工作目录里没有可见项目文件；这只是复核信号，不作为硬失败"
+            )
 
         mentioned_files = set()
         file_re = re.compile(r"(?<![\w./\\-])([\w.-]+\.(?:html|css|js|ts|tsx|jsx|json|md|py|txt|png|jpg|jpeg|webp|svg|yml|yaml))(?![\w./\\-])", re.IGNORECASE)
@@ -966,11 +922,11 @@ def _graph_workspace_health(tg, workspace_dir: Optional[str]) -> Dict[str, Any]:
             if filename.lower() not in existing_names:
                 missing_files.append(filename)
         if missing_files:
-            health.update({
-                "ok": False,
-                "reason": "任务图记录中已完成的文件在工作目录中缺失",
-                "missing": missing_files[:20],
-            })
+            health["needs_review"] = True
+            health.setdefault("warnings", []).append(
+                "任务图记录中已完成的文件在工作目录中缺失；需结合写入证据和最终声明复核"
+            )
+            health["missing"] = missing_files[:20]
     except Exception as exc:
         logger.debug(f"[task_create_plan] 工作目录健康检查跳过: {exc}")
 
@@ -2240,6 +2196,12 @@ class TaskCreatePlanTool(BaseTool):
         start_time = time.time()
         title = request.parameters.get("title", "未命名任务")
         user_requirement = request.parameters.get("user_requirement", "")
+        requested_workspace_path = (
+            request.parameters.get("workspace_path")
+            or request.parameters.get("workspace_dir")
+            or request.parameters.get("cwd")
+            or ""
+        )
         conversation_id = (
             request.parameters.get("conversation_id")
             or request.parameters.get("session_id")
@@ -2251,37 +2213,68 @@ class TaskCreatePlanTool(BaseTool):
             or request.parameters.get("dialogue_session_id")
             or "",
         )
-        inferred_target_path, inferred_project_name = infer_project_workspace_hint(
-            f"{user_requirement}\n{title}"
+        path_candidate_source = f"{user_requirement}\n{title}"
+        path_candidates = request.parameters.get("path_candidates")
+        if not isinstance(path_candidates, list):
+            path_candidates = extract_path_candidates_from_text(path_candidate_source)
+        path_roles = _normalize_path_roles(
+            request.parameters.get("path_roles")
+            or (
+                request.parameters.get("workspace_understanding", {}).get("path_roles")
+                if isinstance(request.parameters.get("workspace_understanding"), dict)
+                else []
+            )
+        )
+        role_workspace_path = _workspace_from_llm_path_roles(path_roles)
+        if role_workspace_path and not requested_workspace_path:
+            requested_workspace_path = role_workspace_path
+        workspace_target_path, workspace_project_name = _split_exact_workspace_path(
+            requested_workspace_path
         )
         requested_target_path = request.parameters.get("target_path", "")
         requested_project_name = request.parameters.get("project_name", "")
-        requested_target_norm = _normalize_path_for_match(requested_target_path)
-        inferred_final_norm = ""
-        if inferred_target_path and inferred_project_name:
-            try:
-                inferred_final_norm = _normalize_path_for_match(
-                    str(Path(inferred_target_path) / inferred_project_name)
+        has_structured_workspace_choice = bool(
+            requested_target_path
+            or requested_project_name
+            or role_workspace_path
+            or (
+                requested_workspace_path
+                and (
+                    not path_candidates
+                    or _path_matches_any_candidate(requested_workspace_path, path_candidates)
                 )
-            except Exception:
-                inferred_final_norm = ""
-        if (
-            user_requirement
-            and inferred_target_path
-            and inferred_project_name
-            and requested_target_norm
-            and requested_target_norm == inferred_final_norm
-            and requested_project_name
-            and requested_project_name != inferred_project_name
-        ):
-            target_path = inferred_target_path
-            project_name = inferred_project_name
-        elif requested_target_path or requested_project_name:
-            target_path = requested_target_path or inferred_target_path
-            project_name = requested_project_name or inferred_project_name or title
+            )
+        )
+        if path_candidates and not has_structured_workspace_choice:
+            return self._create_result(
+                success=False,
+                data={
+                    "status": "workspace_understanding_required",
+                    "path_candidates": path_candidates,
+                    "accepted_workspace_fields": [
+                        "workspace_path",
+                        "target_path + project_name",
+                        "path_roles[{role: task_workspace, path: ...}]",
+                    ],
+                    "message": (
+                        "检测到用户输入包含绝对路径。框架只提供路径候选，"
+                        "不会用关键词替 LLM 判断哪个是任务工作区。"
+                        "请由 LLM 基于完整上下文选择工作区，并重新调用 task_create_plan。"
+                    ),
+                },
+                error="workspace_understanding_required",
+                execution_time=time.time() - start_time,
+                request_id=request.request_id,
+            )
+        if requested_target_path or requested_project_name:
+            target_path = requested_target_path
+            project_name = requested_project_name or title
+        elif workspace_target_path and workspace_project_name:
+            target_path = workspace_target_path
+            project_name = workspace_project_name
         else:
-            target_path = inferred_target_path
-            project_name = inferred_project_name or title
+            target_path = ""
+            project_name = title
         existing_task_policy = str(
             request.parameters.get("existing_task_policy")
             or request.parameters.get("existingTaskPolicy")
@@ -2328,15 +2321,33 @@ class TaskCreatePlanTool(BaseTool):
                 old_tg.title = title
                 old_tg.metadata["user_requirement"] = user_requirement or title
                 old_tg.metadata["user_seeded_empty_graph"] = False
+                old_tg.metadata["path_candidates"] = path_candidates
+                if path_roles:
+                    old_tg.metadata["path_roles"] = path_roles
+                if role_workspace_path:
+                    old_tg.metadata["llm_selected_workspace_dir"] = role_workspace_path
+                old_graph_id = getattr(old_tg, "id", "") or _active_graph_id
+                old_workspace_dir = getattr(old_tg, "metadata", {}).get("workspace_dir") or ""
+                if target_path or project_name:
+                    old_workspace_dir = _create_task_workspace(
+                        old_graph_id,
+                        project_mode=True,
+                        project_name=project_name or title,
+                        project_desc=user_requirement or title,
+                        target_path=target_path,
+                    )
+                    old_tg.metadata["workspace_dir"] = old_workspace_dir
+                    old_tg.metadata["workspace_path"] = old_workspace_dir
                 if project_name:
                     old_tg.metadata["project_name"] = project_name
                 if target_path:
                     old_tg.metadata["target_path"] = target_path
                 set_active_task_graph(
                     old_tg,
-                    getattr(old_tg, "id", "") or _active_graph_id,
+                    old_graph_id,
                     workspace_dir=(
-                        getattr(old_tg, "metadata", {}).get("workspace_dir")
+                        old_workspace_dir
+                        or getattr(old_tg, "metadata", {}).get("workspace_dir")
                         or get_active_workspace_dir()
                         or target_path
                     ),
@@ -2349,23 +2360,28 @@ class TaskCreatePlanTool(BaseTool):
                 )
                 _bind_conversation_task_graph_once(
                     conversation_id=conversation_id,
-                    graph_id=getattr(old_tg, "id", "") or _active_graph_id,
+                    graph_id=old_graph_id,
                     title=title,
-                    workspace_dir=getattr(old_tg, "metadata", {}).get("workspace_dir") or "",
+                    workspace_dir=old_workspace_dir or getattr(old_tg, "metadata", {}).get("workspace_dir") or "",
                     session_node_id=session_node_id,
                     metadata={
                         "user_requirement": user_requirement or title,
+                        "path_candidates": path_candidates,
+                        "path_roles": path_roles,
+                        "llm_selected_workspace_dir": role_workspace_path,
                         "task_graph_file_path": getattr(old_tg, "metadata", {}).get("task_graph_file_path") or "",
                     },
                 )
                 return self._create_result(
                     success=True,
                     data={
-                        "graph_id": getattr(old_tg, "id", "") or _active_graph_id,
+                        "graph_id": old_graph_id,
                         "root_node_id": "req",
                         "title": title,
                         "user_requirement": user_requirement or title,
-                        "workspace_dir": getattr(old_tg, "metadata", {}).get("workspace_dir") or "",
+                        "workspace_dir": old_workspace_dir or getattr(old_tg, "metadata", {}).get("workspace_dir") or "",
+                        "path_candidates": path_candidates,
+                        "path_roles": path_roles,
                         "task_graph_file_path": getattr(old_tg, "metadata", {}).get("task_graph_file_path") or "",
                         "message": "已使用空会话预建图谱承接当前任务。请用 task_add_node 添加子任务。",
                     },
@@ -2632,8 +2648,16 @@ class TaskCreatePlanTool(BaseTool):
                 target_path=target_path,
             )
             tg.metadata["workspace_dir"] = workspace_dir
+            tg.metadata["workspace_path"] = workspace_dir
             tg.metadata["project_name"] = project_name
             tg.metadata["target_path"] = target_path
+            tg.metadata["path_candidates"] = path_candidates
+            if path_roles:
+                tg.metadata["path_roles"] = path_roles
+            if role_workspace_path:
+                tg.metadata["llm_selected_workspace_dir"] = role_workspace_path
+            if requested_workspace_path:
+                tg.metadata["requested_workspace_path"] = _normalize_workspace_dir(requested_workspace_path)
             bind_task_graph_owner(
                 tg,
                 conversation_id=conversation_id,
@@ -2659,6 +2683,9 @@ class TaskCreatePlanTool(BaseTool):
                     "user_requirement": root_desc,
                     "project_name": project_name,
                     "target_path": target_path,
+                    "path_candidates": path_candidates,
+                    "path_roles": path_roles,
+                    "llm_selected_workspace_dir": role_workspace_path,
                 },
             )
             if conversation_id and not bound_ok:
@@ -2714,6 +2741,8 @@ class TaskCreatePlanTool(BaseTool):
                     "project_name": project_name,
                     "target_path": target_path,
                     "workspace_dir": workspace_dir,
+                    "path_candidates": path_candidates,
+                    "path_roles": path_roles,
                     "vscode_opened": bool(vscode_open_result.get("ok")),
                     "vscode_open_result": vscode_open_result,
                     "message": (
@@ -2747,9 +2776,43 @@ class TaskCreatePlanTool(BaseTool):
                     "type": "string",
                     "description": "可选：用户指定的项目父目录绝对路径。例如 Windows 的 D:/project/，或 Linux/macOS 的 /home/user/project/。留空则使用默认工作区。",
                 },
+                "workspace_path": {
+                    "type": "string",
+                    "description": "可选：LLM 基于完整上下文明确选择的实际执行目录。它表示最终 TaskGraph 工作区本身；不要把当前 cwd 或参考目录当作兜底。",
+                },
                 "project_name": {
                     "type": "string",
-                    "description": "可选：用户明确指定的项目文件夹名，例如 tank。若用户只描述任务标题，可留空由系统从需求文本推断。",
+                    "description": "可选：LLM 明确选择的项目文件夹名。若无法确定，应留空并结合 path_roles/澄清，而不是由代码关键词推断。",
+                },
+                "path_roles": {
+                    "type": "array",
+                    "description": (
+                        "可选：LLM 对用户文本中路径角色的结构化理解。"
+                        "框架只提取路径候选，不用关键词决定语义；当文本包含多个绝对路径时，"
+                        "应由 LLM 填写 task_workspace/reference_input/parent_directory/export_target/other 等角色和 reason。"
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "role": {"type": "string"},
+                            "reason": {"type": "string"},
+                            "confidence": {"type": "number"},
+                        },
+                        "required": ["path", "role"],
+                    },
+                },
+                "path_candidates": {
+                    "type": "array",
+                    "description": "可选：框架从用户文本提取的绝对路径候选事实；仅供 LLM 判断，不代表路径角色。",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "index": {"type": "integer"},
+                            "span": {"type": "array", "items": {"type": "integer"}},
+                        },
+                    },
                 },
                 "existing_task_policy": {
                     "type": "string",
@@ -3265,11 +3328,16 @@ class TaskMarkStatusTool(BaseTool):
 
             _save_active_backup()  # 磁盘备份
 
-            # 🔥 [P0] 检测任务整体完成 → 自动归档
+            # 归档只能由 FC 统一完成质量门通过后的 finalize 路径触发。
+            # task_mark_status 只记录节点状态，避免“节点状态已完成”绕过
+            # 原始任务覆盖、工具失败、验证证据等质量门。
             if status == "completed":
-                req_node = tg.get_node("req")
-                if req_node and req_node.status == "completed":
-                    _auto_archive_completed(tg)
+                try:
+                    if hasattr(tg, "metadata"):
+                        tg.metadata["last_explicit_completed_node_id"] = node_id
+                        tg.metadata["last_explicit_completed_at"] = time.time()
+                except Exception:
+                    pass
 
             # Rule E: 大纲阶段软警告（仅信息性提示，不阻止操作）
             _outline_hint = ""
@@ -4630,19 +4698,20 @@ class TaskAttachFileTool(BaseTool):
 
 
 class SubmitFinalAnswerTool(BaseTool):
-    """submit_final_answer — LLM 主动调用以结束当前任务并提交最终答案
+    """submit_final_answer — LLM 主动提交候选最终答案
 
-    语义：该工具是 FC 循环的终止信号。调用后：
-    1. 将 answer 写入活跃 TaskGraph 根节点的 output
-    2. 将根节点标记为 completed
-    3. 返回 success，FC 循环检测到该工具后应终止迭代
+    语义：该工具是 FC 循环的候选终止信号。调用后只记录 answer，
+    不直接把根节点标记为 completed，也不直接归档；最终是否完成必须
+    由 IDEFCRunner 的完成前验证门/质量门基于结构化证据统一判定。
     """
 
     def __init__(self):
         super().__init__(name="submit_final_answer", category=ToolCategory.CUSTOM)
         self.description = (
             "提交最终回答并结束当前任务。当你认为任务已完成、"
-            "可以向用户交付最终结果时调用此工具。参数：answer（最终回答文本）"
+            "可以向用户交付最终结果时调用此工具。参数：answer（最终回答文本）。"
+            "注意：该工具只提交候选最终答案；是否真正完成由完成质量门根据"
+            "原始任务要求、TaskGraph、工具结果和验证证据决定。"
         )
 
     def initialize(self) -> bool:
@@ -4677,21 +4746,26 @@ class SubmitFinalAnswerTool(BaseTool):
                     request_id=request.request_id,
                 )
             try:
-                _write_final_answer_to_task_graph(
-                    tg,
-                    answer,
-                    source="submit_final_answer",
-                )
-                _auto_archive_completed(tg)
+                root = tg.get_node("req")
+                if root is not None:
+                    root.metadata["candidate_final_answer"] = str(answer)
+                    root.metadata["candidate_final_answer_length"] = len(str(answer))
+                    root.metadata["candidate_final_answer_updated_at"] = time.time()
+                    try:
+                        tg._mark_dirty()
+                    except Exception:
+                        pass
+                    _persist_task_graph_backup(tg)
             except Exception as e:
-                logger.warning("[SubmitFinalAnswer] 更新 TaskGraph 失败: %s", e)
+                logger.warning("[SubmitFinalAnswer] 记录候选最终答案失败: %s", e)
 
         return self._create_result(
             success=True,
             data={
-                "message": "最终答案已提交，任务完成",
+                "message": "候选最终答案已提交，等待完成质量门确认",
                 "answer_length": len(answer),
                 "has_task_graph": tg is not None,
+                "requires_quality_gate": True,
             },
             execution_time=time.time() - start_time,
             request_id=request.request_id,

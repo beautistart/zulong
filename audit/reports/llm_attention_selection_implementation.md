@@ -49,11 +49,12 @@
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | enabled | True | 功能开关 |
-| pressure_threshold_high | 0.9 | 高压阈值 |
-| pressure_threshold_medium | 0.75 | 中压阈值 |
+| threshold_budget_ratio | 0.5 | 阈值预算=LLM原始上下文窗口的50% |
+| pressure_threshold_high | 1.0 | RED触发线：上下文压力 >100% |
+| pressure_threshold_medium | 0.9 | YELLOW触发线：上下文压力 >90% |
 | cooldown_base_seconds | 30.0 | 基础冷却时间 |
 | fallback_mode | FOCUS | Fallback模式 |
-| decision_timeout_ms | 500 | 决策超时 |
+| decision_timeout_ms | None | 无限等待LLM完成注意力选择 |
 | oscillation_detection_window | 10 | 震荡检测窗口 |
 
 **核心方法**:
@@ -244,7 +245,7 @@ async def _try_llm_mode_selection(self):
 | 指标 | 目标值 | 实现情况 |
 |------|--------|----------|
 | 压力检测延迟 | < 5ms | ✅ 实现，有性能日志监控 |
-| LLM决策超时 | 500ms | ✅ 实现，asyncio.wait_for() |
+| LLM决策等待 | 默认无限等待 | ✅ 实现；配置为正数时才使用 `asyncio.wait_for()` |
 | 冷却时间 | 30秒起 | ✅ 实现，动态调整 |
 | 震荡检测 | 实时 | ✅ 实现，ABA/ABAB模式检测 |
 

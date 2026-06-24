@@ -525,8 +525,9 @@ class AdjustAttentionModeTool(BaseTool):
     - focus: 聚焦模式，关注某节点的细节和关联
     - single_chain: 单链推理，只保留当前执行链路
 
-    此工具通过 AttentionWindowManager.observe_tool_call() 联动生效，
-    工具本身返回确认信息，实际模式切换由注意力窗口状态机完成。
+    此工具是 LLM 显式注意力控制能力。工具本身返回确认信息，
+    调用结果由 AttentionWindowManager 作为显式注意力选择应用；
+    普通读写/命令/检索工具不得借此路径自动切换注意力。
     """
 
     def __init__(self):
@@ -559,9 +560,9 @@ class AdjustAttentionModeTool(BaseTool):
                 request_id=request.request_id,
             )
 
-        # 工具本身只做验证和返回确认
-        # 实际模式切换由 AttentionWindowManager._compute_transition() 处理
-        # 该方法会检测 tool_name == "adjust_attention_mode" 并从 tool_args 读取 mode
+        # 工具本身只做验证和返回确认。
+        # 模式切换只允许通过显式注意力控制能力进入 AttentionWindowManager；
+        # 普通工具调用不能触发 GLOBAL/FOCUS/SINGLE_CHAIN 切换。
         mode_names = {
             "global": "全局视角",
             "focus": "聚焦模式",
@@ -592,7 +593,7 @@ class AdjustAttentionModeTool(BaseTool):
                         "目标注意力模式: "
                         "global=全局视角（关注大纲和整体进度）, "
                         "focus=聚焦模式（关注某节点的细节和关联）, "
-                        "single_chain=单链推理（深度推理，淘汰不相关内容）"
+                        "single_chain=单链推理（深度推理，暂排当前阶段无关上下文）"
                     ),
                 },
             },

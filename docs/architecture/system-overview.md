@@ -383,16 +383,15 @@ Requirement (深度 0)
 **源文件**: `zulong/l2/attention_window.py`
 **成熟度**: 基本可用
 
-**三模式状态机**:
-- **GLOBAL**: 全局视角，关注大纲和整体结构，深层节点权重递减
-- **FOCUS**: 聚焦特定节点，提高关联上下文权重
-- **SINGLE_CHAIN**: 单链推理，只保留当前执行链路的高权重信息
+**三模式动态注意力**:
+- **GLOBAL**: 全局视角，关注完整任务结构、跨分支依赖、历史证据与最终复核。
+- **FOCUS**: 局部注意，围绕当前节点/需求缺口/关键证据按需注入上下文，暂时排除无关上下文。
+- **SINGLE_CHAIN**: 单链注意，围绕当前推理链或调试链按需注入必要上下文；当需要跨分支判断时可重新注入其他上下文或上浮回 GLOBAL。
 
-**模式切换由工具调用驱动** (零 LLM 开销):
-- `recall_memory` / `read_memory_node` → GLOBAL → FOCUS
-- `exec_write_file` / `exec_run_command` → FOCUS → SINGLE_CHAIN
-- `task_view_overview` / `submit_final_answer` → 强制回 GLOBAL
-- `navigate_attention` → deeper / broader / jump 三种导航
+**模式切换原则**:
+- 上下文压力阈值监控是触发 L2 动态注意力切换的主信号。
+- LLM 根据压力值、当前 TaskGraph 节点、未覆盖 TaskSpec、MemoryGraph 证据和工具结果，自主选择 GLOBAL / FOCUS / SINGLE_CHAIN。
+- 显式注意力导航接口可执行 LLM 的注意力选择；普通工具调用不得作为 L2 注意力主规则绑定，只能进入工具账本、压力观测和质量证据。
 
 **Token 预算**: `budget = (context_window - reserved) × 90%`，reserved = 7096 tokens
 

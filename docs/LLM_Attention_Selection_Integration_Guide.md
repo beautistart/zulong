@@ -323,8 +323,9 @@ attention_selection:
   enabled: true                      # 启用/禁用LLM自主选择
   
   # 压力阈值配置
-  pressure_threshold_high: 0.6       # 高压阈值
-  pressure_threshold_medium: 0.5     # 中压阈值
+  threshold_budget_ratio: 0.5        # 阈值预算=LLM原始上下文窗口的50%
+  pressure_threshold_high: 1.0       # RED触发线：上下文压力 >100%
+  pressure_threshold_medium: 0.9     # YELLOW触发线：上下文压力 >90%
   
   # 冷却时间配置
   cooldown_base_seconds: 30.0        # 基础冷却时间(秒)
@@ -333,7 +334,7 @@ attention_selection:
   fallback_mode: "FOCUS"             # Fallback默认模式
   
   # 性能配置
-  decision_timeout_ms: 500           # LLM决策超时(毫秒)
+  decision_timeout_ms: null          # null表示等待LLM完成注意力选择
   
   # 震荡检测配置
   oscillation_detection_window: 10   # 震荡检测窗口大小
@@ -359,7 +360,12 @@ def test_pressure_detection():
     
 def test_threshold_check():
     """测试阈值判断"""
-    config = AttentionConfig(pressure_threshold_high=0.6)
+    config = AttentionConfig(
+        threshold_budget_ratio=0.5,
+        pressure_threshold_high=1.0,
+        pressure_threshold_medium=0.9,
+        decision_timeout_ms=None,
+    )
     detector = PressureDetector(mock_awm, config)
     metrics = PressureMetrics(current_pressure=1.0, ...)
     result = detector.check_threshold(metrics)

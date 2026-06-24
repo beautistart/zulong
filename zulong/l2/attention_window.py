@@ -7,14 +7,17 @@
 三种注意力模式：
   - GLOBAL: 全局视角，关注大纲和整体结构，深层节点权重递减
   - FOCUS: 聚焦某个节点的细节，提高关联上下文权重
-  - SINGLE_CHAIN: 单链推理，只保留当前执行链路的高权重信息
+  - SINGLE_CHAIN: 单链推理，优先注入当前执行链路的高权重信息，暂排无关上下文
 
-模式切换由工具调用驱动（状态机），无需额外 LLM 判断。
-navigate_attention 工具可直接控制模式和 BFS 种子位置。
+模式切换不再由普通工具名驱动。上下文压力阈值监控会触发 LLM 自主选择
+GLOBAL / FOCUS / SINGLE_CHAIN；LLM 也可以通过显式注意力控制能力
+（如 navigate_attention / adjust_attention_mode 或等价工具）切换模式。
+普通读写、命令、检索工具只进入工具账本、压力观测和质量证据。
 """
 
 import logging
 import re
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Any, Set
@@ -41,7 +44,7 @@ class AttentionMode(Enum):
     """注意力模式"""
     GLOBAL = "global"             # 全局：关注大纲和整体进度
     FOCUS = "focus"               # 聚焦：关注某节点的细节和关联
-    SINGLE_CHAIN = "single_chain" # 单链：深度推理，淘汰不相关内容
+    SINGLE_CHAIN = "single_chain" # 单链：深度推理，暂排不相关上下文
 
 
 def estimate_tokens(text: str) -> int:
@@ -86,25 +89,6 @@ class MessageEnvelope:
     group_id: Optional[int] = None
 
 
-# ── 模式切换触发器（适配当前工具名）──
-
-# 这些工具触发 GLOBAL → FOCUS
-_FOCUS_TRIGGERS: Set[str] = {
-    "recall_memory", "read_memory_node", "discover_related",
-    "search_experience", "task_get_detail",
-}
-
-# 这些工具触发 FOCUS → SINGLE_CHAIN
-_SINGLE_CHAIN_TRIGGERS: Set[str] = {
-    "exec_write_file", "exec_run_command",
-}
-
-# 这些工具强制回到 GLOBAL
-_GLOBAL_FORCE_TRIGGERS: Set[str] = {
-    "task_view_overview", "submit_final_answer",
-    "task_list_suspended",
-}
-
 # 工具结果最大字符数（超出截断）
 MAX_TOOL_RESULT_CHARS = 10000
 
@@ -114,9 +98,9 @@ class AttentionWindowManager:
 
     核心职责：
     1. 接收所有消息（register_message）
-    2. 根据工具调用驱动模式切换（observe_tool_call）
+    2. 记录工具调用的节点/证据关联；普通工具调用不得直接切换模式
     3. 在 LLM 调用前裁剪消息（apply_window）
-    4. 联动 navigate_attention 工具的模式切换
+    4. 执行 LLM 显式注意力选择或压力触发后的模式切换
     """
 
     def __init__(
@@ -139,6 +123,12 @@ class AttentionWindowManager:
         self.reserved_tokens = reserved_tokens
 
         # 可用预算 = (上下文 - 预留) × 90%
+        #
+        # 注意：这是早期“接近原始 LLM 窗口”的兜底预算。动态注意力启用后，
+        # 实际注入给 LLM 的上下文预算必须进一步受 threshold_budget_ratio 约束。
+        # 否则压力监控按“阈值预算”触发了 GLOBAL/FOCUS/SINGLE_CHAIN 切换，
+        # 但 apply_window 仍按原始窗口放行，注意力只会改变 UI 状态，不能真正
+        # 暂排非必要上下文。
         self._base_budget = max(
             int((context_window_size - reserved_tokens) * 0.90),
             1024,
@@ -147,6 +137,14 @@ class AttentionWindowManager:
 
         # P2-13: 动态budget调整因子
         self._budget_multiplier: float = 1.0  # 由任务图节点数动态调整
+        self._threshold_budget_base: int = self._base_budget
+        self._last_window_tokens: int = 0
+        self._last_window_message_count: int = 0
+        self._last_evicted_message_count: int = 0
+        self._last_window_budget: int = self.budget
+        # Per-call dynamic active-context retrieval injection (not persisted/pinned).
+        self._last_active_context_extra_tokens: int = 0
+        self._last_provider_prompt_tokens: int = 0
 
         self.mode: AttentionMode = AttentionMode.GLOBAL
         self.envelopes: List[MessageEnvelope] = []
@@ -170,6 +168,13 @@ class AttentionWindowManager:
         self._mode_controller: Optional[ModeSwitchController] = None
         self._llm_client: Optional[Any] = None
         self._last_llm_selection_time: Optional[float] = None
+        self._last_pressure_metrics: Optional[Any] = None
+        self._last_threshold_result: Optional[Any] = None
+        self._last_llm_decision: Optional[Any] = None
+        self._last_selection_event: Optional[Dict[str, Any]] = None
+        self._selection_attempt_count: int = 0
+        self._selection_inflight: bool = False
+        self._selection_lock = threading.Lock()
 
         try:
             _cfg = AttentionConfig.load_from_yaml()
@@ -260,7 +265,12 @@ class AttentionWindowManager:
         tool_name: str,
         tool_args: Dict,
     ) -> Optional[AttentionMode]:
-        """观察工具调用，驱动模式状态机
+        """观察工具调用并处理显式注意力控制。
+
+        TSD v2.9.22 要求：普通工具名不能作为 GLOBAL/FOCUS/SINGLE_CHAIN
+        的主规则绑定。该入口只做两件事：
+        1. 记录当前工具参数里的节点锚点，供后续压力/LLM 选择使用；
+        2. 当工具本身就是显式注意力控制能力时执行模式切换。
 
         Args:
             tool_name: 工具名
@@ -284,10 +294,10 @@ class AttentionWindowManager:
         if new_mode and new_mode != old_mode:
             self.mode = new_mode
             logger.info(
-                f"[AttentionWindow] 模式切换: {old_mode.value} → {new_mode.value} "
-                f"(触发: {tool_name}, node={self._current_node_id})"
+                f"[AttentionWindow] 显式注意力切换: {old_mode.value} → {new_mode.value} "
+                f"(control={tool_name}, node={self._current_node_id})"
             )
-            self._publish_mode_change(old_mode, new_mode, f"tool:{tool_name}")
+            self._publish_mode_change(old_mode, new_mode, f"attention_control:{tool_name}")
             # 聚焦切换时，自动注入目标节点的已有知识
             if new_mode in (AttentionMode.FOCUS, AttentionMode.SINGLE_CHAIN):
                 self._inject_node_knowledge(self._current_node_id)
@@ -349,46 +359,22 @@ class AttentionWindowManager:
                 self._inject_node_knowledge(self._current_node_id)
 
     def auto_navigate_on_status_change(self, node_id: str, new_status: str):
-        """task_mark_status 后自动导航注意力窗口
+        """兼容旧调用：任务状态变化只更新焦点锚点，不自动切换模式。
 
-        - completed/skipped: 寻找下一个待处理的兄弟节点并跳转；若无，则回退到父级
-        - in_progress: 深入聚焦当前节点
+        v2.9.22 后，状态变化属于 LLM 注意力选择的输入证据；是否从
+        GLOBAL 下探到 FOCUS/SINGLE_CHAIN、或从局部回到 GLOBAL，必须由
+        上下文压力触发后的 LLM 决策或显式注意力工具完成，不能由
+        task_mark_status 这类普通任务工具自动决定。
         """
-        if not self.task_graph or not node_id:
-            return
-
-        if new_status in ("completed", "skipped"):
-            # 找父节点 → 找下一个 pending 兄弟
-            parent_id = self.task_graph.get_parent(node_id)
-            if parent_id:
-                siblings = self.task_graph.get_children(parent_id)
-                next_pending = None
-                for sib in siblings:
-                    if sib.id != node_id and sib.status in ("pending", "blocked"):
-                        next_pending = sib
-                        break
-                if next_pending:
-                    logger.info(
-                        f"[AttentionWindow] 自动导航: 节点 {node_id} 完成 → "
-                        f"跳转到兄弟 {next_pending.id}"
-                    )
-                    self.on_navigate_attention("jump", target_node_id=next_pending.id)
-                else:
-                    # 同级全部完成，回退到父级视角
-                    logger.info(
-                        f"[AttentionWindow] 自动导航: 节点 {node_id} 完成, "
-                        f"同级已全部完成 → 回退到父级 {parent_id}"
-                    )
-                    self.on_navigate_attention("broader")
-
-        elif new_status == "in_progress":
-            # 深入聚焦当前节点
-            depth = self.task_graph.get_node_depth(node_id)
-            if depth is not None and depth >= 2:
-                logger.info(
-                    f"[AttentionWindow] 自动导航: 节点 {node_id} 开始执行 (depth={depth}) → deeper"
-                )
-                self.on_navigate_attention("jump", target_node_id=node_id)
+        if node_id:
+            self._current_node_id = node_id
+        logger.debug(
+            "[AttentionWindow] 状态变化已记录为注意力候选输入，不自动切换: "
+            "node=%s status=%s mode=%s",
+            node_id,
+            new_status,
+            self.mode.value,
+        )
 
     def _publish_mode_change(self, old_mode: AttentionMode, new_mode: AttentionMode, trigger: str):
         """发布注意力模式变更事件到 EventBus → WebBridge → 仪表盘"""
@@ -416,7 +402,12 @@ class AttentionWindowManager:
         tool_name: str,
         tool_args: Dict,
     ) -> Optional[AttentionMode]:
-        """根据工具名和参数计算目标模式"""
+        """根据显式注意力控制计算目标模式。
+
+        TSD v2.9.22: 动态注意力不再由普通工具名硬触发。读写、命令、
+        检索等工具调用只作为上下文压力和 LLM 决策的观测输入；真正切换
+        注意力必须来自 LLM 显式注意力选择或压力控制消息。
+        """
         # navigate_attention 由 on_navigate_attention 单独处理
         if tool_name == "navigate_attention":
             return None
@@ -431,30 +422,6 @@ class AttentionWindowManager:
             }
             return _mode_map.get(mode_str)
 
-        # 强制回全局
-        if tool_name in _GLOBAL_FORCE_TRIGGERS:
-            return AttentionMode.GLOBAL
-
-        # task_mark_status 根据 status 参数决定
-        if tool_name == "task_mark_status":
-            status = tool_args.get("status", "")
-            if status in ("completed", "skipped"):
-                return AttentionMode.GLOBAL
-            if status == "in_progress":
-                if self.mode == AttentionMode.FOCUS:
-                    return AttentionMode.SINGLE_CHAIN
-                return None
-
-        # GLOBAL → FOCUS
-        if self.mode == AttentionMode.GLOBAL:
-            if tool_name in _FOCUS_TRIGGERS:
-                return AttentionMode.FOCUS
-
-        # FOCUS → SINGLE_CHAIN
-        if self.mode == AttentionMode.FOCUS:
-            if tool_name in _SINGLE_CHAIN_TRIGGERS:
-                return AttentionMode.SINGLE_CHAIN
-
         return None
 
     # ── 窗口裁剪 ──
@@ -467,15 +434,7 @@ class AttentionWindowManager:
         """
         # ── LLM自主注意力选择检查 ──
         if self._should_try_llm_selection():
-            try:
-                import asyncio
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.create_task(self._try_llm_mode_selection_async())
-                else:
-                    loop.run_until_complete(self._try_llm_mode_selection_async())
-            except Exception as e:
-                logger.warning(f"[AttentionWindow] LLM注意力选择执行失败: {e}")
+            self._dispatch_llm_mode_selection()
 
         if not self.envelopes:
             self._last_visible_node_ids = set()
@@ -483,6 +442,7 @@ class AttentionWindowManager:
 
         # P2-13: 动态调整budget（基于任务图节点数和当前模式）
         self._adjust_budget()
+        window_budget = self._effective_window_budget()
 
         # 1. 对所有消息评分
         for env in self.envelopes:
@@ -493,12 +453,12 @@ class AttentionWindowManager:
         unpinned = [e for e in self.envelopes if not e.is_pinned]
 
         pinned_tokens = sum(e.tokens for e in pinned)
-        remaining_budget = self.budget - pinned_tokens
+        remaining_budget = window_budget - pinned_tokens
 
         if remaining_budget <= 0:
             logger.warning(
                 f"[AttentionWindow] pinned 消息超预算: "
-                f"{pinned_tokens} > {self.budget}"
+                f"{pinned_tokens} > {window_budget}"
             )
             # 渐进式降级：保留首尾 pinned，其余降级参与权重排序
             sorted_pinned = sorted(pinned, key=lambda e: e.seq)
@@ -506,7 +466,7 @@ class AttentionWindowManager:
                 essential = [sorted_pinned[0], sorted_pinned[-1]]
                 demoted = sorted_pinned[1:-1]
                 essential_tokens = sum(e.tokens for e in essential)
-                demoted_budget = self.budget - essential_tokens
+                demoted_budget = window_budget - essential_tokens
                 if demoted_budget > 0:
                     all_candidates = demoted + unpinned
                     for env in all_candidates:
@@ -524,17 +484,31 @@ class AttentionWindowManager:
                     result = [e.msg for e in essential]
                     result.extend(e.msg for e in kept)
                     self._remember_visible_node_ids(essential + kept)
+                    self._remember_last_window(
+                        essential + kept,
+                        window_budget=window_budget,
+                        evicted_count=len(all_candidates) - len(kept),
+                    )
                     return strip_llm_message_metadata(
                         self._normalize_system_prefix(result)
                     )
             # 兜底：仍然只返回 pinned
             self._remember_visible_node_ids(sorted_pinned)
+            self._remember_last_window(
+                sorted_pinned,
+                window_budget=window_budget,
+                evicted_count=len(unpinned),
+            )
             return strip_llm_message_metadata([e.msg for e in sorted_pinned])
 
         # 3. 按组处理：计算每个组的最高权重和总 tokens
         group_info: Dict[Optional[int], Dict] = {}
         for env in unpinned:
-            gid = env.group_id
+            # Only explicit tool-call groups are atomic.  Plain messages often
+            # have ``group_id=None``; treating all of them as one group makes
+            # FOCUS/SINGLE_CHAIN unable to keep the current-node message while
+            # evicting unrelated history.
+            gid = env.group_id if env.group_id is not None else ("msg", env.seq)
             if gid not in group_info:
                 group_info[gid] = {
                     "max_weight": 0.0,
@@ -553,13 +527,23 @@ class AttentionWindowManager:
             reverse=True,
         )
 
-        # 5. 贪心选择：从高权重到低权重累加，直到用尽预算
+        # 5. 贪心选择：从高权重到低权重累加，直到用尽预算。
+        # 若已经确定会淘汰消息，预留少量预算给“淘汰摘要”。这样动态
+        # 注意力不是把摘要额外塞回去导致再次超预算，而是在同一个阈值
+        # 预算内决定“当前注入什么、暂排什么、用摘要承接什么”。
         kept_envs: List[MessageEnvelope] = []
         evicted_envs: List[MessageEnvelope] = []
         used_tokens = 0
+        total_unpinned_tokens = sum(e.tokens for e in unpinned)
+        summary_reserve = (
+            max(0, int(window_budget * 0.10))
+            if total_unpinned_tokens > remaining_budget
+            else 0
+        )
+        selection_budget = max(0, remaining_budget - summary_reserve)
 
         for group in sorted_groups:
-            if used_tokens + group["total_tokens"] <= remaining_budget:
+            if used_tokens + group["total_tokens"] <= selection_budget:
                 kept_envs.extend(group["envelopes"])
                 used_tokens += group["total_tokens"]
             else:
@@ -581,7 +565,9 @@ class AttentionWindowManager:
             logger.info(
                 f"[AttentionWindow] 淘汰 {len(evicted_envs)} 条消息, "
                 f"保留 {len(kept_envs)} 条, 模式={self.mode.value}, "
-                f"预算={self.budget}, 已用={used_tokens}"
+                f"预算={window_budget}, 已用={used_tokens}, "
+                f"阈值预算={self._threshold_budget_base}, "
+                f"原始预算={self._base_budget}"
             )
 
         # 7. 按原始时间顺序排列
@@ -593,7 +579,19 @@ class AttentionWindowManager:
             result.append(summary_msg)
 
         result.extend(e.msg for e in kept_envs)
-        self._remember_visible_node_ids(list(pinned) + kept_envs)
+        visible_envs = list(pinned) + kept_envs
+        if summary_msg:
+            summary_tokens = _estimate_message_tokens(summary_msg)
+        else:
+            summary_tokens = 0
+        self._remember_visible_node_ids(visible_envs)
+        self._remember_last_window(
+            visible_envs,
+            window_budget=window_budget,
+            evicted_count=len(evicted_envs),
+            extra_tokens=summary_tokens,
+            extra_messages=1 if summary_msg else 0,
+        )
         return strip_llm_message_metadata(self._normalize_system_prefix(result))
 
     def _normalize_system_prefix(self, messages: List[Dict]) -> List[Dict]:
@@ -716,7 +714,7 @@ class AttentionWindowManager:
         return 1.0
 
     def _mult_single_chain(self, env: MessageEnvelope) -> float:
-        """单链模式：只保留当前执行链路，大幅淘汰不相关内容"""
+        """单链模式：优先保留当前执行链路，暂排当前阶段无关上下文"""
         if not self._current_node_id:
             return 1.0
 
@@ -1010,6 +1008,88 @@ class AttentionWindowManager:
         used = sum(e.tokens for e in self.envelopes)
         return min(1.0, used / max(self.budget, 1))
 
+    def _threshold_budget_ratio(self) -> float:
+        """Return configured threshold-budget ratio.
+
+        The threshold budget is the denominator for context pressure:
+        ``occupied context / (LLM original context window × ratio)``.
+        It is intentionally separate from yellow/red trigger lines.
+        """
+        ratio = 1.0
+        try:
+            if self._llm_config is not None:
+                ratio = float(getattr(self._llm_config, "threshold_budget_ratio", ratio) or ratio)
+        except Exception:
+            ratio = 1.0
+        return max(0.01, min(1.0, ratio))
+
+    @property
+    def threshold_budget_tokens(self) -> int:
+        """LLM threshold budget in tokens, based on original context size."""
+        return max(1, int(self.context_window_size * self._threshold_budget_ratio()))
+
+    @property
+    def window_injection_budget_tokens(self) -> int:
+        """Token budget used by ``apply_window`` for injectable message context.
+
+        Tools schema, system scaffolding, and output buffer consume part of the
+        LLM window even though they are not always present in ``envelopes``.
+        Therefore the message-selection budget is bounded by the threshold
+        budget minus reserved tokens.  GLOBAL/FOCUS/SINGLE_CHAIN can only
+        narrow this budget further; they must not expand it past the threshold
+        budget, otherwise attention switching cannot actually control context.
+        """
+        return max(1024, self.threshold_budget_tokens - max(0, int(self.reserved_tokens or 0)))
+
+    @property
+    def active_context_tokens(self) -> int:
+        """Tokens currently visible to the LLM for pressure display/triggering.
+
+        ``_last_window_tokens`` records the message envelopes selected by
+        ``apply_window``.  The real LLM call also needs reserved/system/tool
+        scaffolding tokens, so the user-visible pressure must include the
+        reserved portion once a windowing pass has happened.  Before the first
+        pass this stays at 0 and callers should fall back to the backing-pool
+        pressure for bootstrap.
+        """
+        provider_prompt = max(0, int(getattr(self, "_last_provider_prompt_tokens", 0) or 0))
+        if provider_prompt:
+            return provider_prompt
+        visible = max(0, int(self._last_window_tokens or 0))
+        if self._last_window_message_count:
+            visible += max(0, int(self.reserved_tokens or 0))
+        visible += max(0, int(getattr(self, "_last_active_context_extra_tokens", 0) or 0))
+        return visible
+
+    @property
+    def active_context_pressure_ratio(self) -> float:
+        """Pressure of the last LLM-visible window.
+
+        ``context_pressure_ratio`` below describes the backing context pool and
+        is useful for deciding when to ask the LLM to re-select attention.
+        This property describes what was actually injected after windowing.
+        """
+        return max(0.0, self.active_context_tokens / max(self.threshold_budget_tokens, 1))
+
+    @property
+    def trigger_context_pressure_ratio(self) -> float:
+        """Pressure ratio used for live trigger decisions.
+
+        This matches the Web-visible pressure after at least one windowing pass.
+        Before that pass there is no visible-window telemetry yet, so bootstrap
+        detection still uses the backing context pool to allow the first
+        attention switch under low ``threshold_budget_ratio`` test settings.
+        """
+        if self._last_window_message_count:
+            return self.active_context_pressure_ratio
+        return self.context_pressure_ratio
+
+    @property
+    def context_pressure_ratio(self) -> float:
+        """Return actual occupied context divided by configured threshold budget."""
+        used = sum(e.tokens for e in self.envelopes)
+        return max(0.0, used / max(self.threshold_budget_tokens, 1))
+
     @property
     def stats(self) -> Dict[str, Any]:
         """返回窗口统计信息（供 prompt 注入使用）"""
@@ -1020,11 +1100,20 @@ class AttentionWindowManager:
         return {
             "mode": self.mode.value,
             "budget": self.budget,
+            "threshold_budget_tokens": self.threshold_budget_tokens,
+            "window_injection_budget_tokens": self.window_injection_budget_tokens,
             "total_messages": len(self.envelopes),
             "total_tokens": total_tokens,
             "pinned_tokens": pinned_tokens,
             "remaining_tokens": max(0, self.budget - total_tokens),
             "usage_ratio": self.usage_ratio,
+            "context_pressure_ratio": self.context_pressure_ratio,
+            "active_context_pressure_ratio": self.active_context_pressure_ratio,
+            "trigger_context_pressure_ratio": self.trigger_context_pressure_ratio,
+            "active_context_tokens": self.active_context_tokens,
+            "last_window_tokens": self._last_window_tokens,
+            "last_window_message_count": self._last_window_message_count,
+            "last_evicted_message_count": self._last_evicted_message_count,
             "current_node_id": self._current_node_id,
             "context_window_size": self.context_window_size,
         }
@@ -1065,6 +1154,50 @@ class AttentionWindowManager:
             return False
         return True
 
+    def _dispatch_llm_mode_selection(self) -> None:
+        """线程安全触发 LLM 自主注意力选择。
+
+        apply_window() 会同时出现在 FastAPI/WebSocket 事件循环线程与
+        L2-FC-Worker 等普通工作线程中。普通工作线程没有默认
+        asyncio event loop，不能使用 asyncio.get_event_loop()。这里按
+        当前运行环境选择调度方式：
+
+        - 已在运行中的事件循环：创建后台任务，避免阻塞调用链；
+        - 无运行中事件循环：使用 asyncio.run() 在当前线程同步完成。
+
+        同时用轻量锁避免同一窗口在压力持续期间重入并发触发多个
+        LLM 决策。该方法不做模式规则判断，仍完全交由压力阈值和
+        LLM 自主选择决定 GLOBAL / FOCUS / SINGLE_CHAIN。
+        """
+        with self._selection_lock:
+            if self._selection_inflight:
+                logger.debug("[AttentionWindow] LLM注意力选择已有进行中任务，跳过重复触发")
+                return
+            self._selection_inflight = True
+
+        async def _run_and_clear() -> None:
+            try:
+                await self._try_llm_mode_selection_async()
+            finally:
+                with self._selection_lock:
+                    self._selection_inflight = False
+
+        try:
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop and loop.is_running():
+                loop.create_task(_run_and_clear())
+            else:
+                asyncio.run(_run_and_clear())
+        except Exception as e:
+            with self._selection_lock:
+                self._selection_inflight = False
+            logger.warning(f"[AttentionWindow] LLM注意力选择执行失败: {e}")
+
     async def _try_llm_mode_selection_async(self) -> None:
         """异步执行LLM自主注意力模式选择
 
@@ -1081,23 +1214,37 @@ class AttentionWindowManager:
         try:
             # 1. 计算压力
             metrics = self._pressure_detector.calculate_pressure()
+            self._last_pressure_metrics = metrics
 
             # 2. 检查阈值
             threshold_result = self._pressure_detector.check_threshold(metrics)
+            self._last_threshold_result = threshold_result
             if not threshold_result.should_trigger:
+                self._last_selection_event = {
+                    "attempted": False,
+                    "triggered": False,
+                    "switched": False,
+                    "pressure": metrics.to_dict() if hasattr(metrics, "to_dict") else {},
+                    "threshold": threshold_result.to_dict() if hasattr(threshold_result, "to_dict") else {},
+                    "reason": threshold_result.message,
+                }
                 logger.debug(
                     f"[AttentionWindow] 压力未超阈值: "
-                    f"pressure={metrics.current_pressure:.3f}, "
+                    f"threshold_budget={metrics.threshold_relative_pressure * 100:.1f}%, "
+                    f"raw_pressure={metrics.current_pressure:.3f}, "
                     f"threshold={threshold_result.message}"
                 )
                 return
 
             logger.info(
                 f"[AttentionWindow] 触发LLM注意力选择: "
-                f"pressure={metrics.current_pressure:.3f}, "
+                f"threshold_budget={metrics.threshold_relative_pressure * 100:.1f}%, "
+                f"raw_pressure={metrics.current_pressure:.3f}, "
+                f"reference={metrics.threshold_reference:.3f}, "
                 f"trend={metrics.pressure_trend.value}, "
                 f"trigger={threshold_result.trigger_type}"
             )
+            self._selection_attempt_count += 1
 
             # 3. 构建决策请求
             task_context = self._get_task_context_summary()
@@ -1113,6 +1260,7 @@ class AttentionWindowManager:
 
             # 4. 调用LLM决策
             decision = await self._mode_selector.call_llm_decision(request)
+            self._last_llm_decision = decision
 
             logger.info(
                 f"[AttentionWindow] LLM决策结果: mode={decision.mode}, "
@@ -1122,6 +1270,7 @@ class AttentionWindowManager:
             )
 
             # 5. 应用决策
+            switched = False
             if decision.mode != current_mode:
                 result = self._mode_controller.apply_llm_decision(
                     current_mode=current_mode,
@@ -1130,6 +1279,7 @@ class AttentionWindowManager:
                 )
 
                 if result.switched:
+                    switched = True
                     try:
                         new_mode = AttentionMode[decision.mode]
                         old_mode = self.mode
@@ -1156,9 +1306,23 @@ class AttentionWindowManager:
                     f"[AttentionWindow] LLM选择保持当前模式: {current_mode} "
                     f"(confidence={decision.confidence:.2f})"
                 )
+            self._last_selection_event = {
+                "attempted": True,
+                "triggered": True,
+                "switched": switched,
+                "pressure": metrics.to_dict() if hasattr(metrics, "to_dict") else {},
+                "threshold": threshold_result.to_dict() if hasattr(threshold_result, "to_dict") else {},
+                "decision": decision.to_dict() if hasattr(decision, "to_dict") else {},
+            }
 
         except Exception as e:
             logger.error(f"[AttentionWindow] LLM注意力选择流程异常: {e}")
+            self._last_selection_event = {
+                "attempted": True,
+                "triggered": True,
+                "switched": False,
+                "error": str(e),
+            }
 
     def _get_task_context_summary(self) -> str:
         """获取任务上下文摘要（供LLM决策参考）
@@ -1227,6 +1391,20 @@ class AttentionWindowManager:
             "total_switches": len(history),
             "llm_autonomous_switches": len(llm_switches),
             "fallback_switches": len(fallback_switches),
+            "selection_attempt_count": self._selection_attempt_count,
+            "last_pressure_metrics": (
+                self._last_pressure_metrics.to_dict()
+                if hasattr(self._last_pressure_metrics, "to_dict") else None
+            ),
+            "last_threshold_result": (
+                self._last_threshold_result.to_dict()
+                if hasattr(self._last_threshold_result, "to_dict") else None
+            ),
+            "last_llm_decision": (
+                self._last_llm_decision.to_dict()
+                if hasattr(self._last_llm_decision, "to_dict") else None
+            ),
+            "last_selection_event": self._last_selection_event,
             "cooldown_seconds": (
                 self._cooldown_manager.get_current_cooldown_seconds()
                 if self._cooldown_manager else 0
@@ -1244,8 +1422,8 @@ class AttentionWindowManager:
         规则：
         - 任务图节点数 > 20: budget × 1.3（复杂任务需要更多上下文）
         - 任务图节点数 > 50: budget × 1.5
-        - FOCUS模式: budget × 0.8（聚焦模式精简上下文）
-        - SINGLE_CHAIN模式: budget × 0.6
+        - FOCUS模式: budget × 0.8（按需注入局部必要上下文）
+        - SINGLE_CHAIN模式: budget × 0.6（按需注入当前链路上下文）
         """
         multiplier = 1.0
         if self.task_graph is not None:
@@ -1264,7 +1442,38 @@ class AttentionWindowManager:
             multiplier *= 0.6
 
         self._budget_multiplier = multiplier
-        self.budget = max(int(self._base_budget * multiplier), 1024)
+        # Dynamic attention should not wait for the raw model window to fill.
+        # The configured threshold budget is the upper bound for context
+        # injection; mode-specific multipliers decide which necessary context is
+        # injected inside that threshold.  This is not lossy compression: evicted
+        # envelopes stay in the backing pool and can be re-injected by switching
+        # attention back to GLOBAL or recalling memory.
+        self._threshold_budget_base = min(
+            self._base_budget,
+            self.window_injection_budget_tokens,
+        )
+        self.budget = max(int(self._threshold_budget_base * multiplier), 1024)
+
+    def _effective_window_budget(self) -> int:
+        """Return the current message-selection budget for ``apply_window``."""
+        return max(1024, int(self.budget or self._threshold_budget_base or self._base_budget))
+
+    def _remember_last_window(
+        self,
+        visible_envs: List[MessageEnvelope],
+        *,
+        window_budget: int,
+        evicted_count: int,
+        extra_tokens: int = 0,
+        extra_messages: int = 0,
+    ) -> None:
+        """Record telemetry for the last LLM-visible window."""
+        visible_tokens = sum(max(0, int(getattr(e, "tokens", 0) or 0)) for e in visible_envs)
+        visible_tokens += max(0, int(extra_tokens or 0))
+        self._last_window_tokens = visible_tokens
+        self._last_window_message_count = len(visible_envs) + max(0, int(extra_messages or 0))
+        self._last_evicted_message_count = max(0, int(evicted_count or 0))
+        self._last_window_budget = max(1, int(window_budget or 1))
 
     def serialize(self) -> Dict[str, Any]:
         """序列化当前状态，用于 AgentSession 跨请求持久化"""

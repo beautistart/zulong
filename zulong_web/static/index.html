@@ -5291,10 +5291,13 @@
                 const raw = localStorage.getItem(STORAGE_KEY);
                 if (raw) {
                     const parsed = JSON.parse(raw);
-                    parsed.sessions = (parsed.sessions || []).map(function(s) {
+                    parsed.sessions = dedupeSessionRecords((parsed.sessions || []).map(function(s) {
                         s.messages = s.messages || [];
-                        return s;
-                    });
+                        return normalizeSessionRecord(s);
+                    }));
+                    if (parsed.activeSessionId) {
+                        parsed.activeSessionId = resolveActiveSessionId(parsed.activeSessionId, parsed.sessions);
+                    }
                     return parsed;
                 }
             } catch (e) {
@@ -5369,22 +5372,36 @@
 
         function compactSessionStore(store, summaryOnly) {
             var input = store || { activeSessionId: null, sessions: [] };
+            var sessions = sortSessionRecordsByActivity(input.sessions || []);
             return {
-                activeSessionId: input.activeSessionId || null,
-                sessions: (input.sessions || []).slice(0, 80).map(function(s) {
+                activeSessionId: resolveActiveSessionId(input.activeSessionId, sessions),
+                sessions: sessions.slice(0, 80).map(function(raw) {
+                    var s = normalizeSessionRecord(raw);
                     var messages = Array.isArray(s.messages) ? s.messages : [];
+                    var lastActive = sessionLastActiveSeconds(s);
+                    var createdAtSeconds = sessionCreatedAtSeconds(s) || lastActive;
                     return {
                         id: s.id,
                         title: truncateSessionCacheText(safeSessionTitle(s.title, s.preview || '新会话'), 80),
                         createdAt: s.createdAt || Date.now(),
+                        created_at: createdAtSeconds || ((s.createdAt || Date.now()) / 1000),
+                        updatedAt: s.updatedAt || (lastActive ? lastActive * 1000 : (s.createdAt || Date.now())),
+                        last_active_at: lastActive || createdAtSeconds || ((s.createdAt || Date.now()) / 1000),
                         source: s.source || 'local',
                         dialogue_session_id: s.dialogue_session_id || null,
                         session_node_id: s.session_node_id || s.dialogue_session_id || null,
+                        preview: truncateSessionCacheText(s.preview || '', 120),
+                        round_count: Number(s.round_count || 0) || 0,
+                        bound_task_id: s.bound_task_id || '',
+                        project_id: s.project_id || '',
                         task_graph_id: s.task_graph_id || s.graph_id || null,
                         graph_id: s.graph_id || s.task_graph_id || null,
                         task_graph_file_path: s.task_graph_file_path || null,
+                        graph_file_path: s.graph_file_path || s.task_graph_file_path || null,
                         workspace_dir: s.workspace_dir || s.workspace_path || '',
                         workspace_path: s.workspace_path || s.workspace_dir || '',
+                        cwd: s.cwd || s.workspace_path || s.workspace_dir || '',
+                        history_event_count: Number(s.history_event_count || 0) || 0,
                         fixed_feedback_entries: summaryOnly ? [] : compactFixedFeedbackEntries(s.fixed_feedback_entries || []),
                         fixed_feedback_active_id: s.fixed_feedback_active_id || '',
                         messages: summaryOnly ? [] : messages.slice(-SESSION_CACHE_MAX_MESSAGES).map(function(m) {
@@ -5453,12 +5470,196 @@
             var raw = String(sessionId || '').trim();
             if (!raw) return '';
             if (raw.indexOf('dialogue:session_') === 0 && raw.indexOf('/') < 0) return raw;
+            if (raw.indexOf('dialogue:session_') === 0 && raw.indexOf('/') >= 0) {
+                return raw.split('/', 1)[0];
+            }
             return 'dialogue:session_' + compactDialogueId(raw);
+        }
+
+        function normalizeSessionRecord(session) {
+            var src = session || {};
+            var id = String(src.id || src.conversation_id || src.session_id || '').trim();
+            var rawNode = String(src.session_node_id || src.dialogue_session_id || '').trim();
+            if (!id && rawNode) {
+                id = rawNode.indexOf('dialogue:session_') === 0
+                    ? rawNode.replace(/^dialogue:session_/, '').split('/', 1)[0]
+                    : rawNode.split('/', 1)[0];
+            }
+            if (!id) id = generateId();
+            var rootNodeId = inferSessionNodeId(id);
+            var graphId = normalizeTaskGraphId(src.task_graph_id || src.graph_id || '');
+            var createdAt = _sessionTimestampSeconds(src.createdAt || src.created_at) * 1000;
+            if (!createdAt) createdAt = Date.now();
+            var lastActiveAt = sessionLastActiveSeconds(src);
+            if (!lastActiveAt) lastActiveAt = createdAt / 1000;
+            var normalized = Object.assign({}, src, {
+                id: id,
+                conversation_id: id,
+                session_id: id,
+                dialogue_session_id: rootNodeId,
+                session_node_id: rootNodeId,
+                messages: Array.isArray(src.messages) ? src.messages : [],
+                title: safeSessionTitle(src.title, src.preview || '对话记录'),
+                source: src.source || 'local',
+                createdAt: createdAt,
+                created_at: _sessionTimestampSeconds(src.created_at || createdAt),
+                updatedAt: src.updatedAt || src.updated_at || (lastActiveAt * 1000),
+                last_active_at: lastActiveAt,
+                preview: src.preview || ''
+            });
+            if (graphId) {
+                normalized.task_graph_id = graphId;
+                normalized.graph_id = graphId;
+            } else {
+                normalized.task_graph_id = null;
+                normalized.graph_id = null;
+            }
+            normalized.workspace_path = normalizeWorkspacePath(src.workspace_path || src.workspace_dir || src.cwd || '');
+            normalized.workspace_dir = normalizeWorkspacePath(src.workspace_dir || src.workspace_path || src.cwd || '');
+            normalized.cwd = normalizeWorkspacePath(src.cwd || src.workspace_path || src.workspace_dir || '');
+            return normalized;
+        }
+
+        function _sessionTimestampSeconds(value) {
+            var n = Number(value || 0);
+            if (!isFinite(n) || n <= 0) return 0;
+            if (n > 1000000000000) n = n / 1000;
+            return n;
+        }
+
+        function sessionCreatedAtSeconds(session) {
+            if (!session) return 0;
+            return _sessionTimestampSeconds(session.created_at || session.createdAt || 0);
+        }
+
+        function sessionLastActiveSeconds(session) {
+            if (!session) return 0;
+            var value = Math.max(
+                _sessionTimestampSeconds(session.last_active_at),
+                _sessionTimestampSeconds(session.updated_at),
+                _sessionTimestampSeconds(session.updatedAt),
+                _sessionTimestampSeconds(session.created_at),
+                _sessionTimestampSeconds(session.createdAt)
+            );
+            var messages = Array.isArray(session.messages) ? session.messages : [];
+            messages.forEach(function(msg) {
+                value = Math.max(value, _sessionTimestampSeconds(msg && (msg.timestamp || msg.created_at || msg.createdAt)));
+            });
+            return isFinite(value) ? value : 0;
+        }
+
+        function sortSessionRecordsByActivity(sessions) {
+            var normalized = dedupeSessionRecords(sessions || []).map(function(raw) {
+                return normalizeSessionRecord(raw);
+            });
+            normalized.sort(function(a, b) {
+                var tb = sessionLastActiveSeconds(b);
+                var ta = sessionLastActiveSeconds(a);
+                if (tb !== ta) return tb - ta;
+                var mb = Array.isArray(b.messages) ? b.messages.length : 0;
+                var ma = Array.isArray(a.messages) ? a.messages.length : 0;
+                if (mb !== ma) return mb - ma;
+                return 0;
+            });
+            return normalized;
+        }
+
+        function sessionRecordScore(session) {
+            session = normalizeSessionRecord(session);
+            var score = 0;
+            if (normalizeTaskGraphId(session.task_graph_id || session.graph_id || '')) score += 1000;
+            if (normalizeWorkspacePath(session.workspace_path || session.cwd || session.workspace_dir || '')) score += 300;
+            if (session.source && session.source !== 'local') score += 120;
+            if (Array.isArray(session.messages) && session.messages.length) score += Math.min(session.messages.length, 50);
+            if (Array.isArray(session.fixed_feedback_entries) && session.fixed_feedback_entries.length) score += 30;
+            score += Math.min(sessionLastActiveSeconds(session) / 1000000000, 20);
+            return score;
+        }
+
+        function _isPlaceholderSessionTitle(value) {
+            var text = String(value || '').trim();
+            return !text || text === '新会话' || text === '对话记录';
+        }
+
+        function mergeSessionRecords(a, b) {
+            var first = normalizeSessionRecord(a || {});
+            var second = normalizeSessionRecord(b || {});
+            if (sessionRecordScore(second) > sessionRecordScore(first)) {
+                var tmp = first;
+                first = second;
+                second = tmp;
+            }
+            var merged = Object.assign({}, second, first);
+            if (_isPlaceholderSessionTitle(first.title) && !_isPlaceholderSessionTitle(second.title)) {
+                merged.title = second.title;
+            }
+            if ((!merged.preview || _isPlaceholderSessionTitle(merged.preview)) && second.preview) {
+                merged.preview = second.preview;
+            }
+            var graphId = normalizeTaskGraphId(first.task_graph_id || first.graph_id || second.task_graph_id || second.graph_id || '');
+            if (graphId) {
+                merged.task_graph_id = graphId;
+                merged.graph_id = graphId;
+            }
+            ['workspace_path', 'workspace_dir', 'cwd', 'task_graph_file_path', 'graph_file_path', 'bound_task_id', 'project_id'].forEach(function(key) {
+                if (!merged[key] && second[key]) merged[key] = second[key];
+            });
+            var firstMessages = Array.isArray(first.messages) ? first.messages : [];
+            var secondMessages = Array.isArray(second.messages) ? second.messages : [];
+            merged.messages = firstMessages.length >= secondMessages.length ? firstMessages : secondMessages;
+            var firstFeedback = Array.isArray(first.fixed_feedback_entries) ? first.fixed_feedback_entries : [];
+            var secondFeedback = Array.isArray(second.fixed_feedback_entries) ? second.fixed_feedback_entries : [];
+            merged.fixed_feedback_entries = compactFixedFeedbackEntries(firstFeedback.length >= secondFeedback.length ? firstFeedback : secondFeedback);
+            merged.fixed_feedback_active_id = first.fixed_feedback_active_id || second.fixed_feedback_active_id || '';
+            merged.round_count = Math.max(Number(first.round_count || 0), Number(second.round_count || 0)) || 0;
+            merged.last_active_at = Math.max(sessionLastActiveSeconds(first), sessionLastActiveSeconds(second)) || first.last_active_at || second.last_active_at || 0;
+            return normalizeSessionRecord(merged);
+        }
+
+        function compactSessionIdentityKey(session) {
+            session = normalizeSessionRecord(session);
+            return inferSessionNodeId(session.id);
+        }
+
+        function dedupeSessionRecords(sessions) {
+            var byRoot = {};
+            (sessions || []).forEach(function(raw) {
+                var session = normalizeSessionRecord(raw);
+                var rootKey = compactSessionIdentityKey(session);
+                if (!rootKey) return;
+                byRoot[rootKey] = byRoot[rootKey] ? mergeSessionRecords(byRoot[rootKey], session) : session;
+            });
+            var rootDeduped = Object.keys(byRoot).map(function(key) { return byRoot[key]; });
+            var byGraph = {};
+            var withoutGraph = [];
+            rootDeduped.forEach(function(session) {
+                var graphId = normalizeTaskGraphId(session.task_graph_id || session.graph_id || '');
+                if (!graphId) {
+                    withoutGraph.push(session);
+                    return;
+                }
+                var graphKey = 'graph:' + graphId;
+                byGraph[graphKey] = byGraph[graphKey] ? mergeSessionRecords(byGraph[graphKey], session) : session;
+            });
+            return Object.keys(byGraph).map(function(key) { return byGraph[key]; }).concat(withoutGraph);
+        }
+
+        function resolveActiveSessionId(activeId, sessions) {
+            activeId = String(activeId || '').trim();
+            sessions = sessions || [];
+            if (!activeId) return sessions[0] ? sessions[0].id : null;
+            var direct = sessions.find(function(s) { return s.id === activeId; });
+            if (direct) return direct.id;
+            var root = inferSessionNodeId(activeId);
+            var byRoot = sessions.find(function(s) {
+                return s.session_node_id === root || s.dialogue_session_id === root;
+            });
+            return byRoot ? byRoot.id : (sessions[0] ? sessions[0].id : null);
         }
 
         function getCurrentSessionNodeId() {
             var session = getCurrentSession() || {};
-            return session.session_node_id || session.dialogue_session_id || inferSessionNodeId(currentSessionId);
+            return inferSessionNodeId((session && session.id) || currentSessionId || session.conversation_id || session.session_id || '');
         }
 
         function getTaskGraphOwnerFromGraph(graphData) {
@@ -5752,7 +5953,8 @@
                 (graph && (graph.task_graph_file_path || graph.graph_file_path)) ||
                 ''
             );
-            var sessionNodeId = session.session_node_id || session.dialogue_session_id || inferSessionNodeId(sessionId);
+            var sessionNodeId = inferSessionNodeId(sessionId);
+            var messageCount = Array.isArray(session.messages) ? session.messages.length : 0;
             sendWsMessage({
                 msg_id: generateId(),
                 type: 'conversation:switch',
@@ -5763,6 +5965,8 @@
                     conversation_id: sessionId,
                     session_node_id: sessionNodeId,
                     dialogue_session_id: sessionNodeId,
+                    has_messages: messageCount > 0,
+                    message_count: messageCount,
                     is_new_session: options.isNewSession === true,
                     clear_active_graph: options.isNewSession === true || !taskGraphId,
                     task_graph_id: taskGraphId || '',
@@ -5841,8 +6045,9 @@
             const store = loadSessionStore();
             const container = document.getElementById('sessionItems');
             container.innerHTML = '';
-            
-            store.sessions.forEach(s => {
+
+            const sessions = sortSessionRecordsByActivity(store.sessions || []);
+            sessions.forEach(s => {
                 const div = document.createElement('div');
                 div.className = 'session-item' + (s.id === currentSessionId ? ' active' : '');
                 div.setAttribute('data-sid', s.id);
@@ -5870,18 +6075,31 @@
         // 保存消息到当前会话
         function saveMessageToSession(message) {
             const store = loadSessionStore();
-            const session = store.sessions.find(s => s.id === currentSessionId);
+            let session = store.sessions.find(s => s.id === currentSessionId);
+            if (!session && currentSessionId) {
+                session = {
+                    id: currentSessionId,
+                    title: '新会话',
+                    messages: [],
+                    createdAt: Date.now(),
+                    source: 'local',
+                    dialogue_session_id: inferSessionNodeId(currentSessionId),
+                    session_node_id: inferSessionNodeId(currentSessionId)
+                };
+                store.sessions.push(session);
+            }
             if (!session) return;
 
+            const nowMs = Date.now();
+            const nowSeconds = nowMs / 1000;
+            const cached = normalizeCachedMessage(message);
             // 自动标题：用第一条用户消息
-            if (session.title === '新会话' && message.sender === 'user') {
-                const text = message.text;
+            if (_isPlaceholderSessionTitle(session.title) && cached.sender === 'user') {
+                const text = cached.text || '';
                 session.title = safeSessionTitle(text.length > 20 ? text.substring(0, 20) + '...' : text, '新会话');
-                renderSessionList();
             }
             // 仅保留轻量可见缓存，用于切换会话或刷新瞬时恢复。
             session.messages = session.messages || [];
-            const cached = normalizeCachedMessage(message);
             const existingIndex = session.messages.findIndex(function(m) {
                 if (cached.id && m.id === cached.id) return true;
                 if (cached.card_type && cached.pair_id && m.card_type === cached.card_type && m.pair_id === cached.pair_id) return true;
@@ -5892,7 +6110,21 @@
             } else {
                 session.messages.push(cached);
             }
+            if (cached.text) {
+                session.preview = cached.text;
+            }
+            session.round_count = Math.max(
+                Number(session.round_count || 0) || 0,
+                session.messages.filter(function(m) { return (m.sender || m.role) === 'user'; }).length
+            );
+            if (!session.createdAt) session.createdAt = nowMs;
+            if (!session.created_at) session.created_at = session.createdAt / 1000;
+            session.updatedAt = nowMs;
+            session.last_active_at = nowSeconds;
+            store.activeSessionId = currentSessionId;
+            store.sessions = sortSessionRecordsByActivity(store.sessions);
             saveSessionStore(store);
+            renderSessionList();
         }
 
         function normalizeCachedMessage(message) {
@@ -5986,23 +6218,48 @@
         // 合并服务端和本地会话数据。
         // 服务端是唯一真相；本地只保留当前未落图谱的新会话壳和 UI 选中状态。
         function _mergeSessionStores(serverStore, localStore) {
-            const allSessions = (serverStore.sessions || []).map(function(s) {
+            serverStore = serverStore || { activeSessionId: null, sessions: [] };
+            localStore = localStore || { activeSessionId: null, sessions: [] };
+            const localSessions = dedupeSessionRecords(localStore.sessions || []);
+            const allSessions = (serverStore.sessions || []).map(function(raw) {
+                var s = normalizeSessionRecord(raw);
+                var rootKey = compactSessionIdentityKey(s);
                 const existingSession = (localStore.sessions || []).find(function(local) {
+                    local = normalizeSessionRecord(local);
                     return local.id === s.id ||
+                        compactSessionIdentityKey(local) === rootKey ||
                         local.dialogue_session_id === s.id ||
                         local.dialogue_session_id === (s.dialogue_session_id || s.session_node_id || s.id) ||
                         local.session_node_id === (s.dialogue_session_id || s.session_node_id || s.id);
                 });
                 s.source = s.source || 'interaction_store';
-                s.messages = [];
+                var localMessages = (existingSession && Array.isArray(existingSession.messages) && existingSession.messages.length > 0)
+                    ? existingSession.messages
+                    : [];
+                s.messages = localMessages;
+                s.last_active_at = Math.max(sessionLastActiveSeconds(s), sessionLastActiveSeconds(existingSession || {}));
+                if (existingSession && existingSession.preview && !s.preview) s.preview = existingSession.preview;
                 if (existingSession && Array.isArray(existingSession.fixed_feedback_entries) && existingSession.fixed_feedback_entries.length) {
                     s.fixed_feedback_entries = compactFixedFeedbackEntries(existingSession.fixed_feedback_entries);
                     s.fixed_feedback_active_id = existingSession.fixed_feedback_active_id || '';
                 }
-                return s;
+                return normalizeSessionRecord(s);
             });
-            const activeId = serverStore.activeSessionId || localStore.activeSessionId;
-            const merged = { activeSessionId: activeId, sessions: allSessions };
+            localSessions.forEach(function(local) {
+                const hasLocalMessages = Array.isArray(local.messages) && local.messages.length > 0;
+                const isUnsyncedLocalWithMessages = hasLocalMessages &&
+                    !allSessions.some(function(remote) {
+                        return remote.id === local.id ||
+                            compactSessionIdentityKey(remote) === compactSessionIdentityKey(local);
+                    });
+                if (isUnsyncedLocalWithMessages) allSessions.push(local);
+            });
+            const deduped = sortSessionRecordsByActivity(allSessions);
+            const activeId = resolveActiveSessionId(
+                serverStore.activeSessionId || localStore.activeSessionId,
+                deduped
+            );
+            const merged = { activeSessionId: activeId, sessions: deduped };
             return merged;
         }
         
@@ -6039,30 +6296,39 @@
             const backendIds = new Set();
             const backendDialogueIds = new Set();
             const nextSessions = backendSessions.map(function(bs) {
-                const id = bs.id;
-                const dialogueId = bs.dialogue_session_id || bs.session_node_id || bs.id;
+                const id = String(bs.id || bs.conversation_id || bs.session_id || '').trim();
+                const dialogueId = inferSessionNodeId(id || bs.dialogue_session_id || bs.session_node_id);
                 if (id) backendIds.add(id);
                 if (dialogueId) backendDialogueIds.add(dialogueId);
                 const existingSession = store.sessions.find(function(s) {
+                    s = normalizeSessionRecord(s);
                     return s.id === id ||
                         s.dialogue_session_id === id ||
                         s.dialogue_session_id === dialogueId ||
                         s.session_node_id === dialogueId;
                 });
-                return {
-                    id: bs.id,
+                var localMessages = (existingSession && Array.isArray(existingSession.messages) && existingSession.messages.length > 0)
+                    ? existingSession.messages
+                    : [];
+                var backendLastActive = sessionLastActiveSeconds({
+                    last_active_at: bs.last_active_at || bs.created_at || 0,
+                    created_at: bs.created_at || 0
+                });
+                var localLastActive = sessionLastActiveSeconds(existingSession || {});
+                return normalizeSessionRecord({
+                    id: id,
                     title: safeSessionTitle(
                         bs.title,
                         bs.preview || (existingSession && existingSession.preview) || (existingSession && existingSession.title) || '对话记录'
                     ),
-                    messages: [],
+                    messages: localMessages,
                     createdAt: (bs.created_at || 0) * 1000,
                     source: bs.source || 'interaction_store',
                     dialogue_session_id: dialogueId,
                     session_node_id: dialogueId,
                     round_count: bs.round_count || 0,
-                    preview: bs.preview || '',
-                    last_active_at: bs.last_active_at || bs.created_at || 0,
+                    preview: bs.preview || (existingSession && existingSession.preview) || '',
+                    last_active_at: Math.max(backendLastActive, localLastActive),
                     bound_task_id: bs.bound_task_id || '',
                     workspace_path: bs.workspace_path || bs.cwd || '',
                     cwd: bs.cwd || bs.workspace_path || '',
@@ -6074,27 +6340,28 @@
                         ? compactFixedFeedbackEntries(existingSession.fixed_feedback_entries)
                         : [],
                     fixed_feedback_active_id: existingSession ? (existingSession.fixed_feedback_active_id || '') : ''
-                };
+                });
             });
 
-            // 后端是长期存储真相；本地只保留尚未落库的新会话壳。
+            // 后端是长期存储真相。本地会话保留规则：
+            // 1) 已绑定后端根节点 → 由上方 backendSessions.map() 保留
+            // 2) 未绑定但 messages.length > 0 → 以下保留
+            // 3) 未绑定且 messages.length === 0 → 丢弃（空会话切换/刷新后消失）
             store.sessions.forEach(function(local) {
-                const isUnsyncedLocal = local.source === 'local' &&
+                local = normalizeSessionRecord(local);
+                const hasLocalMessages = Array.isArray(local.messages) && local.messages.length > 0;
+                const isUnsyncedLocalWithMessages = hasLocalMessages &&
                     !backendIds.has(local.id) &&
-                    !backendDialogueIds.has(local.dialogue_session_id || local.session_node_id || '');
-                if (isUnsyncedLocal && local.messages && local.messages.length > 0) {
+                    !backendDialogueIds.has(compactSessionIdentityKey(local));
+                if (isUnsyncedLocalWithMessages) {
                     nextSessions.push(local);
                 }
             });
 
-            nextSessions.sort((a, b) => {
-                const ta = a.last_active_at || (a.createdAt / 1000) || 0;
-                const tb = b.last_active_at || (b.createdAt / 1000) || 0;
-                return tb - ta;
-            });
-            store.sessions = nextSessions;
+            const dedupedSessions = sortSessionRecordsByActivity(nextSessions);
+            store.sessions = dedupedSessions;
             if (!store.sessions.find(function(s) { return s.id === store.activeSessionId; })) {
-                store.activeSessionId = store.sessions[0] ? store.sessions[0].id : null;
+                store.activeSessionId = resolveActiveSessionId(store.activeSessionId, store.sessions);
             }
             saveSessionStore(store);
             if (currentSessionId && !store.sessions.find(function(s) { return s.id === currentSessionId; })) {
@@ -6212,6 +6479,22 @@
             var shouldRestoreScroll = !chatAutoScrollPaused && isChatNearBottom();
             var store = loadSessionStore();
             var session = store.sessions.find(function(s) { return s.id === sessionId; });
+            var hasLocalVisibleMessages = !!(
+                session &&
+                Array.isArray(session.messages) &&
+                session.messages.length > 0
+            );
+            var backendHasHistory = !!(
+                (Array.isArray(messages) && messages.length > 0) ||
+                (Array.isArray(events) && events.length > 0)
+            );
+            if (!backendHasHistory && hasLocalVisibleMessages) {
+                var loading = document.getElementById('session-loading');
+                if (loading) loading.remove();
+                console.log('[Session] 后端暂无历史，保留当前会话本地可见消息:', sessionId);
+                renderSessionList();
+                return;
+            }
             var feedbackSnapshot = session ? compactFixedFeedbackEntries(session.fixed_feedback_entries || []) : [];
             var feedbackActiveId = session ? (session.fixed_feedback_active_id || '') : '';
             var eventList = normalizeSessionMessages(events || []);
@@ -7799,6 +8082,7 @@
             }
             showWebApprovalRequest({
                 approval_id: approvalId,
+                approval_type: p.approval_type || p.type || '',
                 ide_session_id: p.session_id || p.ide_session_id,
                 workspace_path: p.workspace_path,
                 tool_name: p.tool_name,
@@ -7894,6 +8178,7 @@
                     type: 'ide_approval_result',
                     payload: {
                         approval_id: req.approval_id,
+                        approval_type: req.approval_type || req.type || '',
                         approved: approved,
                         ide_session_id: req.ide_session_id,
                         workspace_path: req.workspace_path,
@@ -9978,6 +10263,7 @@
 
             // 切换到停止模式
             switchToStopMode();
+            requestSessionListRefresh(400);
             startResponseWatchdog(text, requestId);
             return requestId;
         }
@@ -14213,16 +14499,20 @@
             var mode = p.mode || 'global';
             var turn = p.turn || '?';
             var focusNode = p.focus_node_id || '';
-            var pressureValue = p.context_pressure;
+            var pressureValue = p.trigger_context_pressure;
             var budgetNumber = 0;
-            if (p.budget_usage !== undefined && p.budget_usage !== null && p.budget_usage !== '') {
-                budgetNumber = Number(p.budget_usage);
+            if (p.trigger_budget_usage !== undefined && p.trigger_budget_usage !== null && p.trigger_budget_usage !== '') {
+                budgetNumber = Number(p.trigger_budget_usage);
             } else if (pressureValue !== undefined && pressureValue !== null && pressureValue !== '') {
                 budgetNumber = Number(pressureValue) * 100;
+            } else if (p.budget_usage !== undefined && p.budget_usage !== null && p.budget_usage !== '') {
+                budgetNumber = Number(p.budget_usage);
+            } else if (p.context_pressure !== undefined && p.context_pressure !== null && p.context_pressure !== '') {
+                budgetNumber = Number(p.context_pressure) * 100;
             }
             if (!isFinite(budgetNumber)) budgetNumber = 0;
             var budget = Math.max(0, Math.min(999, budgetNumber));
-            var tier = p.pressure_tier || (budget >= 60 ? 'red' : (budget >= 50 ? 'yellow' : 'green'));
+            var tier = p.pressure_tier || (budget > 100 ? 'red' : (budget > 90 ? 'yellow' : 'green'));
             var modeLabels = { global: '全局注意', single_chain: '单链注意', focus: '局部注意' };
             var label = modeLabels[mode] || mode;
             updateAttentionStatusPanel({
@@ -14230,7 +14520,9 @@
                 focusNode: focusNode,
                 budget: budget,
                 tier: tier,
-                turn: turn
+                turn: turn,
+                visiblePressure: p.visible_context_pressure,
+                backingPressure: p.backing_context_pressure
             });
             if (typeof isIdeConnected !== 'undefined' && isIdeConnected) {
                 addIdeSystemMessage('[注意] T' + turn + ' ' + label + ' (压力:' + budget.toFixed(0) + '%)' + (focusNode ? ' 焦点:' + focusNode : ''));
@@ -14248,7 +14540,7 @@
                 modeLabel: '全局注意',
                 focusNode: focusNode || '当前任务',
                 budget: percent,
-                tier: percent >= 60 ? 'red' : (percent >= 50 ? 'yellow' : 'green'),
+                tier: percent > 100 ? 'red' : (percent > 90 ? 'yellow' : 'green'),
                 turn: eventData.turn || ''
             });
         }
@@ -14270,6 +14562,12 @@
             pressureEl.textContent = Math.max(0, Math.min(999, budget)).toFixed(0) + '%';
             panel.setAttribute('data-attention-mode', state.modeLabel || '全局注意');
             panel.setAttribute('data-context-pressure', String(Math.max(0, Math.min(999, budget)).toFixed(0)));
+            if (state.visiblePressure !== undefined && state.visiblePressure !== null && state.visiblePressure !== '') {
+                panel.setAttribute('data-visible-context-pressure', String(Math.max(0, Math.min(999, Number(state.visiblePressure) * 100)).toFixed(0)));
+            }
+            if (state.backingPressure !== undefined && state.backingPressure !== null && state.backingPressure !== '') {
+                panel.setAttribute('data-backing-context-pressure', String(Math.max(0, Math.min(999, Number(state.backingPressure) * 100)).toFixed(0)));
+            }
             panel.setAttribute('data-focus-node', state.focusNode || '');
         }
 

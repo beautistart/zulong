@@ -312,6 +312,17 @@ class ConversationOrchestrator:
             workspace_path = workspace_path or existing.get("workspace_path")
             project_id = project_id or existing.get("project_id")
             task_graph_id = task_graph_id or existing.get("task_graph_id")
+            if not task_graph_id:
+                recent = self.store.find_recent_coding_conversation(
+                    workspace_path=workspace_path,
+                    project_id=project_id,
+                )
+                if recent and recent.get("task_graph_id"):
+                    task_graph_id = recent.get("task_graph_id")
+                    last_task_graph_id = last_task_graph_id or task_graph_id
+            if task_graph_id:
+                data["task_graph_id"] = task_graph_id
+                data["graph_id"] = task_graph_id
             task_graph_binding_policy = "keep_recent_task_graph"
             binding_reason = "follow-up/check turn keeps recent task graph"
         elif referenced_task_graph_id:
@@ -446,6 +457,7 @@ class ConversationOrchestrator:
             workspace_path=data.get("workspace_path") or data.get("cwd"),
             project_id=data.get("project_id"),
             task_graph_id=data.get("task_graph_id") or data.get("graph_id"),
+            session_node_id=data.get("session_node_id") or data.get("dialogue_session_id"),
             metadata=data.get("metadata") or {},
             active=True,
         )
