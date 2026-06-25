@@ -14522,7 +14522,11 @@
                 tier: tier,
                 turn: turn,
                 visiblePressure: p.visible_context_pressure,
-                backingPressure: p.backing_context_pressure
+                registeredPressure: p.registered_context_pressure,
+                providerPromptTokens: p.provider_prompt_tokens,
+                providerContextPressurePercent: p.provider_context_pressure_percent,
+                navigationMapInjected: p.navigation_map_injected,
+                navigationMapReason: p.navigation_map_reason
             });
             if (typeof isIdeConnected !== 'undefined' && isIdeConnected) {
                 addIdeSystemMessage('[注意] T' + turn + ' ' + label + ' (压力:' + budget.toFixed(0) + '%)' + (focusNode ? ' 焦点:' + focusNode : ''));
@@ -14565,9 +14569,14 @@
             if (state.visiblePressure !== undefined && state.visiblePressure !== null && state.visiblePressure !== '') {
                 panel.setAttribute('data-visible-context-pressure', String(Math.max(0, Math.min(999, Number(state.visiblePressure) * 100)).toFixed(0)));
             }
-            if (state.backingPressure !== undefined && state.backingPressure !== null && state.backingPressure !== '') {
-                panel.setAttribute('data-backing-context-pressure', String(Math.max(0, Math.min(999, Number(state.backingPressure) * 100)).toFixed(0)));
+            if (state.registeredPressure !== undefined && state.registeredPressure !== null && state.registeredPressure !== '') {
+                panel.setAttribute('data-registered-context-pressure', String(Math.max(0, Math.min(999, Number(state.registeredPressure) * 100)).toFixed(0)));
             }
+            if (state.providerContextPressurePercent !== undefined && state.providerContextPressurePercent !== null) {
+                panel.setAttribute('data-provider-context-pressure', String(Number(state.providerContextPressurePercent).toFixed(1)));
+            }
+            panel.setAttribute('data-navigation-map-injected', state.navigationMapInjected ? 'true' : 'false');
+            panel.setAttribute('data-navigation-map-reason', String(state.navigationMapReason || 'none'));
             panel.setAttribute('data-focus-node', state.focusNode || '');
         }
 

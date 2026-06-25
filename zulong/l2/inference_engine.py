@@ -225,6 +225,8 @@ class InferenceEngine:
             
             # 注意力窗口管理器（FC 循环中按需初始化，此处仅声明）
             self._attn_window: Optional[AttentionWindowManager] = None
+            # TSD §26.1.5: 本轮 active context 诊断字段（供 ATTENTION_UPDATE 透传，不作下轮上下文池）
+            self._last_attention_context_telemetry: Dict[str, Any] = {}
             # 远程模型默认 context window（优先使用配置的 num_ctx）
             self._context_window_size = LLM_NUM_CTX if LLM_NUM_CTX > 0 else 32768
             
@@ -1495,11 +1497,15 @@ class InferenceEngine:
                 "visible_context_pressure": round(
                     float(getattr(attn_window, "active_context_pressure_ratio", ratio) or ratio),
                     3,
-                ) if attn_window is not None else round(ratio, 3),
-                "backing_context_pressure": round(
-                    float(getattr(attn_window, "context_pressure_ratio", ratio) or ratio),
+                ) if attn_window is not None else round(ratio,3),
+                "registered_context_pressure": round(
+                    float(getattr(attn_window, "registered_context_pressure", ratio) or ratio),
                     3,
-                ) if attn_window is not None else round(ratio, 3),
+                ) if attn_window is not None else round(ratio,3),
+                "provider_prompt_tokens": int(getattr(attn_window, "_last_provider_prompt_tokens", 0) or 0) if attn_window is not None else 0,
+                "provider_context_pressure_percent": getattr(attn_window, "provider_context_pressure_percent", None) if attn_window is not None else None,
+                "navigation_map_injected": bool(getattr(self, "_last_attention_context_telemetry", {}).get("navigation_map_injected", False)),
+                "navigation_map_reason": str(getattr(self, "_last_attention_context_telemetry", {}).get("navigation_map_reason", "none")),
                 "pressure_tier": tier,
                 "pressure_threshold_medium": thresholds["medium"],
                 "pressure_threshold_high": thresholds["high"],
@@ -2504,13 +2510,47 @@ class InferenceEngine:
         model_id = vllm_model_id or LLM_MODEL_ID
         sync_engine_tool_budget(self, user_input)
         tool_budget = get_engine_tool_budget(self)
+        # TSD §26.1.5: L2 单次决策入口也必须构建本轮 active context，不得回退旧历史裁剪。
+        _active_messages = (
+            self._attn_window.apply_window()
+            if getattr(self, "_attn_window", None)
+            else strip_llm_message_metadata(messages)
+        )
+        self._last_attention_context_telemetry = {}
+        try:
+            if getattr(self, "_attn_window", None) is not None:
+                from zulong.l2.attention_context_retrieval import (
+                    build_attention_context_bundle,
+                    render_attention_context_message,
+                )
+                _mode_val = (
+                    getattr(self._attn_window.mode, "value", "global")
+                    if self._attn_window.mode else "global"
+                )
+                _pressure_pct = float(
+                    getattr(self._attn_window, "active_context_pressure_ratio", 0.0) or 0.0
+                ) * 100.0
+                _task_graph = getattr(self, "_task_graph", None) or getattr(self, "task_graph", None)
+                _memory_graph = getattr(self, "_memory_graph", None) or getattr(self, "memory_graph", None)
+                _bundle = build_attention_context_bundle(
+                    mode=_mode_val,
+                    query_text=str(user_input or "")[:500],
+                    attention_window=self._attn_window,
+                    task_graph=_task_graph,
+                    memory_graph=_memory_graph,
+                    pressure_percent=_pressure_pct,
+                    trigger_reason="model_call",
+                    include_navigation_map=False,
+                )
+                _rendered_msg = render_attention_context_message(_bundle)
+                if _rendered_msg and _rendered_msg.get("content"):
+                    _active_messages = [_rendered_msg] + list(_active_messages or [])
+                self._last_attention_context_telemetry = _bundle.telemetry or {}
+        except Exception as _ac_err:
+            logger.debug("[L2] active context 构建失败，回退 apply_window: %s", _ac_err)
         api_kwargs: Dict[str, Any] = {
             "model": model_id,
-            "messages": (
-                self._attn_window.apply_window()
-                if getattr(self, "_attn_window", None)
-                else strip_llm_message_metadata(messages)
-            ),
+            "messages": _active_messages,
             "max_tokens": response_max_tokens,
             "temperature": 0.3,
             "top_p": 0.85,
@@ -2597,6 +2637,13 @@ class InferenceEngine:
         usage_summary = _summarize_llm_usage_for_log(
             getattr(api_response, "usage", None)
         )
+        # TSD §26.1.5: 回填 provider prompt_tokens 到 attention 窗口
+        try:
+            _prompt_tokens = int(usage_summary.get("prompt_tokens") or 0)
+            if _prompt_tokens and getattr(self, "_attn_window", None) is not None:
+                self._attn_window.record_provider_usage(_prompt_tokens)
+        except Exception:
+            pass
         tool_call_names = [
             str(getattr(getattr(tc, "function", None), "name", "") or "")
             for tc in raw_tool_calls

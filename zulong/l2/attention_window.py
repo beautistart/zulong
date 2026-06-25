@@ -1049,8 +1049,8 @@ class AttentionWindowManager:
         ``apply_window``.  The real LLM call also needs reserved/system/tool
         scaffolding tokens, so the user-visible pressure must include the
         reserved portion once a windowing pass has happened.  Before the first
-        pass this stays at 0 and callers should fall back to the backing-pool
-        pressure for bootstrap.
+        pass this stays at 0 and callers should fall back to the registered
+        message-pool pressure for bootstrap.
         """
         provider_prompt = max(0, int(getattr(self, "_last_provider_prompt_tokens", 0) or 0))
         if provider_prompt:
@@ -1065,9 +1065,10 @@ class AttentionWindowManager:
     def active_context_pressure_ratio(self) -> float:
         """Pressure of the last LLM-visible window.
 
-        ``context_pressure_ratio`` below describes the backing context pool and
-        is useful for deciding when to ask the LLM to re-select attention.
-        This property describes what was actually injected after windowing.
+        ``context_pressure_ratio`` (a.k.a. registered_context_pressure) describes
+        the registered message pool and is useful for deciding when to ask the
+        LLM to re-select attention.  This property describes what was actually
+        injected after windowing.
         """
         return max(0.0, self.active_context_tokens / max(self.threshold_budget_tokens, 1))
 
@@ -1077,8 +1078,8 @@ class AttentionWindowManager:
 
         This matches the Web-visible pressure after at least one windowing pass.
         Before that pass there is no visible-window telemetry yet, so bootstrap
-        detection still uses the backing context pool to allow the first
-        attention switch under low ``threshold_budget_ratio`` test settings.
+        detection still uses the registered message-pool pressure to allow the
+        first attention switch under low ``threshold_budget_ratio`` test settings.
         """
         if self._last_window_message_count:
             return self.active_context_pressure_ratio
@@ -1117,6 +1118,40 @@ class AttentionWindowManager:
             "current_node_id": self._current_node_id,
             "context_window_size": self.context_window_size,
         }
+
+    # ── Provider usage 回填 (TSD §26.1.5) ──
+
+    def record_provider_usage(self, prompt_tokens: int) -> None:
+        """回填 provider 返回的真实 prompt_tokens，供 active_context_tokens 优先使用。
+
+        TSD §26.1.5 要求压力口径优先使用 provider usage，无 usage 时才退回本地估算。
+        此方法在每次 provider 调用返回后由调用方调用。
+        """
+        try:
+            self._last_provider_prompt_tokens = max(0, int(prompt_tokens or 0))
+        except (TypeError, ValueError):
+            self._last_provider_prompt_tokens = 0
+
+    @property
+    def provider_context_pressure_percent(self) -> Optional[float]:
+        """本轮实际注入压力百分比，优先 provider usage；无 usage 返回 None。"""
+        if self._last_provider_prompt_tokens > 0:
+            return round(
+                self._last_provider_prompt_tokens
+                / max(self.threshold_budget_tokens, 1)
+                * 100.0,
+                2,
+            )
+        return None
+
+    @property
+    def registered_context_pressure(self) -> float:
+        """AttentionWindow 已登记消息池相对阈值预算的压力（诊断字段）。
+
+        TSD §26.1.5：registered 只表示已登记消息池压力，不等于本轮实际发给 LLM 的
+        active context。等价于旧 context_pressure_ratio，重命名以对齐 TSD 字段裁决。
+        """
+        return self.context_pressure_ratio
 
     # ── LLM自主注意力选择辅助方法 ──
 
@@ -1446,8 +1481,8 @@ class AttentionWindowManager:
         # The configured threshold budget is the upper bound for context
         # injection; mode-specific multipliers decide which necessary context is
         # injected inside that threshold.  This is not lossy compression: evicted
-        # envelopes stay in the backing pool and can be re-injected by switching
-        # attention back to GLOBAL or recalling memory.
+        # envelopes stay registered in the message pool and can be re-injected by
+        # switching attention back to GLOBAL or recalling memory.
         self._threshold_budget_base = min(
             self._base_budget,
             self.window_injection_budget_tokens,

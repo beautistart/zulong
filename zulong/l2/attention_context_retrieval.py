@@ -389,7 +389,7 @@ def render_attention_context(bundle: AttentionContextBundle) -> str:
     lines.append(
         f"mode={plan.mode}; reason={plan.trigger_reason}; pressure={plan.pressure_percent:.1f}%; focus={focus}"
     )
-    lines.append("动态注意力=图位置感知的本轮上下文检索与重组；不是压缩器，不维护 backing_pool。")
+    lines.append("动态注意力=图位置感知的本轮上下文检索与重组；不是压缩器，本轮命中内容按重要度拼接注入。")
     if bundle.focus_summary:
         lines.append("【思维导航】")
         lines.extend(_limit_lines(str(bundle.focus_summary), 5))

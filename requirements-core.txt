@@ -9,6 +9,8 @@ python-multipart>=0.0.6
 # Async and HTTP
 aiohttp>=3.8.0
 requests>=2.31.0
+msgspec>=0.18.0
+openai>=2.0.0
 
 # Config and logging
 pyyaml>=6.0
@@ -20,6 +22,9 @@ numpy>=1.24.0
 scipy>=1.10.0
 qdrant-client>=1.3.0
 networkx>=3.0
+igraph>=1.0.0
+lmdb>=2.0.0
+pymongo>=4.0.0
 
 # Code graph / Tree-sitter parsers
 tree-sitter>=0.25.0

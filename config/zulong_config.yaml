@@ -146,7 +146,7 @@ l2_inference:
     safety_hard_cap: null
     time_red_seconds: 120
     time_yellow_seconds: 60
-  core_model: qwen3.5:cloud
+  core_model: deepseek-v4-pro
   fc_loop:
     api_timeout_seconds: 30
     checkpointer_db_path: ./data/fc_loop_checkpoints.db

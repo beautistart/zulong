@@ -48,7 +48,7 @@ class PressureDetector:
         start_time = time.time()
         
         try:
-            backing_tokens = sum(env.tokens for env in self._awm.envelopes)
+            registered_tokens = sum(env.tokens for env in self._awm.envelopes)
             llm_context_budget = getattr(self._awm, "context_window_size", None)
             current_budget = llm_context_budget or self._awm.budget
             has_visible_window = bool(getattr(self._awm, "_last_window_message_count", 0))
@@ -56,9 +56,9 @@ class PressureDetector:
                 total_tokens = int(getattr(self._awm, "active_context_tokens", 0) or 0)
             else:
                 # Bootstrap: no Web-visible/LLM-visible window has been recorded
-                # yet, so use the backing pool once to allow the first attention
-                # choice.  After that, trigger pressure must match the page.
-                total_tokens = backing_tokens
+                # yet, so use the registered message pool once to allow the first
+                # attention choice.  After that, trigger pressure must match the page.
+                total_tokens = registered_tokens
 
             pressure_view = build_context_pressure_view(
                 total_tokens,

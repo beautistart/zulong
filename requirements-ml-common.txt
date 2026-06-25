@@ -9,6 +9,7 @@ sentence-transformers>=2.2.0
 # Vision
 Pillow>=9.5.0
 opencv-python>=4.7.0
+torchvision>=0.20.0
 
 # Optional local ASR fallback
 openai-whisper>=20231117

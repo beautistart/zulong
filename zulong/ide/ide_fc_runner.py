@@ -767,6 +767,7 @@ class IDEFCRunner(FCRunner):
         self._last_bfs_seeds_hash: str = ""
         self._last_bfs_turn: int = 0
         self._last_pressure_tier: str = "green"  # 压力分级跟踪（green/yellow/red）
+        self._last_attention_context_telemetry: Dict[str, Any] = {}  # TSD §26.1.5 本轮 active context 诊断字段
         self._bfs_min_interval: int = 3  # 最小间隔轮次
         # WS层IDESession引用（由 ide_server._run_fc_loop 注入）
         self.ide_session = None
@@ -1700,9 +1701,19 @@ class IDEFCRunner(FCRunner):
                             float(getattr(self._attn_window, "active_context_pressure_ratio", ratio) or ratio),
                             3,
                         ),
-                        "backing_context_pressure": round(
-                            float(getattr(self._attn_window, "context_pressure_ratio", ratio) or ratio),
+                        "registered_context_pressure": round(
+                            float(getattr(self._attn_window, "registered_context_pressure", ratio) or ratio),
                             3,
+                        ),
+                        "provider_prompt_tokens": int(getattr(self._attn_window, "_last_provider_prompt_tokens", 0) or 0),
+                        "provider_context_pressure_percent": getattr(
+                            self._attn_window, "provider_context_pressure_percent", None
+                        ),
+                        "navigation_map_injected": bool(
+                            getattr(self, "_last_attention_context_telemetry", {}).get("navigation_map_injected", False)
+                        ),
+                        "navigation_map_reason": str(
+                            getattr(self, "_last_attention_context_telemetry", {}).get("navigation_map_reason", "none")
                         ),
                         "pressure_tier": pressure_tier,
                         "pressure_threshold_medium": yellow_ratio,
@@ -3123,6 +3134,14 @@ class IDEFCRunner(FCRunner):
                 telemetry["provider_context_pressure_ratio"] = round(prompt_tokens / threshold_budget, 4)
                 telemetry["provider_context_pressure_percent"] = round(prompt_tokens / threshold_budget * 100.0, 1)
                 state.attention_context_telemetry = telemetry
+        except Exception:
+            pass
+        # TSD §26.1.5: 回填 provider prompt_tokens 到 attention 窗口，供压力口径优先使用
+        try:
+            usage_dict = _summarize_usage_for_log(usage)
+            prompt_tokens = int(usage_dict.get("prompt_tokens") or 0)
+            if prompt_tokens and self._attn_window is not None:
+                self._attn_window.record_provider_usage(prompt_tokens)
         except Exception:
             pass
         logger.info(
@@ -5554,10 +5573,10 @@ class IDEFCRunner(FCRunner):
     ) -> Tuple[List[Dict], Optional[Dict]]:
         """Build and inject the per-call active context defined by TSD v2.9.24.
 
-        This is not a backing_pool and is not pinned into the conversation.  It
-        reconstructs the current necessary context from TaskGraph / MemoryGraph /
-        BFS for this one model call, then lets AttentionWindow remain only the
-        low-level safety fallback.
+        This is a per-call temporary context, not pinned into the conversation
+        and not a hidden context pool.  It reconstructs the current necessary
+        context from TaskGraph / MemoryGraph / BFS for this one model call,
+        then lets AttentionWindow remain only the low-level safety fallback.
         """
         if not self._attn_window:
             return base_messages, None
@@ -5662,6 +5681,8 @@ class IDEFCRunner(FCRunner):
         fc = state.fc_turn
         msgs = self._attn_window.apply_window() if self._attn_window else state.messages
         msgs, _attention_context_telemetry = self._build_dynamic_attention_context_message(state, msgs, fc=fc)
+        # TSD §26.1.5: 保留本轮 active context telemetry 供 ATTENTION_UPDATE 透传（诊断字段，不作为下轮上下文池）
+        self._last_attention_context_telemetry = _attention_context_telemetry or {}
         extra_kw = self.engine._get_llm_extra_kwargs()
         # Qwen3 系列默认开启思维链（<think>），FC 模式下禁用以避免空 content
         eb = extra_kw.get("extra_body", {})

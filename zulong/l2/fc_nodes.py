@@ -36,6 +36,10 @@ from zulong.core.message_visibility import (
     internal_control_message,
     strip_llm_message_metadata,
 )
+from zulong.l2.attention_context_retrieval import (
+    build_attention_context_bundle,
+    render_attention_context_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -283,6 +287,32 @@ def _make_call_model_node(engine: "InferenceEngine"):
             engine._attn_window.apply_window()
             if engine._attn_window else strip_llm_message_metadata(messages)
         )
+        # TSD §26.1.5: Full Web/Core FC 入口必须构建本轮 active context 并 prepend，
+        # 不得只走旧 apply_window 历史裁剪。active context 为临时注入，不写回长期消息池。
+        attn_telemetry: Dict[str, Any] = {}
+        try:
+            if engine._attn_window is not None:
+                mode_val = getattr(engine._attn_window.mode, "value", "global") if engine._attn_window.mode else "global"
+                pressure_pct = float(getattr(engine._attn_window, "active_context_pressure_ratio", 0.0) or 0.0) * 100.0
+                task_graph = getattr(engine, "_task_graph", None) or getattr(engine, "task_graph", None)
+                memory_graph = getattr(engine, "_memory_graph", None) or getattr(engine, "memory_graph", None)
+                bundle = build_attention_context_bundle(
+                    mode=mode_val,
+                    query_text=str(state.get("user_input_text", ""))[:500],
+                    attention_window=engine._attn_window,
+                    task_graph=task_graph,
+                    memory_graph=memory_graph,
+                    pressure_percent=pressure_pct,
+                    trigger_reason="model_call",
+                    include_navigation_map=False,
+                )
+                rendered_msg = render_attention_context_message(bundle)
+                if rendered_msg and rendered_msg.get("content"):
+                    windowed_messages = [rendered_msg] + list(windowed_messages or [])
+                attn_telemetry = bundle.telemetry or {}
+        except Exception as ac_err:
+            logger.debug("[FC][Graph] active context 构建失败，回退 apply_window: %s", ac_err)
+        engine._last_attention_context_telemetry = attn_telemetry
         api_kwargs: Dict[str, Any] = {
             "model": vllm_model_id,
             "messages": windowed_messages,
@@ -487,6 +517,13 @@ def _make_call_model_node(engine: "InferenceEngine"):
         raw_tool_calls = getattr(msg, "tool_calls", None) or []
         finish_reason = getattr(choice, "finish_reason", None)
         usage_summary = _summarize_llm_usage(getattr(api_response, "usage", None))
+        # TSD §26.1.5: 回填 provider prompt_tokens 到 attention 窗口
+        try:
+            _prompt_tokens = int(usage_summary.get("prompt_tokens") or 0)
+            if _prompt_tokens and engine._attn_window is not None:
+                engine._attn_window.record_provider_usage(_prompt_tokens)
+        except Exception:
+            pass
         tool_call_names = [
             str(getattr(getattr(tc, "function", None), "name", "") or "")
             for tc in raw_tool_calls
