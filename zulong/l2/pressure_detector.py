@@ -131,23 +131,14 @@ class PressureDetector:
         return velocity
     
     def _predict_pressure(self, current: float, velocity: float) -> float:
-        """预测5秒后的压力值
-        
-        Args:
-            current: 当前压力值
-            velocity: 变化速率
-            
-        Returns:
-            预测压力值
+        """压力预测字段（TSD §26.1.2：仅作日志/telemetry 诊断字段，不作为触发机制）。
+
+        TSD v2.9.23 明确删除「预测5秒后超过红线就提前触发」作为触发机制。
+        此处不再做 current + velocity*5 的提前预测，直接回退当前压力值，
+        保留字段仅为 telemetry 兼容与历史趋势复盘，主触发口径以本轮实际
+        active context pressure 为准（见 check_threshold）。
         """
-        predicted = current + velocity * 5.0
-        
-        if predicted < 0:
-            predicted = 0.0
-        if predicted > 999.0:
-            predicted = 999.0
-        
-        return predicted
+        return max(0.0, min(current, 999.0))
     
     def _determine_trend(self, current_pressure: float) -> PressureTrend:
         """确定压力趋势

@@ -1715,6 +1715,27 @@ class IDEFCRunner(FCRunner):
                         "navigation_map_reason": str(
                             getattr(self, "_last_attention_context_telemetry", {}).get("navigation_map_reason", "none")
                         ),
+                        "active_context_token_estimate": int(
+                            getattr(self, "_last_attention_context_telemetry", {}).get("active_context_token_estimate", 0) or 0
+                        ),
+                        "active_context_item_count": int(
+                            getattr(self, "_last_attention_context_telemetry", {}).get("active_context_item_count", 0) or 0
+                        ),
+                        "active_context_rendered_chars": int(
+                            getattr(self, "_last_attention_context_telemetry", {}).get("active_context_rendered_chars", 0) or 0
+                        ),
+                        "active_context_source_addresses": list(
+                            getattr(self, "_last_attention_context_telemetry", {}).get("active_context_source_addresses", []) or []
+                        ),
+                        "retrieved_memory_count": int(
+                            getattr(self, "_last_attention_context_telemetry", {}).get("retrieved_memory_count", 0) or 0
+                        ),
+                        "bfs_seed_count": int(
+                            getattr(self, "_last_attention_context_telemetry", {}).get("bfs_seed_count", 0) or 0
+                        ),
+                        "bfs_activated_count": int(
+                            getattr(self, "_last_attention_context_telemetry", {}).get("bfs_activated_count", 0) or 0
+                        ),
                         "pressure_tier": pressure_tier,
                         "pressure_threshold_medium": yellow_ratio,
                         "pressure_threshold_high": red_ratio,

@@ -37,7 +37,7 @@ class PressureMetrics:
     current_pressure: float              # 当前上下文压力 (tokens/阈值预算)
     pressure_trend: PressureTrend        # 压力趋势
     pressure_velocity: float             # 压力变化速率
-    predicted_pressure_5s: float         # 预测5秒后压力值
+    predicted_pressure_5s: float         # 诊断字段（TSD §26.1.2：仅 telemetry/复盘，不作触发；当前回退为 current_pressure）
     timestamp: datetime = field(default_factory=datetime.now)
     
     budget_usage: float = 0.0            # 预算使用率

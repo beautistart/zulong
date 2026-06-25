@@ -4,7 +4,8 @@ TSD v2.9.24 defines L2 dynamic attention as graph-position-aware
 context retrieval and reconstruction.  This module is intentionally a thin
 orchestration layer: it builds one per-call AttentionRetrievalPlan, reads
 TaskGraph / MemoryGraph / BFS evidence, renders a compact active context, and
-never stores a backing pool or performs global de-duplication.
+never performs global de-duplication.  Injection volume is driven by what the
+round's retrieval actually hits, capped only by a uniform safety ceiling.
 """
 from __future__ import annotations
 
@@ -33,6 +34,8 @@ class AttentionRetrievalPlan:
     memory_addresses: List[Dict[str, Any]] = field(default_factory=list)
     source_node_ids: List[str] = field(default_factory=list)
     bfs_depth: int = 1
+    allowed_edge_types: List[str] = field(default_factory=list)
+    allowed_node_types: List[str] = field(default_factory=list)
     target_tokens: int = 1200
     max_items: int = 8
     trigger_reason: str = "model_call"
@@ -54,6 +57,8 @@ class AttentionRetrievalPlan:
             "memory_addresses": list(self.memory_addresses),
             "source_node_ids": list(self.source_node_ids),
             "bfs_depth": self.bfs_depth,
+            "allowed_edge_types": list(self.allowed_edge_types),
+            "allowed_node_types": list(self.allowed_node_types),
             "target_tokens": self.target_tokens,
             "max_items": self.max_items,
             "trigger_reason": self.trigger_reason,
@@ -107,6 +112,17 @@ class AttentionContextBundle:
     memory_items: List[AttentionContextItem] = field(default_factory=list)
     bfs_items: List[AttentionContextItem] = field(default_factory=list)
     telemetry: Dict[str, Any] = field(default_factory=dict)
+    # TSD §26.1.5 结构化字段（与 telemetry dict 并存，供强类型消费方使用）
+    rendered_text: str = ""
+    source_addresses: List[str] = field(default_factory=list)
+    token_estimate: int = 0
+    navigation_map_injected: bool = False
+    navigation_map_reason: str = "none"
+    retrieved_memory_count: int = 0
+    bfs_seed_count: int = 0
+    bfs_activated_count: int = 0
+    provider_prompt_tokens: Optional[int] = None
+    provider_context_pressure_percent: Optional[float] = None
 
     @property
     def all_items(self) -> List[AttentionContextItem]:
@@ -239,6 +255,32 @@ def build_attention_retrieval_plan(
     )
 
 
+# TSD §26.1.4 导航地图注入门禁：记录上次注入签名，签名未变化时不重复注入
+_last_navigation_map_key: str = ""
+
+
+def compute_navigation_map_key(
+    task_graph: Any,
+    plan: AttentionRetrievalPlan,
+) -> str:
+    """计算导航地图注入签名：graph_id | mode | focus_node_id | trigger_reason | status_signature。
+
+    status_signature 用 TaskGraph 节点状态分布的紧凑摘要，反映任务结构变化。
+    """
+    graph_id = str(getattr(task_graph, "id", "") or getattr(task_graph, "_graph_id", "") or "tg")
+    sig = ""
+    try:
+        nodes = getattr(task_graph, "_nodes", {}) or {}
+        counts: Dict[str, int] = {}
+        for n in nodes.values():
+            st = str(getattr(n, "status", "") or "unknown")
+            counts[st] = counts.get(st, 0) + 1
+        sig = ",".join(f"{k}:{v}" for k, v in sorted(counts.items()))
+    except Exception:
+        sig = ""
+    return f"{graph_id}|{plan.mode}|{plan.focus_node_id}|{plan.trigger_reason}|{sig}"
+
+
 def build_navigation_map(
     task_graph: Any,
     plan: AttentionRetrievalPlan,
@@ -248,14 +290,23 @@ def build_navigation_map(
         return ""
     if not hasattr(task_graph, "render_navigator_map"):
         return ""
+    # TSD §26.1.4 签名门禁：签名未变化时跳过注入（去重），只更新 telemetry
+    global _last_navigation_map_key
+    current_key = compute_navigation_map_key(task_graph, plan)
+    if current_key and current_key == _last_navigation_map_key:
+        plan.navigation_reason = "deduped"
+        return ""
     try:
-        return str(task_graph.render_navigator_map(
+        rendered = str(task_graph.render_navigator_map(
             plan.focus_node_id or "",
             uncovered_node_ids=list(uncovered_node_ids or []),
         ) or "")
     except Exception as exc:
         logger.debug("[AttentionContext] 导航地图构建跳过: %s", exc)
         return ""
+    if rendered:
+        _last_navigation_map_key = current_key
+    return rendered
 
 
 def retrieve_attention_context(memory_graph: Any, plan: AttentionRetrievalPlan) -> Tuple[List[AttentionContextItem], Dict[str, Any]]:
@@ -366,6 +417,18 @@ def build_attention_context_bundle(
         "navigation_map_injected": bool(navigation_map),
         "navigation_map_reason": plan.navigation_reason if navigation_map else "skipped",
     }
+    # 收集本轮注入项的来源地址（服务覆盖率与下钻，非去重键）
+    source_addresses: List[str] = []
+    for item in (list(task_items) + list(memory_items) + list(bfs_items)):
+        addr = item.address_line() if hasattr(item, "address_line") else ""
+        if addr and addr not in source_addresses:
+            source_addresses.append(addr)
+    nav_reason = plan.navigation_reason if navigation_map else "skipped"
+    nav_injected = bool(navigation_map)
+    retrieved_count = int(retrieval_meta.get("retrieved_memory_count", 0) or 0)
+    bfs_seed = int(bfs_meta.get("bfs_seed_count", 0) or 0)
+    bfs_activated = int(bfs_meta.get("bfs_activated_count", 0) or 0)
+
     bundle = AttentionContextBundle(
         plan=plan,
         focus_summary=focus.get("focus_summary", ""),
@@ -374,10 +437,22 @@ def build_attention_context_bundle(
         memory_items=memory_items,
         bfs_items=bfs_items,
         telemetry=telemetry,
+        # TSD §26.1.5 结构化字段
+        source_addresses=source_addresses,
+        navigation_map_injected=nav_injected,
+        navigation_map_reason=nav_reason,
+        retrieved_memory_count=retrieved_count,
+        bfs_seed_count=bfs_seed,
+        bfs_activated_count=bfs_activated,
+        provider_prompt_tokens=int(getattr(attention_window, "_last_provider_prompt_tokens", 0) or 0) or None,
+        provider_context_pressure_percent=getattr(attention_window, "provider_context_pressure_percent", None),
     )
-    rendered = render_attention_context(bundle)
-    telemetry["active_context_token_estimate"] = estimate_text_tokens(rendered)
+    bundle.rendered_text = render_attention_context(bundle)
+    bundle.token_estimate = estimate_text_tokens(bundle.rendered_text)
+    telemetry["active_context_token_estimate"] = bundle.token_estimate
     telemetry["active_context_item_count"] = len(bundle.all_items)
+    telemetry["active_context_source_addresses"] = source_addresses
+    telemetry["active_context_rendered_chars"] = len(bundle.rendered_text)
     return bundle
 
 
