@@ -507,12 +507,57 @@ class FCRunner:
                 }
                 state["messages"].append(cm)
 
+        # ── save_memory_note 独立连续计数（不检查参数，只看工具名）──
+        # 若 LLM 在高压下连续调用 save_memory_note 但任务停滞，此检测直接纠偏。
+        # 与上面普通工具重复调用不同：普通工具要"同名+同参数"才触发；save_memory_note 每次
+        # 参数不同（不同便签内容）但都不推进任务，所以只统计工具名连续次数。
+        _SMR_TAIL = last_tool_calls[-self._DUPLICATE_TOOL_CHECK_TURNS:]
+        if _SMR_TAIL and all(
+            tc.get("name", "") == "save_memory_note" for tc in _SMR_TAIL
+        ):
+            _smr_prev = state.get("_save_memory_note_consecutive", 0)
+            state["_save_memory_note_consecutive"] = _smr_prev + 1
+            _smr_total = state["_save_memory_note_consecutive"]
+            # 连续次数达阈值：强制 navigate_attention 纠偏（不强制 save_memory_note）
+            if _smr_total >= self._DUPLICATE_TOOL_CHECK_TURNS:
+                logger.warning(
+                    "[FCRunner] save_memory_note 连续 %d 次，强制 navigate_attention 纠偏",
+                    _smr_total,
+                )
+                state["forced_next_tool_name"] = "navigate_attention"
+                state["_save_memory_note_consecutive"] = 0
+                hint = {
+                    "role": "user",
+                    "content": (
+                        "[系统警告] 你已连续多次调用 save_memory_note 但任务未推进。"
+                        "请立即使用 navigate_attention 切换注意力模式重新聚焦当前任务，"
+                        "或输出 partial/blocked summary。"
+                    ),
+                }
+                state.setdefault("messages", []).append(hint)
+            elif _smr_total == 2:
+                hint = {
+                    "role": "user",
+                    "content": (
+                        "[提示] 你已连续调用 save_memory_note，"
+                        "如果当前路径确实无法推进请尝试 navigate_attention 切换注意力，"
+                        "或输出 partial/blocked summary。"
+                    ),
+                }
+                state.setdefault("messages", []).append(hint)
+        else:
+            # 非 save_memory_note，重置连续计数
+            state["_save_memory_note_consecutive"] = 0
+
     def _detect_progress_stall(self, state: Dict) -> bool:
         """进度停滞检测
 
         通过采样工具结果缓冲区的大小和消息列表长度来判断是否有进展。
+        save_memory_note / note_anchor / tag_anchor 等诊断工具不计入采样窗口，
+        避免"每轮写便签→采样值增长→误判为有进展"的死循环逃逸。
         返回 True 表示检测到停滞。
         """
+        _DIAGNOSTIC_TOOLS = {"save_memory_note", "note_anchor", "tag_anchor", "memory_persist"}
         _snapshots = state.setdefault("_progress_snapshots", [])
         fc = state["fc_turn"]
 
@@ -520,9 +565,15 @@ class FCRunner:
         if fc % self._warning_interval != 0 or fc < self._warning_interval:
             return False
 
+        # 过滤掉诊断工具结果，只统计"有实质进展"的工具调用
+        _buf = state.get("tool_results_buffer") or []
+        _meaningful_results = sum(
+            1 for r in _buf
+            if str(r.get("tool_name") or r.get("name") or "").lower() not in _DIAGNOSTIC_TOOLS
+        )
         current_snapshot = {
             "fc_turn": fc,
-            "tool_results_count": len(state.get("tool_results_buffer", [])),
+            "tool_results_count": _meaningful_results,
             "messages_count": len(state.get("messages", [])),
         }
         _snapshots.append(current_snapshot)
@@ -589,19 +640,42 @@ class FCRunner:
         if cb_state == CircuitBreakerState.RED:
             state["cb_force_no_tools"] = True
             state["cb_recovery_stage"] = "restricted_recovery"
-            state["cb_recovery_note_saved"] = False
-            state["cb_recovery_attention_switched"] = False
-            state["cb_recovery_start_result_count"] = len(state.get("tool_results_buffer") or [])
-            convergence = {
-                "role": "user",
-                "content": (
-                    f"[Circuit Breaker RED 受限恢复] {cb_reason}\n"
-                    "请先把当前证据、未完成项、失败原因、下一步建议写入便签/标签/记忆并关联当前任务节点，"
-                    "再进行一次 GLOBAL / FOCUS / SINGLE_CHAIN 注意力重选；"
-                    "本轮只允许使用便签/标签/记忆落盘和注意力切换能力。"
-                ),
-            }
-            state.setdefault("messages", []).append(convergence)
+            # 防死循环：CB RED 连续触发时，若现场已落盘/注意力已切换，不重置恢复进度。
+            # 避免压力信号持续 RED 导致每轮重置 note_saved→强制 save_memory_note 死循环。
+            _cb_red_count = int(state.get("cb_consecutive_red_count", 0)) + 1
+            state["cb_consecutive_red_count"] = _cb_red_count
+            _already_recovered = bool(
+                state.get("cb_recovery_note_saved")
+                and state.get("cb_recovery_attention_switched")
+            )
+            if not _already_recovered or _cb_red_count <= 2:
+                # 首次/第二次 RED 或现场未落盘：正常重置恢复进度
+                state["cb_recovery_note_saved"] = False
+                state["cb_recovery_attention_switched"] = False
+                state["cb_recovery_start_result_count"] = len(state.get("tool_results_buffer") or [])
+            # 连续 RED 超过阈值且现场已落盘：保留恢复进度，不再强制重置，
+            # 让 LLM 能继续用完整工具集推进任务（压力由 apply_window 裁剪控制）
+            _CB_RED_HARD_STOP = 5
+            if _cb_red_count >= _CB_RED_HARD_STOP and _already_recovered:
+                logger.warning(
+                    "[FCRunner][CB] RED 连续 %d 次且现场已落盘，解除受限恢复，"
+                    "恢复完整工具集避免死循环（压力由窗口裁剪控制）",
+                    _cb_red_count,
+                )
+                state["cb_force_no_tools"] = False
+                state["cb_recovery_stage"] = ""
+                state["cb_consecutive_red_count"] = 0
+            else:
+                convergence = {
+                    "role": "user",
+                    "content": (
+                        f"[Circuit Breaker RED 受限恢复] {cb_reason}\n"
+                        "请先把当前证据、未完成项、失败原因、下一步建议写入便签/标签/记忆并关联当前任务节点，"
+                        "再进行一次 GLOBAL / FOCUS / SINGLE_CHAIN 注意力重选；"
+                        "本轮只允许使用便签/标签/记忆落盘和注意力切换能力。"
+                    ),
+                }
+                state.setdefault("messages", []).append(convergence)
             return True, cb_state.value, cb_reason
         if cb_state == CircuitBreakerState.YELLOW:
             hint = {
@@ -613,6 +687,8 @@ class FCRunner:
             }
             state.setdefault("messages", []).append(hint)
             return False, cb_state.value, cb_reason
+        # GREEN: 重置连续 RED 计数
+        state["cb_consecutive_red_count"] = 0
         return False, cb_state.value, cb_reason
 
     # ── 钩子方法（子类可覆盖）─────────────────────────────────

@@ -146,6 +146,72 @@ def _approval_block_response(tool_name: str, result_text: str) -> str:
     )
 
 
+def _try_repair_truncated_json(
+    raw_args: str,
+    original_error: str,
+    tool_name: str = "",
+) -> Tuple[Dict[str, Any], str]:
+    """尝试修复 LLM 输出截断导致的 JSON 解析失败。
+
+    常见截断模式：
+    - 字符串未闭合: {"content": "hello world   → 补上 "}
+    - 对象未闭合: {"content": "hello"}       → 补上 }
+    - 混合截断: 字符串内部被截断            → 补上 "} 闭合
+
+    只对写入类工具做修复（content 字段截断是主要场景），其他工具保持原始错误。
+    """
+    if not raw_args or not raw_args.strip():
+        return {}, original_error
+    text = raw_args.strip()
+    # 策略1：补缺失的尾部引号和括号
+    repaired = text
+    # 统计未闭合的字符串（奇数个引号）
+    in_string = False
+    escaped = False
+    for ch in text:
+        if escaped:
+            escaped = False
+            continue
+        if ch == '\\':
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+    if in_string:
+        repaired += '"'
+    # 统计未闭合的括号
+    brace_depth = repaired.count('{') - repaired.count('}')
+    bracket_depth = repaired.count('[') - repaired.count(']')
+    repaired += '}' * max(0, brace_depth)
+    repaired += ']' * max(0, bracket_depth)
+    # 尝试解析
+    try:
+        return _json.loads(repaired), ""
+    except Exception:
+        pass
+    # 策略2：如果 content 字段截断，尝试用空字符串闭合
+    # 模式: "content": "some text → "content": "some text"}
+    if '"content"' in text or "'content'" in text:
+        try:
+            # 找到最后一个完整的键值对，截断 content 值
+            idx = text.rfind('"content"')
+            if idx < 0:
+                idx = text.rfind("'content'")
+            if idx >= 0:
+                prefix = text[:idx]
+                # 尝试用 content="" 闭合
+                fallback = prefix + '"content": ""}'
+                brace_depth2 = fallback.count('{') - fallback.count('}')
+                fallback += '}' * max(0, brace_depth2)
+                return _json.loads(fallback), (
+                    f"content 字段截断已自动修复（原始错误: {original_error[:80]}），"
+                    f"content 已置空，请用 mode='append' 分段追加剩余内容"
+                )
+        except Exception:
+            pass
+    return {}, original_error
+
+
 def _tool_args_parse_error_result(tool_name: str, parse_error: str) -> str:
     payload = {
         "error": f"工具参数解析失败: {parse_error}",
@@ -649,10 +715,16 @@ def _make_exec_tools_node(engine: "InferenceEngine"):
             tool_name = tc_data["function"]["name"]
             tool_args = {}
             parse_error = ""
+            raw_args = tc_data["function"]["arguments"] or "{}"
             try:
-                tool_args = _json.loads(tc_data["function"]["arguments"] or "{}")
+                tool_args = _json.loads(raw_args)
             except Exception as exc:
                 parse_error = str(exc)
+                # 对写入类工具尝试自动修复截断的 JSON（LLM 长内容常被截断）
+                if tool_name in _WRITE_CONTENT_TOOLS and raw_args:
+                    tool_args, parse_error = _try_repair_truncated_json(
+                        raw_args, parse_error, tool_name
+                    )
 
             if parse_error:
                 logger.error(
@@ -802,7 +874,18 @@ def _make_exec_tools_node(engine: "InferenceEngine"):
                 ))
 
         # Circuit Breaker: 本轮所有工具执行完毕，评估状态
-        cb_state, cb_reason = engine._circuit_breaker.evaluate(fc_turn, messages)
+        # TSD §26.1.2: CB 压力信号应使用 apply_window 裁剪后的实际窗口压力，
+        # 不得用全量历史消息估算（会导致压力虚高、RED 死循环）。
+        _cb_attn_ratio = -1.0
+        _attn_window = getattr(engine, "_attn_window", None)
+        if _attn_window is not None:
+            try:
+                _cb_attn_ratio = float(getattr(_attn_window, "trigger_context_pressure_ratio", -1.0))
+            except Exception:
+                _cb_attn_ratio = -1.0
+        cb_state, cb_reason = engine._circuit_breaker.evaluate(
+            fc_turn, messages, attn_usage_ratio=_cb_attn_ratio
+        )
 
         cb_force_no_tools = False
         forced_next_tool_name = ""

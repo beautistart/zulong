@@ -399,14 +399,18 @@ class IdeOpenWorkspaceTool(BaseTool):
 
 
 class IdeWriteFileTool(BaseTool):
-    """Create a file or directory through the VS Code execution bridge."""
+    """Create, overwrite, append or edit a file through the VS Code execution bridge."""
 
     def __init__(self):
         super().__init__(name="ide_write_file", category=ToolCategory.CODE)
         self.description = (
-            "通过 VS Code 后台桥创建、覆写或追加宿主机文件，或创建文件夹/目录。"
+            "通过 VS Code 后台桥创建、覆写、追加或精准编辑宿主机文件，或创建文件夹/目录。"
             "适合用户明确要求在某个项目目录或绝对路径创建文件、文件夹、目录时使用。"
             "创建文件夹时必须设置 create_directory=true。"
+            "创建新文件或完全重写已有文件用 mode='overwrite'；"
+            "在文件末尾追加内容用 mode='append'；"
+            "精准修改已有文件用 mode='edit' 传 edits 操作列表（修 bug、加函数、改配置），"
+            "不需要传完整文件内容，编辑器内实时更新且支持撤销。"
             "长文件请按 800-1200 字符分片写入：第一片 mode=overwrite，后续 mode=append。"
             "创建新的项目根目录时不得自动回退到父目录作为 VS Code 工作区；"
             "应先由 task_create_plan 创建并绑定任务工作区，或显式传入已有 workspace_path。"
@@ -449,8 +453,21 @@ class IdeWriteFileTool(BaseTool):
             content = ""
         content = str(content)
         write_mode = str(params.get("mode") or params.get("write_mode") or "overwrite").lower()
-        if write_mode not in {"overwrite", "append"}:
+        if write_mode not in {"overwrite", "append", "edit"}:
             write_mode = "overwrite"
+        # mode="edit"：精准编辑已有文件，传 edits 操作列表，不传 content
+        edits = params.get("edits") or []
+        if write_mode == "edit":
+            if not edits:
+                return self._create_result(
+                    success=False,
+                    error="mode='edit' 需要传 edits 参数（操作列表），例如 [{\"op\":\"insert\",\"line\":5,\"text\":\"import os\\n\"}]",
+                    execution_time=time.time() - start,
+                    request_id=request.request_id,
+                )
+            if content:
+                # LLM 可能同时传了 content 和 edits，优先 edits，忽略 content
+                content = ""
         create_directory = bool(
             params.get("create_directory")
             or params.get("is_directory")
@@ -526,11 +543,15 @@ class IdeWriteFileTool(BaseTool):
                     request_id=request.request_id,
                 )
             effective_content = existing + content
-        tool_args: Dict[str, Any] = (
-            {"path": file_path}
-            if create_directory
-            else {"path": file_path, "content": effective_content}
-        )
+        # mode="edit"：走编辑器原生 API（WorkspaceEdit），不拼 content
+        if write_mode == "edit":
+            tool_args = {"path": file_path, "edits": edits}
+            tool_name = "apply_edits"
+            effective_content = ""
+        elif create_directory:
+            tool_args = {"path": file_path}
+        else:
+            tool_args = {"path": file_path, "content": effective_content}
         payload = {
             "workspace_path": workspace_path,
             "cwd": workspace_path,
@@ -565,6 +586,13 @@ class IdeWriteFileTool(BaseTool):
                 redirect_reason,
             )
         if not _ide_bridge_available(workspace_path):
+            if write_mode == "edit":
+                return self._create_result(
+                    success=False,
+                    error="VS Code 后台桥未连接，mode='edit' 需要 IDE 桥支持。请改用 mode='overwrite' 或 'append'。",
+                    execution_time=time.time() - start,
+                    request_id=request.request_id,
+                )
             result = _local_workspace_write(
                 file_path=file_path,
                 workspace_path=workspace_path,
@@ -608,7 +636,8 @@ class IdeWriteFileTool(BaseTool):
                 target = _resolve_ide_target_path(file_path, workspace_path, result)
                 if result.get("ok"):
                     verified = target.is_dir() if create_directory else target.is_file()
-                if result.get("ok") and verified and not create_directory:
+                # mode="edit" 走 WorkspaceEdit API，不比较文件内容（无 effective_content）
+                if result.get("ok") and verified and not create_directory and write_mode != "edit":
                     try:
                         actual = target.read_text(encoding="utf-8")
                         if actual != effective_content:
@@ -723,16 +752,42 @@ class IdeWriteFileTool(BaseTool):
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "要创建或覆写的文件路径，或要创建的文件夹/目录路径。可以是绝对路径；相对路径相对于 VS Code 工作区。",
+                    "description": "要创建、覆写、追加或编辑的文件路径，或要创建的文件夹/目录路径。可以是绝对路径；相对路径相对于 VS Code 工作区。",
                 },
                 "content": {
                     "type": "string",
-                    "description": "本次写入的文件内容。长文件不要一次性传完整内容，单片建议 800-1200 字符。创建空文件时传空字符串。创建文件夹/目录时可省略或传空字符串。",
+                    "description": "本次写入的文件内容（mode='overwrite' 或 'append' 时使用；mode='edit' 时省略）。长文件不要一次性传完整内容，单片建议 800-1200 字符。创建空文件时传空字符串。创建文件夹/目录时可省略或传空字符串。",
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["overwrite", "append"],
-                    "description": "写入模式。默认 overwrite 覆盖整个文件；append 会先读取现有文件并追加本次 content 后再通过 IDE 桥写入完整文件。",
+                    "enum": ["overwrite", "append", "edit"],
+                    "description": (
+                        "写入模式。默认 overwrite 覆盖整个文件；append 先读取现有文件并追加后写入；"
+                        "edit 通过 VS Code 编辑器原生 API 精准修改已有文件，传 edits 操作列表而不传 content，"
+                        "编辑器内实时更新且支持撤销。创建新文件用 overwrite，修改已有文件用 edit，追加用 append。"
+                    ),
+                },
+                "edits": {
+                    "type": "array",
+                    "description": (
+                        "mode='edit' 时的编辑操作列表（mode='overwrite'/'append' 时省略）。"
+                        "每项包含 op(insert/delete/replace/append) 和对应参数。"
+                        "insert: {\"op\":\"insert\",\"line\":N,\"text\":\"...\"} 在第 N 行前插入。"
+                        "delete: {\"op\":\"delete\",\"line\":N,\"count\":M} 从第 N 行起删 M 行。"
+                        "replace: {\"op\":\"replace\",\"start_line\":S,\"end_line\":E,\"text\":\"...\"} 替换 S 到 E 行。"
+                        "append: {\"op\":\"append\",\"text\":\"...\"} 追加到末尾。"
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": {"type": "string", "enum": ["insert", "delete", "replace", "append"]},
+                            "line": {"type": "integer", "description": "insert/delete 的行号"},
+                            "count": {"type": "integer", "description": "delete 的删除行数"},
+                            "start_line": {"type": "integer", "description": "replace 的起始行"},
+                            "end_line": {"type": "integer", "description": "replace 的结束行"},
+                            "text": {"type": "string", "description": "要插入/替换/追加的文本"},
+                        },
+                    },
                 },
                 "workspace_path": {
                     "type": "string",

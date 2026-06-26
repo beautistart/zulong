@@ -6,7 +6,7 @@ attention_selection:
   max_switch_history: 50
   min_confidence_threshold: 0.3
   oscillation_detection_window: 10
-  threshold_budget_ratio: '0.15'
+  threshold_budget_ratio: '0.50'
   pressure_threshold_high: '1.0'
   pressure_threshold_medium: '0.9'
 audio:
@@ -131,7 +131,7 @@ l2_inference:
   backup_model: deepseek-v4-pro
   circuit_breaker:
     bfs_min_interval: 3
-    threshold_budget_ratio: '0.15'
+    threshold_budget_ratio: '0.50'
     context_red_ratio: '1.0'
     context_window_size: 131072
     context_yellow_ratio: '0.9'

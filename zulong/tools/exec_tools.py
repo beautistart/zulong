@@ -50,6 +50,11 @@ COMMON_COMMAND_WHITELIST = {
 WINDOWS_COMMAND_WHITELIST = {
     "dir", "type", "copy", "move", "del", "where",
     "get-childitem", "select-string", "get-content", "set-content", "new-item",
+    # PowerShell 常用别名/命令（LLM 常用 Set-Location 代替 cd 等）
+    "set-location", "get-location", "set-variable", "get-variable",
+    "remove-item", "test-path", "copy-item", "move-item",
+    "write-output", "write-host", "out-string",
+    "invoke-expression", "start-process",
 }
 POSIX_COMMAND_WHITELIST = {
     "cat", "ls", "cp", "mv", "rm", "touch", "chmod", "chown",
@@ -204,7 +209,8 @@ def _scan_external_paths(command: str, workspace: Path) -> list:
 
     # Windows: 盘符后跟路径分隔符
 
-    win_pattern = _re.compile(r'[A-Za-z]:[/\\][^\s\'"`;,&|<>]+')
+    # Windows: 盘符后跟 \ 或 /，但排除 :// (URL 协议如 http://x.com 中的 p://x.com)
+    win_pattern = _re.compile(r'[A-Za-z]:(?!//)[/\\][^\s\'"`;,&|<>]+')
 
     # POSIX: / 开头，且不是单个 /
 

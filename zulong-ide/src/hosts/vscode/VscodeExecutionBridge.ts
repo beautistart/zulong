@@ -178,6 +178,9 @@ export class VscodeExecutionBridge {
 				return this.openSettings(args)
 			case "open_problems":
 				return this.openProblems(args)
+			// ===== 编辑器原生 API（实时编辑，进 undo stack）=====
+			case "apply_edits":
+				return this.applyEdits(args)
 			default:
 				throw new Error(`不支持的后台工具: ${toolName}`)
 		}
@@ -232,7 +235,7 @@ export class VscodeExecutionBridge {
 			original,
 			next: content,
 			operation: existed ? "modify" : "create",
-			summary: mode === "append" ? "追加文件内容" : (existed ? "更新文件内容" : "创建新文件"),
+			summary: mode === "append" ? "追加文件内容" : existed ? "更新文件内容" : "创建新文件",
 		})
 		if (!approved) {
 			return `用户未应用写入: ${filePath}`
@@ -240,7 +243,9 @@ export class VscodeExecutionBridge {
 		await fs.mkdir(path.dirname(filePath), { recursive: true })
 		await fs.writeFile(filePath, content, "utf-8")
 		this.sendFileChanged(filePath, existed ? "updated" : "created")
-		this.scheduleCheckpoint(`${mode === "append" ? "追加" : (existed ? "更新" : "创建")} ${path.relative(this.workspaceRoot(), filePath)}`)
+		this.scheduleCheckpoint(
+			`${mode === "append" ? "追加" : existed ? "更新" : "创建"} ${path.relative(this.workspaceRoot(), filePath)}`,
+		)
 		void this.openFile(filePath)
 		return `已应用文件变更: ${filePath}`
 	}
@@ -330,6 +335,75 @@ export class VscodeExecutionBridge {
 		return `已删除文件: ${filePath}`
 	}
 
+	/** 编辑器原生 API：实时编辑（WorkspaceEdit，进 undo stack，用户可视） */
+	private async applyEdits(args: Record<string, any>): Promise<string> {
+		const filePath = this.resolvePath(args.path || args.file_path)
+		this.ensureInsideWorkspace(filePath)
+		const edits: any[] = args.edits || []
+		if (!edits.length) {
+			return "edits 参数为空，未执行任何编辑操作"
+		}
+		const uri = vscode.Uri.file(filePath)
+		const we = new vscode.WorkspaceEdit()
+		const summaryParts: string[] = []
+		for (let i = 0; i < edits.length; i++) {
+			const e = edits[i]
+			const op = String(e.op || "").toLowerCase()
+			if (op === "insert") {
+				const line = Math.max(0, (Number(e.line) || 1) - 1)
+				const text = String(e.text || "")
+				we.insert(uri, new vscode.Position(line, 0), text)
+				summaryParts.push(`L${line + 1} +${text.split("\n").length}行`)
+			} else if (op === "delete") {
+				const line = Math.max(0, (Number(e.line) || 1) - 1)
+				const count = Math.max(1, Number(e.count) || 1)
+				we.delete(
+					uri,
+					new vscode.Range(
+						new vscode.Position(line, 0),
+						new vscode.Position(line + count - 1, Number.MAX_SAFE_INTEGER),
+					),
+				)
+				summaryParts.push(`L${line + 1} -${count}行`)
+			} else if (op === "replace") {
+				const sl = Math.max(0, (Number(e.start_line) || 1) - 1)
+				const el = Math.max(sl, (Number(e.end_line) || sl + 1) - 1)
+				const text = String(e.text || "")
+				we.replace(
+					uri,
+					new vscode.Range(new vscode.Position(sl, 0), new vscode.Position(el, Number.MAX_SAFE_INTEGER)),
+					text,
+				)
+				summaryParts.push(`L${sl + 1}-${el + 1} → ${text.split("\n").length}行`)
+			} else if (op === "append") {
+				// append = insert at end: read doc to get last line
+				const doc = await vscode.workspace.openTextDocument(uri)
+				const lastLine = doc.lineCount
+				const text = String(e.text || "")
+				we.insert(uri, new vscode.Position(lastLine, 0), "\n" + text)
+				summaryParts.push(`末尾 +${text.split("\n").length}行`)
+			}
+		}
+		const summary = summaryParts.join(", ") || `${edits.length} 个编辑操作`
+		const approved = await this.requestWebApproval(
+			"apply_edits",
+			`编辑 ${path.relative(this.workspaceRoot(), filePath)} (${summary})`,
+			"medium",
+			"将通过 VS Code 编辑器原生 API 直接应用修改",
+		)
+		if (!approved) {
+			return `用户未应用编辑: ${filePath}`
+		}
+		const applied = await vscode.workspace.applyEdit(we)
+		if (!applied) {
+			return `编辑未能应用（可能文件只读或被外部锁定）: ${filePath}`
+		}
+		this.sendFileChanged(filePath, "edited")
+		this.scheduleCheckpoint(`编辑 ${path.relative(this.workspaceRoot(), filePath)} (${summary})`)
+		void this.openFile(filePath)
+		return `已应用 ${summary}: ${filePath}`
+	}
+
 	private async listFiles(args: Record<string, any>): Promise<string> {
 		const root = this.resolvePath(args.path || ".")
 		this.ensureInsideWorkspace(root)
@@ -415,7 +489,9 @@ export class VscodeExecutionBridge {
 	}
 
 	private normalizeCommandShell(raw: unknown): "auto" | "cmd" | "powershell" | "git_bash" {
-		const value = String(raw || "auto").trim().toLowerCase()
+		const value = String(raw || "auto")
+			.trim()
+			.toLowerCase()
 		if (!value || value === "default" || value === "system") {
 			return "auto"
 		}
@@ -467,16 +543,9 @@ export class VscodeExecutionBridge {
 
 	private isUserDeniedResult(result: string): boolean {
 		const text = String(result || "").toLowerCase()
-		return [
-			"用户未应用",
-			"用户未允许",
-			"用户拒绝",
-			"审批拒绝",
-			"审批超时",
-			"审批未通过",
-			"未应用写入",
-			"未允许",
-		].some((marker) => text.includes(marker.toLowerCase()))
+		return ["用户未应用", "用户未允许", "用户拒绝", "审批拒绝", "审批超时", "审批未通过", "未应用写入", "未允许"].some(
+			(marker) => text.includes(marker.toLowerCase()),
+		)
 	}
 
 	private async fileExists(filePath: string): Promise<boolean> {
