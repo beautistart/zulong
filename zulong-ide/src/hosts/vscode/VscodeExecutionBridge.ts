@@ -276,6 +276,10 @@ export class VscodeExecutionBridge {
 			this.scheduleCheckpoint(
 				`${mode === "append" ? "追加" : existed ? "更新" : "创建"} ${path.relative(this.workspaceRoot(), filePath)}`,
 			)
+			// 写入后展示 diff 预览（让用户在 VS Code 里看到变更内容）
+			if (existed && original !== content) {
+				await this.openDiffPreview(filePath, original, content, `祖龙差异: ${path.basename(filePath)}`)
+			}
 			void this.openFile(filePath)
 			return `已应用文件变更: ${filePath}`
 		}
@@ -374,6 +378,8 @@ export class VscodeExecutionBridge {
 			return "edits 参数为空，未执行任何编辑操作"
 		}
 		const uri = vscode.Uri.file(filePath)
+		// 读取编辑前的原始内容（用于 diff 预览）
+		const editOriginal = await fs.readFile(filePath, "utf-8")
 		const we = new vscode.WorkspaceEdit()
 		const summaryParts: string[] = []
 		for (let i = 0; i < edits.length; i++) {
@@ -430,6 +436,15 @@ export class VscodeExecutionBridge {
 		}
 		this.sendFileChanged(filePath, "edited")
 		this.scheduleCheckpoint(`编辑 ${path.relative(this.workspaceRoot(), filePath)} (${summary})`)
+		// 编辑后展示 diff 预览
+		try {
+			const editedContent = await fs.readFile(filePath, "utf-8")
+			if (editOriginal !== editedContent) {
+				await this.openDiffPreview(filePath, editOriginal, editedContent, `祖龙编辑差异: ${path.basename(filePath)}`)
+			}
+		} catch (_) {
+			// diff 预览失败不阻塞
+		}
 		void this.openFile(filePath)
 		return `已应用 ${summary}: ${filePath}`
 	}
@@ -1043,11 +1058,21 @@ export class VscodeExecutionBridge {
 			this.ensureInsideWorkspace(resolvedPath)
 		}
 		const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(resolvedPath))
-		const editor = await vscode.window.showTextDocument(doc, { preview: false })
+		const editor = await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.One })
+		// 强制聚焦 VS Code 窗口
+		await vscode.commands.executeCommand("workbench.action.focusActiveEditor")
 		if (line && line > 0) {
 			const position = new vscode.Position(line - 1, 0)
 			editor.selection = new vscode.Selection(position, position)
-			editor.revealRange(new vscode.Range(position, position))
+			editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter)
+		} else {
+			// 无指定行时，跳到文件末尾（新建/追加内容时跟踪最新写入位置）
+			const lastLine = doc.lineCount - 1
+			if (lastLine > 0) {
+				const position = new vscode.Position(lastLine, 0)
+				editor.selection = new vscode.Selection(position, position)
+				editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter)
+			}
 		}
 	}
 
