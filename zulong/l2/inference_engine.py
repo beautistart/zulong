@@ -503,7 +503,11 @@ class InferenceEngine:
         # 确定目标后端
         target_backend = backend or cm.get('llm.backend', 'ollama')
         target_config = cm.get_dict(f'llm.{target_backend}', {})
-        if not target_config:
+        # 对于 openai_compatible / custom 等中转站后端，llm.* 配置区可能不存在
+        # 此时直接用传入的参数（base_url/model_id/api_key 来自 registry）
+        if not target_config and (base_url and model_id):
+            target_config = {}  # 不从配置读，用传入参数
+        elif not target_config:
             return False, f"后端 '{target_backend}' 未配置"
         
         target_base_url = base_url or target_config.get('base_url', '')
