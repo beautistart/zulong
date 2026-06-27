@@ -540,6 +540,7 @@ class InferenceEngine:
         
         # 更新配置文件（持久化）
         cm.config['llm']['backend'] = target_backend
+        cm.config['llm'].setdefault(target_backend, {})
         if model_id:
             cm.config['llm'][target_backend]['model_id'] = model_id
         if base_url:
