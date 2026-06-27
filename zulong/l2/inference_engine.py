@@ -366,32 +366,20 @@ class InferenceEngine:
             self._ensure_search_tools_tool_rag_bound()
 
             # 🔥 LLM 后端客户端（统一使用 OpenAI 兼容 API）
+            # 注意：这里用 llm.* 配置区初始化默认客户端，但 _apply_registry_llm_config() 会覆盖
             if VLLM_AVAILABLE:
                 try:
                     self.vllm_client = OpenAI(
                         base_url=LLM_BASE_URL,
                         api_key=LLM_API_KEY,
                     )
-                    logger.info(f"✅ [LLM] CORE 客户端已初始化：{LLM_BACKEND} @ {LLM_BASE_URL}")
+                    logger.info(f"✅ [LLM] CORE 默认客户端已初始化：{LLM_BACKEND} @ {LLM_BASE_URL}")
                 except Exception as e:
-                    logger.warning(f"⚠️ [LLM] CORE 客户端初始化失败：{e}，将使用本地模型")
+                    logger.warning(f"⚠️ [LLM] CORE 默认客户端初始化失败：{e}")
                     self.vllm_client = None
-                
-                # 🔥 备用模型客户端（L2 BACKUP）
-                # 当 CORE 与 BACKUP 使用相同端点时，复用同一客户端对象
-                try:
-                    if LLM_BASE_URL_BACKUP == LLM_BASE_URL and LLM_API_KEY_BACKUP == LLM_API_KEY:
-                        self.backup_client = self.vllm_client
-                        logger.info(f"✅ [LLM] BACKUP 复用 CORE 客户端（同一端点），模型: {LLM_MODEL_ID_BACKUP}")
-                    else:
-                        self.backup_client = OpenAI(
-                            base_url=LLM_BASE_URL_BACKUP,
-                            api_key=LLM_API_KEY_BACKUP,
-                        )
-                        logger.info(f"✅ [LLM] BACKUP 客户端已初始化：{LLM_BASE_URL_BACKUP}，模型: {LLM_MODEL_ID_BACKUP}")
-                except Exception as e:
-                    logger.warning(f"⚠️ [LLM] BACKUP 客户端初始化失败：{e}")
-                    self.backup_client = None
+
+                # 默认备用客户端（_apply_registry_llm_config 会覆盖）
+                self.backup_client = self.vllm_client
             else:
                 self.vllm_client = None
                 self.backup_client = None
