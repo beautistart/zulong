@@ -326,13 +326,11 @@ def predict_tools_for_turn(
         task_graph_policy = "inspect_or_create"
 
     if _needs_write(lower) and not context_bundle.get("needs_memory_write"):
-        if _has_explicit_host_path(text):
-            add(["ide_write_file"], "用户请求在明确的宿主机路径创建或修改文件")
-            context_bundle["needs_ide_file_write"] = True
-            if _needs_directory_create(lower):
-                context_bundle["needs_directory_create"] = True
-        else:
-            add(["exec_write_file"], "用户请求在当前任务工作区创建或修改文件")
+        # 统一用 exec_write_file：内部自动检测 VS Code 桥状态路由
+        # （桥可用→编辑器实时通道；桥不可用→本地静默写入）
+        add(["exec_write_file"], "用户请求创建或修改文件")
+        if _needs_directory_create(lower):
+            context_bundle["needs_directory_create"] = True
         add(["task_attach_file", "zulong_memory_write_with_code"], "用户请求创建或修改文件/代码")
         risk_notes.append("涉及文件写入，应走 diff、审批和 checkpoint。")
         task_graph_policy = "inspect_or_create"

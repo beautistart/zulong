@@ -452,8 +452,52 @@ class ExecWriteFileTool(BaseTool):
             # 创建父目录
             target.parent.mkdir(parents=True, exist_ok=True)
 
-            # mode="edit"：精准编辑已有文件（行操作）
-            if mode == "edit":
+            # ===== 桥路由：VS Code 桥可用时走编辑器实时通道 =====
+            _bridge_used = False
+            try:
+                from .ide_bridge_tools import _ide_bridge_available, _run_async_request
+                if _ide_bridge_available(str(workspace)):
+                    if mode == "edit":
+                        if not target.exists():
+                            return self._create_result(
+                                success=False,
+                                error=f"edit 模式要求文件已存在，但文件不存在: {target}",
+                                execution_time=time.time() - start_time,
+                                request_id=request.request_id,
+                            )
+                        _bridge_result = _run_async_request("ide:execute_tool", {
+                            "tool_name": "apply_edits",
+                            "arguments": {"path": str(target), "edits": edits},
+                            "workspace_path": str(workspace),
+                            "cwd": str(workspace),
+                            "source": "exec_write_file_bridge_edit",
+                        })
+                    else:
+                        # overwrite/append：桥走 write_to_file
+                        _pre_existing = ""
+                        if mode == "append" and target.exists():
+                            try:
+                                _pre_existing = target.read_text(encoding="utf-8")
+                            except Exception:
+                                _pre_existing = ""
+                        _bridge_content = _pre_existing + content if mode == "append" else content
+                        _bridge_result = _run_async_request("ide:execute_tool", {
+                            "tool_name": "write_to_file",
+                            "arguments": {"path": str(target), "content": _bridge_content, "mode": mode},
+                            "workspace_path": str(workspace),
+                            "cwd": str(workspace),
+                            "source": "exec_write_file_bridge_write",
+                        })
+                    if _bridge_result.get("ok"):
+                        _bridge_used = True
+                        logger.info("[exec_write_file] 桥写入成功: %s mode=%s", target, mode)
+                    else:
+                        logger.warning("[exec_write_file] 桥写入失败，回退本地: %s", _bridge_result.get("error", ""))
+            except Exception as _bridge_exc:
+                logger.debug("[exec_write_file] 桥检测/写入异常，回退本地: %s", _bridge_exc)
+
+            # mode="edit"：精准编辑已有文件（本地兜底，桥已处理则跳过）
+            if mode == "edit" and not _bridge_used:
                 if not target.exists():
                     return self._create_result(
                         success=False,
@@ -466,7 +510,7 @@ class ExecWriteFileTool(BaseTool):
                     file_path=str(target),
                     edits=edits,
                     workspace_path=str(workspace),
-                    reason="exec_write_file mode=edit",
+                    reason="exec_write_file mode=edit (local fallback)",
                 )
                 if edit_result.get("ok"):
                     _broadcast_local_file_change(
@@ -483,27 +527,32 @@ class ExecWriteFileTool(BaseTool):
                     execution_time=time.time() - start_time,
                     request_id=request.request_id,
                 )
-
-            # 写入文件
-            existing = ""
-            if mode == "append" and target.exists():
-                try:
-                    existing = target.read_text(encoding="utf-8")
-                except Exception as exc:
-                    return self._create_result(
-                        success=False,
-                        data={
-                            "file_path": str(target),
-                            "mode": mode,
-                            "recoverable": True,
-                            "next_action": "请改用 mode='overwrite' 重新写入第一片，后续再 append。",
-                        },
-                        error=f"append 前无法读取现有文件: {file_path} ({exc})",
-                        execution_time=time.time() - start_time,
-                        request_id=request.request_id,
-                    )
-            effective_content = existing + content if mode == "append" else content
-            target.write_text(effective_content, encoding="utf-8")
+            elif mode == "edit" and _bridge_used:
+                # edit 模式桥写入成功，走统一后处理
+                existing = ""
+                effective_content = ""
+            else:
+                # overwrite/append 本地写入（桥未用或失败）
+                existing = ""
+                if mode == "append" and target.exists():
+                    try:
+                        existing = target.read_text(encoding="utf-8")
+                    except Exception as exc:
+                        return self._create_result(
+                            success=False,
+                            data={
+                                "file_path": str(target),
+                                "mode": mode,
+                                "recoverable": True,
+                                "next_action": "请改用 mode='overwrite' 重新写入第一片，后续再 append。",
+                            },
+                            error=f"append 前无法读取现有文件: {file_path} ({exc})",
+                            execution_time=time.time() - start_time,
+                            request_id=request.request_id,
+                        )
+                effective_content = existing + content if mode == "append" else content
+                if not _bridge_used:
+                    target.write_text(effective_content, encoding="utf-8")
             expected_bytes = len(effective_content.encode("utf-8"))
             verified = target.is_file()
             actual_bytes = target.stat().st_size if verified else -1
