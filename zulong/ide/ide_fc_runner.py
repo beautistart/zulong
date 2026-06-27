@@ -5585,6 +5585,30 @@ class IDEFCRunner(FCRunner):
         # 所有指标都无变化 → 停滞
         return True
 
+    @staticmethod
+    def _call_llm_via_gateway(kw: dict):
+        """通过 litellm 网关调用 LLM（替代 vllm_client.chat.completions.create）。"""
+        from zulong.l2.llm_gateway import llm_completion
+        import zulong.models.container as _mc
+        _model = kw.pop("model", _mc.LLM_MODEL_ID)
+        _messages = kw.pop("messages", [])
+        _stream = kw.pop("stream", False)
+        _tools = kw.pop("tools", None)
+        _tool_choice = kw.pop("tool_choice", None)
+        _max_tokens = kw.pop("max_tokens", 1024)
+        _temperature = kw.pop("temperature", 0.3)
+        _top_p = kw.pop("top_p", 0.85)
+        _extra_body = kw.pop("extra_body", None)
+        if _extra_body:
+            kw.update(_extra_body)
+        return llm_completion(
+            model=_model, messages=_messages,
+            api_base=_mc.LLM_BASE_URL, api_key=_mc.LLM_API_KEY,
+            stream=_stream, tools=_tools, tool_choice=_tool_choice,
+            max_tokens=_max_tokens, temperature=_temperature, top_p=_top_p,
+            timeout=300, **kw,
+        )
+
     def _build_dynamic_attention_context_message(
         self,
         state: IDEFCState,
@@ -5773,7 +5797,7 @@ class IDEFCRunner(FCRunner):
                 state.force_first_tool = False
             kw["tool_choice"] = "auto"
         future = self._model_executor.submit(
-            lambda: self.engine.vllm_client.chat.completions.create(**kw))
+            lambda: self._call_llm_via_gateway(kw))
         try:
             # 流式响应处理
             stream_response = future.result(timeout=self._fc_loop_timeout)
@@ -5945,7 +5969,7 @@ class IDEFCRunner(FCRunner):
                 time.sleep(wait_secs)
                 try:
                     # 重试也使用流式
-                    retry_stream = self.engine.vllm_client.chat.completions.create(**kw)
+                    retry_stream = self._call_llm_via_gateway(dict(kw))
                     full_content = ""
                     sentence_buffer = ""
                     sent_count = 0
@@ -6060,12 +6084,16 @@ class IDEFCRunner(FCRunner):
                     f"[IDEFCRunner] 连续 {state.api_timeout_count} 次 API 错误，触发退出")
                 return None, None
             try:
-                from zulong.models.container import LLM_MODEL_ID_BACKUP
-                if self.engine.backup_client and LLM_MODEL_ID_BACKUP:
-                    br = self.engine.backup_client.chat.completions.create(
+                from zulong.models.container import LLM_MODEL_ID_BACKUP, LLM_BASE_URL_BACKUP, LLM_API_KEY_BACKUP
+                import zulong.models.container as _mc_bk
+                if LLM_MODEL_ID_BACKUP:
+                    from zulong.l2.llm_gateway import llm_completion as _lc_bk
+                    br = _lc_bk(
                         model=LLM_MODEL_ID_BACKUP, messages=state.messages,
+                        api_base=LLM_BASE_URL_BACKUP, api_key=LLM_API_KEY_BACKUP,
                         max_tokens=state.response_max_tokens, temperature=0.3,
-                        stream=False, **self.engine._get_llm_extra_kwargs())
+                        stream=False, timeout=self.engine._backup_timeout,
+                    )
                     c = br.choices[0].message.content or ""
                     state.last_response_content = c
                     self._record_model_raw_output(
@@ -8560,12 +8588,15 @@ class IDEFCRunner(FCRunner):
             },
         ]
         try:
-            review = backup_client.chat.completions.create(
+            from zulong.l2.llm_gateway import llm_completion as _lc_review
+            review = _lc_review(
                 model=LLM_MODEL_ID_BACKUP,
                 messages=messages,
+                api_base=LLM_BASE_URL_BACKUP, api_key=LLM_API_KEY_BACKUP,
                 max_tokens=800,
                 temperature=0.0,
                 stream=False,
+                timeout=120,
             )
             text = review.choices[0].message.content or ""
             data = self._parse_reviewer_json(text)

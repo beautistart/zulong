@@ -459,7 +459,23 @@ def _make_call_model_node(engine: "InferenceEngine"):
             time.sleep(_req_interval)
 
         def _call(kwargs=api_kwargs):
-            return engine.vllm_client.chat.completions.create(**kwargs)
+            from zulong.l2.llm_gateway import llm_completion
+            import zulong.models.container as _mc
+            _model = kwargs.pop("model", _mc.LLM_MODEL_ID)
+            _messages = kwargs.pop("messages", [])
+            _stream = kwargs.pop("stream", False)
+            _tools = kwargs.pop("tools", None)
+            _tool_choice = kwargs.pop("tool_choice", None)
+            _max_tokens = kwargs.pop("max_tokens", 1024)
+            _temperature = kwargs.pop("temperature", 0.3)
+            _top_p = kwargs.pop("top_p", 0.85)
+            return llm_completion(
+                model=_model, messages=_messages,
+                api_base=_mc.LLM_BASE_URL, api_key=_mc.LLM_API_KEY, backend=_mc.LLM_BACKEND,
+                stream=_stream, tools=_tools, tool_choice=_tool_choice,
+                max_tokens=_max_tokens, temperature=_temperature, top_p=_top_p,
+                timeout=engine._fc_loop_timeout, **kwargs,
+            )
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
@@ -502,15 +518,18 @@ def _make_call_model_node(engine: "InferenceEngine"):
                     f"[FC][Graph] 连续 {api_timeout_count} 次超时，尝试备用模型"
                 )
                 try:
-                    from zulong.models.container import LLM_MODEL_ID_BACKUP
-                    if engine.backup_client and LLM_MODEL_ID_BACKUP:
-                        backup_resp = engine.backup_client.chat.completions.create(
+                    from zulong.models.container import LLM_MODEL_ID_BACKUP, LLM_BASE_URL_BACKUP, LLM_API_KEY_BACKUP
+                    import zulong.models.container as _mc2
+                    if LLM_MODEL_ID_BACKUP:
+                        from zulong.l2.llm_gateway import llm_completion as _lc2
+                        backup_resp = _lc2(
                             model=LLM_MODEL_ID_BACKUP,
                             messages=strip_llm_message_metadata(messages),
+                            api_base=LLM_BASE_URL_BACKUP, api_key=LLM_API_KEY_BACKUP,
+                            backend=_mc2.LLM_BACKEND,
                             max_tokens=state.get("response_max_tokens", 1024),
-                            temperature=0.3,
-                            stream=False,
-                            **engine._get_llm_extra_kwargs(),
+                            temperature=0.3, stream=False,
+                            timeout=engine._backup_timeout,
                         )
                         return {
                             "response": backup_resp.choices[0].message.content or "",

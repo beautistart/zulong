@@ -6,9 +6,9 @@ attention_selection:
   max_switch_history: 50
   min_confidence_threshold: 0.3
   oscillation_detection_window: 10
-  threshold_budget_ratio: '0.50'
   pressure_threshold_high: '1.0'
   pressure_threshold_medium: '0.9'
+  threshold_budget_ratio: '0.50'
 audio:
   asr:
     backend: sensevoice
@@ -56,7 +56,7 @@ environments:
         enabled: false
   production:
     llm:
-      backend: deepseek
+      backend: openai
     monitoring:
       performance:
         enabled: true
@@ -131,7 +131,6 @@ l2_inference:
   backup_model: deepseek-v4-pro
   circuit_breaker:
     bfs_min_interval: 3
-    threshold_budget_ratio: '0.50'
     context_red_ratio: '1.0'
     context_window_size: 131072
     context_yellow_ratio: '0.9'
@@ -144,6 +143,7 @@ l2_inference:
     pattern_yellow_count: 8
     query_similarity_threshold: 0.85
     safety_hard_cap: null
+    threshold_budget_ratio: '0.50'
     time_red_seconds: 120
     time_yellow_seconds: 60
   core_model: deepseek-v4-pro
@@ -231,7 +231,7 @@ llm:
     base_url: http://localhost:11434/v1
     model_id: qwen3.5:4b
   deepseek:
-    api_key: ${DEEPSEEK_API_KEY}
+    api_key: sk-e8cb32e9686f4e66a1ea7119458ec8e2
     backend: deepseek
     base_url: https://api.deepseek.com
     model_id: deepseek-v4-pro
@@ -253,11 +253,11 @@ llm:
     api_key: EMPTY
     auto_discover: 'true'
     backend: ollama
-    backup_model_id: qwen3.5:4b
+    backup_model_id: qwen2.5-coder:1.5b
     base_url: http://localhost:11434/v1
     health_check_interval: '30'
     keep_alive: 5m
-    model_id: deepseek-v4-pro:cloud
+    model_id: qwen2.5-coder:1.5b
     num_ctx: 1048576
     num_predict: 1024
   oneapi:
@@ -266,13 +266,13 @@ llm:
     base_url: http://localhost:3000/v1
     model_id: gpt-4o-mini
   openai:
-    api_key: ${OPENAI_API_KEY}
+    api_key: sk-9fa9d0962c1444d34ff22b7afa067c55307369ef9d9100aad5a264f82726014d
     backend: openai
-    base_url: https://api.openai.com/v1
+    base_url: https://api.super-nb.me/v1
     fallback_models:
     - gpt-3.5-turbo
     - gpt-4-turbo
-    model_id: gpt-4o-mini
+    model_id: gpt-5.5
   openrouter:
     api_key: ${OPENROUTER_API_KEY}
     app_name: zulong
@@ -326,105 +326,6 @@ llm:
     model_id: ./models/Qwen/Qwen3___5-0.8B-AWQ
     tensor_parallel_size: 1
     tool_call_parser: qwen3_xml
-models:
-  registry:
-  # === L1-A 反射层（可选运动模型，没有就为空/规则驱动）===
-  - id: l1a_motion
-    name: L1-A 运动控制模型
-    layer: l1_a
-    backend: transformer
-    model_path: ''
-    device: cpu
-    enabled: false
-  # === L1-B 调度层（2 个模型各自独立）===
-  - id: l1b_albert
-    name: ALBERT 意图分类
-    layer: l1_b
-    backend: transformer
-    model_path: ./models/albert-tiny-chinese
-    device: cpu
-    enabled: true
-  - id: l1b_qwen35
-    name: Qwen3.5-0.8B 调度
-    layer: l1_b
-    backend: transformer
-    model_path: ./models/Qwen/Qwen3___5-0___8B-Base
-    device: cpu
-    enabled: true
-  # === L1-C 视觉层（3 个模型各自独立配置）===
-  - id: l1c_yolo
-    name: YOLOv10 人体检测
-    layer: l1_c
-    backend: yolo
-    model_path: models/yolov10n.pt
-    device: auto
-    confidence: 0.25
-    enabled: true
-  - id: l1c_mobilenet
-    name: MobileNetV4-TSM 动作分类
-    layer: l1_c
-    backend: transformer
-    model_path: ./models/mobilenet-v4-tsm
-    device: cpu
-    enabled: true
-  - id: l1c_mediapipe
-    name: MediaPipe 手势姿态
-    layer: l1_c
-    backend: mediapipe
-    enabled: true
-  # === L1-D 音频层（ASR + TTS 各独立）===
-  - id: l1d_sensevoice
-    name: SenseVoice ASR
-    layer: l1_d
-    backend: sensevoice
-    model_path: ./models/OpenASR/sensevoice-small-onnx
-    device: auto
-    enabled: true
-  - id: l1d_kokoro
-    name: Kokoro TTS
-    layer: l1_d
-    backend: kokoro
-    model_path: ./models/hexgrad/Kokoro-82M
-    voice: zf_xiaoxiao
-    enabled: true
-  # === L2 推理核心（云端 API，支持多个）===
-  - id: l2_botcf
-    name: BotCF DeepSeek V4
-    layer: l2_core
-    backend: openai
-    model_id: deepseek-v4-pro
-    base_url: https://api.botcf.com/v1
-    api_key: ${BOTCF_API_KEY}
-    num_ctx: 131072
-    enabled: true
-  - id: l2_ollama
-    name: Ollama 本地备用
-    layer: l2_backup
-    backend: ollama
-    model_id: qwen3.5:4b
-    base_url: http://localhost:11434/v1
-    api_key: EMPTY
-    num_ctx: 131072
-    enabled: false
-  # === L3 专家层（Web 端可增减）===
-  - id: l3_nav
-    name: 导航专家
-    layer: l3
-    backend: transformer
-    model_path: ''
-    enabled: true
-  - id: l3_manipulation
-    name: 操作专家
-    layer: l3
-    backend: transformer
-    model_path: ''
-    enabled: true
-  - id: l3_vision
-    name: 视觉专家
-    layer: l3
-    backend: transformer
-    model_path: ''
-    enabled: true
 memory:
   episodic:
     consolidation_threshold: 0.5
@@ -473,6 +374,101 @@ memory:
     persistence_enabled: true
     persistence_path: ./data/short_term_memory
     ttl: 3600
+models:
+  registry:
+  - backend: transformer
+    device: cpu
+    enabled: false
+    id: l1a_motion
+    layer: l1_a
+    model_path: ''
+    name: L1-A 运动控制模型
+  - backend: transformer
+    device: cpu
+    enabled: true
+    id: l1b_albert
+    layer: l1_b
+    model_path: ./models/albert-tiny-chinese
+    name: ALBERT 意图分类
+  - backend: transformer
+    device: cpu
+    enabled: false
+    id: l1b_qwen35
+    layer: l1_b
+    model_path: ./models/Qwen/Qwen3___5-0___8B-Base
+    name: Qwen3.5-0.8B 调度
+  - backend: yolo
+    confidence: 0.25
+    device: auto
+    enabled: true
+    id: l1c_yolo
+    layer: l1_c
+    model_path: models/yolov10n.pt
+    name: YOLOv10 人体检测
+  - backend: transformer
+    device: cpu
+    enabled: true
+    id: l1c_mobilenet
+    layer: l1_c
+    model_path: ./models/mobilenet-v4-tsm
+    name: MobileNetV4-TSM 动作分类
+  - backend: mediapipe
+    enabled: true
+    id: l1c_mediapipe
+    layer: l1_c
+    name: MediaPipe 手势姿态
+  - backend: sensevoice
+    device: auto
+    enabled: true
+    id: l1d_sensevoice
+    layer: l1_d
+    model_path: ./models/OpenASR/sensevoice-small-onnx
+    name: SenseVoice ASR
+  - backend: kokoro
+    enabled: true
+    id: l1d_kokoro
+    layer: l1_d
+    model_path: ./models/hexgrad/Kokoro-82M
+    name: Kokoro TTS
+    voice: zf_xiaoxiao
+  - api_format: chat_completions
+    api_key: sk-9fa9d0962c1444d34ff22b7afa067c55307369ef9d9100aad5a264f82726014d
+    backend: openai_compatible
+    base_url: https://api.super-nb.me/v1
+    enabled: true
+    id: l2_botcf
+    layer: l2_core
+    model_id: gpt-5.5
+    name: BotCF DeepSeek V4
+    num_ctx: 1048576
+  - api_format: chat_completions
+    api_key: sk-208e685e2a126b5b909e0e34611d6683e31308d8cd413b789d2e0ad516931a4b
+    backend: openai_compatible
+    base_url: https://api.super-nb.me/v1
+    enabled: true
+    id: l2_ollama
+    layer: l2_backup
+    model_id: gpt-5.5
+    name: Ollama 本地备用
+    num_ctx: 131072
+  - backend: transformer
+    enabled: true
+    id: l3_nav
+    layer: l3
+    model_path: ''
+    name: 导航专家
+  - backend: transformer
+    enabled: true
+    id: l3_manipulation
+    layer: l3
+    model_path: ''
+    name: 操作专家
+  - backend: transformer
+    enabled: true
+    id: l3_vision
+    layer: l3
+    model_path: ''
+    name: 视觉专家
 monitoring:
   debug:
     backup_count: 5

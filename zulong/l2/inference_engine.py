@@ -93,14 +93,19 @@ class _AttentionDecisionClient:
             return '{"mode":"GLOBAL","reason":"无注意力决策输入","confidence":0.5}'
 
         def _call() -> str:
-            response = self._engine.vllm_client.chat.completions.create(
-                model=LLM_MODEL_ID,
+            from zulong.l2.llm_gateway import llm_completion
+            import zulong.models.container as _mc
+            response = llm_completion(
+                model=_mc.LLM_MODEL_ID,
                 messages=[{"role": "user", "content": prompt}],
+                api_base=_mc.LLM_BASE_URL,
+                api_key=_mc.LLM_API_KEY,
+                backend=_mc.LLM_BACKEND,
                 max_tokens=256,
                 temperature=0.1,
                 top_p=0.8,
                 stream=False,
-                **self._engine._get_llm_extra_kwargs(),
+                timeout=30,
             )
             return response.choices[0].message.content or ""
 
@@ -443,6 +448,9 @@ class InferenceEngine:
                     l2_backup_model = m
 
             if l2_core_model:
+                # 存储 api_format 到全局变量（litellm 网关用）
+                import zulong.models.container as _mc_core
+                _mc_core.LLM_API_FORMAT = l2_core_model.get("api_format", "chat_completions")
                 success, msg = self.hot_switch_llm(
                     backend=l2_core_model.get("backend", "openai"),
                     model_id=l2_core_model.get("model_id", ""),
@@ -451,9 +459,10 @@ class InferenceEngine:
                 )
                 if success:
                     logger.info(
-                        "[LLM] Registry L2_CORE 已应用: %s @ %s",
+                        "[LLM] Registry L2_CORE 已应用: %s @ %s (format=%s)",
                         l2_core_model.get("model_id", ""),
                         l2_core_model.get("base_url", ""),
+                        _mc_core.LLM_API_FORMAT,
                     )
                 else:
                     logger.warning("[LLM] Registry L2_CORE 应用失败: %s", msg)
@@ -464,19 +473,14 @@ class InferenceEngine:
                 _mc.LLM_MODEL_ID_BACKUP = l2_backup_model.get("model_id", _mc.LLM_MODEL_ID_BACKUP)
                 _mc.LLM_BASE_URL_BACKUP = l2_backup_model.get("base_url", _mc.LLM_BASE_URL_BACKUP)
                 _mc.LLM_API_KEY_BACKUP = l2_backup_model.get("api_key", _mc.LLM_API_KEY_BACKUP)
-                try:
-                    from openai import OpenAI as _OpenAI
-                    self.backup_client = _OpenAI(
-                        base_url=l2_backup_model.get("base_url", ""),
-                        api_key=l2_backup_model.get("api_key", "EMPTY"),
-                    )
-                    logger.info(
-                        "[LLM] Registry L2_BACKUP 已应用: %s @ %s",
-                        l2_backup_model.get("model_id", ""),
-                        l2_backup_model.get("base_url", ""),
-                    )
-                except Exception as e:
-                    logger.warning("[LLM] Registry L2_BACKUP 应用失败: %s", e)
+                _mc.LLM_API_FORMAT_BACKUP = l2_backup_model.get("api_format", "chat_completions")
+                # 备用客户端不再需要 OpenAI 对象（litellm 网关处理）
+                self.backup_client = True  # 标记可用（litellm 网关处理实际调用）
+                logger.info(
+                    "[LLM] Registry L2_BACKUP 已应用: %s @ %s",
+                    l2_backup_model.get("model_id", ""),
+                    l2_backup_model.get("base_url", ""),
+                )
         except Exception as e:
             logger.debug("[LLM] Registry LLM 配置应用异常（不影响默认初始化）: %s", e)
 
@@ -577,7 +581,6 @@ class InferenceEngine:
             ollama_options = {}
             if num_ctx > 0:
                 ollama_options["num_ctx"] = num_ctx
-            # 从配置读取 Ollama 特定参数
             try:
                 from zulong.config.config_manager import get_config_manager
                 cm = get_config_manager()
@@ -585,17 +588,9 @@ class InferenceEngine:
                 num_predict = ollama_cfg.get("num_predict")
                 if num_predict:
                     ollama_options["num_predict"] = int(num_predict)
-                keep_alive = ollama_cfg.get("keep_alive")
-                if keep_alive:
-                    ollama_options["mirostat"] = 0  # 默认关闭 mirostat
             except Exception:
                 pass
-            extra_body = {
-                # Ollama thinking models use `think`; Qwen-compatible
-                # backends commonly use `enable_thinking`.
-                "think": False,
-                "enable_thinking": False,
-            }
+            extra_body = {"think": False, "enable_thinking": False}
             if ollama_options:
                 extra_body["options"] = ollama_options
             extra_kw["extra_body"] = extra_body
@@ -616,18 +611,22 @@ class InferenceEngine:
                     extra_kw["extra_headers"] = or_headers
             except Exception:
                 pass
-            extra_kw["extra_body"] = {"enable_thinking": False}
 
-        # DeepSeek API：使用官方 thinking 参数禁用思考模式
+        # DeepSeek 官方 API：使用 thinking 参数
         elif backend == "deepseek":
             extra_kw["extra_body"] = {"thinking": {"type": "disabled"}}
 
-        # 中转站/代理后端：通用处理
+        # OpenAI 官方 API：不发 extra_body（官方不支持 enable_thinking）
+        elif backend == "openai":
+            pass  # 干净的 OpenAI 格式
+
+        # 中转站/OpenAI 兼容 API（oneapi/custom/openai_compatible/siliconflow 等）：
+        # 发送最小化的 extra_body，只禁用思维链
         elif backend in {"siliconflow", "oneapi", "custom", "openai_compatible"}:
             extra_kw["extra_body"] = {"enable_thinking": False}
 
-        else:
-            extra_kw["extra_body"] = {"enable_thinking": False}
+        # 其他未知后端：默认不发 extra_body（避免不兼容参数导致 503/400）
+        # else: pass — 干净的 OpenAI 兼容格式
 
         return extra_kw
 
@@ -2355,14 +2354,19 @@ class InferenceEngine:
             messages_for_llm = strip_llm_message_metadata(messages)
 
             def call_vllm():
-                return self.vllm_client.chat.completions.create(
+                from zulong.l2.llm_gateway import llm_completion
+                import zulong.models.container as _mc
+                return llm_completion(
                     model=vllm_model_id,
                     messages=messages_for_llm,
+                    api_base=_mc.LLM_BASE_URL,
+                    api_key=_mc.LLM_API_KEY,
+                    backend=_mc.LLM_BACKEND,
                     max_tokens=1024,
                     temperature=0.3,
                     top_p=0.85,
                     stream=False,
-                    **self._get_llm_extra_kwargs()
+                    timeout=self._core_timeout,
                 )
             
             # 🔥 关键修复：不使用 with 语句，避免 __exit__ 调用 shutdown(wait=True) 阻塞超时返回
@@ -2689,7 +2693,32 @@ class InferenceEngine:
             logger.info("[L2] 用户显式限制本轮不调用工具，单次决策移除工具定义")
 
         def call_core(kwargs=api_kwargs):
-            return self.vllm_client.chat.completions.create(**kwargs)
+            from zulong.l2.llm_gateway import llm_completion
+            import zulong.models.container as _mc
+            # 从 kwargs 提取参数，通过 litellm 网关调用
+            _model = kwargs.pop("model", _mc.LLM_MODEL_ID)
+            _messages = kwargs.pop("messages", [])
+            _stream = kwargs.pop("stream", False)
+            _tools = kwargs.pop("tools", None)
+            _tool_choice = kwargs.pop("tool_choice", None)
+            _max_tokens = kwargs.pop("max_tokens", 1024)
+            _temperature = kwargs.pop("temperature", 0.3)
+            _top_p = kwargs.pop("top_p", 0.85)
+            return llm_completion(
+                model=_model,
+                messages=_messages,
+                api_base=_mc.LLM_BASE_URL,
+                api_key=_mc.LLM_API_KEY,
+                backend=_mc.LLM_BACKEND,
+                stream=_stream,
+                tools=_tools,
+                tool_choice=_tool_choice,
+                max_tokens=_max_tokens,
+                temperature=_temperature,
+                top_p=_top_p,
+                timeout=self._core_timeout,
+                **kwargs,
+            )
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
@@ -2881,14 +2910,18 @@ class InferenceEngine:
             messages_for_llm = strip_llm_message_metadata(messages)
 
             def call_backup():
-                return self.backup_client.chat.completions.create(
+                from zulong.l2.llm_gateway import llm_completion
+                return llm_completion(
                     model=LLM_MODEL_ID_BACKUP,
                     messages=messages_for_llm,
+                    api_base=LLM_BASE_URL_BACKUP,
+                    api_key=LLM_API_KEY_BACKUP,
+                    backend=_mc.LLM_BACKEND,
                     max_tokens=1024,
                     temperature=0.3,
                     top_p=0.85,
                     stream=False,
-                    **self._get_llm_extra_kwargs()
+                    timeout=self._backup_timeout,
                 )
             
             _backup_start = time.time()

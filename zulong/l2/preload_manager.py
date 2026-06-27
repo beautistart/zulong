@@ -141,15 +141,17 @@ class PreloadManager:
     async def _warmup_core_model(self):
         try:
             health_tracker = getattr(self._engine, '_health_tracker', None)
+            from zulong.l2.llm_gateway import llm_completion
             from zulong.models.container import LLM_BASE_URL, LLM_MODEL_ID, LLM_API_KEY
-            from openai import OpenAI
-            client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY or "EMPTY", timeout=30)
-            response = client.chat.completions.create(
+            response = llm_completion(
                 model=LLM_MODEL_ID,
                 messages=[{"role": "user", "content": self._config.warmup_prompt}],
+                api_base=LLM_BASE_URL,
+                api_key=LLM_API_KEY,
                 max_tokens=32,
                 temperature=0.1,
                 stream=False,
+                timeout=30,
             )
             _text = response.choices[0].message.content if response.choices else ""
             logger.info(f"[PreloadManager] CORE预热成功: \"{_text[:50]}\"")
