@@ -3235,12 +3235,24 @@ async def update_model_in_registry(model_id: str, data: dict):
         try:
             engine = _get_engine()
             if engine and new_layer == "l2_core":
+                # 先把 num_ctx 写入配置，hot_switch_llm 会从配置读取
+                from zulong.config.config_manager import get_config_manager
+                _cm = get_config_manager()
+                _backend_name = found.get("backend", "ollama")
+                if found.get("num_ctx"):
+                    _cm.config.setdefault("llm", {}).setdefault(_backend_name, {})["num_ctx"] = int(found["num_ctx"])
+                    _cm.save()
                 engine.hot_switch_llm(
                     backend=found.get("backend"),
                     model_id=found.get("model_id"),
                     base_url=found.get("base_url"),
                     api_key=found.get("api_key") if config_update.get("api_key") else None,
                 )
+                # 热切换后直接更新 context window（hot_switch_llm 从 llm.{backend} 读 num_ctx，
+                # 但 registry 的 num_ctx 可能和 llm section 不同步）
+                _ctx_val = int(found.get("num_ctx", 0) or 0)
+                if _ctx_val > 0:
+                    engine._context_window_size = _ctx_val
         except Exception as e:
             logger.warning("[ModelRegistry] L2 热切换失败: %s", e)
 

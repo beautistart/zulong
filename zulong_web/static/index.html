@@ -11608,7 +11608,6 @@
             }
 
             var actions = '<button class="layer-save-btn" onclick="saveRegistryModel(\''+mid+'\')">应用</button>';
-            actions += ' <button class="layer-save-btn" onclick="activateRegistryModel(\''+mid+'\')" style="background:#3b82f6;">激活</button>';
             if (isDeletable) {
                 actions += ' <button class="layer-save-btn" onclick="deleteRegistryModel(\''+mid+'\')" style="background:#ef4444;">删除</button>';
             }
@@ -11632,13 +11631,21 @@
                 if (val !== '' && val !== false) config[key] = val;
                 else if (key === 'enabled') config[key] = (val === true);
             });
+            // 读取上下文窗口值（hidden input id=ctxHidden_{mid}，没有 data-mid 属性）
+            var ctxHidden = document.getElementById('ctxHidden_' + mid);
+            if (ctxHidden) {
+                var ctxVal = parseInt(ctxHidden.value) || 131072;
+                config['num_ctx'] = ctxVal;
+            }
             fetch('/api/models/registry/'+mid+'/update', {
                 method: 'POST',
                 headers: {'Content-Type':'application/json'},
                 body: JSON.stringify({config: config}),
             }).then(function(r){return r.json();}).then(function(result){
-                if (result.status === 'ok') { showToast(result.message, 'success'); loadModelLayers(); }
-                else { showToast(result.message||'更新失败', 'error'); }
+                if (result.status === 'ok') {
+                    showToast(result.message, 'success');
+                    loadModelLayers();
+                } else { showToast(result.message||'更新失败', 'error'); }
             }).catch(function(e){ showToast('请求失败: '+e.message, 'error'); });
         }
 
