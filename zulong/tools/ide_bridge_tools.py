@@ -407,6 +407,8 @@ def _local_apply_edits(
             "verified": True,
             "edit_count": len(edits),
             "summary": summary,
+            "original": original,
+            "next": next_content,
         }
     except Exception as exc:
         return {
@@ -416,6 +418,43 @@ def _local_apply_edits(
             "applied": False,
             "verified": False,
         }
+
+
+def _broadcast_local_file_change(
+    *,
+    file_path: str,
+    operation: str,
+    original: str,
+    next: str,
+    summary: str = "",
+) -> None:
+    """本地 edit/写入成功后，向 Web 端推送 file_changed + diff 事件。
+
+    复用 web_chat_router 的 WebSocket 广播通道，让 Web 端 diff 面板能显示本地写入的变更。
+    """
+    try:
+        from zulong.launcher import web_chat_router
+
+        path = str(file_path)
+        # 截断过长的 diff 内容（避免 WebSocket 消息过大）
+        max_chars = 20000
+        orig_trunc = original[:max_chars] if len(original) > max_chars else original
+        next_trunc = next[:max_chars] if len(next) > max_chars else next
+
+        # 推送 IDE_FILE_CHANGED（文件变更通知，触发 Web diff 面板更新）
+        web_chat_router._schedule_broadcast({
+            "type": "IDE_FILE_CHANGED",
+            "payload": {
+                "workspace_path": "",
+                "path": path,
+                "operation": operation,
+                "original": orig_trunc,
+                "next": next_trunc,
+                "summary": summary,
+            },
+        })
+    except Exception as exc:
+        logger.debug("[ide_write_file] 本地变更广播失败（不影响写入结果）: %s", exc)
 
 
 class IdeOpenWorkspaceTool(BaseTool):
@@ -694,6 +733,15 @@ class IdeWriteFileTool(BaseTool):
                     workspace_path=workspace_path,
                     reason=redirect_reason or "VS Code bridge unavailable; applied edits locally",
                 )
+                # 本地 edit 成功后推送 diff/file_changed 事件给 Web 端
+                if result.get("ok"):
+                    _broadcast_local_file_change(
+                        file_path=result.get("resolved_path", file_path),
+                        operation="edited",
+                        original=result.get("original", ""),
+                        next=result.get("next", ""),
+                        summary=result.get("summary", ""),
+                    )
                 return self._create_result(
                     success=bool(result.get("ok")),
                     data=result,
@@ -713,6 +761,15 @@ class IdeWriteFileTool(BaseTool):
                 effective_content_bytes=effective_content_bytes,
                 content_hash=content_hash,
             )
+            # 本地写入成功后推送 diff/file_changed 事件给 Web 端
+            if result.get("ok") and not create_directory:
+                _broadcast_local_file_change(
+                    file_path=result.get("resolved_path", file_path),
+                    operation=write_mode if write_mode != "overwrite" else ("created" if not Path(file_path).exists() else "updated"),
+                    original="",
+                    next=effective_content,
+                    summary=f"本地 {write_mode} 写入",
+                )
             logger.info(
                 "[ide_write_file][P10] local fallback path=%s resolved_path=%s applied=%s verified=%s reason=%s",
                 file_path,
