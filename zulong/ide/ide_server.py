@@ -3137,6 +3137,216 @@ async def add_model_layer(data: dict):
     }
 
 
+# ── 模型注册表 API（每层多模型配置）──────────────────────
+
+# 层定义（顺序即展示顺序）
+_LAYER_DEFS = [
+    {"id": "l0", "name": "L0 设备层", "type": "driver", "desc": "硬件驱动（摄像头/麦克风/扬声器/传感器）"},
+    {"id": "l1_a", "name": "L1-A 反射层", "type": "rule_or_model", "desc": "感知与受控反射"},
+    {"id": "l1_b", "name": "L1-B 调度层", "type": "local", "desc": "调度与意图守门"},
+    {"id": "l1_c", "name": "L1-C 视觉层", "type": "vision", "desc": "静默视觉注意"},
+    {"id": "l1_d", "name": "L1-D 听觉层", "type": "audio", "desc": "三层注意力音频"},
+    {"id": "l1_e", "name": "L1-E 安全层", "type": "sensor", "desc": "安全层（MQ-2 烟雾传感器）"},
+    {"id": "l2_core", "name": "L2 推理核心", "type": "cloud", "desc": "认知推理与决策"},
+    {"id": "l2_backup", "name": "L2 备用", "type": "cloud_or_local", "desc": "热备/降级"},
+    {"id": "l3", "name": "L3 专家层", "type": "expert", "desc": "专家模型池"},
+]
+
+# 允许 Web 端增删的层（仅 L3）
+_REGISTRY_DELETABLE_LAYERS = {"l3"}
+
+
+def _get_model_registry() -> list:
+    """从配置读取模型注册表。"""
+    from zulong.config.config_manager import get_config_manager
+    cm = get_config_manager()
+    registry = cm.get_dict("models.registry", [])
+    if not isinstance(registry, list):
+        registry = []
+    return registry
+
+
+def _save_model_registry(registry: list) -> None:
+    """保存模型注册表到配置。"""
+    from zulong.config.config_manager import get_config_manager
+    cm = get_config_manager()
+    cm.config.setdefault("models", {})["registry"] = registry
+    cm.save()
+
+
+@ide_router.get("/api/models/registry")
+async def get_model_registry():
+    """返回所有注册模型（按 layer 分组）+ 层定义。"""
+    registry = _get_model_registry()
+
+    # 按 layer 分组
+    layers_map = {ld["id"]: [] for ld in _LAYER_DEFS}
+    for model in registry:
+        layer = model.get("layer", "l3")
+        if layer not in layers_map:
+            layers_map[layer] = []
+        # api_key 脱敏
+        m = dict(model)
+        if m.get("api_key") and len(str(m["api_key"])) > 8:
+            m["api_key_masked"] = str(m["api_key"])[:4] + "***" + str(m["api_key"])[-4:]
+            m["has_api_key"] = True
+        else:
+            m["has_api_key"] = bool(m.get("api_key"))
+        layers_map[layer].append(m)
+
+    return {
+        "layers": _LAYER_DEFS,
+        "models_by_layer": layers_map,
+        "deletable_layers": list(_REGISTRY_DELETABLE_LAYERS),
+    }
+
+
+@ide_router.post("/api/models/registry/{model_id}/update")
+async def update_model_in_registry(model_id: str, data: dict):
+    """更新模型参数（含 layer 归属修改）。"""
+    config_update = data.get("config", {})
+    if not config_update:
+        return {"status": "error", "message": "config 不能为空"}
+
+    registry = _get_model_registry()
+    found = None
+    for m in registry:
+        if m.get("id") == model_id:
+            found = m
+            break
+    if not found:
+        return {"status": "error", "message": f"模型 {model_id} 不存在"}
+
+    # 更新字段
+    old_layer = found.get("layer", "")
+    for k, v in config_update.items():
+        if k == "api_key" and (v == "" or v is None):
+            continue  # 空 api_key 不覆盖（保留原值）
+        found[k] = v
+
+    new_layer = found.get("layer", old_layer)
+
+    # 如果是 L2 云端模型且层归属/参数变化，尝试热切换
+    if new_layer in ("l2_core", "l2_backup") and found.get("backend") in ("openai", "deepseek", "ollama", "siliconflow", "vllm", "sglang", "llamacpp", "lmstudio", "custom", "oneapi", "openrouter"):
+        try:
+            engine = _get_engine()
+            if engine and new_layer == "l2_core":
+                engine.hot_switch_llm(
+                    backend=found.get("backend"),
+                    model_id=found.get("model_id"),
+                    base_url=found.get("base_url"),
+                    api_key=found.get("api_key") if config_update.get("api_key") else None,
+                )
+        except Exception as e:
+            logger.warning("[ModelRegistry] L2 热切换失败: %s", e)
+
+    _save_model_registry(registry)
+
+    # 本地模型层（L1）需要重启生效
+    needs_restart = new_layer.startswith("l1") or new_layer == "l0"
+    msg = "配置已更新"
+    if new_layer in ("l2_core", "l2_backup") and not needs_restart:
+        msg = "配置已更新，L2 已热切换即时生效"
+    elif needs_restart:
+        msg = "配置已更新，重启后生效"
+
+    return {"status": "ok", "message": msg}
+
+
+@ide_router.post("/api/models/registry/{model_id}/activate")
+async def activate_model_in_registry(model_id: str):
+    """激活模型到其绑定的层。"""
+    registry = _get_model_registry()
+    found = None
+    for m in registry:
+        if m.get("id") == model_id:
+            found = m
+            break
+    if not found:
+        return {"status": "error", "message": f"模型 {model_id} 不存在"}
+
+    layer = found.get("layer", "")
+    backend = found.get("backend", "")
+
+    # L2 云端模型：热切换
+    if layer in ("l2_core", "l2_backup") and backend in ("openai", "deepseek", "ollama", "siliconflow", "vllm", "sglang", "llamacpp", "lmstudio", "custom", "oneapi", "openrouter"):
+        try:
+            engine = _get_engine()
+            if not engine:
+                return {"status": "error", "message": "Engine 未初始化"}
+            success, msg = engine.hot_switch_llm(
+                backend=backend,
+                model_id=found.get("model_id"),
+                base_url=found.get("base_url"),
+                api_key=found.get("api_key"),
+            )
+            return {"status": "ok" if success else "error", "message": msg}
+        except Exception as e:
+            return {"status": "error", "message": f"热切换失败: {e}"}
+
+    # L1/L0 本地模型：写配置，提示重启
+    return {"status": "ok", "message": f"模型 {found.get('name', model_id)} 已标记激活，重启后生效"}
+
+
+@ide_router.post("/api/models/l3/add")
+async def add_l3_model(data: dict):
+    """添加 L3 专家模型（仅 L3 层可增）。"""
+    name = data.get("name", "").strip()
+    if not name:
+        return {"status": "error", "message": "name 不能为空"}
+
+    model_id_base = "l3_" + name.lower().replace(" ", "_").replace("/", "_")[:20]
+    registry = _get_model_registry()
+
+    # 确保 id 唯一
+    existing_ids = {m.get("id") for m in registry}
+    model_id = model_id_base
+    suffix = 1
+    while model_id in existing_ids:
+        model_id = f"{model_id_base}_{suffix}"
+        suffix += 1
+
+    new_model = {
+        "id": model_id,
+        "name": name,
+        "layer": "l3",
+        "backend": data.get("backend", "transformer"),
+        "model_path": data.get("model_path", ""),
+        "enabled": True,
+    }
+    # 附加用户传入的其他字段
+    for k, v in data.items():
+        if k not in ("name", "backend", "model_path") and v:
+            new_model[k] = v
+
+    registry.append(new_model)
+    _save_model_registry(registry)
+
+    return {"status": "ok", "message": f"已添加 L3 模型: {name}", "model_id": model_id}
+
+
+@ide_router.post("/api/models/registry/{model_id}/delete")
+async def delete_model_in_registry(model_id: str):
+    """删除模型（仅 L3 层模型可删）。"""
+    registry = _get_model_registry()
+    found = None
+    for m in registry:
+        if m.get("id") == model_id:
+            found = m
+            break
+    if not found:
+        return {"status": "error", "message": f"模型 {model_id} 不存在"}
+
+    layer = found.get("layer", "")
+    if layer not in _REGISTRY_DELETABLE_LAYERS:
+        return {"status": "error", "message": f"层 {layer} 的模型不允许删除（仅 L3 可删）"}
+
+    registry = [m for m in registry if m.get("id") != model_id]
+    _save_model_registry(registry)
+
+    return {"status": "ok", "message": f"已删除模型: {found.get('name', model_id)}"}
+
+
 # ── 聊天会话兼容 API ────────────────────────────────
 
 

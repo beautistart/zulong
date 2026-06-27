@@ -11473,15 +11473,209 @@
 
         async function loadModelLayers() {
             try {
-                const resp = await fetch('/api/models/layers');
-                if (!resp.ok) return;
+                const resp = await fetch('/api/models/registry');
+                if (!resp.ok) {
+                    // 回退到旧 API
+                    const oldResp = await fetch('/api/models/layers');
+                    if (oldResp.ok) {
+                        const oldData = await oldResp.json();
+                        _layersCache = oldData.layers || [];
+                        _availableBackends = oldData.available_backends || [];
+                        renderSettingsPanel(_layersCache);
+                    }
+                    return;
+                }
                 const data = await resp.json();
-                _layersCache = data.layers || [];
-                _availableBackends = data.available_backends || [];
-                renderSettingsPanel(_layersCache);
+                _registryLayerDefs = data.layers || [];
+                _registryModelsByLayer = data.models_by_layer || {};
+                _registryDeletableLayers = data.deletable_layers || [];
+                renderRegistrySettingsPanel();
             } catch (e) {
-                console.warn('[Settings] 加载模型层失败:', e);
+                console.warn('[Settings] 加载模型注册表失败:', e);
             }
+        }
+
+        var _registryLayerDefs = [];
+        var _registryModelsByLayer = {};
+        var _registryDeletableLayers = [];
+        var _ALL_LAYER_OPTIONS = ['l0','l1_a','l1_b','l1_c','l1_d','l1_e','l2_core','l2_backup','l3'];
+        var _LAYER_DISPLAY = {
+            'l0':'L0 设备层','l1_a':'L1-A 反射层','l1_b':'L1-B 调度层','l1_c':'L1-C 视觉层',
+            'l1_d':'L1-D 听觉层','l1_e':'L1-E 安全层','l2_core':'L2 推理核心','l2_backup':'L2 备用','l3':'L3 专家层'
+        };
+        var _BACKEND_DISPLAY = {
+            'openai':'OpenAI','deepseek':'DeepSeek','ollama':'Ollama','siliconflow':'SiliconFlow',
+            'vllm':'vLLM','sglang':'SGLang','llamacpp':'llama.cpp','lmstudio':'LM Studio',
+            'custom':'自定义','oneapi':'OneAPI','openrouter':'OpenRouter',
+            'transformer':'本地模型','yolo':'YOLO','mediapipe':'MediaPipe',
+            'sensevoice':'SenseVoice','kokoro':'Kokoro','cosyvoice':'CosyVoice','edge-tts':'Edge TTS'
+        };
+
+        function renderRegistrySettingsPanel() {
+            const body = document.getElementById('settingsPanelBody');
+            if (!body) return;
+            let html = '';
+            html += renderIdeSettingsCard();
+
+            _registryLayerDefs.forEach(function(layerDef) {
+                html += renderRegistryLayerCard(layerDef);
+            });
+
+            body.innerHTML = html;
+            body.querySelectorAll('.layer-card-header').forEach(function(hdr) {
+                hdr.addEventListener('click', function() {
+                    this.parentElement.classList.toggle('expanded');
+                });
+            });
+        }
+
+        function renderRegistryLayerCard(layerDef) {
+            const layerId = layerDef.id;
+            const layerName = layerDef.name || layerId;
+            const layerDesc = layerDef.desc || '';
+            const models = _registryModelsByLayer[layerId] || [];
+            const isDeletable = _registryDeletableLayers.indexOf(layerId) >= 0;
+
+            let bodyHtml = '';
+            if (models.length === 0) {
+                var emptyMsg = '无模型（' + (layerDef.type === 'driver' ? '设备驱动' : layerDef.type === 'rule_or_model' ? '规则驱动' : layerDef.type === 'sensor' ? '传感器' : '未配置') + '）';
+                bodyHtml = '<div style="color:#64748b;font-size:11px;padding:8px 0;">' + emptyMsg + '</div>';
+            } else {
+                models.forEach(function(model) {
+                    bodyHtml += renderRegistryModelItem(model, layerId, isDeletable);
+                });
+            }
+
+            // L3 层添加"+ 添加模型"按钮
+            if (isDeletable) {
+                bodyHtml += '<button class="settings-add-layer-btn" onclick="showAddL3ModelDialog()">+ 添加专家模型</button>';
+            }
+
+            return '<div class="layer-card" data-layer-id="' + layerId + '">'
+                + '<div class="layer-card-header">'
+                + '<div class="layer-card-indicator ' + (models.length > 0 ? 'running' : 'unloaded') + '"></div>'
+                + '<span class="layer-card-title">' + layerName + '</span>'
+                + '<span class="layer-card-summary">' + (models.length > 0 ? models.length + ' 个模型' : layerDesc) + '</span>'
+                + '<span class="layer-card-expand">&#9660;</span>'
+                + '</div>'
+                + '<div class="layer-card-body">' + bodyHtml + '</div>'
+                + '</div>';
+        }
+
+        function renderRegistryModelItem(model, currentLayer, isDeletable) {
+            const mid = model.id || '';
+            const mname = model.name || mid;
+            const backend = model.backend || '';
+            const enabled = model.enabled !== false;
+            var fields = '';
+
+            // 层归属下拉
+            var layerOpts = '';
+            _ALL_LAYER_OPTIONS.forEach(function(l) {
+                layerOpts += '<option value="' + l + '"' + (l === currentLayer ? ' selected' : '') + '>' + (_LAYER_DISPLAY[l]||l) + '</option>';
+            });
+            fields += '<div class="layer-field"><label>层归属</label><select data-mid="' + mid + '" data-field="layer">' + layerOpts + '</select></div>';
+
+            // 启用开关
+            fields += '<div class="layer-field"><label>启用</label><select data-mid="' + mid + '" data-field="enabled"><option value="true"' + (enabled?' selected':'') + '>是</option><option value="false"' + (!enabled?' selected':'') + '>否</option></select></div>';
+
+            // 按类型显示字段
+            if (model.model_id !== undefined || backend === 'openai' || backend === 'deepseek' || backend === 'ollama' || backend === 'siliconflow' || backend === 'vllm' || backend === 'custom' || backend === 'oneapi' || backend === 'openrouter' || backend === 'sglang' || backend === 'llamacpp' || backend === 'lmstudio') {
+                // 云端模型字段
+                var bOpts = '';
+                ['openai','deepseek','ollama','siliconflow','vllm','custom','oneapi','openrouter','sglang','llamacpp','lmstudio'].forEach(function(b){
+                    bOpts += '<option value="'+b+'"'+(b===backend?' selected':'')+'>'+(_BACKEND_DISPLAY[b]||b)+'</option>';
+                });
+                fields += '<div class="layer-field"><label>后端</label><select data-mid="'+mid+'" data-field="backend">'+bOpts+'</select></div>';
+                fields += '<div class="layer-field"><label>模型ID</label><input data-mid="'+mid+'" data-field="model_id" type="text" value="'+escapeHtml(model.model_id||'')+'" placeholder="model_id" /></div>';
+                fields += '<div class="layer-field"><label>URL</label><input data-mid="'+mid+'" data-field="base_url" type="text" value="'+escapeHtml(model.base_url||'')+'" placeholder="base_url" /></div>';
+                fields += '<div class="layer-field"><label>Key</label><input data-mid="'+mid+'" data-field="api_key" type="password" value="" placeholder="'+(model.has_api_key?'(已配置)':'api_key')+'" /></div>';
+                fields += _renderCtxWindowControl(mid, model.num_ctx || 131072);
+            } else if (backend === 'yolo') {
+                fields += '<div class="layer-field"><label>路径</label><input data-mid="'+mid+'" data-field="model_path" type="text" value="'+escapeHtml(model.model_path||'')+'" /></div>';
+                fields += '<div class="layer-field"><label>设备</label><input data-mid="'+mid+'" data-field="device" type="text" value="'+escapeHtml(model.device||'auto')+'" /></div>';
+                fields += '<div class="layer-field"><label>置信度</label><input data-mid="'+mid+'" data-field="confidence" type="text" value="'+escapeHtml(String(model.confidence||0.25))+'" /></div>';
+            } else if (backend === 'kokoro' || backend === 'cosyvoice' || backend === 'edge-tts' || backend === 'sensevoice') {
+                fields += '<div class="layer-field"><label>后端</label><input data-mid="'+mid+'" data-field="backend" type="text" value="'+escapeHtml(backend)+'" readonly /></div>';
+                fields += '<div class="layer-field"><label>路径</label><input data-mid="'+mid+'" data-field="model_path" type="text" value="'+escapeHtml(model.model_path||'')+'" /></div>';
+                fields += '<div class="layer-field"><label>设备</label><input data-mid="'+mid+'" data-field="device" type="text" value="'+escapeHtml(model.device||'auto')+'" /></div>';
+                if (model.voice !== undefined) fields += '<div class="layer-field"><label>语音</label><input data-mid="'+mid+'" data-field="voice" type="text" value="'+escapeHtml(model.voice||'')+'" /></div>';
+            } else {
+                // 本地模型通用字段
+                fields += '<div class="layer-field"><label>后端</label><input data-mid="'+mid+'" data-field="backend" type="text" value="'+escapeHtml(backend||'transformer')+'" /></div>';
+                fields += '<div class="layer-field"><label>路径</label><input data-mid="'+mid+'" data-field="model_path" type="text" value="'+escapeHtml(model.model_path||'')+'" /></div>';
+                fields += '<div class="layer-field"><label>设备</label><input data-mid="'+mid+'" data-field="device" type="text" value="'+escapeHtml(model.device||'cpu')+'" /></div>';
+            }
+
+            var actions = '<button class="layer-save-btn" onclick="saveRegistryModel(\''+mid+'\')">应用</button>';
+            actions += ' <button class="layer-save-btn" onclick="activateRegistryModel(\''+mid+'\')" style="background:#3b82f6;">激活</button>';
+            if (isDeletable) {
+                actions += ' <button class="layer-save-btn" onclick="deleteRegistryModel(\''+mid+'\')" style="background:#ef4444;">删除</button>';
+            }
+
+            return '<div class="model-item" style="border:1px solid #e2e8f0;border-radius:6px;padding:8px;margin-bottom:8px;background:#f8fafc;">'
+                + '<div style="font-weight:600;font-size:12px;margin-bottom:4px;color:#1e293b;">' + escapeHtml(mname) + ' <span style="color:#94a3b8;font-weight:normal;font-size:10px;">('+escapeHtml(mid)+')</span></div>'
+                + fields
+                + '<div class="layer-card-actions">' + actions + '</div>'
+                + '</div>';
+        }
+
+        function saveRegistryModel(mid) {
+            var config = {};
+            document.querySelectorAll('[data-mid="'+mid+'"]').forEach(function(el) {
+                var key = el.dataset.field;
+                var val = el.value.trim();
+                if (val === 'true') val = true;
+                else if (val === 'false') val = false;
+                if (key === 'num_ctx') val = parseInt(val) || 131072;
+                if (key === 'confidence') val = parseFloat(val) || 0.25;
+                if (val !== '' && val !== false) config[key] = val;
+                else if (key === 'enabled') config[key] = (val === true);
+            });
+            fetch('/api/models/registry/'+mid+'/update', {
+                method: 'POST',
+                headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({config: config}),
+            }).then(function(r){return r.json();}).then(function(result){
+                if (result.status === 'ok') { showToast(result.message, 'success'); loadModelLayers(); }
+                else { showToast(result.message||'更新失败', 'error'); }
+            }).catch(function(e){ showToast('请求失败: '+e.message, 'error'); });
+        }
+
+        function activateRegistryModel(mid) {
+            fetch('/api/models/registry/'+mid+'/activate', {
+                method: 'POST',
+                headers: {'Content-Type':'application/json'},
+                body: '{}',
+            }).then(function(r){return r.json();}).then(function(result){
+                showToast(result.message||'激活', result.status==='ok'?'success':'error');
+            }).catch(function(e){ showToast('请求失败: '+e.message, 'error'); });
+        }
+
+        function deleteRegistryModel(mid) {
+            if (!confirm('确定删除此模型？')) return;
+            fetch('/api/models/registry/'+mid+'/delete', {
+                method: 'POST',
+                headers: {'Content-Type':'application/json'},
+            }).then(function(r){return r.json();}).then(function(result){
+                if (result.status === 'ok') { showToast(result.message, 'success'); loadModelLayers(); }
+                else { showToast(result.message||'删除失败', 'error'); }
+            }).catch(function(e){ showToast('请求失败: '+e.message, 'error'); });
+        }
+
+        function showAddL3ModelDialog() {
+            var name = prompt('专家模型名称:');
+            if (!name) return;
+            var backend = prompt('后端（transformer/openai/ollama 等，默认 transformer）:', 'transformer') || 'transformer';
+            var modelPath = prompt('模型路径（可选）:') || '';
+            fetch('/api/models/l3/add', {
+                method: 'POST',
+                headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({name: name, backend: backend, model_path: modelPath}),
+            }).then(function(r){return r.json();}).then(function(result){
+                if (result.status === 'ok') { showToast(result.message, 'success'); loadModelLayers(); }
+                else { showToast(result.message||'添加失败', 'error'); }
+            }).catch(function(e){ showToast('请求失败: '+e.message, 'error'); });
         }
 
         function renderSettingsPanel(layers) {

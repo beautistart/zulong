@@ -326,6 +326,105 @@ llm:
     model_id: ./models/Qwen/Qwen3___5-0.8B-AWQ
     tensor_parallel_size: 1
     tool_call_parser: qwen3_xml
+models:
+  registry:
+  # === L1-A 反射层（可选运动模型，没有就为空/规则驱动）===
+  - id: l1a_motion
+    name: L1-A 运动控制模型
+    layer: l1_a
+    backend: transformer
+    model_path: ''
+    device: cpu
+    enabled: false
+  # === L1-B 调度层（2 个模型各自独立）===
+  - id: l1b_albert
+    name: ALBERT 意图分类
+    layer: l1_b
+    backend: transformer
+    model_path: ./models/albert-tiny-chinese
+    device: cpu
+    enabled: true
+  - id: l1b_qwen35
+    name: Qwen3.5-0.8B 调度
+    layer: l1_b
+    backend: transformer
+    model_path: ./models/Qwen/Qwen3___5-0___8B-Base
+    device: cpu
+    enabled: true
+  # === L1-C 视觉层（3 个模型各自独立配置）===
+  - id: l1c_yolo
+    name: YOLOv10 人体检测
+    layer: l1_c
+    backend: yolo
+    model_path: models/yolov10n.pt
+    device: auto
+    confidence: 0.25
+    enabled: true
+  - id: l1c_mobilenet
+    name: MobileNetV4-TSM 动作分类
+    layer: l1_c
+    backend: transformer
+    model_path: ./models/mobilenet-v4-tsm
+    device: cpu
+    enabled: true
+  - id: l1c_mediapipe
+    name: MediaPipe 手势姿态
+    layer: l1_c
+    backend: mediapipe
+    enabled: true
+  # === L1-D 音频层（ASR + TTS 各独立）===
+  - id: l1d_sensevoice
+    name: SenseVoice ASR
+    layer: l1_d
+    backend: sensevoice
+    model_path: ./models/OpenASR/sensevoice-small-onnx
+    device: auto
+    enabled: true
+  - id: l1d_kokoro
+    name: Kokoro TTS
+    layer: l1_d
+    backend: kokoro
+    model_path: ./models/hexgrad/Kokoro-82M
+    voice: zf_xiaoxiao
+    enabled: true
+  # === L2 推理核心（云端 API，支持多个）===
+  - id: l2_botcf
+    name: BotCF DeepSeek V4
+    layer: l2_core
+    backend: openai
+    model_id: deepseek-v4-pro
+    base_url: https://api.botcf.com/v1
+    api_key: ${BOTCF_API_KEY}
+    num_ctx: 131072
+    enabled: true
+  - id: l2_ollama
+    name: Ollama 本地备用
+    layer: l2_backup
+    backend: ollama
+    model_id: qwen3.5:4b
+    base_url: http://localhost:11434/v1
+    api_key: EMPTY
+    num_ctx: 131072
+    enabled: false
+  # === L3 专家层（Web 端可增减）===
+  - id: l3_nav
+    name: 导航专家
+    layer: l3
+    backend: transformer
+    model_path: ''
+    enabled: true
+  - id: l3_manipulation
+    name: 操作专家
+    layer: l3
+    backend: transformer
+    model_path: ''
+    enabled: true
+  - id: l3_vision
+    name: 视觉专家
+    layer: l3
+    backend: transformer
+    model_path: ''
+    enabled: true
 memory:
   episodic:
     consolidation_threshold: 0.5
