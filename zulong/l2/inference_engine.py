@@ -2916,12 +2916,13 @@ class InferenceEngine:
 
             def call_backup():
                 from zulong.l2.llm_gateway import llm_completion
+                import zulong.models.container as _mc_bk
                 return llm_completion(
                     model=LLM_MODEL_ID_BACKUP,
                     messages=messages_for_llm,
                     api_base=LLM_BASE_URL_BACKUP,
                     api_key=LLM_API_KEY_BACKUP,
-                    backend=_mc.LLM_BACKEND,
+                    backend=_mc_bk.LLM_BACKEND,
                     max_tokens=1024,
                     temperature=0.3,
                     top_p=0.85,
