@@ -3160,7 +3160,11 @@ def _get_model_registry() -> list:
     """从配置读取模型注册表。"""
     from zulong.config.config_manager import get_config_manager
     cm = get_config_manager()
-    registry = cm.get_dict("models.registry", [])
+    # 直接从 config 字典读取（get_dict 不支持返回 list 类型）
+    models_section = cm.config.get("models", {})
+    if not isinstance(models_section, dict):
+        return []
+    registry = models_section.get("registry", [])
     if not isinstance(registry, list):
         registry = []
     return registry
