@@ -1009,24 +1009,19 @@ class AttentionWindowManager:
         return min(1.0, used / max(self.budget, 1))
 
     def _threshold_budget_ratio(self) -> float:
-        """Return configured threshold-budget ratio.
+        """Return 1.0 — threshold budget now equals the full context window size.
 
-        The threshold budget is the denominator for context pressure:
-        ``occupied context / (LLM original context window × ratio)``.
-        It is intentionally separate from yellow/red trigger lines.
+        Previously this returned a configurable ratio (e.g. 0.5) that multiplied
+        the context window to get a smaller pressure budget. That mechanism is
+        removed: threshold_budget_tokens == context_window_size directly.
+        The ratio config field is kept for backward compatibility but always 1.0.
         """
-        ratio = 1.0
-        try:
-            if self._llm_config is not None:
-                ratio = float(getattr(self._llm_config, "threshold_budget_ratio", ratio) or ratio)
-        except Exception:
-            ratio = 1.0
-        return max(0.01, min(1.0, ratio))
+        return 1.0
 
     @property
     def threshold_budget_tokens(self) -> int:
-        """LLM threshold budget in tokens, based on original context size."""
-        return max(1, int(self.context_window_size * self._threshold_budget_ratio()))
+        """LLM threshold budget in tokens — equals the full context window size."""
+        return max(1, int(self.context_window_size))
 
     @property
     def window_injection_budget_tokens(self) -> int:

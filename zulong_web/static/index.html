@@ -3217,14 +3217,14 @@
 
         /* 层级卡片 */
         .layer-card {
-            background: #0f172a;
-            border: 1px solid #334155;
+            background: #1a1a1a;
+            border: 1px solid #333;
             border-radius: 8px;
             margin-bottom: 6px;
             overflow: hidden;
             transition: border-color 0.2s;
         }
-        .layer-card:hover { border-color: #475569; }
+        .layer-card:hover { border-color: #555; }
         .layer-card-header {
             display: flex;
             align-items: center;
@@ -3240,18 +3240,18 @@
             flex-shrink: 0;
         }
         .layer-card-indicator.running { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
-        .layer-card-indicator.stopped { background: #64748b; }
-        .layer-card-indicator.unloaded { background: #475569; }
+        .layer-card-indicator.stopped { background: #666; }
+        .layer-card-indicator.unloaded { background: #444; }
         .layer-card-indicator.error { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
         .layer-card-title {
             font-size: 12px;
             font-weight: 600;
-            color: #e2e8f0;
+            color: #e0e0e0;
             flex: 1;
         }
         .layer-card-summary {
             font-size: 10px;
-            color: #64748b;
+            color: #777;
             max-width: 140px;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -3259,14 +3259,14 @@
         }
         .layer-card-expand {
             font-size: 10px;
-            color: #64748b;
+            color: #777;
             transition: transform 0.2s;
         }
         .layer-card.expanded .layer-card-expand { transform: rotate(180deg); }
         .layer-card-body {
             display: none;
             padding: 0 12px 10px;
-            border-top: 1px solid #1e293b;
+            border-top: 1px solid #2a2a2a;
         }
         .layer-card.expanded .layer-card-body { display: block; }
         .layer-field {
@@ -3276,7 +3276,7 @@
             margin-top: 8px;
         }
         .layer-field label {
-            color: #94a3b8;
+            color: #999;
             font-size: 11px;
             min-width: 40px;
             text-align: right;
@@ -3284,15 +3284,15 @@
         .layer-field input,
         .layer-field select {
             flex: 1;
-            background: #1e293b;
-            border: 1px solid #334155;
+            background: #222;
+            border: 1px solid #333;
             border-radius: 5px;
-            color: #e2e8f0;
+            color: #e0e0e0;
             font-size: 11px;
             padding: 4px 8px;
         }
-        .layer-field select option { background: #1e293b; color: #e2e8f0; }
-        .layer-field input::placeholder { color: #475569; }
+        .layer-field select option { background: #222; color: #e0e0e0; }
+        .layer-field input::placeholder { color: #555; }
         .layer-card-actions {
             display: flex;
             justify-content: flex-end;
@@ -3300,17 +3300,17 @@
             margin-top: 10px;
         }
         .layer-save-btn {
-            background: #3a3a3a;
+            background: #333;
             border: none;
             border-radius: 5px;
-            color: white;
+            color: #e0e0e0;
             font-size: 11px;
             padding: 4px 12px;
             cursor: pointer;
             font-weight: 600;
             transition: background 0.2s;
         }
-        .layer-save-btn:hover { background: #4a4a4a; }
+        .layer-save-btn:hover { background: #444; }
 
         /* 上下文窗口控件 */
         .ctx-window-control {
@@ -11612,8 +11612,7 @@
                 actions += ' <button class="layer-save-btn" onclick="deleteRegistryModel(\''+mid+'\')" style="background:#ef4444;">删除</button>';
             }
 
-            return '<div class="model-item" style="border:1px solid #e2e8f0;border-radius:6px;padding:8px;margin-bottom:8px;background:#f8fafc;">'
-                + '<div style="font-weight:600;font-size:12px;margin-bottom:4px;color:#1e293b;">' + escapeHtml(mname) + '</div>'
+            return '<div class="model-item" style="border:1px solid #333;border-radius:6px;padding:8px;margin-bottom:8px;background:#1a1a1a;">'
                 + fields
                 + '<div class="layer-card-actions">' + actions + '</div>'
                 + '</div>';

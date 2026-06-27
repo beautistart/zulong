@@ -407,7 +407,7 @@ class ToolCallCircuitBreaker:
             source = "AW.trigger_context_pressure_ratio"
         else:
             total_tokens = self._estimate_messages_tokens(messages)
-            threshold_budget = max(1, int(self._context_window_size * max(0.01, min(1.0, self._threshold_budget_ratio))))
+            threshold_budget = max(1, int(self._context_window_size))
             ratio = total_tokens / threshold_budget if threshold_budget > 0 else 0
             source = f"独立估算({total_tokens}t/{threshold_budget}; 原始窗口={self._context_window_size})"
         if ratio > self._context_red_ratio:
