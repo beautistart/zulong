@@ -141,11 +141,17 @@ def _fallback_openai_completion(
     api_key: Optional[str] = None,
     **kwargs,
 ):
-    """litellm 未安装时的回退：直接用 openai SDK。"""
+    """litellm 未安装时的回退：直接用 openai SDK。
+
+    注意：litellm 路径会丢弃非标准参数（drop_params），但本回退直接调用
+    OpenAI SDK，必须主动剔除 SDK 不识别的参数（如 backend / api_format 等
+    来自上层调用的透传字段），否则会报 unexpected keyword argument。
+    """
     from openai import OpenAI
     client = OpenAI(base_url=api_base or "http://localhost:11434/v1", api_key=api_key or "EMPTY")
-    kwargs.pop("api_base", None)
-    kwargs.pop("api_key", None)
+    # 剔除本网关专用、但 OpenAI SDK 不识别的参数
+    for _drop in ("api_base", "api_key", "backend", "api_format"):
+        kwargs.pop(_drop, None)
     return client.chat.completions.create(model=model, messages=messages, **kwargs)
 
 

@@ -4456,7 +4456,8 @@ class IDEFCRunner(FCRunner):
                 logger.info("[IDEFCRunner] 清除残留的中断标志")
                 self.engine._interrupt_flag = False
         
-        from zulong.models.container import LLM_MODEL_ID
+        get_runtime_model = getattr(self.engine, "_get_runtime_model_id", None)
+        runtime_model_id = get_runtime_model("core") if callable(get_runtime_model) else ""
         user_input = ""
         for msg in reversed(messages):
             if msg.get("role") == "user":
@@ -4514,7 +4515,7 @@ class IDEFCRunner(FCRunner):
 
         state = IDEFCState(
             messages=list(messages), fc_turn=0, tool_definitions=tool_defs,
-            user_input_text=user_input, vllm_model_id=LLM_MODEL_ID or "",
+            user_input_text=user_input, vllm_model_id=runtime_model_id,
             phase="running", response_max_tokens=8192,
             is_resume=(task_graph_policy in {"reuse", "inspect", "continue"}),
             task_graph_policy=task_graph_policy,
@@ -5590,7 +5591,7 @@ class IDEFCRunner(FCRunner):
         """通过 litellm 网关调用 LLM（替代 vllm_client.chat.completions.create）。"""
         from zulong.l2.llm_gateway import llm_completion
         import zulong.models.container as _mc
-        _model = kw.pop("model", _mc.LLM_MODEL_ID)
+        _model = kw.pop("model", None) or _mc.LLM_MODEL_ID
         _messages = kw.pop("messages", [])
         _stream = kw.pop("stream", False)
         _tools = kw.pop("tools", None)
@@ -5598,15 +5599,19 @@ class IDEFCRunner(FCRunner):
         _max_tokens = kw.pop("max_tokens", 1024)
         _temperature = kw.pop("temperature", 0.3)
         _top_p = kw.pop("top_p", 0.85)
+        _api_base = kw.pop("api_base", _mc.LLM_BASE_URL)
+        _api_key = kw.pop("api_key", _mc.LLM_API_KEY)
+        _api_format = kw.pop("api_format", getattr(_mc, "LLM_API_FORMAT", "chat_completions"))
+        _backend = kw.pop("backend", _mc.LLM_BACKEND)
         _extra_body = kw.pop("extra_body", None)
         if _extra_body:
             kw.update(_extra_body)
         return llm_completion(
             model=_model, messages=_messages,
-            api_base=_mc.LLM_BASE_URL, api_key=_mc.LLM_API_KEY,
+            api_base=_api_base, api_key=_api_key, api_format=_api_format,
             stream=_stream, tools=_tools, tool_choice=_tool_choice,
             max_tokens=_max_tokens, temperature=_temperature, top_p=_top_p,
-            timeout=300, **kw,
+            timeout=300, backend=_backend, **kw,
         )
 
     def _build_dynamic_attention_context_message(
@@ -5729,6 +5734,15 @@ class IDEFCRunner(FCRunner):
         # TSD §26.1.5: 保留本轮 active context telemetry 供 ATTENTION_UPDATE 透传（诊断字段，不作为下轮上下文池）
         self._last_attention_context_telemetry = _attention_context_telemetry or {}
         extra_kw = self.engine._get_llm_extra_kwargs()
+        get_runtime_model = getattr(self.engine, "_get_runtime_model_id", None)
+        runtime_model_id = get_runtime_model("core") if callable(get_runtime_model) else ""
+        if not state.vllm_model_id:
+            state.vllm_model_id = runtime_model_id
+        get_runtime_call_kwargs = getattr(self.engine, "_get_runtime_llm_call_kwargs", None)
+        runtime_call_kwargs = (
+            get_runtime_call_kwargs("core")
+            if callable(get_runtime_call_kwargs) else {}
+        )
         # Qwen3 系列默认开启思维链（<think>），FC 模式下禁用以避免空 content
         eb = extra_kw.get("extra_body", {})
         eb["enable_thinking"] = False
@@ -5738,6 +5752,8 @@ class IDEFCRunner(FCRunner):
             "max_tokens": state.response_max_tokens, "temperature": 0.3,
             "top_p": 0.85, "stream": True, **extra_kw,  # 启用流式模式
         }
+        if runtime_call_kwargs:
+            kw.update(runtime_call_kwargs)
         if state.tool_call_budget == 0 or (
             state.tool_call_budget is not None
             and int(state.tool_calls_used or 0) >= int(state.tool_call_budget)
@@ -6084,13 +6100,14 @@ class IDEFCRunner(FCRunner):
                     f"[IDEFCRunner] 连续 {state.api_timeout_count} 次 API 错误，触发退出")
                 return None, None
             try:
-                from zulong.models.container import LLM_MODEL_ID_BACKUP, LLM_BASE_URL_BACKUP, LLM_API_KEY_BACKUP
-                import zulong.models.container as _mc_bk
-                if LLM_MODEL_ID_BACKUP:
+                get_runtime_cfg = getattr(self.engine, "_get_runtime_llm_config", None)
+                backup_cfg = get_runtime_cfg("backup") if callable(get_runtime_cfg) else None
+                if backup_cfg and backup_cfg.model_id and backup_cfg.base_url:
                     from zulong.l2.llm_gateway import llm_completion as _lc_bk
                     br = _lc_bk(
-                        model=LLM_MODEL_ID_BACKUP, messages=state.messages,
-                        api_base=LLM_BASE_URL_BACKUP, api_key=LLM_API_KEY_BACKUP,
+                        model=backup_cfg.model_id, messages=state.messages,
+                        api_base=backup_cfg.base_url, api_key=backup_cfg.api_key,
+                        api_format=backup_cfg.api_format, backend=backup_cfg.backend,
                         max_tokens=state.response_max_tokens, temperature=0.3,
                         stream=False, timeout=self.engine._backup_timeout,
                     )
@@ -8540,30 +8557,16 @@ class IDEFCRunner(FCRunner):
                 "[IDEFCRunner][QualityReviewer] L2-BACKUP 外审未配置: backup_client_missing"
             )
             return None
-        LLM_MODEL_ID_BACKUP = (
-            getattr(engine, "backup_model_id", None)
-            or getattr(engine, "l2_backup_model_id", None)
-            or getattr(backup_client, "model", None)
-            or getattr(backup_client, "model_name", None)
-        )
-        if not LLM_MODEL_ID_BACKUP:
-            try:
-                import sys
-
-                container_mod = sys.modules.get("zulong.models.container")
-                LLM_MODEL_ID_BACKUP = getattr(container_mod, "LLM_MODEL_ID_BACKUP", "") if container_mod else ""
-            except Exception:
-                LLM_MODEL_ID_BACKUP = ""
-        if not LLM_MODEL_ID_BACKUP and backup_client:
-            LLM_MODEL_ID_BACKUP = "backup-model"
-        if not LLM_MODEL_ID_BACKUP:
+        get_runtime_cfg = getattr(engine, "_get_runtime_llm_config", None)
+        backup_cfg = get_runtime_cfg("backup") if callable(get_runtime_cfg) else None
+        if not backup_cfg or not backup_cfg.model_id or not backup_cfg.base_url:
             state.quality_reviewer_health = {
                 "status": "not_configured",
-                "reason": "backup_model_id_missing",
+                "reason": "backup_model_config_missing",
                 "score": score,
             }
             logger.info(
-                "[IDEFCRunner][QualityReviewer] L2-BACKUP 外审未配置: backup_model_id_missing"
+                "[IDEFCRunner][QualityReviewer] L2-BACKUP 外审未配置: backup_model_config_missing"
             )
             return None
 
@@ -8590,9 +8593,10 @@ class IDEFCRunner(FCRunner):
         try:
             from zulong.l2.llm_gateway import llm_completion as _lc_review
             review = _lc_review(
-                model=LLM_MODEL_ID_BACKUP,
+                model=backup_cfg.model_id,
                 messages=messages,
-                api_base=LLM_BASE_URL_BACKUP, api_key=LLM_API_KEY_BACKUP,
+                api_base=backup_cfg.base_url, api_key=backup_cfg.api_key,
+                api_format=backup_cfg.api_format, backend=backup_cfg.backend,
                 max_tokens=800,
                 temperature=0.0,
                 stream=False,

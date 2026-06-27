@@ -390,22 +390,41 @@ def get_config(key: str, default: Any = None) -> Any:
 
 
 def get_llm_config(backend: Optional[str] = None) -> Dict[str, Any]:
-    """
-    获取 LLM 配置
-    
+    """获取 LLM 配置（registry 为唯一权威来源）。
+
+    从 models.registry 中读取 enabled 的 l2_core 条目。registry 为空时返回空字段
+    （不静默兜底到任何后端），由调用方决定如何处理配置缺失。
+
     Args:
-        backend: 后端类型 (可选，如果不指定则使用配置的默认值)
-        
+        backend: 已忽略，保留仅为向后兼容签名。LLM 后端由 registry 决定。
+
     Returns:
-        LLM 配置字典
+        LLM 配置字典（backend / base_url / model_id / api_key / num_ctx / api_format）。
+        registry 无配置时各字段为空字符串 / 0。
     """
     config_manager = get_config_manager()
-    from zulong.adapters.backend_resolver import resolve_llm_backend
-
-    resolution = resolve_llm_backend(config_manager.config, backend)
-    for warning in resolution.warnings:
-        logger.warning(f"⚠️ [LLM] {warning}")
-    return resolution.to_config()
+    registry = config_manager.config.get("models", {}).get("registry", [])
+    empty = {
+        "backend": "",
+        "base_url": "",
+        "model_id": "",
+        "api_key": "",
+        "num_ctx": 0,
+        "api_format": "chat_completions",
+    }
+    if not isinstance(registry, list):
+        return empty
+    for m in registry:
+        if isinstance(m, dict) and m.get("layer") == "l2_core" and m.get("enabled", False):
+            return {
+                "backend": m.get("backend", ""),
+                "base_url": m.get("base_url", ""),
+                "model_id": m.get("model_id", ""),
+                "api_key": m.get("api_key", ""),
+                "num_ctx": int(m.get("num_ctx", 0) or 0),
+                "api_format": m.get("api_format", "chat_completions"),
+            }
+    return empty
 
 
 def get_l2_inference_config() -> Dict[str, Any]:

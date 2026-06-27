@@ -2812,28 +2812,29 @@ async def _handle_expand_node(node_id: str, ws: WebSocket) -> None:
 
 @ide_router.get("/api/llm/config")
 async def get_llm_config_api():
-    """获取当前 LLM 配置和可用后端列表"""
-    from zulong.config.config_manager import get_config_manager
+    """获取当前 LLM 配置和可用后端列表（从 registry 读取）"""
+    from zulong.config.config_manager import get_config_manager, get_llm_config
     cm = get_config_manager()
 
-    # 当前活跃配置
-    current_backend = cm.get('llm.backend', 'ollama')
-    current_config = cm.get_dict(f'llm.{current_backend}', {})
+    # 当前活跃配置来自 registry（唯一权威来源）
+    active = get_llm_config()
 
-    # 所有可用后端
+    # 列出 registry 中所有已配置的后端（供前端展示/切换）
     backends = {}
-    for name in ['ollama', 'siliconflow', 'deepseek', 'vllm', 'sglang', 'llamacpp', 'lmstudio', 'openai']:
-        cfg = cm.get_dict(f'llm.{name}', {})
-        if cfg:
-            backends[name] = {
-                'base_url': cfg.get('base_url', ''),
-                'model_id': cfg.get('model_id', ''),
-            }
+    registry = cm.config.get("models", {}).get("registry", [])
+    if isinstance(registry, list):
+        for m in registry:
+            if isinstance(m, dict) and m.get("layer", "").startswith("l2") and m.get("backend"):
+                name = m.get("backend")
+                backends.setdefault(name, {
+                    "base_url": m.get("base_url", ""),
+                    "model_id": m.get("model_id", ""),
+                })
 
     return {
-        "current_backend": current_backend,
-        "current_model_id": current_config.get('model_id', ''),
-        "current_base_url": current_config.get('base_url', ''),
+        "current_backend": active.get("backend", ""),
+        "current_model_id": active.get("model_id", ""),
+        "current_base_url": active.get("base_url", ""),
         "backends": backends,
     }
 
@@ -2933,24 +2934,24 @@ async def get_model_layers():
         "editable_fields": ["backend", "model_path", "voice", "device"],
     })
 
-    # L2 推理核心 (云端 API)
-    current_backend = cm.get('llm.backend', 'ollama')
-    current_llm_config = cm.get_dict(f'llm.{current_backend}', {})
-    api_key_display = current_llm_config.get('api_key', '')
+    # L2 推理核心 (云端 API) —— 从 registry 读取
+    from zulong.config.config_manager import get_llm_config
+    _l2_active = get_llm_config()
+    api_key_display = _l2_active.get("api_key", "")
     if api_key_display and len(api_key_display) > 8:
         api_key_display = api_key_display[:4] + '***' + api_key_display[-4:]
     layers.append({
         "id": "l2_core",
         "name": "L2 推理核心",
         "type": "cloud",
-        "enabled": True,
-        "status": "running",
+        "enabled": bool(_l2_active.get("backend")),
+        "status": "running" if _l2_active.get("backend") else "unconfigured",
         "config": {
-            "backend": current_backend,
-            "model_id": current_llm_config.get('model_id', ''),
-            "base_url": current_llm_config.get('base_url', ''),
+            "backend": _l2_active.get("backend", ""),
+            "model_id": _l2_active.get("model_id", ""),
+            "base_url": _l2_active.get("base_url", ""),
             "api_key": api_key_display,
-            "num_ctx": int(current_llm_config.get('num_ctx', 131072)),
+            "num_ctx": int(_l2_active.get("num_ctx", 0) or 0),
         },
         "editable_fields": ["backend", "model_id", "base_url", "api_key", "num_ctx"],
     })
@@ -3042,20 +3043,16 @@ async def update_model_layer(layer_id: str, data: dict):
 
     try:
         if layer_id == "l2_core":
-            # L2 核心使用现有 hot_switch_llm
+            # L2 核心：通过 hot_switch_llm 热切换（registry 为唯一持久化位置）
             engine = _get_engine()
             if not engine:
                 return {"status": "error", "message": "Engine 未初始化"}
-            # 如果包含 num_ctx，先写入配置（hot_switch_llm 会从配置读取）
-            if "num_ctx" in config:
-                backend_name = config.get("backend") or cm.get("llm.backend", "ollama")
-                cm.config.setdefault("llm", {}).setdefault(backend_name, {})["num_ctx"] = int(config["num_ctx"])
-                cm.save()
             success, msg = engine.hot_switch_llm(
                 backend=config.get("backend"),
                 model_id=config.get("model_id"),
                 base_url=config.get("base_url"),
                 api_key=config.get("api_key"),
+                num_ctx=config.get("num_ctx"),
             )
             return {"status": "ok" if success else "error", "message": msg}
 
@@ -3231,28 +3228,20 @@ async def update_model_in_registry(model_id: str, data: dict):
     new_layer = found.get("layer", old_layer)
 
     # 如果是 L2 云端模型且层归属/参数变化，尝试热切换
-    if new_layer in ("l2_core", "l2_backup") and found.get("backend") in ("openai", "deepseek", "ollama", "siliconflow", "vllm", "sglang", "llamacpp", "lmstudio", "custom", "oneapi", "openrouter"):
+    if new_layer in ("l2_core", "l2_backup") and found.get("backend"):
         try:
             engine = _get_engine()
             if engine and new_layer == "l2_core":
-                # 先把 num_ctx 写入配置，hot_switch_llm 会从配置读取
-                from zulong.config.config_manager import get_config_manager
-                _cm = get_config_manager()
-                _backend_name = found.get("backend", "ollama")
-                if found.get("num_ctx"):
-                    _cm.config.setdefault("llm", {}).setdefault(_backend_name, {})["num_ctx"] = int(found["num_ctx"])
-                    _cm.save()
+                # num_ctx 通过 hot_switch_llm 写入 registry（不再写 llm.{backend}）
                 engine.hot_switch_llm(
                     backend=found.get("backend"),
                     model_id=found.get("model_id"),
                     base_url=found.get("base_url"),
                     api_key=found.get("api_key") if config_update.get("api_key") else None,
+                    num_ctx=found.get("num_ctx"),
+                    api_format=found.get("api_format"),
+                    layer=new_layer,
                 )
-                # 热切换后直接更新 context window（hot_switch_llm 从 llm.{backend} 读 num_ctx，
-                # 但 registry 的 num_ctx 可能和 llm section 不同步）
-                _ctx_val = int(found.get("num_ctx", 0) or 0)
-                if _ctx_val > 0:
-                    engine._context_window_size = _ctx_val
         except Exception as e:
             logger.warning("[ModelRegistry] L2 热切换失败: %s", e)
 
@@ -3284,8 +3273,8 @@ async def activate_model_in_registry(model_id: str):
     layer = found.get("layer", "")
     backend = found.get("backend", "")
 
-    # L2 云端模型：热切换
-    if layer in ("l2_core", "l2_backup") and backend in ("openai", "deepseek", "ollama", "siliconflow", "vllm", "sglang", "llamacpp", "lmstudio", "custom", "oneapi", "openrouter"):
+    # L2 云端模型：热切换（任何 backend 均可，不再用白名单限制）
+    if layer in ("l2_core", "l2_backup") and backend:
         try:
             engine = _get_engine()
             if not engine:
@@ -3295,6 +3284,9 @@ async def activate_model_in_registry(model_id: str):
                 model_id=found.get("model_id"),
                 base_url=found.get("base_url"),
                 api_key=found.get("api_key"),
+                num_ctx=found.get("num_ctx"),
+                api_format=found.get("api_format"),
+                layer=layer,
             )
             return {"status": "ok" if success else "error", "message": msg}
         except Exception as e:

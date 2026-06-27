@@ -16,20 +16,11 @@ set ZULONG_DATA_DIR=%ZULONG_HOME%\data
 
 REM 设置默认环境变量
 set ZULONG_ENV=production
-set ZULONG_LLM_BACKEND=ollama
-set ZULONG_OLLAMA_BASE_URL=http://localhost:11434/v1
-set ZULONG_OLLAMA_MODEL_ID=deepseek-v3.1:671b-cloud
-set ZULONG_OLLAMA_BACKUP_MODEL_ID=qwen3.5:4b
-set ZULONG_OLLAMA_API_KEY=EMPTY
 
-REM L2 推理配置
-set ZULONG_L2_CORE_MODEL=%ZULONG_OLLAMA_MODEL_ID%
-set ZULONG_L2_BACKUP_MODEL=%ZULONG_OLLAMA_BACKUP_MODEL_ID%
-set ZULONG_L2_BACKUP_BASE_URL=%ZULONG_OLLAMA_BASE_URL%
-set ZULONG_L2_BACKUP_API_KEY=%ZULONG_OLLAMA_API_KEY%
-set ZULONG_L2_MAX_TOKENS=1024
-set ZULONG_L2_TEMPERATURE=0.3
-set ZULONG_L2_TOP_P=0.85
+REM 注意：LLM 后端 / 模型 / 密钥不再在此硬编码。
+REM LLM 配置的唯一权威来源是 config/zulong_config.yaml 的 models.registry，
+REM 由 Web 端「模型配置」页面（/api/models/registry/*）维护。
+REM 此脚本只设置非 LLM 的平台默认值。
 
 REM 视觉系统配置
 set ZULONG_CAMERA_ENABLED=false
@@ -65,12 +56,8 @@ set ZULONG_LOG_LEVEL=INFO
 set ZULONG_DEBUG_MODE=false
 
 echo [OK] 环境变量已设置
-echo   - LLM 后端：%ZULONG_LLM_BACKEND%
-echo   - Ollama 地址：%ZULONG_OLLAMA_BASE_URL%
-echo   - 核心模型：%ZULONG_L2_CORE_MODEL%
-echo   - 备用模型：%ZULONG_L2_BACKUP_MODEL%
-echo   - 备用模型地址：%ZULONG_L2_BACKUP_BASE_URL%
 echo   - 环境：%ZULONG_ENV%
+echo   - LLM 配置：见 Web 端「模型配置」(models.registry)
 echo ================================================================
 
 REM 如果存在自定义 .env 文件，加载它
@@ -96,10 +83,7 @@ if exist "config\.env" (
     echo [INFO] 未找到 config\.env 文件，使用默认配置
 )
 
-REM 兼容仍读取旧 LLM_*_BACKUP 命名的模块
-if not defined LLM_MODEL_ID_BACKUP set "LLM_MODEL_ID_BACKUP=%ZULONG_L2_BACKUP_MODEL%"
-if not defined LLM_BASE_URL_BACKUP set "LLM_BASE_URL_BACKUP=%ZULONG_L2_BACKUP_BASE_URL%"
-if not defined LLM_API_KEY_BACKUP set "LLM_API_KEY_BACKUP=%ZULONG_L2_BACKUP_API_KEY%"
+REM LLM_*_BACKUP 兼容变量已不再需要（registry 为唯一来源）
 if not defined USE_VLLM_FOR_L2_BACKUP set "USE_VLLM_FOR_L2_BACKUP=false"
 
 echo ================================================================

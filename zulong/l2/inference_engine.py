@@ -8,6 +8,7 @@ import contextvars
 import os
 import re
 import numpy as np
+from dataclasses import dataclass
 from typing import Optional, Callable, List, Any, Dict, Set
 
 
@@ -75,6 +76,28 @@ from zulong.config.config_manager import get_l2_inference_config
 
 import logging
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LLMRuntimeConfig:
+    """Applied LLM configuration used by runtime inference paths."""
+
+    backend: str = ""
+    model_id: str = ""
+    base_url: str = ""
+    api_key: str = ""
+    api_format: str = "chat_completions"
+    num_ctx: int = 0
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "backend": self.backend,
+            "model_id": self.model_id,
+            "base_url": self.base_url,
+            "api_key": self.api_key,
+            "api_format": self.api_format or "chat_completions",
+            "num_ctx": self.num_ctx,
+        }
 
 
 class _AttentionDecisionClient:
@@ -232,8 +255,13 @@ class InferenceEngine:
             self._attn_window: Optional[AttentionWindowManager] = None
             # TSD §26.1.5: 本轮 active context 诊断字段（供 ATTENTION_UPDATE 透传，不作下轮上下文池）
             self._last_attention_context_telemetry: Dict[str, Any] = {}
+            # 运行时 LLM 配置快照：hot_switch_llm 是唯一写入入口。
+            self._llm_runtime_configs: Dict[str, LLMRuntimeConfig] = {
+                "core": LLMRuntimeConfig(),
+                "backup": LLMRuntimeConfig(),
+            }
             # 远程模型默认 context window（优先使用配置的 num_ctx）
-            self._context_window_size = LLM_NUM_CTX if LLM_NUM_CTX > 0 else 32768
+            self._context_window_size = 32768
             
             # 加载 L2 模型
             self.model_container = ModelContainer()
@@ -411,20 +439,73 @@ class InferenceEngine:
                 self._l2_loaded = False
         return self.l2_model is not None
 
-    def _apply_registry_llm_config(self) -> None:
-        """启动时从 models.registry 读取 l2_core/l2_backup 模型配置，覆盖默认 LLM 客户端。
+    @staticmethod
+    def _normalize_llm_layer(layer: str = "core") -> str:
+        normalized = str(layer or "core").lower().strip()
+        if normalized in {"l2_core", "core", "primary"}:
+            return "core"
+        if normalized in {"l2_backup", "backup"}:
+            return "backup"
+        return normalized or "core"
 
-        registry 是 Web 端配置的权威来源；llm.* 配置区是旧入口。
-        如果 registry 有 enabled 的 l2_core 模型，优先用它初始化 LLM 客户端。
+    def _set_runtime_llm_config(
+        self,
+        layer: str,
+        *,
+        backend: str = "",
+        model_id: str = "",
+        base_url: str = "",
+        api_key: str = "",
+        api_format: str = "chat_completions",
+        num_ctx: int = 0,
+    ) -> LLMRuntimeConfig:
+        layer_key = self._normalize_llm_layer(layer)
+        cfg = LLMRuntimeConfig(
+            backend=str(backend or ""),
+            model_id=str(model_id or ""),
+            base_url=str(base_url or ""),
+            api_key=str(api_key or ""),
+            api_format=str(api_format or "chat_completions"),
+            num_ctx=int(num_ctx or 0),
+        )
+        self._llm_runtime_configs[layer_key] = cfg
+        return cfg
+
+    def _get_runtime_llm_config(self, layer: str = "core") -> LLMRuntimeConfig:
+        layer_key = self._normalize_llm_layer(layer)
+        cfg = getattr(self, "_llm_runtime_configs", {}).get(layer_key)
+        if isinstance(cfg, LLMRuntimeConfig):
+            return cfg
+        return LLMRuntimeConfig()
+
+    def _get_runtime_model_id(self, layer: str = "core") -> str:
+        return self._get_runtime_llm_config(layer).model_id
+
+    def _get_runtime_llm_call_kwargs(self, layer: str = "core") -> Dict[str, Any]:
+        cfg = self._get_runtime_llm_config(layer)
+        return {
+            "api_base": cfg.base_url,
+            "api_key": cfg.api_key,
+            "api_format": cfg.api_format or "chat_completions",
+            "backend": cfg.backend,
+        }
+
+    def _apply_registry_llm_config(self) -> None:
+        """启动时从 models.registry 读取 l2_core/l2_backup 模型配置，注入运行时 LLM 客户端。
+
+        registry 是 LLM 配置的唯一权威来源（由 Web 端 /api/models/registry/* 维护）。
+        - 若 registry 有 enabled 的 l2_core 模型 → 用它初始化 LLM 客户端。
+        - 若没有（用户尚未在 Web 端配置）→ 不崩溃，仅打警告；发消息时会因配置缺失自然报错。
         """
         try:
             from zulong.config.config_manager import get_config_manager
             cm = get_config_manager()
             registry = cm.config.get("models", {}).get("registry", [])
             if not isinstance(registry, list) or not registry:
+                logger.warning("[LLM] models.registry 为空 —— 请在 Web 端「模型配置」中配置 L2 模型后再发消息")
                 return
 
-            # 找 l2_core 的 enabled 模型
+            # 找 l2_core / l2_backup 的 enabled 模型
             l2_core_model = None
             l2_backup_model = None
             for m in registry:
@@ -435,115 +516,169 @@ class InferenceEngine:
                 elif m.get("layer") == "l2_backup" and m.get("enabled", False):
                     l2_backup_model = m
 
-            if l2_core_model:
-                # 存储 api_format 到全局变量（litellm 网关用）
-                import zulong.models.container as _mc_core
-                _mc_core.LLM_API_FORMAT = l2_core_model.get("api_format", "chat_completions")
-                success, msg = self.hot_switch_llm(
-                    backend=l2_core_model.get("backend", "openai"),
-                    model_id=l2_core_model.get("model_id", ""),
-                    base_url=l2_core_model.get("base_url", ""),
-                    api_key=l2_core_model.get("api_key", ""),
+            if not l2_core_model:
+                logger.warning("[LLM] registry 中无 enabled 的 l2_core 模型 —— 请在 Web 端「模型配置」中启用一个 L2 核心模型")
+                return
+
+            import zulong.models.container as _mc_core
+            _api_format = l2_core_model.get("api_format", "chat_completions")
+            success, msg = self.hot_switch_llm(
+                backend=l2_core_model.get("backend", ""),
+                model_id=l2_core_model.get("model_id", ""),
+                base_url=l2_core_model.get("base_url", ""),
+                api_key=l2_core_model.get("api_key", ""),
+                num_ctx=l2_core_model.get("num_ctx"),
+                api_format=_api_format,
+                layer="l2_core",
+            )
+            if success:
+                logger.info(
+                    "[LLM] Registry L2_CORE 已应用: %s @ %s (format=%s)",
+                    l2_core_model.get("model_id", ""),
+                    l2_core_model.get("base_url", ""),
+                    _api_format,
                 )
-                if success:
-                    logger.info(
-                        "[LLM] Registry L2_CORE 已应用: %s @ %s (format=%s)",
-                        l2_core_model.get("model_id", ""),
-                        l2_core_model.get("base_url", ""),
-                        _mc_core.LLM_API_FORMAT,
-                    )
-                else:
-                    logger.warning("[LLM] Registry L2_CORE 应用失败: %s", msg)
+            else:
+                logger.warning("[LLM] Registry L2_CORE 应用失败: %s", msg)
 
             if l2_backup_model and l2_backup_model is not l2_core_model:
-                # 同步备用模型到全局变量
-                import zulong.models.container as _mc
-                _mc.LLM_MODEL_ID_BACKUP = l2_backup_model.get("model_id", _mc.LLM_MODEL_ID_BACKUP)
-                _mc.LLM_BASE_URL_BACKUP = l2_backup_model.get("base_url", _mc.LLM_BASE_URL_BACKUP)
-                _mc.LLM_API_KEY_BACKUP = l2_backup_model.get("api_key", _mc.LLM_API_KEY_BACKUP)
-                _mc.LLM_API_FORMAT_BACKUP = l2_backup_model.get("api_format", "chat_completions")
-                # 备用客户端不再需要 OpenAI 对象（litellm 网关处理）
-                self.backup_client = True  # 标记可用（litellm 网关处理实际调用）
-                logger.info(
-                    "[LLM] Registry L2_BACKUP 已应用: %s @ %s",
-                    l2_backup_model.get("model_id", ""),
-                    l2_backup_model.get("base_url", ""),
+                backup_format = l2_backup_model.get("api_format", "chat_completions")
+                backup_success, backup_msg = self.hot_switch_llm(
+                    backend=l2_backup_model.get("backend", ""),
+                    model_id=l2_backup_model.get("model_id", ""),
+                    base_url=l2_backup_model.get("base_url", ""),
+                    api_key=l2_backup_model.get("api_key", ""),
+                    num_ctx=l2_backup_model.get("num_ctx"),
+                    api_format=backup_format,
+                    layer="l2_backup",
                 )
+                if backup_success:
+                    logger.info(
+                        "[LLM] Registry L2_BACKUP 已应用: %s @ %s (format=%s)",
+                        l2_backup_model.get("model_id", ""),
+                        l2_backup_model.get("base_url", ""),
+                        backup_format,
+                    )
+                else:
+                    logger.warning("[LLM] Registry L2_BACKUP 应用失败: %s", backup_msg)
         except Exception as e:
-            logger.debug("[LLM] Registry LLM 配置应用异常（不影响默认初始化）: %s", e)
+            logger.warning("[LLM] Registry LLM 配置应用异常: %s", e)
 
     def hot_switch_llm(self, backend: str = None, model_id: str = None,
-                       base_url: str = None, api_key: str = None) -> tuple:
-        """运行时热切换 LLM 客户端
-        
+                       base_url: str = None, api_key: str = None,
+                       num_ctx: int = None, api_format: str = None,
+                       layer: str = "l2_core") -> tuple:
+        """运行时热切换 LLM 客户端（registry 唯一权威）
+
+        LLM 配置的唯一来源是 models.registry；本函数不再读写 llm.{backend} 段。
+        调用方（Web 端 /api/models/registry/* 或启动时 _apply_registry_llm_config）
+        传入来自 registry 条目的字段，本函数负责：
+          1. 更新内存全局变量（container.LLM_*）
+          2. 重建 OpenAI 客户端
+          3. 回写 models.registry 对应条目并持久化
+
         Args:
-            backend: 新后端名称（如 "ollama", "siliconflow"）。None 表示保持当前后端。
-            model_id: 覆盖模型 ID。None 表示使用后端默认 model_id。
-            base_url: 覆盖 API 地址。None 表示使用后端默认 base_url。
-            api_key: 覆盖 API 密钥。None 表示使用后端默认 api_key。
-        
+            backend: 后端名称（如 openai_compatible / openai / anthropic / ollama）。
+            model_id: 模型 ID。
+            base_url: API 地址。
+            api_key: API 密钥（None 表示不覆盖已存的 key）。
+            num_ctx: 上下文窗口大小（可选）。
+            api_format: API 格式（chat_completions / anthropic_messages / ...，可选）。
+            layer: 写回 registry 的目标层（l2_core / l2_backup），默认 l2_core。
+
         Returns:
             (success: bool, message: str)
         """
         from zulong.config.config_manager import get_config_manager
         cm = get_config_manager()
-        
-        # 确定目标后端
-        target_backend = backend or cm.get('llm.backend', 'ollama')
-        target_config = cm.get_dict(f'llm.{target_backend}', {})
-        # 对于 openai_compatible / custom 等中转站后端，llm.* 配置区可能不存在
-        # 此时直接用传入的参数（base_url/model_id/api_key 来自 registry）
-        if not target_config and (base_url and model_id):
-            target_config = {}  # 不从配置读，用传入参数
-        elif not target_config:
-            return False, f"后端 '{target_backend}' 未配置"
-        
-        target_base_url = base_url or target_config.get('base_url', '')
-        target_model_id = model_id or target_config.get('model_id', '')
-        target_api_key = api_key or target_config.get('api_key', 'EMPTY')
-        target_num_ctx = int(target_config.get('num_ctx', 0))
-        
-        # 尝试创建新客户端
+
+        # 必须显式提供 backend/model_id/base_url（registry 是唯一来源，不再兜底）
+        target_backend = backend or ""
+        target_model_id = model_id or ""
+        target_base_url = base_url or ""
+        if not target_backend or not target_model_id or not target_base_url:
+            return False, ("LLM 配置不完整（backend/model_id/base_url 必填），"
+                           "请在 Web 端模型配置中补全")
+
+        # api_key 为 None 时保留当前层已应用的 key；为空串则视为清空。
+        layer_key = self._normalize_llm_layer(layer)
+        import zulong.models.container as _mc
+        current_cfg = self._get_runtime_llm_config(layer_key)
+        if api_key is not None:
+            target_api_key = api_key
+        elif current_cfg.api_key:
+            target_api_key = current_cfg.api_key
+        elif layer_key == "backup":
+            target_api_key = getattr(_mc, "LLM_API_KEY_BACKUP", "")
+        else:
+            target_api_key = _mc.LLM_API_KEY
+        target_num_ctx = int(num_ctx) if num_ctx else current_cfg.num_ctx
+        if not target_num_ctx and layer_key == "core":
+            target_num_ctx = _mc.LLM_NUM_CTX
+
+        # 尝试创建新客户端（OpenAI 兼容客户端，litellm 网关负责实际协议适配）
         try:
             from openai import OpenAI as _OpenAI
             new_client = _OpenAI(base_url=target_base_url, api_key=target_api_key)
         except Exception as e:
             return False, f"客户端创建失败: {e}"
-        
-        # 原子替换
-        self.vllm_client = new_client
-        
-        # 更新全局变量（供其他模块引用）
-        import zulong.models.container as _mc
-        _mc.LLM_BACKEND = target_backend
-        _mc.LLM_BASE_URL = target_base_url
-        _mc.LLM_MODEL_ID = target_model_id
-        _mc.LLM_API_KEY = target_api_key
-        _mc.VLLM_BASE_URL = target_base_url
-        _mc.LLM_NUM_CTX = target_num_ctx
-        
-        # 更新 context window size
-        if target_num_ctx > 0:
-            self._context_window_size = target_num_ctx
-        
-        # 更新配置文件（持久化）
-        cm.config['llm']['backend'] = target_backend
-        cm.config['llm'].setdefault(target_backend, {})
-        if model_id:
-            cm.config['llm'][target_backend]['model_id'] = model_id
-        if base_url:
-            cm.config['llm'][target_backend]['base_url'] = base_url
-        if api_key:
-            cm.config['llm'][target_backend]['api_key'] = api_key
-        
-        # 同步更新环境覆盖配置，防止重启时被 _apply_environment_overrides 覆盖
-        env = cm.environment
-        env_cfg = cm.config.get('environments', {}).get(env, {})
-        if env_cfg and 'llm' in env_cfg:
-            env_cfg['llm']['backend'] = target_backend
-        
-        cm.save()
-        
+
+        # 原子替换运行时状态。registry 是持久源，engine runtime 是执行源，
+        # container.LLM_* 只作为兼容层同步写入。
+        target_api_format = api_format or current_cfg.api_format or "chat_completions"
+        self._set_runtime_llm_config(
+            layer_key,
+            backend=target_backend,
+            model_id=target_model_id,
+            base_url=target_base_url,
+            api_key=target_api_key,
+            api_format=target_api_format,
+            num_ctx=target_num_ctx,
+        )
+        if layer_key == "backup":
+            self.backup_client = new_client
+            _mc.LLM_MODEL_ID_BACKUP = target_model_id
+            _mc.LLM_BASE_URL_BACKUP = target_base_url
+            _mc.LLM_API_KEY_BACKUP = target_api_key
+            _mc.LLM_API_FORMAT_BACKUP = target_api_format
+        else:
+            self.vllm_client = new_client
+            _mc.LLM_BACKEND = target_backend
+            _mc.LLM_BASE_URL = target_base_url
+            _mc.LLM_MODEL_ID = target_model_id
+            _mc.LLM_API_KEY = target_api_key
+            _mc.VLLM_BASE_URL = target_base_url
+            _mc.LLM_NUM_CTX = target_num_ctx
+            _mc.LLM_API_FORMAT = target_api_format
+            # 更新 context window size
+            if target_num_ctx > 0:
+                self._context_window_size = target_num_ctx
+
+        # 回写 models.registry（唯一持久化位置），保持 registry 与运行时一致
+        registry = cm.config.get("models", {}).get("registry", [])
+        if isinstance(registry, list):
+            updated = False
+            for m in registry:
+                if (
+                    isinstance(m, dict)
+                    and self._normalize_llm_layer(m.get("layer")) == layer_key
+                    and m.get("enabled")
+                ):
+                    m["backend"] = target_backend
+                    m["model_id"] = target_model_id
+                    m["base_url"] = target_base_url
+                    if api_key is not None:
+                        m["api_key"] = target_api_key
+                    if num_ctx is not None:
+                        m["num_ctx"] = target_num_ctx
+                    if api_format:
+                        m["api_format"] = api_format
+                    updated = True
+                    break
+            if updated:
+                cm.config.setdefault("models", {})["registry"] = registry
+                cm.save()
+
         logger.info(f"[LLM] 热切换完成: {target_backend} / {target_model_id} @ {target_base_url}")
         return True, f"已切换到 {target_backend} / {target_model_id}"
     
@@ -558,10 +693,9 @@ class InferenceEngine:
         Returns:
             dict: 可直接解包到 chat.completions.create() 的额外参数
         """
-        # 动态读取模块级变量（热切换后值会更新）
-        import zulong.models.container as _mc
-        backend = _mc.LLM_BACKEND
-        num_ctx = _mc.LLM_NUM_CTX
+        cfg = self._get_runtime_llm_config("core")
+        backend = cfg.backend
+        num_ctx = cfg.num_ctx
         extra_kw: dict = {}
 
         # vLLM 后端：支持 repetition_penalty 和禁用思维链
@@ -2339,7 +2473,11 @@ class InferenceEngine:
             logger.info(f"🚀 [vLLM] 开始调用 OpenAI API...")
             logger.info(f"🚀 [vLLM] 消息数：{len(messages)}")
             
-            vllm_model_id = LLM_MODEL_ID
+            core_cfg = self._get_runtime_llm_config("core")
+            vllm_model_id = core_cfg.model_id
+            if not vllm_model_id or not core_cfg.base_url:
+                logger.warning("[vLLM] CORE 运行时配置未应用，使用降级回复")
+                return self._get_fallback_response("")
             
             # 🔥 新增：超时保护（30 秒）
             import concurrent.futures
@@ -2348,13 +2486,13 @@ class InferenceEngine:
 
             def call_vllm():
                 from zulong.l2.llm_gateway import llm_completion
-                import zulong.models.container as _mc
                 return llm_completion(
                     model=vllm_model_id,
                     messages=messages_for_llm,
-                    api_base=_mc.LLM_BASE_URL,
-                    api_key=_mc.LLM_API_KEY,
-                    backend=_mc.LLM_BACKEND,
+                    api_base=core_cfg.base_url,
+                    api_key=core_cfg.api_key,
+                    api_format=core_cfg.api_format,
+                    backend=core_cfg.backend,
                     max_tokens=1024,
                     temperature=0.3,
                     top_p=0.85,
@@ -2617,7 +2755,18 @@ class InferenceEngine:
             sync_engine_tool_budget,
         )
 
-        model_id = vllm_model_id or LLM_MODEL_ID
+        # 配置缺失守卫：registry 未配置 LLM 时，直接返回明确错误，不尝试调用。
+        core_cfg = self._get_runtime_llm_config("core")
+        if not core_cfg.base_url or not core_cfg.model_id:
+            logger.warning("[L2] LLM 未配置（base_url/model_id 为空），请在 Web 端「模型配置」中启用一个 L2 核心模型")
+            return {
+                "response_content": "⚠️ LLM 尚未配置，请在 Web 端「模型配置」中启用一个 L2 核心模型后再发送消息。",
+                "tool_calls_data": None,
+                "fallback_used": False,
+                "config_missing": True,
+            }
+
+        model_id = vllm_model_id or core_cfg.model_id
         sync_engine_tool_budget(self, user_input)
         tool_budget = get_engine_tool_budget(self)
         # TSD §26.1.5: L2 单次决策入口也必须构建本轮 active context，不得回退旧历史裁剪。
@@ -2687,9 +2836,8 @@ class InferenceEngine:
 
         def call_core(kwargs=api_kwargs):
             from zulong.l2.llm_gateway import llm_completion
-            import zulong.models.container as _mc
             # 从 kwargs 提取参数，通过 litellm 网关调用
-            _model = kwargs.pop("model", _mc.LLM_MODEL_ID)
+            _model = kwargs.pop("model", None) or core_cfg.model_id
             _messages = kwargs.pop("messages", [])
             _stream = kwargs.pop("stream", False)
             _tools = kwargs.pop("tools", None)
@@ -2700,9 +2848,9 @@ class InferenceEngine:
             return llm_completion(
                 model=_model,
                 messages=_messages,
-                api_base=_mc.LLM_BASE_URL,
-                api_key=_mc.LLM_API_KEY,
-                backend=_mc.LLM_BACKEND,
+                api_base=core_cfg.base_url,
+                api_key=core_cfg.api_key,
+                api_format=core_cfg.api_format,
                 stream=_stream,
                 tools=_tools,
                 tool_choice=_tool_choice,
@@ -2869,7 +3017,9 @@ class InferenceEngine:
         Returns:
             生成的响应文本
         """
-        if not self.backup_client or not LLM_MODEL_ID_BACKUP:
+        core_cfg = self._get_runtime_llm_config("core")
+        backup_cfg = self._get_runtime_llm_config("backup")
+        if not self.backup_client or not backup_cfg.model_id or not backup_cfg.base_url:
             logger.warning("⚠️ [BACKUP] 备用客户端不可用，使用静态降级回复")
             self._last_timeout_phase = TimeoutPhase.BACKUP_UNAVAILABLE
             self._event_logger.log_degradation_decision(
@@ -2878,7 +3028,7 @@ class InferenceEngine:
             return self._get_fallback_response(user_input)
         
         # 跳过备用模型调用：如果 CORE 和 BACKUP 是同一个模型，直接降级
-        if LLM_MODEL_ID_BACKUP == LLM_MODEL_ID and LLM_BASE_URL_BACKUP == LLM_BASE_URL:
+        if backup_cfg.model_id == core_cfg.model_id and backup_cfg.base_url == core_cfg.base_url:
             logger.info("⚠️ [BACKUP] CORE 与 BACKUP 是同一模型，跳过备用调用")
             self._last_timeout_phase = TimeoutPhase.CORE_BACKUP_SAME_MODEL
             self._event_logger.log_degradation_decision(
@@ -2896,7 +3046,7 @@ class InferenceEngine:
             return self._get_fallback_response(user_input)
         
         try:
-            logger.info(f"🔄 [BACKUP] 切换到备用模型：{LLM_MODEL_ID_BACKUP} @ {LLM_BASE_URL_BACKUP}")
+            logger.info(f"🔄 [BACKUP] 切换到备用模型：{backup_cfg.model_id} @ {backup_cfg.base_url}")
             
             import concurrent.futures
             
@@ -2904,13 +3054,13 @@ class InferenceEngine:
 
             def call_backup():
                 from zulong.l2.llm_gateway import llm_completion
-                import zulong.models.container as _mc_bk
                 return llm_completion(
-                    model=LLM_MODEL_ID_BACKUP,
+                    model=backup_cfg.model_id,
                     messages=messages_for_llm,
-                    api_base=LLM_BASE_URL_BACKUP,
-                    api_key=LLM_API_KEY_BACKUP,
-                    backend=_mc_bk.LLM_BACKEND,
+                    api_base=backup_cfg.base_url,
+                    api_key=backup_cfg.api_key,
+                    api_format=backup_cfg.api_format,
+                    backend=backup_cfg.backend,
                     max_tokens=1024,
                     temperature=0.3,
                     top_p=0.85,
@@ -3817,7 +3967,7 @@ class InferenceEngine:
                 # ====== 远程模型：L2 单次决策 + 按需工具循环 ======
                 # 工具清单只代表可用范围；只有模型真实返回 tool_call 才进入工具循环。
                 logger.info(f"🚀 [L2] 远程 API 单次决策，候选工具数: {len(tool_definitions)}")
-                vllm_model_id = LLM_MODEL_ID
+                vllm_model_id = self._get_runtime_model_id("core")
                 
                 # 初始化 FC 循环变量
                 response = None
@@ -4490,8 +4640,7 @@ class InferenceEngine:
             
             # 获取工具定义
             tool_definitions = self._collect_tool_definitions()
-            from zulong.models.container import LLM_MODEL_ID
-            vllm_model_id = LLM_MODEL_ID
+            vllm_model_id = self._get_runtime_model_id("core")
             
             self._last_fc_messages = messages
             decision = self._call_l2_once(

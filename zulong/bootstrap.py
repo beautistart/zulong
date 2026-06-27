@@ -45,15 +45,15 @@ from zulong.config.config_manager import init_config, get_config, get_llm_config
 config_manager = init_config()
 logger_info = []  # 临时存储日志，直到 logging 初始化
 
-# 从配置文件设置 LLM 后端环境变量
+# 从 registry 读取 LLM 后端（registry 是唯一权威来源）
+_llm_cfg = get_llm_config()
+_llm_backend = _llm_cfg.get("backend", "")
 if 'USE_VLLM_FOR_L2' not in os.environ:
-    llm_backend = get_config('llm.backend', 'ollama')
-    os.environ['USE_VLLM_FOR_L2'] = 'true' if llm_backend == 'vllm' else 'false'
-    logger_info.append(f"🔧 [CONFIG] LLM 后端：{llm_backend}")
+    os.environ['USE_VLLM_FOR_L2'] = 'true' if _llm_backend == 'vllm' else 'false'
+    logger_info.append(f"🔧 [CONFIG] LLM 后端：{_llm_backend or '(未配置)'}")
 
 if 'USE_VLLM_FOR_L2_BACKUP' not in os.environ:
-    backup_backend = get_config('llm.backend', 'ollama')
-    os.environ['USE_VLLM_FOR_L2_BACKUP'] = 'true' if backup_backend == 'vllm' else 'false'
+    os.environ['USE_VLLM_FOR_L2_BACKUP'] = 'true' if _llm_backend == 'vllm' else 'false'
 
 # 设置其他关键环境变量
 os.environ.setdefault('ZULONG_LOG_LEVEL', get_config('system.log_level', 'INFO'))
@@ -283,12 +283,11 @@ class SystemBootstrap:
             
             # 注入 vLLM 客户端供技能包使用（如 TaskPlanner 的 LLM 拆解）
             self.skill_pack_runtime._vllm_client = getattr(inference_engine, 'vllm_client', None)
-            # 使用与主推理引擎相同的模型 ID（而非硬编码文件路径）
-            try:
-                from zulong.models.container import LLM_MODEL_ID as _skill_model_id
-                self.skill_pack_runtime._vllm_model_id = _skill_model_id
-            except ImportError:
-                self.skill_pack_runtime._vllm_model_id = None
+            # 使用与主推理引擎相同的已应用运行时模型 ID。
+            get_runtime_model = getattr(inference_engine, '_get_runtime_model_id', None)
+            self.skill_pack_runtime._vllm_model_id = (
+                get_runtime_model('core') if callable(get_runtime_model) else None
+            )
             self.skill_pack_loader = SkillPackLoader(self.skill_pack_runtime)
             
             # 从配置加载技能包

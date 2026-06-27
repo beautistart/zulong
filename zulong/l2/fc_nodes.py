@@ -343,7 +343,17 @@ def _make_call_model_node(engine: "InferenceEngine"):
         messages = state["messages"]
         cb_force_no_tools = state.get("cb_force_no_tools", False)
         tool_definitions = state["tool_definitions"]
-        vllm_model_id = state["vllm_model_id"]
+        vllm_model_id = state.get("vllm_model_id") or ""
+        if not vllm_model_id:
+            get_runtime_model = getattr(engine, "_get_runtime_model_id", None)
+            if callable(get_runtime_model):
+                vllm_model_id = get_runtime_model("core")
+            state["vllm_model_id"] = vllm_model_id
+        get_runtime_call_kwargs = getattr(engine, "_get_runtime_llm_call_kwargs", None)
+        runtime_call_kwargs = (
+            get_runtime_call_kwargs("core")
+            if callable(get_runtime_call_kwargs) else {}
+        )
         force_first_tool = state.get("force_first_tool", False)
         forced_first_tool_name = state.get("forced_first_tool_name")
         forced_next_tool_name = state.get("forced_next_tool_name")
@@ -388,6 +398,8 @@ def _make_call_model_node(engine: "InferenceEngine"):
             "stream": False,
             **engine._get_llm_extra_kwargs(),
         }
+        if runtime_call_kwargs:
+            api_kwargs.update(runtime_call_kwargs)
 
         # 传入工具定义
         tool_budget = get_engine_tool_budget(engine)
@@ -460,8 +472,7 @@ def _make_call_model_node(engine: "InferenceEngine"):
 
         def _call(kwargs=api_kwargs):
             from zulong.l2.llm_gateway import llm_completion
-            import zulong.models.container as _mc
-            _model = kwargs.pop("model", _mc.LLM_MODEL_ID)
+            _model = kwargs.pop("model", None) or vllm_model_id
             _messages = kwargs.pop("messages", [])
             _stream = kwargs.pop("stream", False)
             _tools = kwargs.pop("tools", None)
@@ -469,12 +480,16 @@ def _make_call_model_node(engine: "InferenceEngine"):
             _max_tokens = kwargs.pop("max_tokens", 1024)
             _temperature = kwargs.pop("temperature", 0.3)
             _top_p = kwargs.pop("top_p", 0.85)
+            _api_base = kwargs.pop("api_base", runtime_call_kwargs.get("api_base", ""))
+            _api_key = kwargs.pop("api_key", runtime_call_kwargs.get("api_key", ""))
+            _api_format = kwargs.pop("api_format", runtime_call_kwargs.get("api_format", "chat_completions"))
+            _backend = kwargs.pop("backend", runtime_call_kwargs.get("backend", ""))
             return llm_completion(
                 model=_model, messages=_messages,
-                api_base=_mc.LLM_BASE_URL, api_key=_mc.LLM_API_KEY, backend=_mc.LLM_BACKEND,
+                api_base=_api_base, api_key=_api_key, api_format=_api_format,
                 stream=_stream, tools=_tools, tool_choice=_tool_choice,
                 max_tokens=_max_tokens, temperature=_temperature, top_p=_top_p,
-                timeout=engine._fc_loop_timeout, **kwargs,
+                timeout=engine._fc_loop_timeout, backend=_backend, **kwargs,
             )
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -518,15 +533,17 @@ def _make_call_model_node(engine: "InferenceEngine"):
                     f"[FC][Graph] 连续 {api_timeout_count} 次超时，尝试备用模型"
                 )
                 try:
-                    from zulong.models.container import LLM_MODEL_ID_BACKUP, LLM_BASE_URL_BACKUP, LLM_API_KEY_BACKUP
-                    import zulong.models.container as _mc2
-                    if LLM_MODEL_ID_BACKUP:
+                    get_runtime_cfg = getattr(engine, "_get_runtime_llm_config", None)
+                    backup_cfg = get_runtime_cfg("backup") if callable(get_runtime_cfg) else None
+                    if backup_cfg and backup_cfg.model_id and backup_cfg.base_url:
                         from zulong.l2.llm_gateway import llm_completion as _lc2
                         backup_resp = _lc2(
-                            model=LLM_MODEL_ID_BACKUP,
+                            model=backup_cfg.model_id,
                             messages=strip_llm_message_metadata(messages),
-                            api_base=LLM_BASE_URL_BACKUP, api_key=LLM_API_KEY_BACKUP,
-                            backend=_mc2.LLM_BACKEND,
+                            api_base=backup_cfg.base_url,
+                            api_key=backup_cfg.api_key,
+                            api_format=backup_cfg.api_format,
+                            backend=backup_cfg.backend,
                             max_tokens=state.get("response_max_tokens", 1024),
                             temperature=0.3, stream=False,
                             timeout=engine._backup_timeout,
@@ -558,16 +575,22 @@ def _make_call_model_node(engine: "InferenceEngine"):
             logger.error(f"🚨 [FC][Graph] Turn {fc_turn} API 调用失败: {api_err}")
             # 尝试备用模型
             try:
-                from zulong.models.container import LLM_MODEL_ID_BACKUP
-                if engine.backup_client and LLM_MODEL_ID_BACKUP:
-                    logger.info(f"🔄 [FC][Graph] 切换备用模型: {LLM_MODEL_ID_BACKUP}")
-                    backup_resp = engine.backup_client.chat.completions.create(
-                        model=LLM_MODEL_ID_BACKUP,
+                get_runtime_cfg = getattr(engine, "_get_runtime_llm_config", None)
+                backup_cfg = get_runtime_cfg("backup") if callable(get_runtime_cfg) else None
+                if engine.backup_client and backup_cfg and backup_cfg.model_id:
+                    logger.info(f"🔄 [FC][Graph] 切换备用模型: {backup_cfg.model_id}")
+                    from zulong.l2.llm_gateway import llm_completion as _lc_backup
+                    backup_resp = _lc_backup(
+                        model=backup_cfg.model_id,
                         messages=strip_llm_message_metadata(messages),
+                        api_base=backup_cfg.base_url,
+                        api_key=backup_cfg.api_key,
+                        api_format=backup_cfg.api_format,
+                        backend=backup_cfg.backend,
                         max_tokens=1024,
                         temperature=0.3,
                         stream=False,
-                        **engine._get_llm_extra_kwargs(),
+                        timeout=engine._backup_timeout,
                     )
                     return {
                         "response": backup_resp.choices[0].message.content or "",

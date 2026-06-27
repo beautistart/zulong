@@ -198,26 +198,20 @@ def preload_model_from_config(config_manager) -> Optional[ModelPreloader]:
     """
     global _active_preloader
 
-    from zulong.adapters.backend_resolver import resolve_llm_backend
+    # LLM 配置从 registry 读取（唯一权威来源）
+    from zulong.config.config_manager import get_llm_config
+    llm_cfg = get_llm_config()
+    backend = llm_cfg.get("backend", "")
+    base_url = llm_cfg.get("base_url", "")
+    model_id = llm_cfg.get("model_id", "")
+    api_key = llm_cfg.get("api_key", "")
+    num_ctx = int(llm_cfg.get("num_ctx", 0) or 0)
 
-    resolution = resolve_llm_backend(config_manager.config)
-    backend = resolution.backend
-    backend_cfg = resolution.config
-    for warning in resolution.warnings:
-        logger.warning(f"⚠️ [ModelPreloader] {warning}")
-    if not backend_cfg:
-        logger.warning("⚠️ [ModelPreloader] 未找到 LLM 后端配置，跳过预热")
+    if not backend or not base_url or not model_id:
+        logger.info("ℹ️ [ModelPreloader] registry 无可用 L2 配置，跳过预热（请在 Web 端配置）")
         return None
 
-    base_url = backend_cfg.get("base_url", "http://localhost:11434/v1")
-    model_id = backend_cfg.get("model_id", "")
-    api_key = backend_cfg.get("api_key", "EMPTY")
-    timeout = config_manager.get("llm.preload_timeout", 300)
-    num_ctx = int(backend_cfg.get("num_ctx", 0))
-
-    if not model_id:
-        logger.warning("⚠️ [ModelPreloader] model_id 为空，跳过预热")
-        return None
+    timeout = config_manager.get("llm.preload.timeout", 300)
 
     preloader = ModelPreloader(
         base_url=base_url,

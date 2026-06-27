@@ -2600,9 +2600,9 @@ class Gatekeeper:
         大参数模型 (>8B): 关闭 Hint，完全信任模型自主判断
         """
         try:
-            from zulong.models.container import LLM_MODEL_ID
-            model_id = (LLM_MODEL_ID or "").lower()
-        except ImportError:
+            from zulong.config.config_manager import get_llm_config
+            model_id = (get_llm_config().get("model_id") or "").lower()
+        except Exception:
             model_id = ""
 
         small_model_patterns = [

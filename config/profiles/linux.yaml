@@ -5,21 +5,6 @@ system:
   models_dir: ${ZULONG_MODEL_BASE_DIR:./models}
   cache_dir: ${ZULONG_CACHE_DIR:./cache}
 
-llm:
-  backend: ${ZULONG_LLM_BACKEND:ollama}
-  ollama:
-    base_url: ${ZULONG_OLLAMA_BASE_URL:http://localhost:11434/v1}
-    model_id: ${ZULONG_OLLAMA_MODEL_ID:deepseek-v4-pro:cloud}
-    backup_model_id: ${ZULONG_OLLAMA_BACKUP_MODEL_ID:qwen3.5:4b}
-  vllm:
-    base_url: ${ZULONG_VLLM_BASE_URL:http://localhost:8000/v1}
-    model_id: ${ZULONG_VLLM_MODEL_ID:./models/Qwen/Qwen3___5-0.8B-AWQ}
-  sglang:
-    base_url: ${ZULONG_SGLANG_BASE_URL:http://localhost:30000/v1}
-    model_id: ${ZULONG_SGLANG_MODEL_ID:./models/Qwen/Qwen3___5-0.8B-AWQ}
-  transformer:
-    device: auto
-
 audio:
   asr:
     device: auto

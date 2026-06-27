@@ -141,13 +141,18 @@ class PreloadManager:
     async def _warmup_core_model(self):
         try:
             health_tracker = getattr(self._engine, '_health_tracker', None)
+            get_runtime_cfg = getattr(self._engine, "_get_runtime_llm_config", None)
+            core_cfg = get_runtime_cfg("core") if callable(get_runtime_cfg) else None
+            if not core_cfg or not core_cfg.model_id or not core_cfg.base_url:
+                raise RuntimeError("CORE 模型运行时配置未应用")
             from zulong.l2.llm_gateway import llm_completion
-            from zulong.models.container import LLM_BASE_URL, LLM_MODEL_ID, LLM_API_KEY
             response = llm_completion(
-                model=LLM_MODEL_ID,
+                model=core_cfg.model_id,
                 messages=[{"role": "user", "content": self._config.warmup_prompt}],
-                api_base=LLM_BASE_URL,
-                api_key=LLM_API_KEY,
+                api_base=core_cfg.base_url,
+                api_key=core_cfg.api_key,
+                api_format=core_cfg.api_format,
+                backend=core_cfg.backend,
                 max_tokens=32,
                 temperature=0.1,
                 stream=False,
@@ -168,9 +173,10 @@ class PreloadManager:
     async def _load_backup_model(self):
         backup_client = getattr(self._engine, 'backup_client', None)
         if backup_client:
-            from zulong.models.container import LLM_BASE_URL_BACKUP, LLM_MODEL_ID_BACKUP
-            if LLM_MODEL_ID_BACKUP and LLM_BASE_URL_BACKUP:
-                logger.info(f"[PreloadManager] BACKUP模型已配置: {LLM_MODEL_ID_BACKUP}")
+            get_runtime_cfg = getattr(self._engine, "_get_runtime_llm_config", None)
+            backup_cfg = get_runtime_cfg("backup") if callable(get_runtime_cfg) else None
+            if backup_cfg and backup_cfg.model_id and backup_cfg.base_url:
+                logger.info(f"[PreloadManager] BACKUP模型已配置: {backup_cfg.model_id}")
                 return
         logger.info("[PreloadManager] BACKUP模型未配置或不可用，跳过")
 

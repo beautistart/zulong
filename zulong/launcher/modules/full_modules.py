@@ -198,11 +198,10 @@ class SkillPackModule(Module):
             core_tool_manager=core_tool_manager,
         )
         runtime._vllm_client = getattr(engine, "vllm_client", None)
-        try:
-            from zulong.models.container import LLM_MODEL_ID
-            runtime._vllm_model_id = LLM_MODEL_ID
-        except ImportError:
-            runtime._vllm_model_id = None
+        get_runtime_model = getattr(engine, "_get_runtime_model_id", None)
+        runtime._vllm_model_id = (
+            get_runtime_model("core") if callable(get_runtime_model) else None
+        )
 
         loader = SkillPackLoader(runtime)
         config_path = os.path.join(

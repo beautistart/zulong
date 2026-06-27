@@ -32,13 +32,13 @@ class ConfigModule(Module):
         config_mgr = init_config()
         self._context["config_manager"] = config_mgr
 
-        # 设置环境变量（与 bootstrap.py 对齐）
+        # 设置环境变量（与 bootstrap.py 对齐）：从 registry 读 LLM 后端
+        from zulong.config.config_manager import get_llm_config
+        _llm_backend = get_llm_config().get("backend", "")
         if "USE_VLLM_FOR_L2" not in os.environ:
-            backend = get_config("llm.backend", "ollama")
-            os.environ["USE_VLLM_FOR_L2"] = "true" if backend == "vllm" else "false"
+            os.environ["USE_VLLM_FOR_L2"] = "true" if _llm_backend == "vllm" else "false"
         if "USE_VLLM_FOR_L2_BACKUP" not in os.environ:
-            backup = get_config("llm.backend", "ollama")
-            os.environ["USE_VLLM_FOR_L2_BACKUP"] = "true" if backup == "vllm" else "false"
+            os.environ["USE_VLLM_FOR_L2_BACKUP"] = "true" if _llm_backend == "vllm" else "false"
         os.environ.setdefault("ZULONG_LOG_LEVEL", get_config("system.log_level", "INFO"))
         os.environ.setdefault("ZULONG_DEBUG_MODE", str(get_config("system.debug_mode", False)).lower())
         os.environ.setdefault("ZULONG_DATA_DIR", get_config("system.data_dir", "./data"))

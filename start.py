@@ -13,12 +13,54 @@ import os
 import signal
 import threading
 import webbrowser
+from pathlib import Path
 
 # 🔥 设置项目根目录环境变量（所有模块从此派生路径）
-os.environ.setdefault("ZULONG_HOME", os.path.dirname(os.path.abspath(__file__)))
+_PROJECT_ROOT = Path(__file__).resolve().parent
+os.environ.setdefault("ZULONG_HOME", str(_PROJECT_ROOT))
+
+
+def _ensure_project_venv() -> None:
+    """确保统一使用项目内 zulong_env 运行后端。
+
+    用户可能直接运行系统 Python: `python start.py`。为避免出现系统 Python
+    与项目虚拟环境依赖不一致（例如 litellm 只装在其中一个环境）的情况，
+    启动入口在导入业务模块前自动重进 zulong_env 的解释器。
+    """
+    if os.environ.get("ZULONG_SKIP_VENV_REEXEC", "").lower() in {"1", "true", "yes"}:
+        return
+
+    if sys.platform == "win32":
+        venv_python = _PROJECT_ROOT / "zulong_env" / "Scripts" / "python.exe"
+    else:
+        venv_python = _PROJECT_ROOT / "zulong_env" / "bin" / "python"
+
+    if not venv_python.exists():
+        print(f"[Zulong] 未找到项目虚拟环境解释器: {venv_python}", flush=True)
+        print("[Zulong] 将继续使用当前 Python，但建议先创建 zulong_env。", flush=True)
+        return
+
+    current = Path(sys.executable).resolve()
+    target = venv_python.resolve()
+    if os.name == "nt":
+        same_python = str(current).casefold() == str(target).casefold()
+    else:
+        same_python = current == target
+    if same_python:
+        return
+
+    print(f"[Zulong] 切换到项目虚拟环境: {target}", flush=True)
+    os.execv(str(target), [str(target), str(_PROJECT_ROOT / "start.py"), *sys.argv[1:]])
+
+
+if __name__ == "__main__":
+    _ensure_project_venv()
+    if "--show-python" in sys.argv:
+        print(sys.executable)
+        raise SystemExit(0)
 
 # 确保项目根目录在 sys.path 中
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(_PROJECT_ROOT))
 
 import uvicorn
 from zulong.launcher.app import LauncherApp

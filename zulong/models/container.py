@@ -4,7 +4,7 @@
 
 import time
 import os
-from typing import Dict, Optional
+from typing import Dict
 from zulong.models.config import ModelID, MODEL_CONFIGS, BASE_VRAM_USAGE, SAFE_VRAM_LIMIT_GB
 from zulong.models.engine import RealModelLoader
 
@@ -41,15 +41,16 @@ def _load_project_dotenv() -> None:
 _load_project_dotenv()
 
 # ================================================================================
-# 🔥 配置系统集成 (优先使用统一配置，兼容旧环境变量)
+# 🔥 配置系统集成
+# --------------------------------------------------------------------------------
+# 注意：LLM 配置不再从此处读取，统一由 models.registry 提供
+# （见 InferenceEngine._apply_registry_llm_config）。此处仅保留日志可用性检测。
 # ================================================================================
 try:
-    from zulong.config.config_manager import get_config, get_llm_config
-    _use_config_system = True
+    import zulong.config.config_manager  # noqa: F401  (确认配置系统可导入)
     logger.info("✅ [ModelContainer] 使用统一配置系统")
 except ImportError:
-    _use_config_system = False
-    logger.info("⚠️ [ModelContainer] 使用环境变量配置 (兼容模式)")
+    logger.info("⚠️ [ModelContainer] 配置系统不可用 (降级模式)")
 
 # 🔥 关键：手动注册 qwen3_5 架构（解决 Transformers 识别问题）
 def register_qwen35_architecture():
@@ -91,107 +92,23 @@ print("[ModelContainer] 开始注册 qwen3_5 架构...")
 register_qwen35_architecture()
 
 # ================================================================================
-# 🔥 LLM 后端配置（优先使用统一配置，兼容旧环境变量）
+# 🔥 LLM 后端配置
+# --------------------------------------------------------------------------------
+# 唯一权威来源是 models.registry（由 Web 端 /api/models/registry/* 维护）。
+# 此处模块级全局变量初始化为空；运行时由 InferenceEngine._apply_registry_llm_config()
+# 在启动时从 registry 注入真实值（或保持空 —— 此时发消息会自然报错）。
+# 不再从 llm.* 配置段 / 环境变量 / 字面量默认值读取，杜绝硬编码与静默兜底。
 # ================================================================================
-if _use_config_system:
-    # 从统一配置读取（按活跃后端获取，不再仅限 Ollama 段）
-    llm_config = get_llm_config()
-    LLM_BACKEND = llm_config.get('backend', 'ollama')
-    LLM_BASE_URL = llm_config.get('base_url', 'http://localhost:11434/v1')
-    LLM_MODEL_ID = llm_config.get('model_id', 'qwen3.5:4b')
-    LLM_API_KEY = llm_config.get('api_key', 'EMPTY')
-    # 从活跃后端读取 num_ctx（所有后端均可配置，不再仅限 Ollama）
-    LLM_NUM_CTX = int(llm_config.get('num_ctx', 0))
-    
-    logger.info(f"📄 [ModelContainer] 从配置文件加载 LLM 配置:")
-    logger.info(f"   后端：{LLM_BACKEND}")
-    logger.info(f"   API 地址：{LLM_BASE_URL}")
-    logger.info(f"   模型 ID: {LLM_MODEL_ID}")
-else:
-    # 兼容旧环境变量模式
-    LLM_BACKEND = os.environ.get("LLM_BACKEND", "ollama").lower()
-    LLM_BASE_URL = os.environ.get("LLM_BASE_URL", None)
-    LLM_MODEL_ID = os.environ.get("LLM_MODEL_ID", None)
-    LLM_API_KEY = os.environ.get("LLM_API_KEY", "EMPTY")
-    LLM_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "0"))
-    
-    # 根据后端类型推断默认值
-    _BACKEND_DEFAULTS = {
-        "vllm": {
-            "base_url": "http://localhost:8000/v1",
-            "model_id": "./models/Qwen/Qwen3___5-0.8B-AWQ",
-        },
-        "ollama": {
-            "base_url": "http://localhost:11434/v1",
-            "model_id": "deepseek-v3.1:671b-cloud",
-        },
-        "lmstudio": {
-            "base_url": "http://localhost:1234/v1",
-            "model_id": "qwen3.5-4b",
-        },
-        "openai": {
-            "base_url": "https://api.openai.com/v1",
-            "model_id": "gpt-4o-mini",
-        },
-        "siliconflow": {
-            "base_url": "https://api.siliconflow.cn/v1",
-            "model_id": "deepseek-ai/DeepSeek-V4-Flash",
-        },
-        "openrouter": {
-            "base_url": "https://openrouter.ai/api/v1",
-            "model_id": "openai/gpt-4o-mini",
-        },
-        "oneapi": {
-            "base_url": "http://localhost:3000/v1",
-            "model_id": "gpt-4o-mini",
-        },
-        "custom": {
-            "base_url": "http://localhost:11434/v1",
-            "model_id": "qwen3.5:4b",
-        },
-        "openai_compatible": {
-            "base_url": "http://localhost:11434/v1",
-            "model_id": "qwen3.5:4b",
-        },
-    }
-    
-    _defaults = _BACKEND_DEFAULTS.get(LLM_BACKEND, _BACKEND_DEFAULTS["ollama"])
-    if LLM_BASE_URL is None:
-        LLM_BASE_URL = _defaults["base_url"]
-    if LLM_MODEL_ID is None:
-        LLM_MODEL_ID = _defaults["model_id"]
+LLM_BACKEND = ""          # 后端类型，如 openai_compatible / openai / anthropic / ollama
+LLM_BASE_URL = ""         # API 地址
+LLM_MODEL_ID = ""         # 模型 ID
+LLM_API_KEY = ""          # API 密钥
+LLM_NUM_CTX = 0           # 上下文窗口大小（0 = 未设置）
 
-# 🔥 L2 BACKUP 备用模型配置（独立于主模型）
-# 当主模型（L2 CORE）超时/不可用时，自动切换到备用模型。
-# 优先读取项目统一命名的 ZULONG_L2_BACKUP_*；旧 LLM_*_BACKUP 继续兼容。
-def _first_env(*names: str, default: Optional[str] = None) -> Optional[str]:
-    for name in names:
-        value = os.environ.get(name)
-        if value not in (None, ""):
-            return value
-    return default
-
-
-_backup_model_default = (
-    get_config("l2_inference.backup_model", "qwen3.5:4b")
-    if _use_config_system
-    else "qwen3.5:4b"
-)
-LLM_MODEL_ID_BACKUP = _first_env(
-    "ZULONG_L2_BACKUP_MODEL",
-    "LLM_MODEL_ID_BACKUP",
-    default=_backup_model_default,
-)
-LLM_BASE_URL_BACKUP = _first_env(
-    "ZULONG_L2_BACKUP_BASE_URL",
-    "LLM_BASE_URL_BACKUP",
-    default="http://localhost:11434/v1",
-)
-LLM_API_KEY_BACKUP = _first_env(
-    "ZULONG_L2_BACKUP_API_KEY",
-    "LLM_API_KEY_BACKUP",
-    default="EMPTY",
-)
+# 🔥 L2 BACKUP 备用模型配置（同主模型，registry 为唯一来源，初始为空）
+LLM_MODEL_ID_BACKUP = ""
+LLM_BASE_URL_BACKUP = ""
+LLM_API_KEY_BACKUP = ""
 
 # 向后兼容：保留 USE_VLLM_FOR_L2 和 VLLM_BASE_URL
 USE_VLLM_FOR_L2 = os.environ.get("USE_VLLM_FOR_L2", "false").lower() == "true"
@@ -201,11 +118,11 @@ VLLM_BASE_URL = LLM_BASE_URL  # 向后兼容别名
 LLM_API_FORMAT = "chat_completions"
 LLM_API_FORMAT_BACKUP = "chat_completions"
 
-print(f"[ModelContainer] [LLM] 后端: {LLM_BACKEND}")
-print(f"[ModelContainer] [LLM] API 地址: {LLM_BASE_URL}")
-print(f"[ModelContainer] [LLM] 模型 ID (CORE): {LLM_MODEL_ID}")
-print(f"[ModelContainer] [LLM] 模型 ID (BACKUP): {LLM_MODEL_ID_BACKUP}")
-print(f"[ModelContainer] [LLM] API Key: {'***' if LLM_API_KEY != 'EMPTY' else 'EMPTY'}")
+print(f"[ModelContainer] [LLM] 后端: {LLM_BACKEND or '(未配置，等待 registry 注入)'}")
+print(f"[ModelContainer] [LLM] API 地址: {LLM_BASE_URL or '(空)'}")
+print(f"[ModelContainer] [LLM] 模型 ID (CORE): {LLM_MODEL_ID or '(空)'}")
+print(f"[ModelContainer] [LLM] 模型 ID (BACKUP): {LLM_MODEL_ID_BACKUP or '(空)'}")
+print(f"[ModelContainer] [LLM] API Key: {'***' if LLM_API_KEY else '(空)'}")
 print(f"[ModelContainer] [LLM] USE_VLLM_FOR_L2 = {USE_VLLM_FOR_L2}")
 
 

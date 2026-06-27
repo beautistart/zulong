@@ -157,6 +157,12 @@ class FCRunner:
         if hasattr(self.engine, '_rule_guardian'):
             self.engine._rule_guardian.reset()
         sync_engine_tool_budget(self.engine, user_input)
+        if not vllm_model_id:
+            get_runtime_model = getattr(self.engine, "_get_runtime_model_id", None)
+            if callable(get_runtime_model):
+                vllm_model_id = get_runtime_model("core")
+        if not vllm_model_id:
+            logger.warning("[FCRunner] 运行时 LLM 模型 ID 为空，后续模型调用可能失败")
 
         # 组装初始状态
         state: Dict = {

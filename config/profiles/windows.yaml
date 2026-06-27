@@ -6,37 +6,6 @@ system:
   models_dir: ${ZULONG_MODEL_BASE_DIR:./models}
   cache_dir: ${ZULONG_CACHE_DIR:./cache}
 
-llm:
-  backend: ${ZULONG_LLM_BACKEND:deepseek}
-  ollama:
-    base_url: ${ZULONG_OLLAMA_BASE_URL:http://localhost:11434/v1}
-    model_id: ${ZULONG_OLLAMA_MODEL_ID:deepseek-v4-pro:cloud}
-    backup_model_id: ${ZULONG_OLLAMA_BACKUP_MODEL_ID:qwen3.5:4b}
-    auto_discover: ${ZULONG_OLLAMA_AUTO_DISCOVER:true}
-    health_check_interval: ${ZULONG_OLLAMA_HEALTH_CHECK_INTERVAL:30}
-    keep_alive: ${ZULONG_OLLAMA_KEEP_ALIVE:5m}
-  vllm:
-    base_url: ${ZULONG_VLLM_BASE_URL:http://localhost:8000/v1}
-    model_id: ${ZULONG_VLLM_MODEL_ID:./models/Qwen/Qwen3___5-0.8B-AWQ}
-  sglang:
-    base_url: ${ZULONG_SGLANG_BASE_URL:http://localhost:30000/v1}
-    model_id: ${ZULONG_SGLANG_MODEL_ID:./models/Qwen/Qwen3___5-0.8B-AWQ}
-  siliconflow:
-    base_url: ${ZULONG_SILICONFLOW_BASE_URL:https://api.siliconflow.cn/v1}
-    model_id: ${ZULONG_SILICONFLOW_MODEL_ID:deepseek-ai/DeepSeek-V4-Flash}
-  openrouter:
-    base_url: ${ZULONG_OPENROUTER_BASE_URL:https://openrouter.ai/api/v1}
-    model_id: ${ZULONG_OPENROUTER_MODEL_ID:openai/gpt-4o-mini}
-  oneapi:
-    base_url: ${ZULONG_ONEAPI_BASE_URL:http://localhost:3000/v1}
-    model_id: ${ZULONG_ONEAPI_MODEL_ID:gpt-4o-mini}
-  custom:
-    base_url: ${ZULONG_CUSTOM_LLM_BASE_URL:http://localhost:11434/v1}
-    api_key: ${ZULONG_CUSTOM_LLM_API_KEY:EMPTY}
-    model_id: ${ZULONG_CUSTOM_LLM_MODEL_ID:qwen3.5:4b}
-  transformer:
-    device: auto
-
 audio:
   asr:
     device: auto
