@@ -840,7 +840,48 @@ class InferenceEngine:
 
         search_tools_tool.set_tool_rag(tool_rag)
         logger.info("[ToolBundle] search_tools 已绑定 ToolRAG")
+        # 自动把注册表工具索引到 ToolRAG（首次绑定时填充，让 request_tool_supplement 能语义检索到所有工具）
+        self._index_registry_tools_to_rag(tool_rag)
         return True
+
+    def _index_registry_tools_to_rag(self, tool_rag: Any) -> None:
+        """把工具注册表的所有工具索引进 ToolRAG，让 LLM 通过 request_tool_supplement 语义检索补充。"""
+        try:
+            registry = getattr(self, "tool_engine", None)
+            registry = getattr(registry, "registry", None) if registry else None
+            if not registry or not hasattr(tool_rag, "add_tool"):
+                return
+            tools = getattr(registry, "tools", {}) or {}
+            if not tools:
+                return
+            indexed = 0
+            for name, tool in tools.items():
+                if not getattr(tool, "enabled", True):
+                    continue
+                desc = getattr(tool, "description", "") or ""
+                schema = tool.get_function_schema() if hasattr(tool, "get_function_schema") else None
+                params = []
+                if schema and isinstance(schema, dict):
+                    props = (schema.get("function") or {}).get("parameters", {}).get("properties", {})
+                    params = list(props.keys()) if isinstance(props, dict) else []
+                # 跳过已索引的（避免重复）
+                if name in getattr(tool_rag, "_tool_index", {}):
+                    continue
+                try:
+                    tool_rag.add_tool(
+                        tool_name=str(name),
+                        description=str(desc),
+                        param_names=params,
+                        source="builtin",
+                        function_schema=schema,
+                    )
+                    indexed += 1
+                except Exception:
+                    pass
+            if indexed > 0:
+                logger.info("[ToolBundle] ToolRAG 已索引 %d 个注册表工具（共 %d）", indexed, len(tools))
+        except Exception as exc:
+            logger.debug("[ToolBundle] ToolRAG 索引注册表工具失败: %s", exc)
 
     def _collect_tool_definitions_for_bundle(
         self,
