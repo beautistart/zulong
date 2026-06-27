@@ -356,10 +356,12 @@ class ExecWriteFileTool(BaseTool):
     def __init__(self):
         super().__init__(name="exec_write_file", category=ToolCategory.SYSTEM)
         self.description = (
-            "创建、覆写或追加写入工作区中的文件。"
+            "创建、覆写、追加或精准编辑工作区中的文件。"
             "用于生成代码、配置文件、文档等。"
             "文件路径会被限制在工作区目录内。"
             "支持一次写入完整文件；写入后会读取校验，失败时返回结构化错误。"
+            "mode='overwrite' 创建新文件或完全重写；mode='append' 追加；"
+            "mode='edit' 精准修改已有文件（传 edits 操作列表，不传完整文件内容）。"
         )
 
 
@@ -388,8 +390,19 @@ class ExecWriteFileTool(BaseTool):
             or request.parameters.get("write_mode")
             or "overwrite"
         ).strip().lower()
-        if mode not in {"overwrite", "append"}:
+        if mode not in {"overwrite", "append", "edit"}:
             mode = "overwrite"
+
+        # mode="edit"：精准编辑已有文件，传 edits 操作列表
+        edits = request.parameters.get("edits") or []
+        if mode == "edit":
+            if not edits:
+                return self._create_result(
+                    success=False,
+                    error="mode='edit' 需要传 edits 参数（操作列表），例如 [{\"op\":\"insert\",\"line\":5,\"text\":\"import os\\n\"}]",
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
 
         if not file_path:
             return self._create_result(
@@ -438,6 +451,38 @@ class ExecWriteFileTool(BaseTool):
 
             # 创建父目录
             target.parent.mkdir(parents=True, exist_ok=True)
+
+            # mode="edit"：精准编辑已有文件（行操作）
+            if mode == "edit":
+                if not target.exists():
+                    return self._create_result(
+                        success=False,
+                        error=f"edit 模式要求文件已存在，但文件不存在: {target}",
+                        execution_time=time.time() - start_time,
+                        request_id=request.request_id,
+                    )
+                from .ide_bridge_tools import _local_apply_edits, _broadcast_local_file_change
+                edit_result = _local_apply_edits(
+                    file_path=str(target),
+                    edits=edits,
+                    workspace_path=str(workspace),
+                    reason="exec_write_file mode=edit",
+                )
+                if edit_result.get("ok"):
+                    _broadcast_local_file_change(
+                        file_path=edit_result.get("resolved_path", str(target)),
+                        operation="edited",
+                        original=edit_result.get("original", ""),
+                        next=edit_result.get("next", ""),
+                        summary=edit_result.get("summary", ""),
+                    )
+                return self._create_result(
+                    success=bool(edit_result.get("ok")),
+                    data=edit_result,
+                    error=None if edit_result.get("ok") else edit_result.get("error", "edit failed"),
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
 
             # 写入文件
             existing = ""
@@ -496,6 +541,19 @@ class ExecWriteFileTool(BaseTool):
                     execution_time=time.time() - start_time,
                     request_id=request.request_id,
                 )
+
+            # 推送 diff/file_changed 事件给 Web 端
+            try:
+                from .ide_bridge_tools import _broadcast_local_file_change
+                _broadcast_local_file_change(
+                    file_path=str(target),
+                    operation="created" if not existing else "updated",
+                    original=existing,
+                    next=effective_content,
+                    summary=f"exec_write_file {mode}",
+                )
+            except Exception:
+                pass
 
             # 关联到活跃任务图
             try:
@@ -580,8 +638,37 @@ class ExecWriteFileTool(BaseTool):
                 },
                 "mode": {
                     "type": "string",
-                    "enum": ["overwrite", "append"],
-                    "description": "写入模式。默认 overwrite 覆盖整个文件；append 会读取现有文件并追加本次 content。",
+                    "enum": ["overwrite", "append", "edit"],
+                    "description": "写入模式。overwrite 覆盖整个文件；append 读取现有文件并追加；edit 精准修改已有文件传 edits 操作列表。创建新文件用 overwrite，修改已有文件优先用 edit。",
+                },
+                "edits": {
+
+                    "type": "array",
+
+                    "description": "mode='edit' 时的编辑操作列表（其他模式省略）。insert:{op,line,text}; delete:{op,line,count}; replace:{op,start_line,end_line,text}; append:{op,text}",
+
+                    "items": {
+
+                        "type": "object",
+
+                        "properties": {
+
+                            "op": {"type": "string", "enum": ["insert", "delete", "replace", "append"]},
+
+                            "line": {"type": "integer"},
+
+                            "count": {"type": "integer"},
+
+                            "start_line": {"type": "integer"},
+
+                            "end_line": {"type": "integer"},
+
+                            "text": {"type": "string"},
+
+                        },
+
+                    },
+
                 },
                 "node_id": {
                     "type": "string",
@@ -591,7 +678,7 @@ class ExecWriteFileTool(BaseTool):
 
             },
 
-            "required": ["file_path", "content"],
+            "required": ["file_path"],
 
         }
 

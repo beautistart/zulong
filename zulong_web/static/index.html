@@ -104,56 +104,64 @@
         /* === Diff 面板 === */
         .diff-panel {
             display: none; width: 0; min-width: 0; height: 100%;
-            background: #f8fafc; border-left: 1px solid #e2e8f0;
+            background: #1a1a1a; border-left: 1px solid #333;
             overflow: hidden; flex-direction: column;
         }
         .app-wrapper.diff-mode .diff-panel {
             display: flex; width: 42%; min-width: 300px;
         }
         .app-wrapper.diff-mode .chat-container { flex: 1; }
+        /* diff 拖拽分隔条 */
+        .diff-resize-handle {
+            width: 5px; min-width: 5px; cursor: col-resize; background: #2a2a2a;
+            display: none; flex-shrink: 0;
+        }
+        .app-wrapper.diff-mode .diff-resize-handle { display: block; }
+        .diff-resize-handle:hover { background: #3b82f6; }
         .diff-panel-header {
             display: flex; align-items: center; justify-content: space-between;
-            padding: 8px 14px; background: #fff; border-bottom: 1px solid #e2e8f0;
+            padding: 8px 14px; background: #222; border-bottom: 1px solid #333;
         }
-        .diff-panel-title { font-size: 14px; font-weight: 600; color: #1e293b; }
+        .diff-panel-title { font-size: 14px; font-weight: 600; color: #e0e0e0; }
         .diff-panel-close {
             background: none; border: none; font-size: 18px; cursor: pointer;
-            color: #64748b; padding: 2px 8px; border-radius: 4px;
+            color: #888; padding: 2px 8px; border-radius: 4px;
         }
-        .diff-panel-close:hover { background: #f1f5f9; color: #ef4444; }
+        .diff-panel-close:hover { background: #333; color: #ef4444; }
         .diff-panel-body { flex: 1; overflow-y: auto; padding: 0; }
-        .diff-file-block { border-bottom: 1px solid #e2e8f0; }
+        .diff-file-block { border-bottom: 1px solid #2a2a2a; }
         .diff-file-header {
             display: flex; align-items: center; gap: 6px; padding: 6px 14px;
-            background: #f1f5f9; font-size: 12px; font-weight: 600; color: #475569;
+            background: #222; font-size: 12px; font-weight: 600; color: #aaa;
             cursor: pointer; user-select: none;
         }
-        .diff-file-header:hover { background: #e2e8f0; }
+        .diff-file-header:hover { background: #2a2a2a; }
         .diff-file-header .file-op { font-size: 10px; padding: 1px 6px; border-radius: 3px; margin-left: auto; }
-        .diff-file-header .file-op.created { background: #dcfce7; color: #16a34a; }
-        .diff-file-header .file-op.updated { background: #dbeafe; color: #2563eb; }
-        .diff-file-header .file-op.edited { background: #fef3c7; color: #d97706; }
-        .diff-file-header .file-op.deleted { background: #fee2e2; color: #dc2626; }
+        .diff-file-header .file-op.created { background: #1a3a1a; color: #4ade80; }
+        .diff-file-header .file-op.updated { background: #1a2a3a; color: #60a5fa; }
+        .diff-file-header .file-op.edited { background: #3a3a1a; color: #fbbf24; }
+        .diff-file-header .file-op.deleted { background: #3a1a1a; color: #f87171; }
         .diff-file-content { display: block; }
         .diff-file-block.collapsed .diff-file-content { display: none; }
         .diff-line { display: flex; font-family: 'Consolas','Monaco','Courier New',monospace; font-size: 12px; line-height: 1.5; }
         .diff-line-num { width: 44px; min-width: 44px; padding: 0 6px; text-align: right;
-            color: #94a3b8; background: #f1f5f9; user-select: none; }
+            color: #555; background: #1e1e1e; user-select: none; }
         .diff-line-content { flex: 1; padding: 0 8px; white-space: pre-wrap; word-break: break-all; }
-        .diff-line.added { background: #dcfce7; }
-        .diff-line.added .diff-line-content { color: #16a34a; }
-        .diff-line.removed { background: #fee2e2; }
-        .diff-line.removed .diff-line-content { color: #dc2626; }
-        .diff-line.context .diff-line-content { color: #64748b; }
-        .diff-line.added .diff-line-num { background: #bbf7d0; }
-        .diff-line.removed .diff-line-num { background: #fecaca; }
-        .diff-empty { padding: 20px; text-align: center; color: #94a3b8; font-size: 13px; }
-        body.dark-mode .diff-panel { background: #0f172a; border-left-color: #334155; }
-        body.dark-mode .diff-panel-header { background: #1e293b; border-bottom-color: #334155; }
-        body.dark-mode .diff-panel-title { color: #e2e8f0; }
-        body.dark-mode .diff-file-header { background: #1e293b; color: #94a3b8; }
-        body.dark-mode .diff-line-num { background: #1e293b; color: #475569; }
-        body.dark-mode .diff-line.context .diff-line-content { color: #94a3b8; }
+        .diff-line.added { background: #1a2a1a; }
+        .diff-line.added .diff-line-content { color: #4ade80; }
+        .diff-line.removed { background: #2a1a1a; }
+        .diff-line.removed .diff-line-content { color: #f87171; }
+        .diff-line.context .diff-line-content { color: #888; }
+        .diff-line.added .diff-line-num { background: #1e3a1e; }
+        .diff-line.removed .diff-line-num { background: #3a1e1e; }
+        .diff-empty { padding: 20px; text-align: center; color: #555; font-size: 13px; }
+        /* 暗夜模式（diff 面板本身就是黑灰配色，dark-mode 下略加深） */
+        body.dark-mode .diff-panel { background: #0d0d0d; border-left-color: #1a1a1a; }
+        body.dark-mode .diff-panel-header { background: #161616; border-bottom-color: #1a1a1a; }
+        body.dark-mode .diff-panel-title { color: #ccc; }
+        body.dark-mode .diff-file-header { background: #161616; color: #666; }
+        body.dark-mode .diff-line-num { background: #0d0d0d; color: #333; }
+        body.dark-mode .diff-line.context .diff-line-content { color: #555; }
         .graph-tab-btn {
             padding: 5px 14px;
             font-size: 12px;
@@ -4187,6 +4195,8 @@
 
     </div><!-- graph-panel end -->
 
+    <!-- ===== Diff 拖拽分隔条 ===== -->
+    <div class="diff-resize-handle" id="diffResizeHandle"></div>
     <!-- ===== Diff 面板 ===== -->
     <div class="diff-panel" id="diffPanel">
         <div class="diff-panel-header">
@@ -8393,10 +8403,40 @@
             }
             wrapper.classList.add('diff-mode');
             renderDiffPanel();
+            initDiffResize();
         }
         function closeDiffPanel() {
             var wrapper = document.getElementById('appWrapper');
             wrapper.classList.remove('diff-mode');
+        }
+        // 拖拽缩放 diff 面板
+        function initDiffResize() {
+            var handle = document.getElementById('diffResizeHandle');
+            if (!handle || handle.dataset.bound === '1') return;
+            handle.dataset.bound = '1';
+            handle.addEventListener('mousedown', function(e) {
+                e.preventDefault();
+                var wrapper = document.getElementById('appWrapper');
+                var panel = document.getElementById('diffPanel');
+                var startX = e.clientX;
+                var startWidth = panel.offsetWidth;
+                document.body.style.cursor = 'col-resize';
+                document.body.style.userSelect = 'none';
+                function onMove(ev) {
+                    var dx = startX - ev.clientX; // 向左拖增大面板
+                    var newWidth = Math.max(280, Math.min(window.innerWidth - 400, startWidth + dx));
+                    panel.style.width = newWidth + 'px';
+                    panel.style.flex = 'none';
+                }
+                function onUp() {
+                    document.body.style.cursor = '';
+                    document.body.style.userSelect = '';
+                    document.removeEventListener('mousemove', onMove);
+                    document.removeEventListener('mouseup', onUp);
+                }
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+            });
         }
         function renderDiffPanel() {
             var body = document.getElementById('diffPanelBody');
