@@ -390,7 +390,10 @@ class InferenceEngine:
             else:
                 self.vllm_client = None
                 self.backup_client = None
-            
+
+            # 🔥 Registry 优先：如果 models.registry 有 l2_core/l2_backup 配置，用它覆盖默认初始化
+            self._apply_registry_llm_config()
+
             # 🔧 显式调试日志：确认代码已加载
             logger.info("=" * 80)
             logger.info("🔧 InferenceEngine 初始化完成（FC 自主循环模式）")
@@ -414,7 +417,69 @@ class InferenceEngine:
                 self.l2_model = None
                 self._l2_loaded = False
         return self.l2_model is not None
-    
+
+    def _apply_registry_llm_config(self) -> None:
+        """启动时从 models.registry 读取 l2_core/l2_backup 模型配置，覆盖默认 LLM 客户端。
+
+        registry 是 Web 端配置的权威来源；llm.* 配置区是旧入口。
+        如果 registry 有 enabled 的 l2_core 模型，优先用它初始化 LLM 客户端。
+        """
+        try:
+            from zulong.config.config_manager import get_config_manager
+            cm = get_config_manager()
+            registry = cm.config.get("models", {}).get("registry", [])
+            if not isinstance(registry, list) or not registry:
+                return
+
+            # 找 l2_core 的 enabled 模型
+            l2_core_model = None
+            l2_backup_model = None
+            for m in registry:
+                if not isinstance(m, dict):
+                    continue
+                if m.get("layer") == "l2_core" and m.get("enabled", False):
+                    l2_core_model = m
+                elif m.get("layer") == "l2_backup" and m.get("enabled", False):
+                    l2_backup_model = m
+
+            if l2_core_model:
+                success, msg = self.hot_switch_llm(
+                    backend=l2_core_model.get("backend", "openai"),
+                    model_id=l2_core_model.get("model_id", ""),
+                    base_url=l2_core_model.get("base_url", ""),
+                    api_key=l2_core_model.get("api_key", ""),
+                )
+                if success:
+                    logger.info(
+                        "[LLM] Registry L2_CORE 已应用: %s @ %s",
+                        l2_core_model.get("model_id", ""),
+                        l2_core_model.get("base_url", ""),
+                    )
+                else:
+                    logger.warning("[LLM] Registry L2_CORE 应用失败: %s", msg)
+
+            if l2_backup_model and l2_backup_model is not l2_core_model:
+                # 同步备用模型到全局变量
+                import zulong.models.container as _mc
+                _mc.LLM_MODEL_ID_BACKUP = l2_backup_model.get("model_id", _mc.LLM_MODEL_ID_BACKUP)
+                _mc.LLM_BASE_URL_BACKUP = l2_backup_model.get("base_url", _mc.LLM_BASE_URL_BACKUP)
+                _mc.LLM_API_KEY_BACKUP = l2_backup_model.get("api_key", _mc.LLM_API_KEY_BACKUP)
+                try:
+                    from openai import OpenAI as _OpenAI
+                    self.backup_client = _OpenAI(
+                        base_url=l2_backup_model.get("base_url", ""),
+                        api_key=l2_backup_model.get("api_key", "EMPTY"),
+                    )
+                    logger.info(
+                        "[LLM] Registry L2_BACKUP 已应用: %s @ %s",
+                        l2_backup_model.get("model_id", ""),
+                        l2_backup_model.get("base_url", ""),
+                    )
+                except Exception as e:
+                    logger.warning("[LLM] Registry L2_BACKUP 应用失败: %s", e)
+        except Exception as e:
+            logger.debug("[LLM] Registry LLM 配置应用异常（不影响默认初始化）: %s", e)
+
     def hot_switch_llm(self, backend: str = None, model_id: str = None,
                        base_url: str = None, api_key: str = None) -> tuple:
         """运行时热切换 LLM 客户端
