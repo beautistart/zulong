@@ -318,6 +318,106 @@ def _local_workspace_write(
         }
 
 
+def _local_apply_edits(
+    *,
+    file_path: str,
+    edits: list,
+    workspace_path: str,
+    reason: str = "",
+) -> Dict[str, Any]:
+    """本地执行 edit 模式行操作（VS Code 桥未连接时的静默兜底）。
+
+    读取文件内容按行分割，逐条应用 insert/delete/replace/append 操作，写回文件。
+    行为等价于 VS Code WorkspaceEdit，但不走编辑器 API。
+    """
+    workspace = _active_or_explicit_workspace(workspace_path)
+    if not workspace:
+        return {
+            "ok": False,
+            "status": "workspace_required",
+            "error": "workspace_path is required for local edit fallback",
+            "applied": False,
+            "verified": False,
+        }
+    try:
+        workspace_resolved = Path(workspace).resolve()
+        target = _resolve_ide_target_path(file_path, str(workspace_resolved), {})
+        target = target.resolve()
+        try:
+            target.relative_to(workspace_resolved)
+        except Exception:
+            return {
+                "ok": False,
+                "status": "path_outside_workspace",
+                "error": f"target path must stay inside the active task workspace: {target}",
+                "workspace_path": str(workspace_resolved),
+                "applied": False,
+                "verified": False,
+            }
+        if not target.exists():
+            return {
+                "ok": False,
+                "status": "file_not_found",
+                "error": f"edit 模式要求文件已存在，但文件不存在: {target}",
+                "applied": False,
+                "verified": False,
+            }
+        # 读取文件内容
+        original = target.read_text(encoding="utf-8")
+        lines = original.split("\n")
+        summary_parts = []
+
+        for e in edits:
+            op = str(e.get("op", "")).lower()
+            if op == "insert":
+                line_idx = max(0, int(e.get("line", 1)) - 1)
+                text = str(e.get("text", ""))
+                new_lines = text.split("\n")
+                lines[line_idx:line_idx] = new_lines
+                summary_parts.append(f"L{line_idx + 1} +{len(new_lines)}行")
+            elif op == "delete":
+                line_idx = max(0, int(e.get("line", 1)) - 1)
+                count = max(1, int(e.get("count", 1)))
+                del lines[line_idx:line_idx + count]
+                summary_parts.append(f"L{line_idx + 1} -{count}行")
+            elif op == "replace":
+                sl = max(0, int(e.get("start_line", 1)) - 1)
+                el = max(sl, int(e.get("end_line", sl + 1)) - 1)
+                text = str(e.get("text", ""))
+                new_lines = text.split("\n")
+                lines[sl:el + 1] = new_lines
+                summary_parts.append(f"L{sl + 1}-{el + 1} →{len(new_lines)}行")
+            elif op == "append":
+                text = str(e.get("text", ""))
+                lines.append("")  # 确保末尾换行
+                lines.extend(text.split("\n"))
+                summary_parts.append(f"末尾 +{len(text.split(chr(10)))}行")
+
+        next_content = "\n".join(lines)
+        summary = ", ".join(summary_parts) or f"{len(edits)} 个编辑操作"
+        target.write_text(next_content, encoding="utf-8")
+        logger.info("[ide_write_file][edit] local apply_edits: %s (%s)", target, summary)
+        return {
+            "ok": True,
+            "status": "local_edit",
+            "result": f"已本地应用 {summary}: {target}",
+            "workspace_path": str(workspace_resolved),
+            "resolved_path": str(target),
+            "applied": True,
+            "verified": True,
+            "edit_count": len(edits),
+            "summary": summary,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "local_edit_failed",
+            "error": str(exc),
+            "applied": False,
+            "verified": False,
+        }
+
+
 class IdeOpenWorkspaceTool(BaseTool):
     """Open or switch a VS Code workspace through the Zulong IDE bridge."""
 
@@ -587,9 +687,17 @@ class IdeWriteFileTool(BaseTool):
             )
         if not _ide_bridge_available(workspace_path):
             if write_mode == "edit":
+                # VS Code 桥未连接：本地静默执行 edit 行操作（不弹窗、不阻塞）
+                result = _local_apply_edits(
+                    file_path=file_path,
+                    edits=edits,
+                    workspace_path=workspace_path,
+                    reason=redirect_reason or "VS Code bridge unavailable; applied edits locally",
+                )
                 return self._create_result(
-                    success=False,
-                    error="VS Code 后台桥未连接，mode='edit' 需要 IDE 桥支持。请改用 mode='overwrite' 或 'append'。",
+                    success=bool(result.get("ok")),
+                    data=result,
+                    error=None if result.get("ok") else result.get("error", "local edit failed"),
                     execution_time=time.time() - start,
                     request_id=request.request_id,
                 )

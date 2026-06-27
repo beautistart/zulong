@@ -222,33 +222,63 @@ export class VscodeExecutionBridge {
 		return raw
 	}
 
-	private async writeFile(args: Record<string, any>): Promise<string> {
-		const filePath = this.resolvePath(args.path)
-		this.ensureInsideWorkspace(filePath)
-		const chunk = args.content || ""
-		const mode = String(args.mode || args.write_mode || "overwrite").toLowerCase()
-		const existed = await this.fileExists(filePath)
-		const original = existed ? await fs.readFile(filePath, "utf-8") : ""
-		const content = mode === "append" ? `${original}${chunk}` : chunk
-		const approved = await this.confirmFileChange({
-			filePath,
-			original,
-			next: content,
-			operation: existed ? "modify" : "create",
-			summary: mode === "append" ? "追加文件内容" : existed ? "更新文件内容" : "创建新文件",
-		})
-		if (!approved) {
-			return `用户未应用写入: ${filePath}`
+		private async writeFile(args: Record<string, any>): Promise<string> {
+			const filePath = this.resolvePath(args.path)
+			this.ensureInsideWorkspace(filePath)
+			const chunk = args.content || ""
+			const mode = String(args.mode || args.write_mode || "overwrite").toLowerCase()
+			const existed = await this.fileExists(filePath)
+			const original = existed ? await fs.readFile(filePath, "utf-8") : ""
+			const content = mode === "append" ? `${original}${chunk}` : chunk
+			const approved = await this.confirmFileChange({
+				filePath,
+				original,
+				next: content,
+				operation: existed ? "modify" : "create",
+				summary: mode === "append" ? "追加文件内容" : existed ? "更新文件内容" : "创建新文件",
+			})
+			if (!approved) {
+				return `用户未应用写入: ${filePath}`
+			}
+			// 使用 WorkspaceEdit 替代 fs.writeFile：编辑器打开时实时可见，关闭时照样写入文件系统
+			const uri = vscode.Uri.file(filePath)
+			const we = new vscode.WorkspaceEdit()
+			if (!existed) {
+				we.createFile(uri, { overwrite: true })
+			}
+			// 获取当前文档内容以确定替换范围（编辑器可能已有未保存修改）
+			let docContent = original
+			try {
+				const doc = await vscode.workspace.openTextDocument(uri)
+				docContent = doc.getText()
+			} catch (_) {
+				// 文件不在编辑器中，用文件系统内容
+			}
+			const docLines = docContent.split("\n")
+			const lastLine = Math.max(0, docLines.length - 1)
+			const lastChar = (docLines[docLines.length - 1] || "").length
+			const fullRange = new vscode.Range(0, 0, lastLine, lastChar)
+			we.replace(uri, fullRange, content)
+			const applied = await vscode.workspace.applyEdit(we)
+			if (!applied) {
+				// WorkspaceEdit 失败时回退到 fs.writeFile（兜底）
+				await fs.mkdir(path.dirname(filePath), { recursive: true })
+				await fs.writeFile(filePath, content, "utf-8")
+			}
+			// 保存文件到磁盘（WorkspaceEdit 只改缓冲区，需显式保存）
+			try {
+				const doc = await vscode.workspace.openTextDocument(uri)
+				await doc.save()
+			} catch (_) {
+				// 保存失败不阻塞，文件系统已有内容
+			}
+			this.sendFileChanged(filePath, existed ? "updated" : "created")
+			this.scheduleCheckpoint(
+				`${mode === "append" ? "追加" : existed ? "更新" : "创建"} ${path.relative(this.workspaceRoot(), filePath)}`,
+			)
+			void this.openFile(filePath)
+			return `已应用文件变更: ${filePath}`
 		}
-		await fs.mkdir(path.dirname(filePath), { recursive: true })
-		await fs.writeFile(filePath, content, "utf-8")
-		this.sendFileChanged(filePath, existed ? "updated" : "created")
-		this.scheduleCheckpoint(
-			`${mode === "append" ? "追加" : existed ? "更新" : "创建"} ${path.relative(this.workspaceRoot(), filePath)}`,
-		)
-		void this.openFile(filePath)
-		return `已应用文件变更: ${filePath}`
-	}
 
 	private async createDirectory(args: Record<string, any>): Promise<string> {
 		const dirPath = this.resolvePath(args.path || args.file_path)
@@ -794,13 +824,8 @@ export class VscodeExecutionBridge {
 			approval_mode: this.currentApprovalMode(),
 		})
 		return new Promise<boolean>((resolve) => {
-			const timeout = setTimeout(() => {
-				this.pendingApprovals.delete(approvalId)
-				this.sendApprovalDecision(approvalId, toolName, actionSummary, false, extra)
-				resolve(false)
-			}, 60_000)
+			// 审批不限时：等待用户审批或拒绝后才继续（不设超时自动拒绝）
 			this.pendingApprovals.set(approvalId, (approved) => {
-				clearTimeout(timeout)
 				this.sendApprovalDecision(approvalId, toolName, actionSummary, approved, extra)
 				resolve(approved)
 			})
@@ -837,13 +862,8 @@ export class VscodeExecutionBridge {
 			},
 		})
 		return new Promise<boolean>((resolve) => {
-			const timeout = setTimeout(() => {
-				this.pendingApprovals.delete(approvalId)
-				this.sendApprovalDecision(approvalId, toolName, actionSummary, false, extra)
-				resolve(false)
-			}, 60_000)
+			// 审批不限时：等待用户审批或拒绝后才继续（不设超时自动拒绝）
 			this.pendingApprovals.set(approvalId, (approved) => {
-				clearTimeout(timeout)
 				this.sendApprovalDecision(approvalId, toolName, actionSummary, approved, extra)
 				resolve(approved)
 			})

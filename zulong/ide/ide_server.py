@@ -529,11 +529,16 @@ async def ensure_vscode_bridge(
     vscode_command: Optional[str] = None,
     reason: str = "",
     timeout: float = 25.0,
+    silent: bool = True,
 ) -> Dict[str, Any]:
     """Ensure a VS Code extension bridge is connected for workspace work.
 
     This is intentionally an internal state helper, not a new event channel:
     status still goes through broadcast_monitor_event and normal IDE messages.
+
+    silent=True（默认）：桥未连接时不自动拉起 VS Code，直接返回 bridge_not_connected，
+        让调用方走本地静默写入。用于后台编码，不弹出前台 VS Code 窗口。
+    silent=False：桥未连接时拉起 VS Code 并等待连接。供"打开 VS Code"按钮等显式场景使用。
     """
     requested_workspace = _resolve_active_task_workspace(workspace_path)
     if not requested_workspace:
@@ -559,6 +564,16 @@ async def ensure_vscode_bridge(
             "session": session,
             "ide_session_id": session.session_id,
             "workspace_path": session.cwd or requested_workspace,
+        }
+
+    # 桥未连接：silent 模式不自动拉起 VS Code，让调用方走本地静默写入
+    if silent:
+        return {
+            "ok": False,
+            "status": "bridge_not_connected",
+            "silent": True,
+            "workspace_path": requested_workspace,
+            "error": "VS Code 后台桥未连接（静默模式不自动拉起）。",
         }
 
     launched = _launch_vscode_workspace(requested_workspace, vscode_command)
