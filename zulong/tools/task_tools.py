@@ -3309,7 +3309,7 @@ class TaskMarkStatusTool(BaseTool):
                         f"操作被拒绝：节点 {node_id}（{node.label}）声明产出文件，"
                         f"但未检测到真实文件: {', '.join(missing_files)}。"
                         f"{workspace_hint}"
-                        "请先调用 ide_write_file 等真实写入工具完成落盘，"
+                        "请先调用 exec_write_file 等真实写入工具完成落盘，"
                         "再标记该节点为 completed。"
                     )
                     logger.info(

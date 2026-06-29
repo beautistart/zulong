@@ -3,8 +3,9 @@
 This module keeps three concepts separate:
 
 1. **LLM original context**: the full context-window size reported by the LLM.
-2. **Threshold budget**: a configured share of the original context window,
-   used as the denominator for pressure calculation.
+2. **Threshold budget**: the full context-window size configured in Web.
+   ``threshold_budget_ratio`` is kept as compatibility telemetry and is 1.0
+   in normal runtime.
 3. **Actual occupied context**: the context tokens currently used by messages.
 4. **Context pressure**: ``occupied_context_tokens / threshold_budget_tokens``.
 
@@ -118,9 +119,10 @@ def build_context_pressure_view(
     """Build a context-pressure view from token counts."""
     occupied = _safe_non_negative(occupied_context_tokens, 0.0)
     llm_budget = _safe_positive(llm_context_budget_tokens, 1.0)
-    threshold_ratio = _safe_positive(threshold_budget_ratio, 0.5)
-    if threshold_ratio > 1.0:
-        threshold_ratio = 1.0
+    # v2.9.28: Web-configured full context window is the threshold budget.
+    # Keep the ratio field for backward-compatible telemetry, but ignore legacy
+    # temporary values such as 0.50/0.15 so they cannot become system policy.
+    threshold_ratio = 1.0
     threshold_budget = max(1.0, llm_budget * threshold_ratio)
     pressure_ratio = occupied / threshold_budget
     red = _safe_positive(red_ratio, 1.0)

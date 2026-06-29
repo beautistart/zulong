@@ -4080,7 +4080,7 @@
     </div><!-- chat-container end -->
 
     <div class="approval-modal-backdrop is-hidden" id="approvalModalBackdrop" role="presentation">
-        <div class="approval-modal" id="approvalModal" role="dialog" aria-modal="true" aria-labelledby="approvalModalTitle"></div>
+        <div class="approval-modal" id="approvalModal" role="dialog" aria-modal="true" aria-labelledby="approvalModalTitle" tabindex="-1"></div>
     </div>
 
     <!-- ===== 拖拽分隔条 + 图谱面板折叠按钮 ===== -->
@@ -5120,7 +5120,13 @@
         });
 
         // ── TSD v1.7 §23.4: 审批模式 (Web 端全局设置) ──
-        var approvalMode = 'full_auto';  // full_auto | whitelist | manual | popup
+        var approvalMode = (function() {
+            try {
+                return localStorage.getItem('zulong_approval_mode') || 'full_auto';
+            } catch (e) {
+                return 'full_auto';
+            }
+        })();  // full_auto | whitelist | manual | popup
         var approvalModeLabels = {
             full_auto: '完全访问',
             whitelist: '替我审批',
@@ -5132,6 +5138,9 @@
             options = options || {};
             if (!approvalModeLabels[mode]) mode = 'manual';
             approvalMode = mode;
+            if (options.persist !== false) {
+                try { localStorage.setItem('zulong_approval_mode', approvalMode); } catch (e) {}
+            }
             var btn = document.getElementById('approvalModeBtn');
             if (btn) {
                 btn.setAttribute('data-mode', approvalMode);
@@ -5187,10 +5196,13 @@
             approvalModal.appendChild(box);
             approvalModalBackdrop.classList.remove('is-hidden');
             document.body.classList.add('approval-modal-open');
-            var firstAction = box.querySelector('.approval-btn:not(:disabled)');
-            if (firstAction) {
-                setTimeout(function() { firstAction.focus(); }, 0);
-            }
+            setTimeout(function() {
+                try {
+                    approvalModal.focus({ preventScroll: true });
+                } catch (e) {
+                    approvalModal.focus();
+                }
+            }, 0);
             return true;
         }
 
@@ -6261,7 +6273,7 @@
             var changed = false;
             session.messages.forEach(function(msg) {
                 if (!msg || msg.card_type !== 'approval') return;
-                var payload = msg.payload || {};
+                var payload = msg.payload || msg || {};
                 var msgId = payload.approval_id || payload.approvalId || msg.pair_id || msg.id || '';
                 if (String(msgId) !== targetId) return;
                 msg.payload = Object.assign({}, payload, {
@@ -6769,7 +6781,7 @@
                 if (interaction) {
                     cardType = 'interaction';
                     pairId = interaction.pair_id || interaction.interaction_id || '';
-                } else if (eventType === 'IDE_APPROVAL_STATUS' || eventType === 'approval_required') {
+                } else if (eventType === 'IDE_APPROVAL_STATUS' || eventType === 'approval_required' || eventType === 'APPROVAL_REQUIRED' || eventType === 'approval:required') {
                     cardType = 'approval';
                     pairId = payload.approval_id || payload.approvalId || msg.node_id || msg.id || '';
                 }
@@ -6860,7 +6872,7 @@
                 }, { persist: false, historical: true });
                 return;
             }
-            if (eventType === 'IDE_APPROVAL_STATUS' || eventType === 'approval_required' || normalized.card_type === 'approval') {
+            if (eventType === 'IDE_APPROVAL_STATUS' || eventType === 'approval_required' || eventType === 'APPROVAL_REQUIRED' || eventType === 'approval:required' || normalized.card_type === 'approval') {
                 showWebApprovalRequest(buildApprovalRequestFromMessage(normalized), { persist: false, historical: true });
                 return;
             }
@@ -6878,7 +6890,7 @@
         }
 
         function buildApprovalRequestFromMessage(msg) {
-            var payload = msg.payload || {};
+            var payload = msg.payload || msg || {};
             var status = payload.status || '';
             var approved = payload.approved;
             var confirmationState = payload.confirmation_state || '';
@@ -7418,6 +7430,9 @@
                 case 'ide:approval_status':
                     normalized.type = 'IDE_APPROVAL_STATUS';
                     break;
+                case 'approval:required':
+                    normalized.type = 'IDE_APPROVAL_STATUS';
+                    break;
                 case 'ide:approval_result':
                     normalized.type = 'ide_approval_result';
                     normalized.action = 'ide:approval_result';
@@ -7536,6 +7551,7 @@
                     type: "handshake",
                     payload: { client_type: "dashboard", api_version: "2.0" }
                 });
+                setApprovalMode(approvalMode, { persist: false });
                 // 重连后自动同步后端状态（图谱+会话）
                 syncBackendState();
                 if (currentSessionId) {
@@ -7717,8 +7733,14 @@
 
                 case 'IDE_APPROVAL_STATUS':
                 case 'approval_required':
+                case 'APPROVAL_REQUIRED':
+                case 'approval:required':
                     data.type = 'IDE_APPROVAL_STATUS';
                     handleIdeApprovalStatus(data);
+                    break;
+
+                case 'approval_ack':
+                    handleApprovalAck(data);
                     break;
 
                 case 'IDE_DIFF_STATUS':
@@ -7933,6 +7955,10 @@
         function taskStatusLabelFor(state, phase) {
             if (state === 'waiting_approval' || state === 'awaiting_approval') return '等待审批';
             if (state === 'workspace_trust_required' || phase === 'workspace_trust_required') return '等待信任';
+            if (phase === 'llm.request') {
+                if (state === 'possibly_stalled' || state === 'stalled') return '模型等待';
+                return '请求模型';
+            }
             if (state === 'possibly_stalled' || state === 'stalled' || phase === 'stalled_watch') return '疑似卡住';
             if (state === 'completed' || state === 'succeeded') return '已完成';
             if (state === 'failed') return '失败';
@@ -8203,6 +8229,31 @@
             closeApprovalModalIfResolved();
         }
 
+        function resolveApprovalInteractionById(approvalId, approved) {
+            if (!approvalId) return false;
+            var targetId = String(approvalId);
+            var changed = false;
+            var resolvedStatus = approved ? 'approved' : 'rejected';
+            Object.keys(interactionCardMap || {}).forEach(function(pairId) {
+                if (String(pairId) !== targetId) return;
+                var card = interactionCardMap[pairId];
+                if (!card) return;
+                card.classList.remove('awaiting_approval', 'running', 'approved', 'rejected');
+                card.classList.add(resolvedStatus);
+                var title = card.querySelector('.interaction-title');
+                if (title) renderCardMarkdown(title, approved ? '已允许继续执行' : '已拒绝本次操作', { inline: true });
+                var detail = card.querySelector('.interaction-detail');
+                if (detail) renderCardMarkdown(detail, approved ? '已通过审批，任务正在继续执行。' : '已拒绝审批，任务不会执行该操作。');
+                var meta = card.querySelector('.interaction-meta');
+                if (meta) {
+                    renderCardMarkdown(meta, '确认: ' + (approved ? '已允许' : '已拒绝'), { inline: true });
+                    meta.style.display = '';
+                }
+                changed = true;
+            });
+            return changed;
+        }
+
         function resolveApprovalCardById(approvalId, approved, message) {
             if (!approvalId) return;
             var targetId = String(approvalId);
@@ -8218,7 +8269,26 @@
                     }
                 });
             }
+            resolveApprovalInteractionById(targetId, approved);
             updatePersistedApprovalCard(targetId, approved);
+        }
+
+        function handleApprovalAck(data) {
+            var p = data.payload || data || {};
+            var approvalId = p.approval_id || p.approvalId || '';
+            if (!approvalId) return;
+            var approved = p.approved === true || String(p.approved || '').toLowerCase() === 'true';
+            resolveApprovalCardById(
+                approvalId,
+                approved,
+                approved ? '已允许，任务继续执行。' : '已拒绝，不会执行。'
+            );
+            updateTaskStatusUi({
+                state: approved ? 'running' : 'blocked',
+                phase: 'approval_resolved',
+                message: approved ? '审批已通过，任务继续执行。' : '审批已拒绝，任务将停止或重新规划。',
+                awaiting_approval: false
+            }, { renderCard: false });
         }
 
         function showWebApprovalRequest(req, options) {
@@ -8238,8 +8308,8 @@
                 '<div class="approval-summary"></div>' +
                 '<div class="approval-meta"></div>' +
                 '<div class="approval-actions">' +
-                '<button class="approval-btn approve">允许</button>' +
-                '<button class="approval-btn reject">拒绝</button>' +
+                '<button type="button" class="approval-btn approve">允许</button>' +
+                '<button type="button" class="approval-btn reject">拒绝</button>' +
                 '</div>';
             box.querySelector('.approval-summary').textContent = summary;
             box.querySelector('.approval-meta').textContent = riskText + (reason ? ' · ' + reason : '');
@@ -10828,6 +10898,19 @@
                 }
             }
 
+            if (stepData.step_type === 'llm.request') {
+                var llmStatus = Object.assign({}, stepData.data || {}, {
+                    state: (stepData.data && stepData.data.state) || 'running',
+                    phase: 'llm.request',
+                    message: (stepData.data && stepData.data.message) || '正在请求模型，等待返回结果。',
+                    request_id: data.request_id || currentRequestId || '',
+                    conversation_id: data.conversation_id || data.session_id || currentSessionId || ''
+                });
+                if (shouldApplyTaskExecutionStatus(llmStatus)) {
+                    updateTaskStatusUi(llmStatus, { renderCard: false });
+                }
+            }
+
             appendThinkingStepToFixedLedger(stepData);
         }
         
@@ -11122,6 +11205,7 @@
             var icons = {
                 'iteration_start': '🔄',
                 'model_call': '🤖',
+                'llm.request': '🤖',
                 'tool_call': '🔧',
                 'tool_result': '📋',
                 'cb_evaluation': '⚡',
@@ -11144,6 +11228,8 @@
                     return '第 ' + (data.iteration_number || '?') + ' 轮推理';
                 case 'model_call':
                     return '调用模型';
+                case 'llm.request':
+                    return getLlmRequestLabel(data);
                 case 'tool_call':
                     return '正在' + friendlyToolName(data.tool_name || '');
                 case 'tool_result':
@@ -11187,6 +11273,8 @@
                         return 'Prompt 长度: ' + data.prompt_length;
                     }
                     return '';
+                case 'llm.request':
+                    return getLlmRequestDetail(data);
                 case 'tool_call':
                     if (data.arguments) {
                         var argStr = typeof data.arguments === 'string' ? data.arguments : JSON.stringify(data.arguments);
@@ -11224,6 +11312,38 @@
                 default:
                     return '';
             }
+        }
+
+        function getLlmRequestLabel(data) {
+            data = data || {};
+            var status = String(data.status || '').toLowerCase();
+            if (status === 'started') return '正在请求模型';
+            if (status === 'waiting') return '模型请求等待中';
+            if (status === 'long_wait') return '模型请求等待过久';
+            if (status === 'timeout') return '模型请求超时';
+            if (status === 'api_error') return '模型接口异常';
+            if (status === 'interrupted') return '模型请求已停止';
+            if (status === 'success') return '模型已返回';
+            return '模型请求状态';
+        }
+
+        function getLlmRequestDetail(data) {
+            data = data || {};
+            var parts = [];
+            if (data.message) parts.push(escapeHtml(String(data.message)));
+            if (data.layer || data.model_id) {
+                parts.push('通道: ' + escapeHtml([data.layer, data.model_id].filter(Boolean).join(' / ')));
+            }
+            if (data.elapsed_s !== undefined && data.elapsed_s !== null) {
+                parts.push('已等待 ' + escapeHtml(String(data.elapsed_s)) + ' 秒');
+            }
+            if (data.timeout_s !== undefined && data.timeout_s !== null) {
+                parts.push('超时阈值 ' + escapeHtml(String(data.timeout_s)) + ' 秒');
+            }
+            if (data.error) {
+                parts.push('错误: ' + escapeHtml(String(data.error)));
+            }
+            return parts.join(' | ');
         }
         
         // HTML 转义

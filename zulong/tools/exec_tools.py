@@ -19,6 +19,7 @@ import subprocess
 import signal
 import hashlib
 import shutil
+import re
 from typing import Dict, Any
 from pathlib import Path
 
@@ -128,6 +129,89 @@ def _build_shell_command(command: str, shell: str) -> tuple:
             return [], False, shell
         return [bash, "-lc", command], False, shell
     return [], False, shell
+
+
+def _is_inline_file_write_command(command: str) -> bool:
+    """Detect shell snippets that try to create/write files directly.
+
+    Long source text should be passed to exec_write_file as structured JSON.
+    Letting the model embed code in shell one-liners makes quoting/newline
+    handling unreliable and often corrupts generated files.
+    """
+    text = str(command or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+
+    direct_write_markers = (
+        "set-content",
+        "add-content",
+        "out-file",
+        "new-item",
+        "tee-object",
+        "writealltext",
+        "appendalltext",
+        "fs.writefilesync",
+        "fs.appendfilesync",
+    )
+    if any(marker in lowered for marker in direct_write_markers):
+        return True
+
+    redirection_pattern = r'(^|[\s;&|])(?:echo|printf|type|cat)\b[\s\S]{0,400}?(?:>>?|2>|1>)'
+    heredoc_pattern = r'(^|[\s;&|])cat\s+<<'
+    if re.search(redirection_pattern, lowered) or re.search(heredoc_pattern, lowered):
+        return True
+
+    inline_interpreter = (
+        re.search(r'(^|[\s;&|])python(?:3)?(?:\.exe)?\s+(-c|/c)\b', lowered)
+        or re.search(r'(^|[\s;&|])node(?:\.exe)?\s+(-e|--eval)\b', lowered)
+    )
+    if inline_interpreter and any(
+        marker in lowered
+        for marker in (
+            "open(",
+            ".write(",
+            "pathlib",
+            "write_text",
+            "write_bytes",
+            "fs.",
+            "writefile",
+            "appendfile",
+        )
+    ):
+        return True
+
+    return False
+
+
+def _inline_file_write_block_result(
+    *,
+    command: str,
+    workspace: Path,
+    request: ToolRequest,
+    start_time: float,
+) -> ToolResult:
+    return ToolResult(
+        success=False,
+        data={
+            "blocked": True,
+            "reason": "inline_file_write_requires_write_tool",
+            "recoverable": True,
+            "workspace": str(workspace),
+            "next_action": (
+                "请改用 exec_write_file 写入文件内容：file_path 使用相对路径，"
+                "content 直接传真实文本；长文件第一片 mode='overwrite'，后续 mode='append'。"
+            ),
+            "command_preview": str(command or "")[:240],
+        },
+        error=(
+            "exec_run_command 只用于运行/验证命令，不能用 set-content、python -c、node -e "
+            "或重定向来内联写文件。请改用 exec_write_file，避免引号转义、JSON 截断和 \\n 被写成字面量。"
+        ),
+        status_code=400,
+        execution_time=time.time() - start_time,
+        request_id=request.request_id,
+    )
 
 
 
@@ -413,25 +497,69 @@ class ExecWriteFileTool(BaseTool):
             )
 
         try:
-            # 路径安全检查：优先使用活跃任务的专属工作目录
-
+            # 路径安全检查：显式 workspace_path 必须与活跃 TaskGraph 工作区一致。
             from .task_tools import get_active_workspace_dir
 
             active_ws = get_active_workspace_dir()
 
-            workspace = Path(active_ws).resolve() if active_ws else Path(WORKSPACE_DIR).resolve()
+            requested_workspace = (
+                request.parameters.get("workspace_path")
+                or request.parameters.get("workspace_dir")
+                or request.parameters.get("cwd")
+                or ""
+            )
+            requested_workspace = str(requested_workspace or "").strip()
+            active_resolved = Path(active_ws).resolve() if active_ws else None
+            requested_resolved = Path(requested_workspace).resolve() if requested_workspace else None
+            if active_resolved and requested_resolved and active_resolved != requested_resolved:
+                return self._create_result(
+                    success=False,
+                    data={
+                        "status": "workspace_conflict",
+                        "error": (
+                            "工具请求的 workspace_path 与当前 TaskGraph 工作区不一致，"
+                            "已拒绝执行以避免写入错误目录。"
+                        ),
+                        "active_workspace": str(active_resolved),
+                        "requested_workspace": str(requested_resolved),
+                        "workspace_path": str(active_resolved),
+                        "file_path": file_path,
+                        "applied": False,
+                        "verified": False,
+                    },
+                    error=(
+                        "工具请求的 workspace_path 与当前 TaskGraph 工作区不一致，"
+                        "已拒绝执行以避免写入错误目录。"
+                    ),
+                    execution_time=time.time() - start_time,
+                    request_id=request.request_id,
+                )
+
+            workspace = requested_resolved or active_resolved or Path(WORKSPACE_DIR).resolve()
 
             workspace.mkdir(parents=True, exist_ok=True)
 
-            target = (workspace / file_path).resolve()
+            raw_target = Path(str(file_path))
+            target = raw_target.resolve() if raw_target.is_absolute() else (workspace / raw_target).resolve()
 
 
 
-            if not str(target).startswith(str(workspace)):
+            try:
+                target.relative_to(workspace)
+            except Exception:
 
                 return self._create_result(
 
                     success=False,
+                    data={
+                        "status": "path_outside_workspace",
+                        "error": "路径越界：文件必须在工作区目录内。",
+                        "workspace_path": str(workspace),
+                        "resolved_path": str(target),
+                        "file_path": str(target),
+                        "applied": False,
+                        "verified": False,
+                    },
 
                     error=(
 
@@ -454,6 +582,8 @@ class ExecWriteFileTool(BaseTool):
 
             # ===== 桥路由：VS Code 桥可用时走编辑器实时通道 =====
             _bridge_used = False
+            _bridge_original_content = ""
+            _bridge_effective_content = None
             try:
                 from .ide_bridge_tools import _ide_bridge_available, _run_async_request
                 if _ide_bridge_available(str(workspace)):
@@ -480,7 +610,9 @@ class ExecWriteFileTool(BaseTool):
                                 _pre_existing = target.read_text(encoding="utf-8")
                             except Exception:
                                 _pre_existing = ""
+                        _bridge_original_content = _pre_existing
                         _bridge_content = _pre_existing + content if mode == "append" else content
+                        _bridge_effective_content = _bridge_content
                         _bridge_result = _run_async_request("ide:execute_tool", {
                             "tool_name": "write_to_file",
                             "arguments": {"path": str(target), "content": _bridge_content, "mode": mode},
@@ -533,24 +665,28 @@ class ExecWriteFileTool(BaseTool):
                 effective_content = ""
             else:
                 # overwrite/append 本地写入（桥未用或失败）
-                existing = ""
-                if mode == "append" and target.exists():
-                    try:
-                        existing = target.read_text(encoding="utf-8")
-                    except Exception as exc:
-                        return self._create_result(
-                            success=False,
-                            data={
-                                "file_path": str(target),
-                                "mode": mode,
-                                "recoverable": True,
-                                "next_action": "请改用 mode='overwrite' 重新写入第一片，后续再 append。",
-                            },
-                            error=f"append 前无法读取现有文件: {file_path} ({exc})",
-                            execution_time=time.time() - start_time,
-                            request_id=request.request_id,
-                        )
-                effective_content = existing + content if mode == "append" else content
+                existing = _bridge_original_content if _bridge_used else ""
+                if _bridge_used:
+                    effective_content = str(_bridge_effective_content or "")
+                else:
+                    if mode == "append" and target.exists():
+                        try:
+                            existing = target.read_text(encoding="utf-8")
+                        except Exception as exc:
+                            return self._create_result(
+                                success=False,
+                                data={
+                                    "file_path": str(target),
+                                    "resolved_path": str(target),
+                                    "mode": mode,
+                                    "recoverable": True,
+                                    "next_action": "请改用 mode='overwrite' 重新写入第一片，后续再 append。",
+                                },
+                                error=f"append 前无法读取现有文件: {file_path} ({exc})",
+                                execution_time=time.time() - start_time,
+                                request_id=request.request_id,
+                            )
+                    effective_content = existing + content if mode == "append" else content
                 if not _bridge_used:
                     target.write_text(effective_content, encoding="utf-8")
             expected_bytes = len(effective_content.encode("utf-8"))
@@ -576,17 +712,23 @@ class ExecWriteFileTool(BaseTool):
                 hashlib.sha256(effective_content.encode("utf-8")).hexdigest()[:12],
             )
             if not verified_content:
+                verification_error = (
+                    f"文件写入后校验失败，目标文件未真实存在: {file_path}"
+                    if not verified
+                    else f"文件写入后校验失败，目标文件内容未应用为本次写入内容: {file_path}"
+                )
                 return self._create_result(
                     success=False,
                     data={
                         "file_path": str(target),
+                        "resolved_path": str(target),
                         "bytes_written": expected_bytes,
                         "mode": mode,
                         "applied": target.exists(),
                         "verified": False,
                         "actual_bytes": actual_bytes,
                     },
-                    error=f"文件写入后校验失败: {file_path}",
+                    error=verification_error,
                     execution_time=time.time() - start_time,
                     request_id=request.request_id,
                 )
@@ -632,6 +774,7 @@ class ExecWriteFileTool(BaseTool):
 
                 data={
                     "file_path": str(target),
+                    "resolved_path": str(target),
                     "bytes_written": expected_bytes,
                     "chunk_bytes": len(content.encode("utf-8")),
                     "mode": mode,
@@ -845,6 +988,18 @@ class ExecRunCommandTool(BaseTool):
             workspace = Path(WORKSPACE_DIR).resolve()
 
 
+
+        if _is_inline_file_write_command(command):
+            logger.warning(
+                "[exec_run_command] blocked inline file write; use exec_write_file: %s",
+                command[:240],
+            )
+            return _inline_file_write_block_result(
+                command=command,
+                workspace=workspace,
+                request=request,
+                start_time=start_time,
+            )
 
         illegal_paths = _scan_external_paths(command, workspace)
 

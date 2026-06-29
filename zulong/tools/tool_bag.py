@@ -16,7 +16,6 @@ from zulong.tools.base import BaseTool, ToolCategory
 
 WRITE_TOOL_NAMES = {
     "exec_write_file",
-    "ide_write_file",
     "write_to_file",
     "replace_in_file",
     "delete_file",
@@ -33,7 +32,6 @@ TERMINAL_TOOL_NAMES = {
 
 IDE_TOOL_NAMES = {
     "ide_open_workspace",
-    "ide_write_file",
     # VS Code 完整控制工具 (TSD v2.7 工具袋扩充)
     "vscode_run_command",
     "get_diagnostics",
@@ -489,13 +487,13 @@ def summarize_tool_bundle(prediction: Dict[str, Any], *, limit: int = 1600) -> s
         if policy == "inspect_or_create":
             lines.append(
                 "- 文件写入提示: 用户给出了宿主机绝对路径。若任务需要新建项目/多步开发，"
-                "先建立 TaskGraph/workspace 绑定，再调用 ide_write_file 写具体文件；"
+                "先建立 TaskGraph/workspace 绑定，再调用 exec_write_file 写具体文件；"
                 "长文件按 800-1200 字符分片，第一片 mode='overwrite'，后续 mode='append'；"
                 "不要只用自然语言声称创建成功。"
             )
         else:
             lines.append(
-                "- 文件写入提示: 用户给出了宿主机绝对路径，优先调用 ide_write_file，"
+                "- 文件写入提示: 用户给出了宿主机绝对路径，统一调用 exec_write_file，"
                 "长文件按 800-1200 字符分片，第一片 mode='overwrite'，后续 mode='append'；"
                 "不要只用自然语言声称创建成功。"
             )
@@ -503,12 +501,12 @@ def summarize_tool_bundle(prediction: Dict[str, Any], *, limit: int = 1600) -> s
         if policy == "inspect_or_create":
             lines.append(
                 "- 目录创建提示: 若这是新项目/复杂任务的根目录，先检索历史经验并调用 "
-                "task_create_plan 创建绑定 workspace_dir；ide_write_file(create_directory=true) "
+                "task_create_plan 创建绑定 workspace_dir；exec_write_file 只用于写入工作区内文件。"
                 "只用于已有工作区内的普通子目录创建。"
             )
         else:
             lines.append(
-                "- 目录创建提示: 用户要求创建文件夹/目录，调用 ide_write_file 时必须设置 create_directory=true。"
+                "- 目录创建提示: 用户要求创建文件夹/目录时，先确认 TaskGraph 工作区，再用写文件工具在工作区内落盘。"
             )
     if ctx.get("code_graph_requires_task_graph"):
         lines.append(
@@ -789,7 +787,7 @@ def _add_rule_guards(
         ])
 
     if context_bundle.get("needs_ide_file_write") and not has_any(WRITE_TOOL_NAMES):
-        add_names(["ide_write_file", "task_attach_file", "zulong_memory_write_with_code"])
+        add_names(["exec_write_file", "task_attach_file", "zulong_memory_write_with_code"])
     elif any(name in WRITE_TOOL_NAMES for name in rule_predicted) and not has_any(WRITE_TOOL_NAMES):
         add_names([name for name in rule_predicted if name in WRITE_TOOL_NAMES])
 
@@ -991,6 +989,18 @@ def _needs_extension_management(text: str) -> bool:
 
 def _has_read_only_constraint(text: str) -> bool:
     lowered = (text or "").lower()
+    task_write_cues = (
+        "开发", "实现", "创建", "新建", "修改", "修复", "补全", "构建", "编写",
+        "write", "create", "modify", "fix", "implement", "develop", "build",
+    )
+    scoped_exclusion_cues = (
+        "只修改", "仅修改", "不要修改祖龙", "不要修改 aimami", "不要修改任何本地代理",
+        "不要修改 ai", "不要修改其他", "do not modify other", "only modify",
+    )
+    if any(cue in lowered for cue in task_write_cues) and any(
+        cue in lowered for cue in scoped_exclusion_cues
+    ):
+        return False
     literal_cues = (
         "不要修改", "不修改", "无需修改", "不需要修改",
         "不要改", "别改", "不要动", "不要动文件", "不要改文件",
@@ -1020,7 +1030,7 @@ def _is_presentation_only_request(text: str) -> bool:
         return False
     lightweight_write_cues = (
         "创建文件", "新建文件", "修改文件", "写入文件", "保存到文件",
-        "exec_write_file", "ide_write_file",
+        "exec_write_file",
     )
     if any(cue in lowered for cue in lightweight_write_cues):
         return False

@@ -31,6 +31,7 @@ from zulong.l2.attention_pressure_view import build_threshold_pressure_view
 from zulong.l2.attention_context_retrieval import (
     build_attention_context_bundle,
     render_attention_context_message,
+    should_include_memory_context_for_turn,
 )
 from zulong.ide.ide_session import IDEFCState, AgentSession
 from zulong.ide.ide_tool_registry import (
@@ -74,7 +75,6 @@ _EMBEDDING_PREWARM_STARTED = False
 _EMBEDDING_PREWARM_LOCK = threading.Lock()
 
 _FRIENDLY_TOOL_NAMES = {
-    "ide_write_file": "写入文件",
     "exec_write_file": "写入文件",
     "write_to_file": "写入文件",
     "ide_read_file": "读取文件",
@@ -147,7 +147,6 @@ _READ_TOOLS = frozenset({
 })
 
 _WRITE_TOOLS = frozenset({
-    "ide_write_file",
     "exec_write_file",
     "write_to_file",
     "ide_replace_text",
@@ -379,7 +378,7 @@ def _plan_steps_for_feedback(
         steps.append("读取或检索项目代码，确认真实实现")
     if policy in {"reuse", "inspect", "inspect_or_create", "continue"} or any(t.startswith("task_") for t in tools):
         steps.append("同步任务图状态")
-    if any(t in {"exec_write_file", "ide_write_file", "replace_in_file", "exec_run_command", "execute_command"} for t in tools):
+    if any(t in {"exec_write_file", "replace_in_file", "exec_run_command", "execute_command"} for t in tools):
         steps.append("涉及写入或命令时先处理风险与审批")
         if tools:
             steps.append("按当前任务需要执行具体处理步骤")
@@ -764,7 +763,7 @@ class IDEFCRunner(FCRunner):
         self._current_session_id: Optional[str] = None
         self._model_executor = ThreadPoolManager.get_instance()
         # BFS 调度控制
-        self._last_bfs_seeds_hash: str = ""
+        self._last_bfs_seed_ids: List[str] = []
         self._last_bfs_turn: int = 0
         self._last_pressure_tier: str = "green"  # 压力分级跟踪（green/yellow/red）
         self._last_attention_context_telemetry: Dict[str, Any] = {}  # TSD §26.1.5 本轮 active context 诊断字段
@@ -1740,7 +1739,9 @@ class IDEFCRunner(FCRunner):
                         "pressure_threshold_medium": yellow_ratio,
                         "pressure_threshold_high": red_ratio,
                     }
-                    await send_callback(MessageType.ATTENTION_UPDATE, _attn_state)
+                    _attn_diff = self._attention_update_diff(state, _attn_state)
+                    if _attn_diff:
+                        await send_callback(MessageType.ATTENTION_UPDATE, _attn_diff)
                 except Exception as _e:
                     logger.debug(f"[IDEFCRunner] 发射 attention:update 失败: {_e}")
 
@@ -3204,7 +3205,7 @@ class IDEFCRunner(FCRunner):
             tool = str(item.get("tool_name") or "")
             result = str(item.get("result") or "")
             success = bool(item.get("success", True))
-            if tool in {"write_to_file", "replace_in_file", "ide_write_file", "exec_write_file"} and not success:
+            if tool in {"write_to_file", "replace_in_file", "exec_write_file"} and not success:
                 if any(marker in result for marker in (
                     "未真实存在", "未应用", "未允许", "内容未应用", "内容不一致", "verified",
                 )):
@@ -3542,11 +3543,21 @@ class IDEFCRunner(FCRunner):
                 ]
                 focus_node_id = in_progress[0].id if in_progress else "req"
             graph_id = str(getattr(tg, "id", "") or "")
-            signature = self._task_graph_status_signature(tg)
-            key = f"{graph_id}|{mode}|{focus_node_id}|{reason}|{signature}"
-            if key == getattr(state, "last_navigation_map_key", ""):
+            navigation_state = {
+                "graph_id": graph_id,
+                "mode": mode,
+                "focus_node_id": focus_node_id,
+                "reason": reason,
+            }
+            if navigation_state == getattr(state, "last_navigation_map_state", {}):
                 return None
-            state.last_navigation_map_key = key
+            state.last_navigation_map_state = navigation_state
+            state.last_navigation_map_key = "%s|%s|%s|%s" % (
+                graph_id,
+                mode,
+                focus_node_id,
+                reason,
+            )
             uncovered_node_ids: List[str] = []
             try:
                 coverage = self._compute_node_coverage(state, tg)
@@ -3560,7 +3571,7 @@ class IDEFCRunner(FCRunner):
             return {
                 "role": "system",
                 "content": (
-                    f"[导航地图] reason={reason}; mode={mode}; turn={fc}\n"
+                    f"[导航地图] reason={reason}; mode={mode}\n"
                     f"{map_text}\n"
                     "请基于当前位置继续推进；没有新的注意力切换时不要请求重复地图。"
                 ),
@@ -5649,18 +5660,69 @@ class IDEFCRunner(FCRunner):
             mode_value = getattr(getattr(self._attn_window, "mode", None), "value", "global")
             pressure_stage = str(getattr(state, "pressure_stage", "") or "")
             pressure_context = getattr(state, "pressure_attention_context", {}) or {}
-            include_navigation = pressure_stage in {"yellow_guidance", "restricted_recovery"}
-            if not include_navigation and str(mode_value).lower() != "global":
-                include_navigation = True
-            trigger_reason = pressure_stage or "model_call"
-            if pressure_context.get("tier"):
-                trigger_reason = f"pressure_{pressure_context.get('tier')}_{pressure_stage or 'active'}"
+            pressure_tier = str(pressure_context.get("tier") or "").lower()
+            if not pressure_tier:
+                try:
+                    yellow_ratio = 0.90
+                    red_ratio = 1.0
+                    attn_cfg = getattr(self._attn_window, "_llm_config", None)
+                    if attn_cfg:
+                        yellow_ratio = float(getattr(attn_cfg, "pressure_threshold_medium", yellow_ratio))
+                        red_ratio = float(getattr(attn_cfg, "pressure_threshold_high", red_ratio))
+                    pressure_tier = "red" if ratio > red_ratio else "yellow" if ratio > yellow_ratio else "green"
+                except Exception:
+                    pressure_tier = "green"
+            if pressure_stage == "yellow_guidance":
+                trigger_reason = "pressure_dive"
+            elif pressure_stage == "restricted_recovery":
+                trigger_reason = "pressure_recovery"
+            else:
+                trigger_reason = pressure_stage or "model_call"
+
+            last_mode = str(getattr(state, "last_llm_injected_attention_mode", "") or "")
+            include_mode_update = (mode_value != last_mode and bool(last_mode)) or (
+                not last_mode and str(mode_value).lower() != "global"
+            )
+            if mode_value != last_mode:
+                state.last_llm_injected_attention_mode = mode_value
+
+            last_pressure_tier = str(getattr(state, "last_llm_injected_pressure_tier", "") or "")
+            include_pressure_update = pressure_tier in {"yellow", "red"} and pressure_tier != last_pressure_tier
+            if pressure_tier != last_pressure_tier:
+                state.last_llm_injected_pressure_tier = pressure_tier
+
+            graph_id = str(getattr(task_graph, "id", "") or "") if task_graph else ""
+            focus_node_id = str(getattr(self._attn_window, "_current_node_id", "") or "")
+            if not focus_node_id and task_graph:
+                try:
+                    in_progress = [
+                        n for n in task_graph.get_nodes_by_status("in_progress")
+                        if not str(getattr(n, "id", "")).startswith("crg_")
+                    ]
+                    focus_node_id = str(getattr(in_progress[0], "id", "") or "") if in_progress else "req"
+                except Exception:
+                    focus_node_id = "req"
+            navigation_requested = pressure_stage in {"yellow_guidance", "restricted_recovery"}
+            navigation_state = {
+                "graph_id": graph_id,
+                "mode": mode_value,
+                "focus_node_id": focus_node_id,
+                "reason": trigger_reason,
+            }
+            include_navigation = bool(navigation_requested and navigation_state != getattr(state, "last_navigation_map_state", {}))
+
             query_text = str(getattr(state, "user_input_text", "") or "")
             if not query_text:
                 for msg in reversed(list(getattr(state, "messages", []) or [])):
                     if isinstance(msg, dict) and msg.get("role") == "user" and msg.get("content"):
                         query_text = str(msg.get("content") or "")
                         break
+            include_memory_context = should_include_memory_context_for_turn(
+                tool_prediction=getattr(state, "tool_prediction", None),
+                query_text=query_text,
+                pressure_trigger=include_pressure_update,
+                restricted_recovery=pressure_stage == "restricted_recovery",
+            )
 
             uncovered_node_ids: List[str] = []
             try:
@@ -5678,10 +5740,16 @@ class IDEFCRunner(FCRunner):
                 memory_graph=memory_graph,
                 pressure_percent=ratio * 100.0,
                 trigger_reason=trigger_reason,
+                pressure_tier=pressure_tier,
+                include_mode_update=include_mode_update,
+                include_pressure_update=include_pressure_update,
+                include_memory_context=include_memory_context,
                 include_navigation_map=include_navigation,
                 navigation_reason=trigger_reason if include_navigation else "",
                 uncovered_node_ids=uncovered_node_ids,
             )
+            if bundle.navigation_map:
+                state.last_navigation_map_state = navigation_state
             rendered_msg = render_attention_context_message(bundle)
             rendered_text = rendered_msg.get("content", "")
             if not rendered_text:
@@ -8876,6 +8944,76 @@ class IDEFCRunner(FCRunner):
         except Exception as e:
             logger.warning(f"[IDEFCRunner][Backfill] {e}")
 
+    def _attention_update_diff(self, state: IDEFCState, current: Dict[str, Any]) -> Dict[str, Any]:
+        """Return sparse attention:update payload for changed, relevant fields only."""
+        if not isinstance(current, dict):
+            return {}
+        previous = dict(getattr(state, "last_attention_update_state", {}) or {})
+        diff: Dict[str, Any] = {}
+
+        def put(key: str, value: Any) -> None:
+            if value is not None:
+                diff[key] = value
+
+        mode = current.get("mode")
+        if mode and mode != previous.get("mode"):
+            put("mode", mode)
+            put("focus_node_id", current.get("focus_node_id"))
+            put("focus_address", current.get("focus_address"))
+
+        pressure_tier = str(current.get("pressure_tier") or "")
+        pressure_changed = pressure_tier != str(previous.get("pressure_tier") or "")
+        if pressure_tier in {"yellow", "red"} and pressure_changed:
+            for key in (
+                "pressure_tier",
+                "budget_usage",
+                "pressure_threshold_medium",
+                "pressure_threshold_high",
+                "trigger_budget_usage",
+                "active_context_token_estimate",
+                "active_context_item_count",
+            ):
+                put(key, current.get(key))
+
+        retrieved_memory = int(current.get("retrieved_memory_count") or 0)
+        bfs_seed = int(current.get("bfs_seed_count") or 0)
+        bfs_activated = int(current.get("bfs_activated_count") or 0)
+        previous_bfs = (
+            int(previous.get("retrieved_memory_count") or 0),
+            int(previous.get("bfs_seed_count") or 0),
+            int(previous.get("bfs_activated_count") or 0),
+        )
+        current_bfs = (retrieved_memory, bfs_seed, bfs_activated)
+        if (retrieved_memory or bfs_seed) and current_bfs != previous_bfs:
+            put("retrieved_memory_count", retrieved_memory)
+            put("bfs_seed_count", bfs_seed)
+            put("bfs_activated_count", bfs_activated)
+
+        nav_state = (
+            bool(current.get("navigation_map_injected")),
+            str(current.get("navigation_map_reason") or ""),
+            str(current.get("focus_node_id") or ""),
+        )
+        previous_nav = (
+            bool(previous.get("navigation_map_injected")),
+            str(previous.get("navigation_map_reason") or ""),
+            str(previous.get("focus_node_id") or ""),
+        )
+        if nav_state[0] and nav_state != previous_nav:
+            put("navigation_map_injected", True)
+            put("navigation_map_reason", current.get("navigation_map_reason"))
+            put("focus_node_id", current.get("focus_node_id"))
+            put("active_context_item_count", current.get("active_context_item_count"))
+
+        state.last_attention_update_state = dict(current)
+        if not diff:
+            return {}
+        put("turn", current.get("turn"))
+        put("task_graph_id", current.get("task_graph_id"))
+        diff["_partial"] = True
+        diff["_changed_keys"] = [key for key in diff.keys() if not key.startswith("_")]
+        return diff
+
     def _apply_pressure_guidance(self, state: IDEFCState, fc: int) -> None:
         """Apply TSD-aligned context-pressure attention guidance.
 
@@ -8904,18 +9042,18 @@ class IDEFCRunner(FCRunner):
         )
         yellow_ratio = 0.90
         red_ratio = 1.0
-        threshold_budget_ratio = 0.5
+        threshold_budget_ratio = 1.0
         try:
             attn_cfg = getattr(self._attn_window, "_llm_config", None)
             if attn_cfg:
                 yellow_ratio = float(getattr(attn_cfg, "pressure_threshold_medium", yellow_ratio))
                 red_ratio = float(getattr(attn_cfg, "pressure_threshold_high", red_ratio))
-                threshold_budget_ratio = float(getattr(attn_cfg, "threshold_budget_ratio", threshold_budget_ratio))
+                threshold_budget_ratio = 1.0
             elif self._circuit_breaker:
                 cb_cfg = getattr(self._circuit_breaker, "_config", {}) or {}
                 yellow_ratio = float(cb_cfg.get("context_yellow_ratio", yellow_ratio))
                 red_ratio = float(cb_cfg.get("context_red_ratio", red_ratio))
-                threshold_budget_ratio = float(cb_cfg.get("threshold_budget_ratio", threshold_budget_ratio))
+                threshold_budget_ratio = 1.0
         except Exception:
             pass
 
@@ -9210,13 +9348,11 @@ class IDEFCRunner(FCRunner):
         if not seeds:
             return None
 
-        # 变更检测
-        import hashlib
-        seeds_hash = hashlib.md5("|".join(sorted(seeds)).encode()).hexdigest()[:8]
-
-        if trigger != "pressure_crossing":
-            # 非压力触发：检查种子变更 + 最小间隔
-            if seeds_hash == self._last_bfs_seeds_hash:
+        seed_ids = sorted(str(seed) for seed in seeds)
+        pressure_triggers = {"pressure_crossing", "pressure_threshold_guidance", "pressure_restricted_recovery"}
+        if trigger not in pressure_triggers:
+            # 非压力触发：检查种子变更 + 最小间隔，不再使用 hash 门禁。
+            if seed_ids == self._last_bfs_seed_ids:
                 return None
             if fc_turn - self._last_bfs_turn < self._bfs_min_interval:
                 return None
@@ -9253,7 +9389,7 @@ class IDEFCRunner(FCRunner):
             acts = mg.compute_activations(seeds, max_depth=3, decay=0.5,
                                           min_activation=_min_act)
 
-        self._last_bfs_seeds_hash = seeds_hash
+        self._last_bfs_seed_ids = seed_ids
         self._last_bfs_turn = fc_turn
 
         # 日志

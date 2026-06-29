@@ -125,7 +125,8 @@ class AttentionWindowManager:
         # 可用预算 = (上下文 - 预留) × 90%
         #
         # 注意：这是早期“接近原始 LLM 窗口”的兜底预算。动态注意力启用后，
-        # 实际注入给 LLM 的上下文预算必须进一步受 threshold_budget_ratio 约束。
+        # 实际注入给 LLM 的上下文预算以 Web 配置的完整上下文窗口为准；
+        # threshold_budget_ratio 仅保留为 1.0 兼容遥测。
         # 否则压力监控按“阈值预算”触发了 GLOBAL/FOCUS/SINGLE_CHAIN 切换，
         # 但 apply_window 仍按原始窗口放行，注意力只会改变 UI 状态，不能真正
         # 暂排非必要上下文。
@@ -1074,7 +1075,7 @@ class AttentionWindowManager:
         This matches the Web-visible pressure after at least one windowing pass.
         Before that pass there is no visible-window telemetry yet, so bootstrap
         detection still uses the registered message-pool pressure to allow the
-        first attention switch under low ``threshold_budget_ratio`` test settings.
+        first attention switch before provider-visible pressure telemetry exists.
         """
         if self._last_window_message_count:
             return self.active_context_pressure_ratio

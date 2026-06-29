@@ -39,13 +39,13 @@ from zulong.core.message_visibility import (
 from zulong.l2.attention_context_retrieval import (
     build_attention_context_bundle,
     render_attention_context_message,
+    should_include_memory_context_for_turn,
 )
 
 logger = logging.getLogger(__name__)
 
 
 _PROTECTED_MUTATION_TOOLS = {
-    "ide_write_file",
     "write_to_file",
     "replace_in_file",
     "delete_file",
@@ -60,7 +60,6 @@ _LOCAL_MUTATION_TOOLS = {
 
 _WRITE_CONTENT_TOOLS = {
     "exec_write_file",
-    "ide_write_file",
     "write_to_file",
 }
 
@@ -369,17 +368,42 @@ def _make_call_model_node(engine: "InferenceEngine"):
         try:
             if engine._attn_window is not None:
                 mode_val = getattr(engine._attn_window.mode, "value", "global") if engine._attn_window.mode else "global"
-                pressure_pct = float(getattr(engine._attn_window, "active_context_pressure_ratio", 0.0) or 0.0) * 100.0
+                pressure_ratio = float(getattr(engine._attn_window, "active_context_pressure_ratio", 0.0) or 0.0)
+                pressure_pct = pressure_ratio * 100.0
+                get_tier = getattr(engine, "_attention_pressure_tier_for_feedback", None)
+                pressure_tier = get_tier(pressure_ratio) if callable(get_tier) else "green"
+                last_mode = getattr(engine, "_last_llm_injected_attention_mode", "")
+                include_mode_update = (bool(last_mode) and mode_val != last_mode) or (
+                    not last_mode and str(mode_val).lower() != "global"
+                )
+                if mode_val != last_mode:
+                    engine._last_llm_injected_attention_mode = mode_val
+                last_pressure_tier = getattr(engine, "_last_llm_injected_pressure_tier", "")
+                include_pressure_update = pressure_tier in ("yellow", "red") and pressure_tier != last_pressure_tier
+                if pressure_tier != last_pressure_tier:
+                    engine._last_llm_injected_pressure_tier = pressure_tier
                 task_graph = getattr(engine, "_task_graph", None) or getattr(engine, "task_graph", None)
                 memory_graph = getattr(engine, "_memory_graph", None) or getattr(engine, "memory_graph", None)
+                query_text = str(state.get("user_input_text", ""))[:500]
+                include_memory_context = should_include_memory_context_for_turn(
+                    tool_prediction=getattr(engine, "_current_tool_prediction_for_feedback", {}) or state.get("tool_prediction"),
+                    tool_names=getattr(engine, "_current_tool_bundle_for_feedback", []) or [],
+                    query_text=query_text,
+                    pressure_trigger=include_pressure_update,
+                    restricted_recovery=state.get("pressure_stage") == "restricted_recovery",
+                )
                 bundle = build_attention_context_bundle(
                     mode=mode_val,
-                    query_text=str(state.get("user_input_text", ""))[:500],
+                    query_text=query_text,
                     attention_window=engine._attn_window,
                     task_graph=task_graph,
                     memory_graph=memory_graph,
                     pressure_percent=pressure_pct,
-                    trigger_reason="model_call",
+                    trigger_reason="pressure_threshold" if include_pressure_update else "model_call",
+                    pressure_tier=pressure_tier,
+                    include_mode_update=include_mode_update,
+                    include_pressure_update=include_pressure_update,
+                    include_memory_context=include_memory_context,
                     include_navigation_map=False,
                 )
                 rendered_msg = render_attention_context_message(bundle)
@@ -494,6 +518,17 @@ def _make_call_model_node(engine: "InferenceEngine"):
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
+            publish_llm_status = getattr(engine, "_publish_llm_status", None)
+            if callable(publish_llm_status):
+                publish_llm_status(
+                    "started",
+                    model_id=vllm_model_id,
+                    layer="CORE",
+                    phase="fc_loop",
+                    turn=fc_turn,
+                    timeout_s=engine._fc_loop_timeout,
+                    message=f"正在请求模型继续第 {fc_turn} 轮判断。",
+                )
             future = executor.submit(_call)
             wait_with_interrupt = getattr(engine, "_wait_future_with_interrupt", None)
             if callable(wait_with_interrupt):
@@ -501,11 +536,34 @@ def _make_call_model_node(engine: "InferenceEngine"):
                     future,
                     engine._fc_loop_timeout,
                     label=f"[FC][Graph] Turn {fc_turn}",
+                    status_callback=(
+                        (lambda status, elapsed, remaining: publish_llm_status(
+                            status,
+                            model_id=vllm_model_id,
+                            layer="CORE",
+                            phase="fc_loop",
+                            turn=fc_turn,
+                            elapsed_s=elapsed,
+                            timeout_s=engine._fc_loop_timeout,
+                            remaining_s=remaining,
+                        ))
+                        if callable(publish_llm_status) else None
+                    ),
                 )
             else:
                 api_response = future.result(timeout=engine._fc_loop_timeout)
         except InterruptedError:
             logger.info(f"[FC][Graph] Turn {fc_turn}: 模型调用被用户停止")
+            if callable(getattr(engine, "_publish_llm_status", None)):
+                engine._publish_llm_status(
+                    "interrupted",
+                    model_id=vllm_model_id,
+                    layer="CORE",
+                    phase="fc_loop",
+                    turn=fc_turn,
+                    message="模型请求已停止。",
+                    state="cancelled",
+                )
             return {
                 "response": state.get("response") or state.get("response_content") or "",
                 "should_terminate": "interrupt",
@@ -516,6 +574,18 @@ def _make_call_model_node(engine: "InferenceEngine"):
             logger.warning(
                 f"⚠️ [FC][Graph] Turn {fc_turn} 超时 (>{engine._fc_loop_timeout}s)，继续尝试..."
             )
+            if callable(getattr(engine, "_publish_llm_status", None)):
+                engine._publish_llm_status(
+                    "timeout",
+                    model_id=vllm_model_id,
+                    layer="CORE",
+                    phase="fc_loop",
+                    turn=fc_turn,
+                    elapsed_s=engine._fc_loop_timeout,
+                    timeout_s=engine._fc_loop_timeout,
+                    message=f"第 {fc_turn} 轮模型请求超时，正在尝试备用模型或降级处理。",
+                    state="possibly_stalled",
+                )
             api_timeout_count = state.get("api_timeout_count", 0) + 1
             _MAX_API_TIMEOUTS = 1  # 超时 1 次即切换备用模型，避免用户长时间等待
 
@@ -537,6 +607,16 @@ def _make_call_model_node(engine: "InferenceEngine"):
                     backup_cfg = get_runtime_cfg("backup") if callable(get_runtime_cfg) else None
                     if backup_cfg and backup_cfg.model_id and backup_cfg.base_url:
                         from zulong.l2.llm_gateway import llm_completion as _lc2
+                        if callable(getattr(engine, "_publish_llm_status", None)):
+                            engine._publish_llm_status(
+                                "started",
+                                model_id=backup_cfg.model_id,
+                                layer="BACKUP",
+                                phase="fc_loop_backup",
+                                turn=fc_turn,
+                                timeout_s=engine._backup_timeout,
+                                message="正在请求备用模型继续任务。",
+                            )
                         backup_resp = _lc2(
                             model=backup_cfg.model_id,
                             messages=strip_llm_message_metadata(messages),
@@ -557,6 +637,17 @@ def _make_call_model_node(engine: "InferenceEngine"):
                         }
                 except Exception as backup_err:
                     logger.warning(f"[FC][Graph] 备用模型也失败: {backup_err}")
+                    if callable(getattr(engine, "_publish_llm_status", None)):
+                        engine._publish_llm_status(
+                            "api_error",
+                            model_id=getattr(backup_cfg, "model_id", "") if backup_cfg else "",
+                            layer="BACKUP",
+                            phase="fc_loop_backup",
+                            turn=fc_turn,
+                            message="备用模型接口异常，已转入降级处理。",
+                            error=str(backup_err),
+                            state="possibly_stalled",
+                        )
                 return {
                     "response": engine._get_fallback_response(state.get("user_input_text", "")),
                     "should_terminate": "api_error",
@@ -573,6 +664,17 @@ def _make_call_model_node(engine: "InferenceEngine"):
             }
         except Exception as api_err:
             logger.error(f"🚨 [FC][Graph] Turn {fc_turn} API 调用失败: {api_err}")
+            if callable(getattr(engine, "_publish_llm_status", None)):
+                engine._publish_llm_status(
+                    "api_error",
+                    model_id=vllm_model_id,
+                    layer="CORE",
+                    phase="fc_loop",
+                    turn=fc_turn,
+                    message=f"第 {fc_turn} 轮模型接口断链或返回异常，正在尝试备用模型或降级处理。",
+                    error=str(api_err),
+                    state="possibly_stalled",
+                )
             # 尝试备用模型
             try:
                 get_runtime_cfg = getattr(engine, "_get_runtime_llm_config", None)
@@ -580,6 +682,16 @@ def _make_call_model_node(engine: "InferenceEngine"):
                 if engine.backup_client and backup_cfg and backup_cfg.model_id:
                     logger.info(f"🔄 [FC][Graph] 切换备用模型: {backup_cfg.model_id}")
                     from zulong.l2.llm_gateway import llm_completion as _lc_backup
+                    if callable(getattr(engine, "_publish_llm_status", None)):
+                        engine._publish_llm_status(
+                            "started",
+                            model_id=backup_cfg.model_id,
+                            layer="BACKUP",
+                            phase="fc_loop_backup",
+                            turn=fc_turn,
+                            timeout_s=engine._backup_timeout,
+                            message="正在请求备用模型继续任务。",
+                        )
                     backup_resp = _lc_backup(
                         model=backup_cfg.model_id,
                         messages=strip_llm_message_metadata(messages),
@@ -607,6 +719,17 @@ def _make_call_model_node(engine: "InferenceEngine"):
                     }
             except Exception as backup_err:
                 logger.warning(f"🚨 [FC][Graph] 备用模型也失败: {backup_err}")
+                if callable(getattr(engine, "_publish_llm_status", None)):
+                    engine._publish_llm_status(
+                        "api_error",
+                        model_id=getattr(backup_cfg, "model_id", "") if backup_cfg else "",
+                        layer="BACKUP",
+                        phase="fc_loop_backup",
+                        turn=fc_turn,
+                        message="备用模型接口异常，已转入降级处理。",
+                        error=str(backup_err),
+                        state="possibly_stalled",
+                    )
                 return {
                     "response": engine._get_fallback_response(state.get("user_input_text", "")),
                     "should_terminate": "api_error",
@@ -648,6 +771,15 @@ def _make_call_model_node(engine: "InferenceEngine"):
             tool_call_names,
             usage_summary,
         )
+        if callable(getattr(engine, "_publish_llm_status", None)):
+            engine._publish_llm_status(
+                "success",
+                model_id=vllm_model_id,
+                layer="CORE",
+                phase="fc_loop",
+                turn=fc_turn,
+                message=f"第 {fc_turn} 轮模型已返回，正在解析结果。",
+            )
         if not response_content and not raw_tool_calls:
             logger.warning(
                 "[FC][Graph][EmptyLLMReturn] turn=%s model=%s finish_reason=%r "
@@ -855,6 +987,49 @@ def _make_exec_tools_node(engine: "InferenceEngine"):
             engine._publish_task_graph_event(
                 "agent_tool_call", fc_turn, tool_name, "", tc_data.get("id", ""),
             )
+
+            # ── 审批检查（Web 端同步审批）──
+            try:
+                from zulong.l2.fc_approval import request_tool_approval_sync
+
+                approved, approval_info = request_tool_approval_sync(
+                    tool_name,
+                    raw_args,
+                    conversation_id=getattr(engine, "_current_session_id", ""),
+                    session_id=getattr(engine, "_current_session_id", ""),
+                    request_id=getattr(engine, "_current_user_turn_id", ""),
+                    call_id=tc_data.get("id", ""),
+                )
+                if not approved:
+                    denial_text = approval_info.get("reason", "审批未通过")
+                    logger.warning(
+                        "[FC][Graph] 工具 %s 审批未通过: %s", tool_name, denial_text,
+                    )
+                    result_text = f"[审批未通过] {denial_text}"
+                    tool_msg = {
+                        "role": "tool",
+                        "tool_call_id": tc_data.get("id", ""),
+                        "content": result_text,
+                    }
+                    messages.append(tool_msg)
+                    if engine._attn_window:
+                        engine._attn_window.register_message(
+                            tool_msg, turn=fc_turn,
+                            tool_name=tool_name,
+                            group_id=grp,
+                        )
+                    tool_results_buffer.append({
+                        "tool_name": tool_name,
+                        "reason": approval_info.get("reason", "审批拒绝"),
+                        "result": result_text,
+                    })
+                    engine._publish_task_graph_event(
+                        "agent_tool_call", fc_turn, tool_name, result_text, tc_data.get("id", ""),
+                    )
+                    continue
+            except Exception as _approval_exc:
+                logger.debug("[FC][Graph] 审批检查跳过（可能未启用或异常）: %s", _approval_exc)
+
             result_text = engine._execute_tool_call(tc_proxy)
 
             if tool_name in ("request_tool_supplement", "search_tools"):
@@ -1645,9 +1820,7 @@ def _make_eval_response_node(engine: "InferenceEngine"):
             file_guard_hint = internal_control_message(
                     "[文件操作真实性校验] 用户要求创建、写入、修改或删除文件，"
                     "但目前没有看到任何成功的文件操作工具结果。"
-                    "请立刻调用可用的写入工具完成真实落盘："
-                    "如果用户给出宿主机绝对路径，优先调用 ide_write_file；"
-                    "否则调用 exec_write_file。"
+                    "请立刻调用 exec_write_file 完成真实落盘；"
                     "完成前不要声称文件已创建或已写入。"
             )
             messages.append(rejected_reply)
@@ -2394,8 +2567,6 @@ def _build_uncompleted_task_correction(
     if expected_files:
         if not available_tools or "exec_write_file" in available_tools:
             forced_tool = "exec_write_file"
-        elif "ide_write_file" in available_tools:
-            forced_tool = "ide_write_file"
     current_line = (
         f"当前应执行节点: {node_id}({label})。" if node_id or label
         else "当前任务图仍有未完成节点。"
@@ -2416,15 +2587,6 @@ def _build_uncompleted_task_correction(
                 f"下一轮必须优先调用 exec_write_file 写入 {expected_files[0]}。"
                 "如果内容较长，先用 mode='overwrite' 写第一段，再用 mode='append' "
                 "分多轮追加，每轮 content 控制在 800-1200 字符；写入成功并验证后再调用 "
-                f"task_mark_status(node_id='{node_id}', status='completed')。"
-            )
-        elif forced_tool == "ide_write_file":
-            action_line = (
-                f"下一轮必须优先调用 ide_write_file 写入 {expected_files[0]}。"
-                "如果内容较长，先用 mode='overwrite' 写第一段，再用 mode='append' "
-                "通过同一个受保护通道分段追加；每轮 content 控制在 800-1200 字符，"
-                "不要继续输出超长工具参数。"
-                "写入成功并验证后再调用 "
                 f"task_mark_status(node_id='{node_id}', status='completed')。"
             )
         else:
@@ -2512,7 +2674,6 @@ def _check_file_operation_truth(
 
     file_tools = {
         "exec_write_file",
-        "ide_write_file",
         "write_to_file",
         "replace_in_file",
         "delete_file",

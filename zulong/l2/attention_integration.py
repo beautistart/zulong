@@ -258,7 +258,7 @@ attention_selection:
   enabled: true
   
   # 压力阈值配置
-  threshold_budget_ratio: 0.5       # 阈值预算=LLM原始上下文窗口的50%
+  threshold_budget_ratio: 1.0       # 兼容字段：阈值预算=Web配置的完整LLM上下文窗口
   pressure_threshold_high: 1.0      # RED触发线：上下文压力 >100%
   pressure_threshold_medium: 0.9    # YELLOW触发线：上下文压力 >90%
   

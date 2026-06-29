@@ -186,7 +186,7 @@ class IDEFormatTranslator:
             "task_view_overview", "task_get_detail", "task_update_node",
             "task_add_dependency", "task_remove_node", "task_list_suspended",
             "task_suspend", "submit_final_answer", "read_file",
-            "exec_write_file", "exec_run_command", "ide_write_file",
+            "exec_write_file", "exec_run_command",
             "recall_memory", "save_memory_note", "read_memory_node",
             "discover_related", "navigate_attention", "adjust_attention_mode",
             "search_experience", "search_tools", "zulong_code_query",

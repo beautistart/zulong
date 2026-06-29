@@ -281,8 +281,8 @@ class TaskExperienceGenerator:
             " ".join(str(item.get("result_preview") or item.get("action_summary") or "") for item in tool_chain),
         ]).lower()
 
-        has_ide_dir_tool = any(name in {"ide_write_file", "create_directory"} for name in tool_names) or (
-            "ide_write_file" in haystack or "create_directory" in haystack
+        has_file_dir_tool = any(name in {"exec_write_file", "create_directory"} for name in tool_names) or (
+            "exec_write_file" in haystack or "create_directory" in haystack
         )
         missing_task_plan = "task_create_plan" not in tool_names
         complex_project = any(k in haystack for k in (
@@ -293,19 +293,19 @@ class TaskExperienceGenerator:
             "workspace_required", "workspace_not_found", "工作目录不存在",
             "任务图未完成", "父目录", "尚不存在", "新项目工作区", "create_directory",
         ))
-        if not (has_ide_dir_tool and missing_task_plan and complex_project and workspace_problem):
+        if not (has_file_dir_tool and missing_task_plan and complex_project and workspace_problem):
             return None
 
         goal = _short(trace.get("goal"), 160) or "新建项目并写代码"
         content = (
             f"失败经验：处理「{goal}」这类新建项目目录并开发代码/网页/小游戏的复杂任务时，"
-            "不能用 ide_write_file(create_directory=true) 代替 task_create_plan。"
+            "不能用文件写入工具创建项目根目录来代替 task_create_plan。"
             "正确顺序是先检索历史经验，再调用 task_create_plan 创建任务图并绑定 workspace_dir，"
-            "由任务创建流程负责创建目标目录和打开 VS Code；之后再用 IDE/文件工具写入具体文件。"
+            "由任务创建流程负责创建目标目录和打开 VS Code；之后再用 exec_write_file 写入具体文件。"
         )
         confidence = 0.86
         return TaskExperienceCandidate(
-            candidate_key="failure:workspace_bootstrap:ide_write_file_create_directory_without_task_graph",
+            candidate_key="failure:workspace_bootstrap:file_write_create_directory_without_task_graph",
             experience_type="failure",
             content=content,
             success=False,
@@ -316,14 +316,14 @@ class TaskExperienceGenerator:
                 "failure",
                 "workspace_bootstrap",
                 "task_create_plan",
-                "ide_write_file",
+                "exec_write_file",
                 "create_directory",
                 "vscode_workspace",
             ]),
             metadata=self._metadata(trace, "workspace_bootstrap_failure", confidence),
             if_condition="新建项目根目录并开发代码、网页或小游戏",
-            then_action="先调用 task_create_plan 创建任务图并绑定 workspace_dir，再用 IDE/文件工具写入具体文件",
-            avoid_action="不要用 ide_write_file(create_directory=true) 代替项目工作区 bootstrap",
+            then_action="先调用 task_create_plan 创建任务图并绑定 workspace_dir，再用 exec_write_file 写入具体文件",
+            avoid_action="不要用文件写入工具创建项目根目录来代替项目工作区 bootstrap",
             evidence_summary="新项目目录创建与 VS Code 工作区绑定失败",
             source_graph_nodes=self._source_graph_nodes(trace),
             source_task_nodes=self._source_task_nodes(trace, completed=False),

@@ -260,6 +260,16 @@ class InferenceEngine:
                 "core": LLMRuntimeConfig(),
                 "backup": LLMRuntimeConfig(),
             }
+            # attention.update 按需增量推送：各指标只在触发条件满足时推送
+            self._last_attention_mode: str = ""
+            self._last_attention_tier: str = ""
+            self._last_navigation_map_injected: bool = False
+            self._last_bfs_activated_count: int = 0
+            self._last_llm_selection_switched: Optional[bool] = None
+            self._last_llm_selection_mode: str = ""
+            # 模型可见 active context 按需注入状态；与前端 attention.update 状态分开。
+            self._last_llm_injected_attention_mode: str = ""
+            self._last_llm_injected_pressure_tier: str = ""
             # 远程模型默认 context window（优先使用配置的 num_ctx）
             self._context_window_size = 32768
             
@@ -1202,7 +1212,7 @@ class InferenceEngine:
         except (json.JSONDecodeError, AttributeError) as e:
             logger.error(f"[FC] 工具 {func_name} 参数解析失败: {e}")
             payload = {"error": f"参数解析失败: {e}"}
-            if func_name in {"ide_write_file", "exec_write_file", "write_to_file"}:
+            if func_name in {"exec_write_file", "write_to_file"}:
                 payload["recovery_hint"] = (
                     "工具参数疑似被模型输出长度截断。下一轮不要一次性写完整大文件；"
                     "请只生成 800-1200 字符的小片段，首次 mode='overwrite'，"
@@ -1329,7 +1339,7 @@ class InferenceEngine:
                 parameters=arguments,
                 timeout=30.0,
             )
-            if func_name in {"ide_write_file", "write_to_file", "replace_in_file", "delete_file", "execute_command", "create_directory"}:
+            if func_name in {"write_to_file", "replace_in_file", "delete_file", "execute_command", "create_directory"}:
                 if self._looks_like_approval_denial(str(result.error or result.data or "")):
                     self._approval_block_active = True
                 elif result.success:
@@ -1712,56 +1722,77 @@ class InferenceEngine:
             last_decision = selection_stats.get("last_llm_decision") or {}
             last_pressure = selection_stats.get("last_pressure_metrics") or {}
             last_threshold = selection_stats.get("last_threshold_result") or {}
-            self._send_thinking_step("attention.update", {
-                "mode": mode,
-                "turn": fc_turn,
-                "focus_node_id": active_node_id,
-                "task_graph_id": task_graph_id,
-                "budget_usage": round(pressure_view.get("context_pressure_percent", ratio * 100), 1),
-                "context_pressure": round(pressure_view.get("context_pressure_ratio", ratio), 3),
-                "threshold_budget_pressure": round(pressure_view.get("context_pressure_ratio", ratio), 3),
-                "threshold_budget_percent": pressure_view.get("context_pressure_percent"),
-                "active_threshold_ratio": pressure_view.get("active_threshold_ratio"),
-                "budget_reference": pressure_view.get("budget_reference"),
-                "raw_context_pressure": round(ratio, 3),
-                "trigger_context_pressure": round(ratio, 3),
-                "trigger_budget_usage": round(pressure_view.get("context_pressure_percent", ratio * 100), 1),
-                "visible_context_pressure": round(
-                    float(getattr(attn_window, "active_context_pressure_ratio", ratio) or ratio),
-                    3,
-                ) if attn_window is not None else round(ratio,3),
-                "registered_context_pressure": round(
-                    float(getattr(attn_window, "registered_context_pressure", ratio) or ratio),
-                    3,
-                ) if attn_window is not None else round(ratio,3),
-                "provider_prompt_tokens": int(getattr(attn_window, "_last_provider_prompt_tokens", 0) or 0) if attn_window is not None else 0,
-                "provider_context_pressure_percent": getattr(attn_window, "provider_context_pressure_percent", None) if attn_window is not None else None,
-                "navigation_map_injected": bool(getattr(self, "_last_attention_context_telemetry", {}).get("navigation_map_injected", False)),
-                "navigation_map_reason": str(getattr(self, "_last_attention_context_telemetry", {}).get("navigation_map_reason", "none")),
-                "active_context_token_estimate": int(getattr(self, "_last_attention_context_telemetry", {}).get("active_context_token_estimate", 0) or 0),
-                "active_context_item_count": int(getattr(self, "_last_attention_context_telemetry", {}).get("active_context_item_count", 0) or 0),
-                "active_context_rendered_chars": int(getattr(self, "_last_attention_context_telemetry", {}).get("active_context_rendered_chars", 0) or 0),
-                "active_context_source_addresses": list(getattr(self, "_last_attention_context_telemetry", {}).get("active_context_source_addresses", []) or []),
-                "retrieved_memory_count": int(getattr(self, "_last_attention_context_telemetry", {}).get("retrieved_memory_count", 0) or 0),
-                "bfs_seed_count": int(getattr(self, "_last_attention_context_telemetry", {}).get("bfs_seed_count", 0) or 0),
-                "bfs_activated_count": int(getattr(self, "_last_attention_context_telemetry", {}).get("bfs_activated_count", 0) or 0),
-                "pressure_tier": tier,
-                "pressure_threshold_medium": thresholds["medium"],
-                "pressure_threshold_high": thresholds["high"],
-                "llm_selection_enabled": bool(selection_stats.get("enabled", False)),
-                "selection_attempt_count": selection_stats.get("selection_attempt_count", 0),
-                "last_pressure_value": last_pressure.get("current_pressure"),
-                "last_pressure_trigger": last_threshold.get("trigger_type"),
-                "last_pressure_should_trigger": last_threshold.get("should_trigger"),
-                "last_selection_attempted": last_selection.get("attempted"),
-                "last_selection_triggered": last_selection.get("triggered"),
-                "last_selection_mode": last_decision.get("mode"),
-                "last_selection_reason": last_decision.get("reason"),
-                "last_selection_confidence": last_decision.get("confidence"),
-                "last_selection_fallback": last_decision.get("is_fallback"),
-                "last_selection_switched": last_selection.get("switched"),
-                "progress": progress,
-            })
+
+            # ── 按需增量推送：各维度只在自身触发条件满足时才推 ──
+            diff: Dict[str, Any] = {}
+
+            # 注意力模式：变更时推送
+            attention_telemetry = getattr(self, "_last_attention_context_telemetry", {}) or {}
+            if mode != getattr(self, "_last_attention_mode", ""):
+                diff["mode"] = mode
+                if attention_telemetry.get("focus_address"):
+                    diff["focus_address"] = attention_telemetry.get("focus_address")
+                if attention_telemetry.get("focus_path"):
+                    diff["focus_path"] = attention_telemetry.get("focus_path")
+                self._last_attention_mode = mode
+
+            # 压力层级：达到 yellow/red 阈值时推送
+            if tier != getattr(self, "_last_attention_tier", ""):
+                if tier in ("yellow", "red"):
+                    diff["pressure_tier"] = tier
+                    diff["budget_usage"] = round(pressure_view.get("context_pressure_percent", ratio * 100), 1)
+                    diff["context_pressure"] = round(pressure_view.get("context_pressure_ratio", ratio), 3)
+                    diff["pressure_threshold_medium"] = thresholds["medium"]
+                    diff["pressure_threshold_high"] = thresholds["high"]
+                    diff["trigger_context_pressure"] = round(ratio, 3)
+                    diff["trigger_budget_usage"] = round(pressure_view.get("context_pressure_percent", ratio * 100), 1)
+                self._last_attention_tier = tier
+
+            # LLM 自主注意力选择：仅在触发阈值（yellow/red）时推送切换结果
+            llm_selection_switched = last_selection.get("switched")
+            llm_selection_mode = last_decision.get("mode")
+            if tier in ("yellow", "red"):
+                prev_switched = getattr(self, "_last_llm_selection_switched", None)
+                prev_mode = getattr(self, "_last_llm_selection_mode", "")
+                if llm_selection_switched is not prev_switched or llm_selection_mode != prev_mode:
+                    diff["llm_selection_enabled"] = bool(selection_stats.get("enabled", False))
+                    diff["last_selection_switched"] = llm_selection_switched
+                    diff["last_selection_mode"] = llm_selection_mode
+                    diff["last_selection_reason"] = last_decision.get("reason")
+                    self._last_llm_selection_switched = llm_selection_switched
+                    self._last_llm_selection_mode = llm_selection_mode
+
+            # BFS 扩散节点数：只有发生记忆检索/扩散时推送，不把 0 值当实时状态刷新。
+            attention_telemetry = getattr(self, "_last_attention_context_telemetry", {}) or {}
+            bfs_activated = int(attention_telemetry.get("bfs_activated_count", 0) or 0)
+            bfs_seed = int(attention_telemetry.get("bfs_seed_count", 0) or 0)
+            retrieved_memory = int(attention_telemetry.get("retrieved_memory_count", 0) or 0)
+            if (bfs_seed or retrieved_memory) and bfs_activated != getattr(self, "_last_bfs_activated_count", 0):
+                diff["retrieved_memory_count"] = retrieved_memory
+                diff["bfs_activated_count"] = bfs_activated
+                diff["bfs_seed_count"] = bfs_seed
+                self._last_bfs_activated_count = bfs_activated
+
+            # 导航地图：注入状态变化时推送
+            nav_injected = bool(getattr(self, "_last_attention_context_telemetry", {}).get("navigation_map_injected", False))
+            if nav_injected != getattr(self, "_last_navigation_map_injected", False):
+                diff["navigation_map_injected"] = nav_injected
+                diff["navigation_map_reason"] = str(getattr(self, "_last_attention_context_telemetry", {}).get("navigation_map_reason", "none"))
+                diff["active_context_item_count"] = int(getattr(self, "_last_attention_context_telemetry", {}).get("active_context_item_count", 0) or 0)
+                diff["focus_node_id"] = str(graph_data.get("activeNodeId") or "req")
+                self._last_navigation_map_injected = nav_injected
+
+            # 没有需要推送的变化 → 跳过
+            if not diff:
+                return
+
+            # 始终携带标识字段
+            diff.setdefault("turn", fc_turn)
+            diff.setdefault("task_graph_id", task_graph_id)
+            diff["_partial"] = True
+            diff["_changed_keys"] = list(key for key in diff.keys() if not key.startswith("_"))
+
+            self._send_thinking_step("attention.update", diff)
         except Exception as exc:
             logger.debug(f"[图谱推送] attention:update fallback 发送跳过: {exc}")
 
@@ -1926,7 +1957,6 @@ class InferenceEngine:
         key = str(tool_name or "").strip()
         lower = key.lower()
         mapping = {
-            "ide_write_file": "写入文件",
             "exec_write_file": "写入文件",
             "write_to_file": "写入文件",
             "ide_read_file": "读取文件",
@@ -2459,6 +2489,61 @@ class InferenceEngine:
         except Exception as e:
             import traceback
             logger.error(f"[图谱推送] 发布事件失败: {e}\n{traceback.format_exc()}")
+
+    def _publish_llm_status(
+        self,
+        status: str,
+        *,
+        model_id: str = "",
+        layer: str = "CORE",
+        phase: str = "model_call",
+        turn: int = 0,
+        elapsed_s: Optional[float] = None,
+        timeout_s: Optional[float] = None,
+        remaining_s: Optional[float] = None,
+        message: str = "",
+        error: str = "",
+        state: str = "running",
+    ) -> None:
+        """Publish a Web-visible model request status without leaking secrets."""
+        safe_error = ""
+        if error:
+            safe_error = re.sub(r"sk-[A-Za-z0-9_\-]{12,}", "sk-***", str(error))
+            safe_error = _compact_log_line(safe_error, 180)
+        if not message:
+            if status == "started":
+                message = "正在请求模型，等待返回结果。"
+            elif status == "waiting":
+                message = "模型请求仍在等待返回。"
+            elif status == "long_wait":
+                message = "模型请求等待时间较长，接口可能正在重试。"
+            elif status == "timeout":
+                message = "模型请求超时，正在尝试降级处理。"
+            elif status == "api_error":
+                message = "模型接口断链或返回异常，正在尝试降级处理。"
+            elif status == "success":
+                message = "模型已返回，正在解析结果。"
+            else:
+                message = "模型请求状态更新。"
+        if state == "running" and status in {"long_wait", "timeout", "api_error"}:
+            state = "possibly_stalled"
+        data: Dict[str, Any] = {
+            "status": status,
+            "state": state,
+            "phase": phase,
+            "message": message,
+            "model_id": model_id,
+            "layer": layer,
+            "turn": turn,
+            "elapsed_s": round(float(elapsed_s), 1) if elapsed_s is not None else None,
+            "timeout_s": round(float(timeout_s), 1) if timeout_s is not None else None,
+            "remaining_s": round(float(remaining_s), 1) if remaining_s is not None else None,
+            "error": safe_error or None,
+        }
+        self._send_thinking_step(
+            "llm.request",
+            {k: v for k, v in data.items() if v is not None},
+        )
     
     async def _generate_with_vllm(self, messages: List[Dict[str, str]]) -> str:
         """使用 vLLM OpenAI API 生成响应（不支持工具调用）
@@ -2640,12 +2725,16 @@ class InferenceEngine:
         *,
         label: str = "LLM request",
         poll_interval: float = 0.5,
+        status_callback: Optional[Callable[[str, float, float], None]] = None,
+        status_interval: float = 15.0,
+        stall_after: float = 20.0,
     ):
         """等待阻塞式模型请求，同时响应用户停止。"""
         import concurrent.futures
 
         started_at = time.time()
         deadline = started_at + max(0.0, float(timeout or 0.0))
+        next_status_at = max(1.0, float(status_interval or 15.0))
         while True:
             if self._is_interrupt_requested():
                 future.cancel()
@@ -2660,6 +2749,15 @@ class InferenceEngine:
             try:
                 return future.result(timeout=min(poll_interval, remaining))
             except concurrent.futures.TimeoutError:
+                elapsed = time.time() - started_at
+                if status_callback and elapsed >= next_status_at:
+                    status = "long_wait" if elapsed >= float(stall_after or 0.0) else "waiting"
+                    try:
+                        status_callback(status, elapsed, max(0.0, remaining))
+                    except Exception as cb_err:
+                        logger.debug("%s status callback failed: %s", label, cb_err)
+                    while next_status_at <= elapsed:
+                        next_status_at += max(1.0, float(status_interval or 15.0))
                 continue
 
     def _get_fallback_response(self, user_input: str) -> str:
@@ -2781,24 +2879,49 @@ class InferenceEngine:
                 from zulong.l2.attention_context_retrieval import (
                     build_attention_context_bundle,
                     render_attention_context_message,
+                    should_include_memory_context_for_turn,
                 )
                 _mode_val = (
                     getattr(self._attn_window.mode, "value", "global")
                     if self._attn_window.mode else "global"
                 )
-                _pressure_pct = float(
+                _pressure_ratio = float(
                     getattr(self._attn_window, "active_context_pressure_ratio", 0.0) or 0.0
-                ) * 100.0
+                )
+                _pressure_pct = _pressure_ratio * 100.0
+                _pressure_tier = self._attention_pressure_tier_for_feedback(_pressure_ratio)
+                _last_mode = getattr(self, "_last_llm_injected_attention_mode", "")
+                _include_mode_update = (bool(_last_mode) and _mode_val != _last_mode) or (
+                    not _last_mode and str(_mode_val).lower() != "global"
+                )
+                if _mode_val != _last_mode:
+                    self._last_llm_injected_attention_mode = _mode_val
+                _last_pressure_tier = getattr(self, "_last_llm_injected_pressure_tier", "")
+                _include_pressure_update = _pressure_tier in ("yellow", "red") and _pressure_tier != _last_pressure_tier
+                if _pressure_tier != _last_pressure_tier:
+                    self._last_llm_injected_pressure_tier = _pressure_tier
                 _task_graph = getattr(self, "_task_graph", None) or getattr(self, "task_graph", None)
                 _memory_graph = getattr(self, "_memory_graph", None) or getattr(self, "memory_graph", None)
+                _query_text = str(user_input or "")[:500]
+                _include_memory_context = should_include_memory_context_for_turn(
+                    tool_prediction=getattr(self, "_current_tool_prediction_for_feedback", {}),
+                    tool_names=getattr(self, "_current_tool_bundle_for_feedback", []) or [],
+                    query_text=_query_text,
+                    pressure_trigger=_include_pressure_update,
+                    restricted_recovery=False,
+                )
                 _bundle = build_attention_context_bundle(
                     mode=_mode_val,
-                    query_text=str(user_input or "")[:500],
+                    query_text=_query_text,
                     attention_window=self._attn_window,
                     task_graph=_task_graph,
                     memory_graph=_memory_graph,
                     pressure_percent=_pressure_pct,
-                    trigger_reason="model_call",
+                    trigger_reason="pressure_threshold" if _include_pressure_update else "model_call",
+                    pressure_tier=_pressure_tier,
+                    include_mode_update=_include_mode_update,
+                    include_pressure_update=_include_pressure_update,
+                    include_memory_context=_include_memory_context,
                     include_navigation_map=False,
                 )
                 _rendered_msg = render_attention_context_message(_bundle)
@@ -2863,14 +2986,39 @@ class InferenceEngine:
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
+            self._publish_llm_status(
+                "started",
+                model_id=model_id,
+                layer="CORE",
+                phase="single_decision",
+                timeout_s=self._core_timeout,
+                message="正在请求主模型，等待返回结果。",
+            )
             future = executor.submit(call_core)
             api_response = self._wait_future_with_interrupt(
                 future,
                 self._core_timeout,
                 label="[L2] CORE single decision",
+                status_callback=lambda status, elapsed, remaining: self._publish_llm_status(
+                    status,
+                    model_id=model_id,
+                    layer="CORE",
+                    phase="single_decision",
+                    elapsed_s=elapsed,
+                    timeout_s=self._core_timeout,
+                    remaining_s=remaining,
+                ),
             )
         except InterruptedError:
             logger.info("[L2] CORE 单次推理被用户停止")
+            self._publish_llm_status(
+                "interrupted",
+                model_id=model_id,
+                layer="CORE",
+                phase="single_decision",
+                message="模型请求已停止。",
+                state="cancelled",
+            )
             return {
                 "response_content": "",
                 "tool_calls_data": None,
@@ -2886,6 +3034,16 @@ class InferenceEngine:
                 "🚨 [L2] CORE 单次推理超时 (>%s秒)，尝试备用模型",
                 self._core_timeout,
             )
+            self._publish_llm_status(
+                "timeout",
+                model_id=model_id,
+                layer="CORE",
+                phase="single_decision",
+                elapsed_s=self._core_timeout,
+                timeout_s=self._core_timeout,
+                message="主模型请求超时，正在尝试备用模型或降级处理。",
+                state="possibly_stalled",
+            )
             backup_text = asyncio.run(
                 self._generate_with_backup(messages, user_input)
             )
@@ -2900,6 +3058,15 @@ class InferenceEngine:
             self._last_timeout_elapsed = 0.0
             self._last_model_error_reason = reason
             logger.error("🚨 [L2] CORE 单次推理失败: %s", api_err)
+            self._publish_llm_status(
+                "api_error",
+                model_id=model_id,
+                layer="CORE",
+                phase="single_decision",
+                message="主模型接口断链或返回异常，正在尝试备用模型或降级处理。",
+                error=str(api_err),
+                state="possibly_stalled",
+            )
             backup_text = asyncio.run(
                 self._generate_with_backup(messages, user_input)
             )
@@ -2941,6 +3108,13 @@ class InferenceEngine:
             len(raw_tool_calls),
             tool_call_names,
             usage_summary,
+        )
+        self._publish_llm_status(
+            "success",
+            model_id=model_id,
+            layer="CORE",
+            phase="single_decision",
+            message="主模型已返回，正在解析结果。",
         )
         if not response_content and not raw_tool_calls:
             logger.warning(
@@ -3047,6 +3221,14 @@ class InferenceEngine:
         
         try:
             logger.info(f"🔄 [BACKUP] 切换到备用模型：{backup_cfg.model_id} @ {backup_cfg.base_url}")
+            self._publish_llm_status(
+                "started",
+                model_id=backup_cfg.model_id,
+                layer="BACKUP",
+                phase="backup_model",
+                timeout_s=self._backup_timeout,
+                message="正在请求备用模型。",
+            )
             
             import concurrent.futures
             
@@ -3076,9 +3258,26 @@ class InferenceEngine:
                     future,
                     self._backup_timeout,
                     label="[BACKUP]",
+                    status_callback=lambda status, elapsed, remaining: self._publish_llm_status(
+                        status,
+                        model_id=backup_cfg.model_id,
+                        layer="BACKUP",
+                        phase="backup_model",
+                        elapsed_s=elapsed,
+                        timeout_s=self._backup_timeout,
+                        remaining_s=remaining,
+                    ),
                 )
             except InterruptedError:
                 logger.info("[BACKUP] 备用模型生成被用户停止")
+                self._publish_llm_status(
+                    "interrupted",
+                    model_id=backup_cfg.model_id,
+                    layer="BACKUP",
+                    phase="backup_model",
+                    message="备用模型请求已停止。",
+                    state="cancelled",
+                )
                 return ""
             except concurrent.futures.TimeoutError:
                 _elapsed = time.time() - _backup_start
@@ -3093,6 +3292,16 @@ class InferenceEngine:
                     "fallback_static", "backup_timeout", "BACKUP",
                     _current_request_id_var.get())
                 logger.error(f"🚨 [BACKUP] 备用模型也超时 (>{self._backup_timeout}秒)")
+                self._publish_llm_status(
+                    "timeout",
+                    model_id=backup_cfg.model_id,
+                    layer="BACKUP",
+                    phase="backup_model",
+                    elapsed_s=_elapsed,
+                    timeout_s=self._backup_timeout,
+                    message="备用模型请求超时，已转入静态降级。",
+                    state="possibly_stalled",
+                )
                 return self._get_fallback_response(user_input)
             finally:
                 executor.shutdown(wait=False)
@@ -3101,6 +3310,13 @@ class InferenceEngine:
             self._health_tracker.record_success("BACKUP")
             self._last_model_error_reason = None
             logger.info(f"✅ [BACKUP] 备用模型生成完成，长度：{len(response_text)}")
+            self._publish_llm_status(
+                "success",
+                model_id=backup_cfg.model_id,
+                layer="BACKUP",
+                phase="backup_model",
+                message="备用模型已返回，正在整理结果。",
+            )
             response_text = self._degradation_handler.append_backup_hint(response_text)
             return response_text
             
@@ -3111,6 +3327,15 @@ class InferenceEngine:
                 "fallback_static", f"backup_exception: {e}", "BACKUP",
                 _current_request_id_var.get())
             logger.error(f"❌ [BACKUP] 备用模型生成失败：{e}")
+            self._publish_llm_status(
+                "api_error",
+                model_id=backup_cfg.model_id,
+                layer="BACKUP",
+                phase="backup_model",
+                message="备用模型接口异常，已转入静态降级。",
+                error=str(e),
+                state="possibly_stalled",
+            )
             return self._get_fallback_response(user_input)
 
     # _detect_needs_tools 已移除：不再使用关键词预路由
@@ -3327,7 +3552,7 @@ class InferenceEngine:
                         "task_update_node",
                         "task_mark_status",
                         "task_attach_file",
-                        "ide_write_file",
+                        "exec_write_file",
                         "read_file",
                         "exec_run_command",
                         "submit_final_answer",

@@ -146,7 +146,7 @@ class ToolCallCircuitBreaker:
 
         # --- 信号 4: 上下文窗口压力 ---
         self._context_window_size = _cfg_int(cfg.get("context_window_size", 131072), 131072)
-        self._threshold_budget_ratio = _cfg_float(cfg.get("threshold_budget_ratio", 0.50), 0.50)
+        self._threshold_budget_ratio = 1.0
         self._context_yellow_ratio = _cfg_float(cfg.get("context_yellow_ratio", 0.90), 0.90)
         self._context_red_ratio = _cfg_float(cfg.get("context_red_ratio", 1.0), 1.0)
 
@@ -213,7 +213,7 @@ class ToolCallCircuitBreaker:
         self._pattern_red_count = _cfg_int(cfg.get("pattern_red_count", 10), 10)
         self._query_similarity_threshold = _cfg_float(cfg.get("query_similarity_threshold", 0.85), 0.85)
         self._context_window_size = _cfg_int(cfg.get("context_window_size", 131072), 131072)
-        self._threshold_budget_ratio = _cfg_float(cfg.get("threshold_budget_ratio", 0.50), 0.50)
+        self._threshold_budget_ratio = 1.0
         self._context_yellow_ratio = _cfg_float(cfg.get("context_yellow_ratio", 0.90), 0.90)
         self._context_red_ratio = _cfg_float(cfg.get("context_red_ratio", 1.0), 1.0)
         self._time_yellow_seconds = _cfg_float(cfg.get("time_yellow_seconds", 60), 60)

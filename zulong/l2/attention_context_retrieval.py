@@ -40,6 +40,11 @@ class AttentionRetrievalPlan:
     max_items: int = 8
     trigger_reason: str = "model_call"
     pressure_percent: float = 0.0
+    pressure_tier: str = ""
+    include_mode_update: bool = False
+    include_pressure_update: bool = False
+    include_task_context: bool = True
+    include_memory_context: bool = False
     include_navigation_map: bool = False
     navigation_reason: str = ""
 
@@ -63,6 +68,11 @@ class AttentionRetrievalPlan:
             "max_items": self.max_items,
             "trigger_reason": self.trigger_reason,
             "pressure_percent": round(float(self.pressure_percent or 0.0), 1),
+            "pressure_tier": self.pressure_tier,
+            "include_mode_update": self.include_mode_update,
+            "include_pressure_update": self.include_pressure_update,
+            "include_task_context": self.include_task_context,
+            "include_memory_context": self.include_memory_context,
             "include_navigation_map": self.include_navigation_map,
             "navigation_reason": self.navigation_reason,
         }
@@ -147,6 +157,70 @@ def normalize_attention_mode(mode: Any) -> str:
     return text
 
 
+_MEMORY_CONTEXT_TOOLS = {
+    "recall_memory",
+    "read_memory_node",
+    "save_memory_note",
+    "discover_related",
+    "activate_memory_network",
+    "list_memory",
+    "search_experience",
+}
+
+_MEMORY_CONTEXT_CUES = (
+    "记忆",
+    "回忆",
+    "记得",
+    "历史",
+    "经验",
+    "上次",
+    "之前",
+    "刚才",
+    "长期记忆",
+    "memory",
+    "recall",
+    "previous",
+    "last time",
+)
+
+
+def should_include_memory_context_for_turn(
+    *,
+    tool_prediction: Optional[Dict[str, Any]] = None,
+    tool_names: Optional[List[Any]] = None,
+    query_text: str = "",
+    pressure_trigger: bool = False,
+    restricted_recovery: bool = False,
+) -> bool:
+    """Return True only when this turn explicitly needs MemoryGraph context."""
+    if pressure_trigger or restricted_recovery:
+        return True
+
+    prediction = tool_prediction or {}
+    context = prediction.get("context_bundle") if isinstance(prediction, dict) else {}
+    context = context if isinstance(context, dict) else {}
+    if any(context.get(key) for key in ("needs_memory", "needs_memory_write", "referenced_nodes")):
+        return True
+
+    names: List[str] = []
+    sources = [
+        tool_names or [],
+        prediction.get("predicted_tools") if isinstance(prediction, dict) else [],
+        prediction.get("suggested_tools") if isinstance(prediction, dict) else [],
+        prediction.get("tool_bag") if isinstance(prediction, dict) else [],
+    ]
+    for source in sources:
+        for name in list(source or []):
+            text = str(name or "").strip().lower()
+            if text:
+                names.append(text)
+    if any(name in _MEMORY_CONTEXT_TOOLS or "memory" in name or "记忆" in name for name in names):
+        return True
+
+    lowered_query = str(query_text or "").lower()
+    return any(cue in lowered_query for cue in _MEMORY_CONTEXT_CUES)
+
+
 def estimate_text_tokens(text: str) -> int:
     """Cheap local estimate used only to cap active-context rendering."""
     if not text:
@@ -216,6 +290,11 @@ def build_attention_retrieval_plan(
     trigger_reason: str = "model_call",
     focus: Optional[Dict[str, Any]] = None,
     threshold_budget_tokens: int = 0,
+    pressure_tier: str = "",
+    include_mode_update: bool = False,
+    include_pressure_update: bool = False,
+    include_task_context: bool = True,
+    include_memory_context: bool = False,
     include_navigation_map: bool = False,
     navigation_reason: str = "",
 ) -> AttentionRetrievalPlan:
@@ -250,35 +329,14 @@ def build_attention_retrieval_plan(
         max_items=max_items,
         trigger_reason=trigger_reason,
         pressure_percent=float(pressure_percent or 0.0),
+        pressure_tier=str(pressure_tier or "").lower(),
+        include_mode_update=bool(include_mode_update),
+        include_pressure_update=bool(include_pressure_update),
+        include_task_context=bool(include_task_context),
+        include_memory_context=bool(include_memory_context),
         include_navigation_map=bool(include_navigation_map),
         navigation_reason=navigation_reason or (trigger_reason if include_navigation_map else ""),
     )
-
-
-# TSD §26.1.4 导航地图注入门禁：记录上次注入签名，签名未变化时不重复注入
-_last_navigation_map_key: str = ""
-
-
-def compute_navigation_map_key(
-    task_graph: Any,
-    plan: AttentionRetrievalPlan,
-) -> str:
-    """计算导航地图注入签名：graph_id | mode | focus_node_id | trigger_reason | status_signature。
-
-    status_signature 用 TaskGraph 节点状态分布的紧凑摘要，反映任务结构变化。
-    """
-    graph_id = str(getattr(task_graph, "id", "") or getattr(task_graph, "_graph_id", "") or "tg")
-    sig = ""
-    try:
-        nodes = getattr(task_graph, "_nodes", {}) or {}
-        counts: Dict[str, int] = {}
-        for n in nodes.values():
-            st = str(getattr(n, "status", "") or "unknown")
-            counts[st] = counts.get(st, 0) + 1
-        sig = ",".join(f"{k}:{v}" for k, v in sorted(counts.items()))
-    except Exception:
-        sig = ""
-    return f"{graph_id}|{plan.mode}|{plan.focus_node_id}|{plan.trigger_reason}|{sig}"
 
 
 def build_navigation_map(
@@ -290,12 +348,6 @@ def build_navigation_map(
         return ""
     if not hasattr(task_graph, "render_navigator_map"):
         return ""
-    # TSD §26.1.4 签名门禁：签名未变化时跳过注入（去重），只更新 telemetry
-    global _last_navigation_map_key
-    current_key = compute_navigation_map_key(task_graph, plan)
-    if current_key and current_key == _last_navigation_map_key:
-        plan.navigation_reason = "deduped"
-        return ""
     try:
         rendered = str(task_graph.render_navigator_map(
             plan.focus_node_id or "",
@@ -304,8 +356,6 @@ def build_navigation_map(
     except Exception as exc:
         logger.debug("[AttentionContext] 导航地图构建跳过: %s", exc)
         return ""
-    if rendered:
-        _last_navigation_map_key = current_key
     return rendered
 
 
@@ -383,6 +433,11 @@ def build_attention_context_bundle(
     memory_graph: Any = None,
     pressure_percent: float = 0.0,
     trigger_reason: str = "model_call",
+    pressure_tier: str = "",
+    include_mode_update: bool = False,
+    include_pressure_update: bool = False,
+    include_task_context: bool = True,
+    include_memory_context: bool = False,
     include_navigation_map: bool = False,
     navigation_reason: str = "",
     uncovered_node_ids: Optional[Sequence[str]] = None,
@@ -400,13 +455,22 @@ def build_attention_context_bundle(
         trigger_reason=trigger_reason,
         focus=focus,
         threshold_budget_tokens=threshold_budget_tokens,
+        pressure_tier=pressure_tier,
+        include_mode_update=include_mode_update,
+        include_pressure_update=include_pressure_update,
+        include_task_context=include_task_context,
+        include_memory_context=include_memory_context,
         include_navigation_map=include_navigation_map,
         navigation_reason=navigation_reason,
     )
-    task_items = _task_context_items(task_graph, plan)
+    task_items = _task_context_items(task_graph, plan) if plan.include_task_context else []
     navigation_map = build_navigation_map(task_graph, plan, uncovered_node_ids=uncovered_node_ids)
-    memory_items, retrieval_meta = retrieve_attention_context(memory_graph, plan)
-    bfs_items, bfs_meta = run_bfs_expansion(memory_graph, plan)
+    if plan.include_memory_context:
+        memory_items, retrieval_meta = retrieve_attention_context(memory_graph, plan)
+        bfs_items, bfs_meta = run_bfs_expansion(memory_graph, plan)
+    else:
+        memory_items, retrieval_meta = [], {"retrieved_memory_count": 0, "retrieval_skipped": "not_requested"}
+        bfs_items, bfs_meta = [], {"bfs_seed_count": 0, "bfs_activated_count": 0, "bfs_skipped": "not_requested"}
 
     telemetry = {
         **retrieval_meta,
@@ -415,7 +479,7 @@ def build_attention_context_bundle(
         "focus_address": plan.focus_node_address,
         "focus_path": list(plan.focus_path),
         "navigation_map_injected": bool(navigation_map),
-        "navigation_map_reason": plan.navigation_reason if navigation_map else "skipped",
+        "navigation_map_reason": plan.navigation_reason if navigation_map else "none",
     }
     # 收集本轮注入项的来源地址（服务覆盖率与下钻，非去重键）
     source_addresses: List[str] = []
@@ -423,7 +487,7 @@ def build_attention_context_bundle(
         addr = item.address_line() if hasattr(item, "address_line") else ""
         if addr and addr not in source_addresses:
             source_addresses.append(addr)
-    nav_reason = plan.navigation_reason if navigation_map else "skipped"
+    nav_reason = plan.navigation_reason if navigation_map else "none"
     nav_injected = bool(navigation_map)
     retrieved_count = int(retrieval_meta.get("retrieved_memory_count", 0) or 0)
     bfs_seed = int(bfs_meta.get("bfs_seed_count", 0) or 0)
@@ -460,15 +524,17 @@ def render_attention_context(bundle: AttentionContextBundle) -> str:
     plan = bundle.plan
     lines: List[str] = []
     focus = plan.focus_node_address or plan.focus_node_id or "unknown"
-    lines.append("【注意力计划】")
-    lines.append(
-        f"mode={plan.mode}; reason={plan.trigger_reason}; pressure={plan.pressure_percent:.1f}%; focus={focus}"
-    )
-    lines.append("动态注意力=图位置感知的本轮上下文检索与重组；不是压缩器，本轮命中内容按重要度拼接注入。")
-    if bundle.focus_summary:
+    if plan.include_mode_update:
+        lines.append("【注意力模式更新】")
+        lines.append(f"当前模式={plan.mode}; focus={focus}; reason={plan.trigger_reason}")
+        lines.append("动态注意力=图位置感知的本轮上下文检索与重组；不是压缩器。")
+    if plan.include_pressure_update and plan.pressure_tier in {"yellow", "red"}:
+        lines.append("【上下文压力阈值】")
+        lines.append(f"pressure_tier={plan.pressure_tier}; pressure={plan.pressure_percent:.1f}%; reason={plan.trigger_reason}")
+    if bundle.focus_summary and plan.include_task_context:
         lines.append("【思维导航】")
         lines.extend(_limit_lines(str(bundle.focus_summary), 5))
-    elif plan.focus_path_addresses:
+    elif plan.focus_path_addresses and plan.include_task_context:
         lines.append("【思维导航】")
         lines.append(" › ".join(plan.focus_path_addresses[-5:]))
 
@@ -493,7 +559,7 @@ def render_attention_context(bundle: AttentionContextBundle) -> str:
         lines.extend(rendered_items)
 
     jump_lines = _address_jump_lines(bundle)
-    if jump_lines:
+    if jump_lines and (rendered_items or bundle.navigation_map or plan.include_mode_update or plan.include_pressure_update):
         lines.append("【地址回跳】")
         lines.extend(jump_lines[:8])
 

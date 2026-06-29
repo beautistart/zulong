@@ -11,6 +11,7 @@
 所有 LLM 调用应通过 llm_completion()，不再直接用 openai SDK。
 """
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,142 @@ try:
 except ImportError:
     _LITELLM_AVAILABLE = False
     logger.warning("[LLMGateway] litellm 未安装，回退到 openai SDK")
+
+
+def _load_retry_config() -> Dict[str, float]:
+    """Load LLM retry config from runtime config with safe defaults."""
+    default = {"max_attempts": 3, "delay": 1.0, "backoff_factor": 2.0}
+    try:
+        from zulong.config.config_manager import ConfigManager
+
+        cfg = ConfigManager().get_dict("l2_inference.retry") or {}
+    except Exception:
+        cfg = {}
+    result = dict(default)
+    for key in ("max_attempts", "delay", "backoff_factor"):
+        value = cfg.get(key, default[key])
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = default[key]
+        result[key] = parsed
+    result["max_attempts"] = max(1, int(result["max_attempts"]))
+    result["delay"] = max(0.0, float(result["delay"]))
+    result["backoff_factor"] = max(1.0, float(result["backoff_factor"]))
+    return result
+
+
+def _http_status_from_error(exc: Exception) -> Optional[int]:
+    for attr in ("status_code", "status"):
+        value = getattr(exc, attr, None)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                pass
+    response = getattr(exc, "response", None)
+    value = getattr(response, "status_code", None)
+    if value is not None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _is_retryable_llm_error(exc: Exception) -> bool:
+    """Return whether an LLM API error is worth retrying.
+
+    Retry transient transport/provider instability only. Do not retry malformed
+    requests, authentication problems, quota/balance failures, or invalid URLs.
+    """
+    status = _http_status_from_error(exc)
+    text = str(exc or "")
+    lower = text.lower()
+
+    if status in {400, 401, 402, 403, 404, 422}:
+        return False
+    if any(
+        marker in lower
+        for marker in (
+            "insufficient balance",
+            "quota",
+            "invalid api key",
+            "unauthorized",
+            "forbidden",
+            "authentication",
+            "bad request",
+            "invalid request",
+            "unsupported",
+            "model not found",
+            "no connection adapters",
+            "invalid url",
+            "missing schema",
+            "unknown url type",
+        )
+    ):
+        return False
+
+    if status == 429 or (status is not None and 500 <= status <= 599):
+        return True
+    return any(
+        marker in lower
+        for marker in (
+            "timeout",
+            "timed out",
+            "readtimeout",
+            "connecttimeout",
+            "connection error",
+            "connection reset",
+            "connection aborted",
+            "temporarily unavailable",
+            "service unavailable",
+            "bad gateway",
+            "gateway timeout",
+            "internalservererror",
+            "internal server error",
+            "rate limit",
+            "too many requests",
+        )
+    )
+
+
+def _completion_with_retry(call_kwargs: Dict[str, Any], *, retry_config: Dict[str, float]):
+    max_attempts = max(1, int(retry_config.get("max_attempts", 1)))
+    delay = max(0.0, float(retry_config.get("delay", 0.0)))
+    backoff = max(1.0, float(retry_config.get("backoff_factor", 1.0)))
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return litellm.completion(**call_kwargs)
+        except Exception as exc:
+            last_error = exc
+            retryable = _is_retryable_llm_error(exc)
+            if attempt >= max_attempts or not retryable:
+                if attempt > 1:
+                    logger.warning(
+                        "[LLMGateway] LLM 调用重试结束: attempt=%s/%s retryable=%s error=%s",
+                        attempt,
+                        max_attempts,
+                        retryable,
+                        exc,
+                    )
+                raise
+            sleep_s = delay * (backoff ** (attempt - 1))
+            logger.warning(
+                "[LLMGateway] LLM 调用失败，将重试: attempt=%s/%s delay=%.2fs error=%s",
+                attempt,
+                max_attempts,
+                sleep_s,
+                exc,
+            )
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("LLM retry loop exited unexpectedly")
 
 
 def _build_litellm_model(
@@ -126,11 +263,14 @@ def llm_completion(
         call_kwargs["tools"] = tools
     if tool_choice:
         call_kwargs["tool_choice"] = tool_choice
+    retry_config = extra_kwargs.pop("retry_config", None) or _load_retry_config()
+    for key in ("retry_max_attempts", "retry_delay", "retry_backoff_factor"):
+        extra_kwargs.pop(key, None)
     call_kwargs.update(extra_kwargs)
 
     logger.debug("[LLMGateway] litellm model=%s api_base=%s format=%s stream=%s",
                  full_model, api_base, api_format, stream)
-    return litellm.completion(**call_kwargs)
+    return _completion_with_retry(call_kwargs, retry_config=retry_config)
 
 
 def _fallback_openai_completion(

@@ -8,7 +8,7 @@ attention_selection:
   oscillation_detection_window: 10
   pressure_threshold_high: '1.0'
   pressure_threshold_medium: '0.9'
-  threshold_budget_ratio: '0.50'
+  threshold_budget_ratio: '1.0'
 audio:
   asr:
     backend: sensevoice
@@ -135,7 +135,7 @@ l2_inference:
     pattern_yellow_count: 8
     query_similarity_threshold: 0.85
     safety_hard_cap: null
-    threshold_budget_ratio: '0.50'
+    threshold_budget_ratio: '1.0'
     time_red_seconds: 120
     time_yellow_seconds: 60
   core_model: ''
@@ -325,16 +325,16 @@ models:
     model_path: ./models/hexgrad/Kokoro-82M
     name: Kokoro TTS
     voice: zf_xiaoxiao
-  - api_format: chat_completions
-    api_key: sk-3f80fe717eb8d830d80abda048ef8cdb3623eaedc20d6296d1f9e3de93ff2e12
+  - api_format: openai_responses
+    api_key: sk-a80520e509f38624f7943a9449299a586efd49e68cc31a9a912ef1517eef3872
     backend: openai_compatible
-    base_url: https://shayulajiao.xyz/v1
+    base_url: https://api.super-nb.me/v1
     enabled: true
     id: l2_botcf
     layer: l2_core
     model_id: gpt-5.5
     name: L2 核心
-    num_ctx: 1048576
+    num_ctx: 131072
   - api_format: chat_completions
     api_key: ''
     backend: openai_compatible

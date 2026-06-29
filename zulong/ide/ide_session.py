@@ -86,7 +86,12 @@ class IDEFCState:
     last_attention_context_rendered: str = ""
 
     # FC 执行纪律增强：导航地图与观察提示去重
-    last_navigation_map_key: str = ""
+    last_navigation_map_key: str = ""  # 兼容旧 session；新逻辑使用下面的语义字段
+    last_navigation_map_state: Dict[str, Any] = field(default_factory=dict)
+    last_llm_injected_attention_mode: str = ""
+    last_llm_injected_pressure_tier: str = ""
+    last_bfs_seed_ids: List[str] = field(default_factory=list)
+    last_attention_update_state: Dict[str, Any] = field(default_factory=dict)
     observation_nudge_turn: int = 0
     observation_nudge_count: int = 0
 

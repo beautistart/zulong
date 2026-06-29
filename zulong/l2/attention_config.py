@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 class AttentionConfig:
     """注意力选择配置类"""
     enabled: bool = True                          # 功能开关
-    threshold_budget_ratio: float = 0.5           # 阈值预算=LLM原始上下文窗口的比例
+    threshold_budget_ratio: float = 1.0           # 兼容字段：阈值预算=Web配置的完整LLM上下文窗口
     pressure_threshold_high: float = 1.0          # 高压阈值（上下文压力 > 100%）
     pressure_threshold_medium: float = 0.9        # 中压阈值（上下文压力 > 90%）
     cooldown_base_seconds: float = 30.0           # 基础冷却时间(秒)
@@ -119,7 +119,7 @@ class AttentionConfig:
             
             config = cls(
                 enabled=_get_bool("enabled", default_config.enabled),
-                threshold_budget_ratio=_get_float("threshold_budget_ratio", default_config.threshold_budget_ratio),
+                threshold_budget_ratio=1.0,
                 pressure_threshold_high=_get_float("pressure_threshold_high", default_config.pressure_threshold_high),
                 pressure_threshold_medium=_get_float("pressure_threshold_medium", default_config.pressure_threshold_medium),
                 cooldown_base_seconds=_get_float("cooldown_base_seconds", default_config.cooldown_base_seconds),
@@ -147,11 +147,13 @@ class AttentionConfig:
         """
         is_valid = True
         
-        if not (0.01 <= self.threshold_budget_ratio <= 1.0):
+        if self.threshold_budget_ratio != 1.0:
             old_value = self.threshold_budget_ratio
-            self.threshold_budget_ratio = max(0.01, min(1.0, self.threshold_budget_ratio))
-            logger.warning(f"[AttentionConfig] threshold_budget_ratio超出范围[0.01, 1.0]，"
-                          f"从{old_value}修正为{self.threshold_budget_ratio}")
+            self.threshold_budget_ratio = 1.0
+            logger.info(
+                "[AttentionConfig] threshold_budget_ratio 已固定为 1.0 "
+                f"(阈值预算=Web配置完整上下文窗口)，忽略旧值 {old_value}"
+            )
             is_valid = False
 
         if not (0.01 <= self.pressure_threshold_high <= 2.0):

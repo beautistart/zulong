@@ -157,6 +157,13 @@ class FCRunner:
         if hasattr(self.engine, '_rule_guardian'):
             self.engine._rule_guardian.reset()
         sync_engine_tool_budget(self.engine, user_input)
+
+        # 重置审批上下文（每次新任务开始时清理上一次任务残留的审批状态）
+        try:
+            from zulong.l2.fc_approval import reset_approval_context
+            reset_approval_context()
+        except Exception:
+            pass
         if not vllm_model_id:
             get_runtime_model = getattr(self.engine, "_get_runtime_model_id", None)
             if callable(get_runtime_model):
@@ -403,7 +410,6 @@ class FCRunner:
         inspecting or marking "in_progress" without producing files/results.
         """
         progress_tools = {
-            "ide_write_file",
             "exec_write_file",
             "write_to_file",
             "replace_in_file",
@@ -836,19 +842,19 @@ class FCRunner:
             ratio = 0.0
         yellow_ratio = 0.90
         red_ratio = 1.0
-        threshold_budget_ratio = 0.5
+        threshold_budget_ratio = 1.0
         try:
             attn_cfg = getattr(attn_window, "_llm_config", None)
             if attn_cfg:
                 yellow_ratio = float(getattr(attn_cfg, "pressure_threshold_medium", yellow_ratio))
                 red_ratio = float(getattr(attn_cfg, "pressure_threshold_high", red_ratio))
-                threshold_budget_ratio = float(getattr(attn_cfg, "threshold_budget_ratio", threshold_budget_ratio))
+                threshold_budget_ratio = 1.0
             else:
                 cb = getattr(self.engine, "_circuit_breaker", None)
                 cb_cfg = getattr(cb, "_config", {}) or {}
                 yellow_ratio = float(cb_cfg.get("context_yellow_ratio", yellow_ratio))
                 red_ratio = float(cb_cfg.get("context_red_ratio", red_ratio))
-                threshold_budget_ratio = float(cb_cfg.get("threshold_budget_ratio", threshold_budget_ratio))
+                threshold_budget_ratio = 1.0
         except Exception:
             pass
 
@@ -1247,7 +1253,7 @@ class FCRunner:
             "content": (
                 "[任务图继续执行] 当前任务图仍有未完成节点。"
                 "请继续调用真实工具推进任务，不要直接总结或只输出进度句。"
-                "如果当前节点要求文件产出，下一步必须调用 ide_write_file 或相应写入工具真实落盘。"
+                "如果当前节点要求文件产出，下一步必须调用 exec_write_file 真实落盘。"
                 f"{detail}"
             ),
         })

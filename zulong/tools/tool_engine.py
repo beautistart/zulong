@@ -666,7 +666,7 @@ class ToolEngine:
                 logger.debug("[ToolEngine] experience_tool 模块未找到，跳过注册")
 
             # 注册 IDE 后台桥工具（供 L2 主动打开/切换 VS Code 工作区）
-            # 注意：ide_write_file 已合并到 exec_write_file（内部自动桥路由），不再独立注册
+            # 文件写入统一由 exec_write_file 处理，并在内部按需路由到编辑器桥。
             try:
                 from zulong.tools.ide_bridge_tools import (
                     IdeOpenWorkspaceTool,
